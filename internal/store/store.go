@@ -7,6 +7,7 @@ import (
 	"iter"
 	"maps"
 	"math"
+	"math/bits"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -14,15 +15,19 @@ import (
 
 const shardFanout = 256
 
-type shardBucket[V any] [shardFanout]map[uint64]V
+type shardBucket[V any] struct {
+	values [shardFanout]map[uint64]V
+	active [shardFanout / 64]uint64
+}
 
 type ShardMap[V any] struct {
 	root          *[shardFanout]*shardBucket[V]
 	length        int
 	clonedBuckets [shardFanout / 64]uint64
 	clonedShards  map[uint16]struct{}
-	active        []uint16
-	activeCloned  bool
+	activeBuckets [shardFanout / 64]uint64
+	smallActive   [2]uint16
+	smallCount    uint8
 	shardShift    uint8
 }
 
@@ -228,7 +233,7 @@ func (m ShardMap[V]) Get(id uint64) V {
 		var zero V
 		return zero
 	}
-	return m.root[bucket][shard][id]
+	return m.root[bucket].values[shard][id]
 }
 
 func (m ShardMap[V]) Has(id uint64) bool {
@@ -236,7 +241,7 @@ func (m ShardMap[V]) Has(id uint64) bool {
 	if m.root == nil || m.root[bucket] == nil {
 		return false
 	}
-	_, exists := m.root[bucket][shard][id]
+	_, exists := m.root[bucket].values[shard][id]
 	return exists
 }
 
@@ -247,12 +252,33 @@ func (m ShardMap[V]) All() iter.Seq2[uint64, V] {
 		if m.root == nil {
 			return
 		}
-		for _, index := range m.active {
-			bucket, shard := uint8(index>>8), uint8(index)
-			for id, value := range m.root[bucket][shard] {
-				if !yield(id, value) {
-					return
+		if m.smallCount <= uint8(len(m.smallActive)) {
+			for _, index := range m.smallActive[:m.smallCount] {
+				bucket, shard := uint8(index>>8), uint8(index)
+				for id, value := range m.root[bucket].values[shard] {
+					if !yield(id, value) {
+						return
+					}
 				}
+			}
+			return
+		}
+		for bucketWord, activeBuckets := range m.activeBuckets {
+			for activeBuckets != 0 {
+				bucket := uint8(bucketWord*64 + bits.TrailingZeros64(activeBuckets))
+				item := m.root[bucket]
+				for shardWord, activeShards := range item.active {
+					for activeShards != 0 {
+						shard := uint8(shardWord*64 + bits.TrailingZeros64(activeShards))
+						for id, value := range item.values[shard] {
+							if !yield(id, value) {
+								return
+							}
+						}
+						activeShards &= activeShards - 1
+					}
+				}
+				activeBuckets &= activeBuckets - 1
 			}
 		}
 	}
@@ -263,18 +289,21 @@ func (m *ShardMap[V]) Set(id uint64, value V) {
 	if m.root[bucket] == nil {
 		m.root[bucket] = new(shardBucket[V])
 	}
-	if m.root[bucket][shard] == nil {
-		if m.clonedShards != nil && !m.activeCloned {
-			m.active = slices.Clone(m.active)
-			m.activeCloned = true
+	m.activeBuckets[bucket/64] |= uint64(1) << (bucket % 64)
+	if m.root[bucket].values[shard] == nil {
+		m.root[bucket].values[shard] = map[uint64]V{}
+		m.root[bucket].active[shard/64] |= uint64(1) << (shard % 64)
+		if m.smallCount < uint8(len(m.smallActive)) {
+			m.smallActive[m.smallCount] = uint16(bucket)<<8 | uint16(shard)
+			m.smallCount++
+		} else {
+			m.smallCount = uint8(len(m.smallActive)) + 1
 		}
-		m.root[bucket][shard] = map[uint64]V{}
-		m.active = append(m.active, uint16(bucket)<<8|uint16(shard))
 	}
-	if _, exists := m.root[bucket][shard][id]; !exists {
+	if _, exists := m.root[bucket].values[shard][id]; !exists {
 		m.length++
 	}
-	m.root[bucket][shard][id] = value
+	m.root[bucket].values[shard][id] = value
 }
 
 func (m *ShardMap[V]) Delete(id uint64) {
@@ -282,28 +311,34 @@ func (m *ShardMap[V]) Delete(id uint64) {
 	if m.root[bucket] == nil {
 		return
 	}
-	if _, exists := m.root[bucket][shard][id]; exists {
-		delete(m.root[bucket][shard], id)
+	if _, exists := m.root[bucket].values[shard][id]; exists {
+		delete(m.root[bucket].values[shard], id)
 		m.length--
-		if len(m.root[bucket][shard]) == 0 {
-			m.root[bucket][shard] = nil
-			if m.clonedShards != nil && !m.activeCloned {
-				m.active = slices.Clone(m.active)
-				m.activeCloned = true
-			}
-			index := uint16(bucket)<<8 | uint16(shard)
-			for activeIndex, active := range m.active {
-				if active == index {
-					m.active = slices.Delete(m.active, activeIndex, activeIndex+1)
-					break
+		if len(m.root[bucket].values[shard]) == 0 {
+			m.root[bucket].values[shard] = nil
+			m.root[bucket].active[shard/64] &^= uint64(1) << (shard % 64)
+			if m.smallCount <= uint8(len(m.smallActive)) {
+				index := uint16(bucket)<<8 | uint16(shard)
+				for activeIndex, active := range m.smallActive[:m.smallCount] {
+					if active == index {
+						m.smallCount--
+						m.smallActive[activeIndex] = m.smallActive[m.smallCount]
+						break
+					}
 				}
+			} else if m.length == 0 {
+				m.smallCount = 0
+			}
+			if m.root[bucket].active == [shardFanout / 64]uint64{} {
+				m.root[bucket] = nil
+				m.activeBuckets[bucket/64] &^= uint64(1) << (bucket % 64)
 			}
 		}
 	}
 }
 
 func (m ShardMap[V]) Fork() ShardMap[V] {
-	return ShardMap[V]{root: m.root, length: m.length, active: m.active, shardShift: m.shardShift}
+	return ShardMap[V]{root: m.root, length: m.length, activeBuckets: m.activeBuckets, smallActive: m.smallActive, smallCount: m.smallCount, shardShift: m.shardShift}
 }
 
 func (m *ShardMap[V]) CloneShardOnce(id uint64) {
@@ -319,7 +354,7 @@ func (m *ShardMap[V]) CloneShardOnce(id uint64) {
 		m.clonedShards = map[uint16]struct{}{}
 	}
 	word, bit := bucket/64, uint64(1)<<(bucket%64)
-	if m.clonedBuckets[word]&bit == 0 {
+	if m.clonedBuckets[word]&bit == 0 || m.root[bucket] == nil {
 		cloned := new(shardBucket[V])
 		if m.root[bucket] != nil {
 			*cloned = *m.root[bucket]
@@ -327,7 +362,7 @@ func (m *ShardMap[V]) CloneShardOnce(id uint64) {
 		m.root[bucket] = cloned
 		m.clonedBuckets[word] |= bit
 	}
-	m.root[bucket][shard] = maps.Clone(m.root[bucket][shard])
+	m.root[bucket].values[shard] = maps.Clone(m.root[bucket].values[shard])
 	m.clonedShards[index] = struct{}{}
 }
 

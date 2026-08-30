@@ -238,21 +238,22 @@ func (tx *Tx) appendPropertyChanges(entity string, id uint64, before, after map[
 			payload["edge_id"] = int64(id)
 		}
 		if newOK {
-			payload["new_value"] = changefeedValue(newValue)
+			payload["new_value"] = tx.changefeedValue(newValue)
 			if oldOK {
-				payload["old_value"] = changefeedValue(oldValue)
+				payload["old_value"] = tx.changefeedValue(oldValue)
 			}
 			tx.appendChange(entity+".property_set", payload)
 			continue
 		}
-		payload["old_value"] = changefeedValue(oldValue)
+		payload["old_value"] = tx.changefeedValue(oldValue)
 		tx.appendChange(entity+".property_remove", payload)
 	}
 }
 
-func changefeedValue(value any) any {
+func (tx *Tx) changefeedValue(value any) any {
 	encodedBytes := store.EstimatePropertyIndexValueBytes(value)
-	if encodedBytes <= changefeedInlineValueBytes {
+	inlineLimit := min(uint64(changefeedInlineValueBytes), tx.db.changefeedMaxBytes/4)
+	if encodedBytes <= inlineLimit {
 		return store.CloneValue(value)
 	}
 	return map[string]any{

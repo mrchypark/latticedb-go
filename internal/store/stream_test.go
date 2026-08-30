@@ -4,6 +4,7 @@ import (
 	"math"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -123,5 +124,14 @@ func TestStreamBulkReadAndByteRetention(t *testing.T) {
 	retained := store.Read("events", 0, 10_000)
 	if len(retained) == 0 || retained[0].Sequence != through+1 || retained[len(retained)-1].Sequence != 10_000 {
 		t.Fatalf("retained range after %d = %#v", through, retained)
+	}
+}
+
+func TestStreamByteRetentionRemovesOversizedNewestRecord(t *testing.T) {
+	store := NewStreamStore()
+	store.Publish("events", "event", strings.Repeat("x", 10_000))
+	through, trimmed := store.TrimToBytes("events", 1_000)
+	if !trimmed || through != 1 || store.StreamBytes("events") != 0 || len(store.Read("events", 0, 1)) != 0 {
+		t.Fatalf("oversized trim = through %d, trimmed %v, bytes %d", through, trimmed, store.StreamBytes("events"))
 	}
 }

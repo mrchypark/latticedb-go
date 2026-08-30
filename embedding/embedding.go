@@ -262,21 +262,38 @@ func (client *Client) parse(data []byte) ([]float32, error) {
 	if client.config.APIFormat == APIFormatOpenAI {
 		var response struct {
 			Data []struct {
-				Embedding []float32 `json:"embedding"`
+				Embedding json.RawMessage `json:"embedding"`
 			} `json:"data"`
 		}
-		if err := json.Unmarshal(data, &response); err != nil || len(response.Data) != 1 || len(response.Data[0].Embedding) == 0 {
+		if err := json.Unmarshal(data, &response); err != nil || len(response.Data) != 1 {
 			return nil, errors.New("invalid OpenAI embedding response")
 		}
-		return response.Data[0].Embedding, nil
+		if vector, ok := decodeEmbedding(response.Data[0].Embedding); ok {
+			return vector, nil
+		}
+		return nil, errors.New("invalid OpenAI embedding response")
 	}
 	var response struct {
-		Embedding []float32 `json:"embedding"`
+		Embedding json.RawMessage `json:"embedding"`
 	}
-	if err := json.Unmarshal(data, &response); err != nil || len(response.Embedding) == 0 {
+	if err := json.Unmarshal(data, &response); err != nil {
 		return nil, errors.New("invalid Ollama embedding response")
 	}
-	return response.Embedding, nil
+	if vector, ok := decodeEmbedding(response.Embedding); ok {
+		return vector, nil
+	}
+	return nil, errors.New("invalid Ollama embedding response")
+}
+
+func decodeEmbedding(data json.RawMessage) ([]float32, bool) {
+	if len(data) == 0 || bytes.Contains(data, []byte("null")) {
+		return nil, false
+	}
+	var vector []float32
+	if err := json.Unmarshal(data, &vector); err != nil || len(vector) == 0 {
+		return nil, false
+	}
+	return vector, true
 }
 
 func hashWordByte(value byte) bool {

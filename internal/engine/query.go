@@ -949,7 +949,7 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 		if part == "" {
 			return nil, fmt.Errorf("empty MATCH pattern in %q", text)
 		}
-		if strings.Contains(part, "->") {
+		if findTopLevelToken(part, "->") >= 0 {
 			pattern, err := parseEdgePattern(part)
 			if err != nil {
 				return nil, err
@@ -1050,15 +1050,16 @@ func parseNodePattern(text string) (nodePattern, error) {
 }
 
 func parseEdgePattern(text string) (edgePattern, error) {
-	leftEnd := strings.Index(text, ")-[")
-	if leftEnd < 0 {
+	leftLink := findTopLevelToken(text, "-[")
+	if leftLink <= 0 || text[leftLink-1] != ')' {
 		return edgePattern{}, fmt.Errorf("invalid edge pattern %q", text)
 	}
-	rightStart := strings.Index(text[leftEnd+3:], "]->")
-	if rightStart < 0 {
+	leftEnd := leftLink - 1
+	rightArrow := findTopLevelToken(text, "->")
+	if rightArrow <= leftLink || text[rightArrow-1] != ']' {
 		return edgePattern{}, fmt.Errorf("invalid edge pattern %q", text)
 	}
-	rightStart += leftEnd + 3
+	rightStart := rightArrow - 1
 
 	left, err := parseNodePattern(text[:leftEnd+1])
 	if err != nil {
@@ -1188,15 +1189,16 @@ func parseSetClause(text string) (*setClause, error) {
 }
 
 func parseCreateClause(text string) (*createClause, error) {
-	leftEnd := strings.Index(text, ")-[")
-	if leftEnd < 0 {
+	leftLink := findTopLevelToken(text, "-[")
+	if leftLink <= 0 || text[leftLink-1] != ')' {
 		return nil, fmt.Errorf("unsupported CREATE clause %q", text)
 	}
-	rightStart := strings.Index(text[leftEnd+3:], "]->")
-	if rightStart < 0 {
+	leftEnd := leftLink - 1
+	rightArrow := findTopLevelToken(text, "->")
+	if rightArrow <= leftLink || text[rightArrow-1] != ']' {
 		return nil, fmt.Errorf("unsupported CREATE clause %q", text)
 	}
-	rightStart += leftEnd + 3
+	rightStart := rightArrow - 1
 
 	sourceBody, err := trimEnclosed(text[:leftEnd+1], '(', ')')
 	if err != nil {
@@ -2313,11 +2315,47 @@ func isQueryIdentifier(value string) bool {
 }
 
 func splitOperator(text string, operator string) (string, string, bool) {
-	index := strings.Index(text, operator)
+	index := findTopLevelToken(text, operator)
 	if index < 0 {
 		return "", "", false
 	}
 	return strings.TrimSpace(text[:index]), strings.TrimSpace(text[index+len(operator):]), true
+}
+
+func findTopLevelToken(text, token string) int {
+	var quote byte
+	braceDepth := 0
+	bracketDepth := 0
+	parenDepth := 0
+	for index := 0; index < len(text); index++ {
+		if scanQueryString(text, index, &quote) {
+			continue
+		}
+		if braceDepth == 0 && bracketDepth == 0 && parenDepth == 0 && strings.HasPrefix(text[index:], token) {
+			return index
+		}
+		switch text[index] {
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		}
+	}
+	return -1
 }
 
 func splitOnNextClause(input string, keywords ...string) (string, string, string) {

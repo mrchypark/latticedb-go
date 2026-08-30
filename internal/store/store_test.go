@@ -37,6 +37,36 @@ func TestStringPostingsForkIsolationAcrossPromotion(t *testing.T) {
 	}
 }
 
+func TestShardMapDeleteOccupiedShardsInInsertionOrder(t *testing.T) {
+	base := NewShardMap[uint64]()
+	for id := uint64(0); id < 10_000; id++ {
+		base.Set(id, id)
+	}
+	fork := base.Fork()
+	for id := uint64(0); id < 10_000; id++ {
+		fork.CloneShardOnce(id)
+		fork.Delete(id)
+	}
+	if fork.Len() != 0 || base.Len() != 10_000 {
+		t.Fatalf("lengths after deletion = fork %d, base %d", fork.Len(), base.Len())
+	}
+	for range fork.All() {
+		t.Fatal("deleted shard remained active")
+	}
+	fork.CloneShardOnce(20_000)
+	fork.Set(20_000, 1)
+	if fork.Get(20_000) != 1 || base.Has(20_000) {
+		t.Fatal("reusing emptied shard map changed the base")
+	}
+	for id, value := range fork.All() {
+		if id != 20_000 || value != 1 {
+			t.Fatalf("reused shard iteration = %d:%d", id, value)
+		}
+		return
+	}
+	t.Fatal("reused shard was absent from iteration")
+}
+
 func TestPagedMapForkIsolationAndHighIDs(t *testing.T) {
 	base := NewPagedMap[uint64]()
 	for _, id := range []uint64{1, 64, 65, 1 << 48} {

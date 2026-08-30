@@ -2201,6 +2201,33 @@ func TestQuerySingleQuotedStructuralCharacters(t *testing.T) {
 	}
 }
 
+func TestQueryQuotedOperatorsAreNotStructural(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "quoted-operators.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for index, quote := range []string{"'", `"`} {
+		value := fmt.Sprintf("value-%d )->[ -> += <=> @@ = :", index)
+		literal := quote + value + quote
+		if _, err := db.Query("CREATE (n {text: "+literal+"})", nil); err != nil {
+			t.Fatalf("create with %s quote: %v", quote, err)
+		}
+		result, err := db.Query("MATCH (n {text: "+literal+"}) RETURN count(n) AS count", nil)
+		if err != nil || result.Rows[0]["count"] != int64(1) {
+			t.Fatalf("match with %s quote = %#v, %v", quote, result, err)
+		}
+		updated := quote + value + " updated += <=> @@" + quote
+		if _, err := db.Query("MATCH (n {text: "+literal+"}) SET n.text = "+updated, nil); err != nil {
+			t.Fatalf("set with %s quote: %v", quote, err)
+		}
+		result, err = db.Query("MATCH (n) WHERE n.text = "+updated+" RETURN count(n) AS count", nil)
+		if err != nil || result.Rows[0]["count"] != int64(1) {
+			t.Fatalf("where with %s quote = %#v, %v", quote, result, err)
+		}
+	}
+}
+
 func TestQuerySemanticValidationFailsClosed(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "query-semantics.ltdb"), OpenOptions{Create: true})
 	if err != nil {

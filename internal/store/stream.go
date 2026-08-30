@@ -188,7 +188,7 @@ func (store *StreamStore) TrimToBytes(name string, maxBytes uint64) (uint64, boo
 	for chunk := log.tail; chunk != nil; chunk = chunk.previous {
 		for index := len(chunk.records) - 1; index >= 0; index-- {
 			recordBytes := streamRecordBytes(chunk.records[index])
-			if retained != 0 && snapshotAdd(retained, recordBytes) > target {
+			if snapshotAdd(retained, recordBytes) > target {
 				store.Trim(name, chunk.records[index].Sequence)
 				return chunk.records[index].Sequence, true
 			}

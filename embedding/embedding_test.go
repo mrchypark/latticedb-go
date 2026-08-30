@@ -223,3 +223,21 @@ func TestClientOpenAIAndValidation(t *testing.T) {
 		t.Fatal("non-200 response accepted")
 	}
 }
+
+func TestClientRejectsNullEmbeddingComponents(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		format APIFormat
+		body   string
+	}{
+		{"ollama", APIFormatOllama, `{"embedding":[null,1]}`},
+		{"openai", APIFormatOpenAI, `{"data":[{"embedding":[null,1]}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &Client{config: Config{APIFormat: test.format}}
+			if vector, err := client.parse([]byte(test.body)); err == nil {
+				t.Fatalf("null component accepted as %#v", vector)
+			}
+		})
+	}
+}

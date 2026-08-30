@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -103,6 +104,25 @@ func TestAutomaticChangefeedRetentionPersists(t *testing.T) {
 	changes, err = reopened.Changes(0, 1_000, 0)
 	if err != nil || len(changes) == 0 || changes[0].Sequence != first || changes[len(changes)-1].Sequence != 102 {
 		t.Fatalf("recovered retained changes = %#v, %v", changes, err)
+	}
+}
+
+func TestOversizedChangeRecordCannotExhaustSnapshotBudget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversized-change.ltdb")
+	db, err := Open(path, OpenOptions{
+		Create:                   true,
+		MaxDatabaseSnapshotBytes: 100_000,
+		ChangefeedMaxBytes:       12_500,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"v": strings.Repeat("x", 10_000)}})
+		return err
+	}); err != nil {
+		t.Fatalf("graph write below snapshot limit failed because of changefeed: %v", err)
 	}
 }
 

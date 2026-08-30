@@ -139,6 +139,46 @@ func BenchmarkSequentialMapForkSet(b *testing.B) {
 	}
 }
 
+func BenchmarkShardMapDeleteOccupiedShards(b *testing.B) {
+	for _, size := range []int{10_000, 50_000} {
+		base := NewShardMap[uint64]()
+		for id := 0; id < size; id++ {
+			base.Set(uint64(id), uint64(id))
+		}
+		b.Run(fmt.Sprintf("entries_%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				fork := base.Fork()
+				for id := 0; id < size; id++ {
+					fork.CloneShardOnce(uint64(id))
+					fork.Delete(uint64(id))
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkShardMapAllScaling(b *testing.B) {
+	for _, size := range []int{1, 1_000, 10_000} {
+		values := NewShardMap[uint64]()
+		for id := 0; id < size; id++ {
+			values.Set(uint64(id), uint64(id))
+		}
+		b.Run(fmt.Sprintf("entries_%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				var count int
+				for range values.All() {
+					count++
+				}
+				if count != size {
+					b.Fatal("short shard map iteration")
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkAdjacencyAppendScaling(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
 		var chunked *EdgeList
