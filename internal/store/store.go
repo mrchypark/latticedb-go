@@ -1,22 +1,397 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
+	"maps"
+	"math"
 	"path/filepath"
 	"reflect"
 	"slices"
 )
 
+const shardFanout = 256
+
+type shardBucket[V any] [shardFanout]map[uint64]V
+
+type ShardMap[V any] struct {
+	root          *[shardFanout]*shardBucket[V]
+	length        int
+	clonedBuckets [shardFanout / 64]uint64
+	clonedShards  map[uint16]struct{}
+	active        []uint16
+	activeCloned  bool
+	shardShift    uint8
+}
+
+type StringPostings struct {
+	buckets      ShardMap[map[string]postingList]
+	clonedHashes map[uint64]struct{}
+	clonedKeys   map[string]struct{}
+}
+
+const smallPostingLimit = 64
+
+type postingList struct {
+	small map[uint64]struct{}
+	large ShardMap[struct{}]
+}
+
+func NewStringPostings() StringPostings {
+	return StringPostings{buckets: NewShardMap[map[string]postingList]()}
+}
+
+func (postings StringPostings) Fork() StringPostings {
+	return StringPostings{buckets: postings.buckets.Fork()}
+}
+
+func (postings StringPostings) Get(key string) []uint64 {
+	list := postings.buckets.Get(hashString(key))[key]
+	ids := make([]uint64, 0, list.len())
+	for id := range list.all() {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+func (postings StringPostings) Len(key string) int {
+	return postings.buckets.Get(hashString(key))[key].len()
+}
+
+func (postings StringPostings) All(key string) iter.Seq[uint64] {
+	list := postings.buckets.Get(hashString(key))[key]
+	if list.large.root != nil {
+		large := list.large
+		return func(yield func(uint64) bool) {
+			for id := range large.All() {
+				if !yield(id) {
+					return
+				}
+			}
+		}
+	}
+	small := list.small
+	return func(yield func(uint64) bool) {
+		for id := range small {
+			if !yield(id) {
+				return
+			}
+		}
+	}
+}
+
+func (postings StringPostings) Keys() iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for _, bucket := range postings.buckets.All() {
+			for key := range bucket {
+				if !yield(key) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func (postings *StringPostings) Add(key string, id uint64) {
+	list := postings.writable(key)
+	if list.large.root != nil {
+		list.large.CloneShardOnce(id)
+		list.large.Set(id, struct{}{})
+	} else {
+		list.small[id] = struct{}{}
+		if len(list.small) > smallPostingLimit {
+			list.large = newPostingShardMap()
+			for postingID := range list.small {
+				list.large.Set(postingID, struct{}{})
+			}
+			list.small = nil
+		}
+	}
+	postings.buckets.Get(hashString(key))[key] = list
+}
+
+func (postings *StringPostings) Remove(key string, id uint64) {
+	list := postings.buckets.Get(hashString(key))[key]
+	if !list.has(id) {
+		return
+	}
+	list = postings.writable(key)
+	if list.large.root != nil {
+		list.large.CloneShardOnce(id)
+		list.large.Delete(id)
+	} else {
+		delete(list.small, id)
+	}
+	postings.buckets.Get(hashString(key))[key] = list
+}
+
+func (postings *StringPostings) writable(key string) postingList {
+	hash := hashString(key)
+	postings.buckets.CloneShardOnce(hash)
+	if postings.clonedHashes == nil {
+		postings.clonedHashes = map[uint64]struct{}{}
+		postings.clonedKeys = map[string]struct{}{}
+	}
+	if _, cloned := postings.clonedHashes[hash]; !cloned {
+		bucket := maps.Clone(postings.buckets.Get(hash))
+		if bucket == nil {
+			bucket = map[string]postingList{}
+		}
+		postings.buckets.Set(hash, bucket)
+		postings.clonedHashes[hash] = struct{}{}
+	}
+	bucket := postings.buckets.Get(hash)
+	if _, cloned := postings.clonedKeys[key]; !cloned {
+		list := bucket[key]
+		if list.large.root != nil {
+			list.large = list.large.Fork()
+		} else if list.small == nil {
+			list.small = map[uint64]struct{}{}
+		} else {
+			list.small = maps.Clone(list.small)
+		}
+		bucket[key] = list
+		postings.clonedKeys[key] = struct{}{}
+	}
+	return bucket[key]
+}
+
+func (list postingList) len() int {
+	if list.large.root != nil {
+		return list.large.Len()
+	}
+	return len(list.small)
+}
+
+func (list postingList) has(id uint64) bool {
+	if list.large.root != nil {
+		return list.large.Has(id)
+	}
+	_, ok := list.small[id]
+	return ok
+}
+
+func (list postingList) all() iter.Seq[uint64] {
+	return func(yield func(uint64) bool) {
+		if list.large.root != nil {
+			for id := range list.large.All() {
+				if !yield(id) {
+					return
+				}
+			}
+			return
+		}
+		for id := range list.small {
+			if !yield(id) {
+				return
+			}
+		}
+	}
+}
+
+func hashString(value string) uint64 {
+	const offset = uint64(14695981039346656037)
+	const prime = uint64(1099511628211)
+	hash := offset
+	for index := range len(value) {
+		hash ^= uint64(value[index])
+		hash *= prime
+	}
+	return hash
+}
+
+func NewShardMap[V any]() ShardMap[V] {
+	return ShardMap[V]{root: new([shardFanout]*shardBucket[V])}
+}
+
+func newPostingShardMap() ShardMap[struct{}] {
+	return ShardMap[struct{}]{root: new([shardFanout]*shardBucket[struct{}]), shardShift: 8}
+}
+
+func (m ShardMap[V]) Get(id uint64) V {
+	bucket, shard := m.indexes(id)
+	if m.root[bucket] == nil {
+		var zero V
+		return zero
+	}
+	return m.root[bucket][shard][id]
+}
+
+func (m ShardMap[V]) Has(id uint64) bool {
+	bucket, shard := m.indexes(id)
+	if m.root == nil || m.root[bucket] == nil {
+		return false
+	}
+	_, exists := m.root[bucket][shard][id]
+	return exists
+}
+
+func (m ShardMap[V]) Len() int { return m.length }
+
+func (m ShardMap[V]) All() iter.Seq2[uint64, V] {
+	return func(yield func(uint64, V) bool) {
+		if m.root == nil {
+			return
+		}
+		for _, index := range m.active {
+			bucket, shard := uint8(index>>8), uint8(index)
+			for id, value := range m.root[bucket][shard] {
+				if !yield(id, value) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func (m *ShardMap[V]) Set(id uint64, value V) {
+	bucket, shard := m.indexes(id)
+	if m.root[bucket] == nil {
+		m.root[bucket] = new(shardBucket[V])
+	}
+	if m.root[bucket][shard] == nil {
+		if m.clonedShards != nil && !m.activeCloned {
+			m.active = slices.Clone(m.active)
+			m.activeCloned = true
+		}
+		m.root[bucket][shard] = map[uint64]V{}
+		m.active = append(m.active, uint16(bucket)<<8|uint16(shard))
+	}
+	if _, exists := m.root[bucket][shard][id]; !exists {
+		m.length++
+	}
+	m.root[bucket][shard][id] = value
+}
+
+func (m *ShardMap[V]) Delete(id uint64) {
+	bucket, shard := m.indexes(id)
+	if m.root[bucket] == nil {
+		return
+	}
+	if _, exists := m.root[bucket][shard][id]; exists {
+		delete(m.root[bucket][shard], id)
+		m.length--
+	}
+}
+
+func (m ShardMap[V]) Fork() ShardMap[V] {
+	return ShardMap[V]{root: m.root, length: m.length, active: m.active, shardShift: m.shardShift}
+}
+
+func (m *ShardMap[V]) CloneShardOnce(id uint64) {
+	bucket, shard := m.indexes(id)
+	index := uint16(bucket)<<8 | uint16(shard)
+	if _, cloned := m.clonedShards[index]; cloned {
+		return
+	}
+	if m.clonedShards == nil {
+		root := new([shardFanout]*shardBucket[V])
+		*root = *m.root
+		m.root = root
+		m.clonedShards = map[uint16]struct{}{}
+	}
+	word, bit := bucket/64, uint64(1)<<(bucket%64)
+	if m.clonedBuckets[word]&bit == 0 {
+		cloned := new(shardBucket[V])
+		if m.root[bucket] != nil {
+			*cloned = *m.root[bucket]
+		}
+		m.root[bucket] = cloned
+		m.clonedBuckets[word] |= bit
+	}
+	m.root[bucket][shard] = maps.Clone(m.root[bucket][shard])
+	m.clonedShards[index] = struct{}{}
+}
+
+func shardIndexes(id uint64) (uint8, uint8) {
+	index := uint16(id)
+	return uint8(index >> 8), uint8(index)
+}
+
+func (m ShardMap[V]) indexes(id uint64) (uint8, uint8) {
+	return shardIndexes(id >> m.shardShift)
+}
+
+const (
+	maxValueDepth    = 64
+	maxValueElements = 1_000_000
+	maxValueBytes    = 64 << 20
+)
+
+var (
+	ErrValueCycle = errors.New("value contains a cycle")
+	ErrValueLimit = errors.New("value exceeds resource limit")
+)
+
+type valueWalk struct {
+	active   map[valueVisit]struct{}
+	elements int
+	bytes    int
+}
+
+type valueVisit struct {
+	kind reflect.Kind
+	ptr  uintptr
+	len  int
+	cap  int
+}
+
 const (
 	stateFileName = "state.json"
 	walFileName   = "wal.log"
-	FTSTextKey    = "text"
+	idsFileName   = "ids.json"
 )
 
 type GraphState struct {
-	Nodes map[uint64]*NodeRecord
-	Edges map[uint64]*EdgeRecord
+	DatabaseID       string
+	VectorDimensions uint16
+	SnapshotBytes    uint64
+	Nodes            ShardMap[*NodeRecord]
+	Edges            ShardMap[*EdgeRecord]
+	FTS              ShardMap[*FTSRecord]
+	Outgoing         ShardMap[[]uint64]
+	Incoming         ShardMap[[]uint64]
+	Labels           StringPostings
+	EdgeTypes        StringPostings
+	FTSTokens        StringPostings
+	NodeProperties   PropertyIndexes
+	EdgeProperties   PropertyIndexes
+	VectorIndex      VectorIndex
+	VectorTombstones ShardMap[[]float32]
+	VectorMutations  uint64
+	// DerivedIndexWork/LogicalBytes are rebuilt on recovery and maintained by mutations.
+	DerivedIndexWork         uint64
+	DerivedIndexLogicalBytes uint64
+	Streams                  StreamStore
+}
+
+// VectorIndex is derived from node properties and is intentionally not persisted.
+type VectorIndex struct {
+	EntryID  uint64
+	MaxLevel int
+	Nodes    ShardMap[*VectorIndexNode]
+}
+
+type VectorIndexNode struct {
+	Level     int
+	Neighbors [][]uint64
+}
+
+func NewVectorIndex() VectorIndex {
+	return VectorIndex{Nodes: ShardMap[*VectorIndexNode]{root: new([shardFanout]*shardBucket[*VectorIndexNode]), shardShift: 3}}
+}
+
+func (index VectorIndex) Fork() VectorIndex {
+	index.Nodes = index.Nodes.Fork()
+	return index
+}
+
+type FTSRecord struct {
+	Text   string
+	Tokens []string
 }
 
 type NodeRecord struct {
@@ -34,11 +409,75 @@ type EdgeRecord struct {
 }
 
 type persistedState struct {
+	DatabaseID       string                             `json:"database_id,omitempty"`
+	VectorDimensions uint16                             `json:"vector_dimensions,omitempty"`
+	CommitID         uint64                             `json:"commit_id"`
+	NextNodeID       uint64                             `json:"next_node_id"`
+	NextEdgeID       uint64                             `json:"next_edge_id"`
+	Nodes            []persistedNode                    `json:"nodes"`
+	Edges            []persistedEdge                    `json:"edges"`
+	FTS              []persistedFTS                     `json:"fts,omitempty"`
+	NodeIndexes      []persistedPropertyIndexDefinition `json:"node_property_indexes,omitempty"`
+	EdgeIndexes      []persistedPropertyIndexDefinition `json:"edge_property_indexes,omitempty"`
+	Streams          persistedStreams                   `json:"streams,omitempty"`
+}
+
+type persistedEnvelope struct {
+	Magic      string          `json:"magic"`
+	Version    uint32          `json:"version"`
+	DatabaseID string          `json:"database_id"`
 	CommitID   uint64          `json:"commit_id"`
-	NextNodeID uint64          `json:"next_node_id"`
-	NextEdgeID uint64          `json:"next_edge_id"`
-	Nodes      []persistedNode `json:"nodes"`
-	Edges      []persistedEdge `json:"edges"`
+	Checksum   uint32          `json:"checksum"`
+	Payload    json.RawMessage `json:"payload"`
+}
+
+type persistedIDs struct {
+	Magic      string `json:"magic,omitempty"`
+	Version    uint32 `json:"version,omitempty"`
+	DatabaseID string `json:"database_id,omitempty"`
+	NextNodeID uint64 `json:"next_node_id"`
+	NextEdgeID uint64 `json:"next_edge_id"`
+	Checksum   uint32 `json:"checksum,omitempty"`
+}
+
+type walPayload struct {
+	Kind     string          `json:"kind"`
+	Snapshot *persistedState `json:"snapshot,omitempty"`
+	Delta    *persistedDelta `json:"delta,omitempty"`
+}
+
+type persistedDelta struct {
+	DatabaseID        string                             `json:"database_id"`
+	CommitID          uint64                             `json:"commit_id"`
+	NextNodeID        uint64                             `json:"next_node_id"`
+	NextEdgeID        uint64                             `json:"next_edge_id"`
+	UpsertNodes       []persistedNode                    `json:"upsert_nodes,omitempty"`
+	DeleteNodes       []uint64                           `json:"delete_nodes,omitempty"`
+	UpsertEdges       []persistedEdge                    `json:"upsert_edges,omitempty"`
+	DeleteEdges       []uint64                           `json:"delete_edges,omitempty"`
+	UpsertFTS         []persistedFTS                     `json:"upsert_fts,omitempty"`
+	DeleteFTS         []uint64                           `json:"delete_fts,omitempty"`
+	Streams           *persistedStreams                  `json:"streams,omitempty"`
+	StreamOperations  []persistedStreamOperation         `json:"stream_operations,omitempty"`
+	CreateNodeIndexes []persistedPropertyIndexDefinition `json:"create_node_indexes,omitempty"`
+	DropNodeIndexes   []persistedPropertyIndexDefinition `json:"drop_node_indexes,omitempty"`
+	CreateEdgeIndexes []persistedPropertyIndexDefinition `json:"create_edge_indexes,omitempty"`
+	DropEdgeIndexes   []persistedPropertyIndexDefinition `json:"drop_edge_indexes,omitempty"`
+}
+
+type GraphDelta struct {
+	UpsertNodes       []uint64
+	DeleteNodes       []uint64
+	UpsertEdges       []uint64
+	DeleteEdges       []uint64
+	UpsertFTS         []uint64
+	DeleteFTS         []uint64
+	StreamsChanged    bool
+	StreamOperations  []StreamOperation
+	CreateNodeIndexes []PropertyIndexDefinition
+	DropNodeIndexes   []PropertyIndexDefinition
+	CreateEdgeIndexes []PropertyIndexDefinition
+	DropEdgeIndexes   []PropertyIndexDefinition
 }
 
 type persistedNode struct {
@@ -55,6 +494,16 @@ type persistedEdge struct {
 	Properties map[string]persistedValue `json:"properties"`
 }
 
+type persistedFTS struct {
+	NodeID uint64 `json:"node_id"`
+	Text   string `json:"text"`
+}
+
+type persistedPropertyIndexDefinition struct {
+	Scope    string `json:"scope"`
+	Property string `json:"property"`
+}
+
 type persistedValue struct {
 	Kind   string                    `json:"kind"`
 	Bool   bool                      `json:"bool,omitempty"`
@@ -69,30 +518,121 @@ type persistedValue struct {
 
 func NewGraphState() *GraphState {
 	return &GraphState{
-		Nodes: map[uint64]*NodeRecord{},
-		Edges: map[uint64]*EdgeRecord{},
+		SnapshotBytes:    4096,
+		Nodes:            NewShardMap[*NodeRecord](),
+		Edges:            NewShardMap[*EdgeRecord](),
+		FTS:              NewShardMap[*FTSRecord](),
+		Outgoing:         NewShardMap[[]uint64](),
+		Incoming:         NewShardMap[[]uint64](),
+		Labels:           NewStringPostings(),
+		EdgeTypes:        NewStringPostings(),
+		FTSTokens:        NewStringPostings(),
+		NodeProperties:   NewPropertyIndexes(),
+		EdgeProperties:   NewPropertyIndexes(),
+		VectorIndex:      NewVectorIndex(),
+		VectorTombstones: NewShardMap[[]float32](),
+		Streams:          NewStreamStore(),
 	}
 }
 
 func CloneGraphState(graph *GraphState) *GraphState {
 	cloned := NewGraphState()
-	for id, node := range graph.Nodes {
-		cloned.Nodes[id] = &NodeRecord{
+	cloned.DatabaseID = graph.DatabaseID
+	cloned.VectorDimensions = graph.VectorDimensions
+	cloned.SnapshotBytes = graph.SnapshotBytes
+	cloned.DerivedIndexWork = graph.DerivedIndexWork
+	cloned.DerivedIndexLogicalBytes = graph.DerivedIndexLogicalBytes
+	for id, node := range graph.Nodes.All() {
+		cloned.Nodes.Set(id, &NodeRecord{
 			ID:         node.ID,
 			Labels:     slices.Clone(node.Labels),
 			Properties: ClonePropertyMap(node.Properties),
+		})
+		for _, label := range node.Labels {
+			cloned.Labels.Add(label, id)
 		}
 	}
-	for id, edge := range graph.Edges {
-		cloned.Edges[id] = &EdgeRecord{
+	for id, edge := range graph.Edges.All() {
+		cloned.Edges.Set(id, &EdgeRecord{
 			ID:         edge.ID,
 			SourceID:   edge.SourceID,
 			TargetID:   edge.TargetID,
 			Type:       edge.Type,
 			Properties: ClonePropertyMap(edge.Properties),
+		})
+		cloned.EdgeTypes.Add(edge.Type, id)
+	}
+	for id, record := range graph.FTS.All() {
+		cloned.FTS.Set(id, &FTSRecord{Text: record.Text, Tokens: slices.Clone(record.Tokens)})
+		for _, token := range record.Tokens {
+			cloned.FTSTokens.Add(token, id)
 		}
 	}
+	for id, edges := range graph.Outgoing.All() {
+		cloned.Outgoing.Set(id, slices.Clone(edges))
+	}
+	for id, edges := range graph.Incoming.All() {
+		cloned.Incoming.Set(id, slices.Clone(edges))
+	}
+	cloned.VectorIndex.EntryID = graph.VectorIndex.EntryID
+	cloned.VectorIndex.MaxLevel = graph.VectorIndex.MaxLevel
+	cloned.VectorMutations = graph.VectorMutations
+	cloned.Streams = graph.Streams.Fork()
+	for definition := range graph.NodeProperties.Definitions() {
+		cloned.NodeProperties.Create(definition)
+		for id, node := range cloned.Nodes.All() {
+			if slices.Contains(node.Labels, definition.Scope) {
+				if value, ok := node.Properties[definition.Property]; ok {
+					_ = cloned.NodeProperties.Add(definition, value, id)
+				}
+			}
+		}
+	}
+	for definition := range graph.EdgeProperties.Definitions() {
+		cloned.EdgeProperties.Create(definition)
+		for id, edge := range cloned.Edges.All() {
+			if edge.Type == definition.Scope {
+				if value, ok := edge.Properties[definition.Property]; ok {
+					_ = cloned.EdgeProperties.Add(definition, value, id)
+				}
+			}
+		}
+	}
+	for id, node := range graph.VectorIndex.Nodes.All() {
+		copyNode := &VectorIndexNode{Level: node.Level, Neighbors: make([][]uint64, len(node.Neighbors))}
+		for level := range node.Neighbors {
+			copyNode.Neighbors[level] = slices.Clone(node.Neighbors[level])
+		}
+		cloned.VectorIndex.Nodes.Set(id, copyNode)
+	}
+	for id, vector := range graph.VectorTombstones.All() {
+		cloned.VectorTombstones.Set(id, slices.Clone(vector))
+	}
 	return cloned
+}
+
+func CloneGraphStateShallow(graph *GraphState) *GraphState {
+	return &GraphState{
+		DatabaseID:               graph.DatabaseID,
+		VectorDimensions:         graph.VectorDimensions,
+		SnapshotBytes:            graph.SnapshotBytes,
+		Nodes:                    graph.Nodes.Fork(),
+		Edges:                    graph.Edges.Fork(),
+		FTS:                      graph.FTS.Fork(),
+		Outgoing:                 graph.Outgoing.Fork(),
+		Incoming:                 graph.Incoming.Fork(),
+		Labels:                   graph.Labels.Fork(),
+		EdgeTypes:                graph.EdgeTypes.Fork(),
+		FTSTokens:                graph.FTSTokens.Fork(),
+		NodeProperties:           graph.NodeProperties.Fork(),
+		EdgeProperties:           graph.EdgeProperties.Fork(),
+		VectorIndex:              graph.VectorIndex.Fork(),
+		VectorTombstones:         graph.VectorTombstones.Fork(),
+		VectorMutations:          graph.VectorMutations,
+		DerivedIndexWork:         graph.DerivedIndexWork,
+		DerivedIndexLogicalBytes: graph.DerivedIndexLogicalBytes,
+		Streams:                  graph.Streams.Fork(),
+	}
 }
 
 func ClonePropertyMap(in map[string]any) map[string]any {
@@ -148,6 +688,13 @@ func CloneValue(value any) any {
 }
 
 func NormalizeValue(value any) (any, error) {
+	return normalizeValue(value, 0, newValueWalk())
+}
+
+func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
+	if depth > maxValueDepth {
+		return nil, fmt.Errorf("%w: nesting exceeds %d", ErrValueLimit, maxValueDepth)
+	}
 	switch v := value.(type) {
 	case nil:
 		return nil, nil
@@ -164,6 +711,9 @@ func NormalizeValue(value any) (any, error) {
 	case int64:
 		return v, nil
 	case uint:
+		if uint64(v) > math.MaxInt64 {
+			return nil, fmt.Errorf("uint value %d exceeds int64 range", v)
+		}
 		return int64(v), nil
 	case uint8:
 		return int64(v), nil
@@ -172,24 +722,51 @@ func NormalizeValue(value any) (any, error) {
 	case uint32:
 		return int64(v), nil
 	case uint64:
-		if v > uint64(^uint64(0)>>1) {
+		if v > math.MaxInt64 {
 			return nil, fmt.Errorf("uint64 value %d exceeds int64 range", v)
 		}
 		return int64(v), nil
 	case float32:
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return nil, errors.New("non-finite float32 value")
+		}
 		return float64(v), nil
 	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, errors.New("non-finite float64 value")
+		}
 		return v, nil
 	case string:
+		if err := walk.addBytes(len(v)); err != nil {
+			return nil, err
+		}
 		return v, nil
 	case []byte:
+		if err := walk.addBytes(len(v)); err != nil {
+			return nil, err
+		}
 		return append([]byte(nil), v...), nil
 	case []float32:
+		if len(v) > maxValueBytes/4 {
+			return nil, fmt.Errorf("%w: byte count exceeds %d", ErrValueLimit, maxValueBytes)
+		}
+		if err := walk.addBytes(len(v) * 4); err != nil {
+			return nil, err
+		}
+		for _, item := range v {
+			if math.IsNaN(float64(item)) || math.IsInf(float64(item), 0) {
+				return nil, errors.New("vector contains non-finite value")
+			}
+		}
 		return append([]float32(nil), v...), nil
 	case []any:
+		if err := walk.enter(reflect.ValueOf(v), len(v)); err != nil {
+			return nil, err
+		}
+		defer walk.leave(reflect.ValueOf(v))
 		list := make([]any, len(v))
 		for i, item := range v {
-			normalized, err := NormalizeValue(item)
+			normalized, err := normalizeValue(item, depth+1, walk)
 			if err != nil {
 				return nil, err
 			}
@@ -197,9 +774,16 @@ func NormalizeValue(value any) (any, error) {
 		}
 		return list, nil
 	case map[string]any:
+		if err := walk.enter(reflect.ValueOf(v), len(v)); err != nil {
+			return nil, err
+		}
+		defer walk.leave(reflect.ValueOf(v))
 		out := make(map[string]any, len(v))
 		for key, item := range v {
-			normalized, err := NormalizeValue(item)
+			if err := walk.addBytes(len(key)); err != nil {
+				return nil, err
+			}
+			normalized, err := normalizeValue(item, depth+1, walk)
 			if err != nil {
 				return nil, err
 			}
@@ -213,9 +797,17 @@ func NormalizeValue(value any) (any, error) {
 	case reflect.Invalid:
 		return nil, nil
 	case reflect.Slice, reflect.Array:
+		if rv.Kind() == reflect.Slice {
+			if err := walk.enter(rv, rv.Len()); err != nil {
+				return nil, err
+			}
+			defer walk.leave(rv)
+		} else if err := walk.add(rv.Len()); err != nil {
+			return nil, err
+		}
 		list := make([]any, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
-			normalized, err := NormalizeValue(rv.Index(i).Interface())
+			normalized, err := normalizeValue(rv.Index(i).Interface(), depth+1, walk)
 			if err != nil {
 				return nil, err
 			}
@@ -226,10 +818,17 @@ func NormalizeValue(value any) (any, error) {
 		if rv.Type().Key().Kind() != reflect.String {
 			return nil, fmt.Errorf("map key type %s is not supported", rv.Type().Key())
 		}
+		if err := walk.enter(rv, rv.Len()); err != nil {
+			return nil, err
+		}
+		defer walk.leave(rv)
 		out := make(map[string]any, rv.Len())
 		iter := rv.MapRange()
 		for iter.Next() {
-			normalized, err := NormalizeValue(iter.Value().Interface())
+			if err := walk.addBytes(len(iter.Key().String())); err != nil {
+				return nil, err
+			}
+			normalized, err := normalizeValue(iter.Value().Interface(), depth+1, walk)
 			if err != nil {
 				return nil, err
 			}
@@ -241,13 +840,67 @@ func NormalizeValue(value any) (any, error) {
 	}
 }
 
+func (walk *valueWalk) add(count int) error {
+	walk.elements += count
+	if walk.elements > maxValueElements {
+		return fmt.Errorf("%w: element count exceeds %d", ErrValueLimit, maxValueElements)
+	}
+	return nil
+}
+
+func (walk *valueWalk) addBytes(count int) error {
+	if count > maxValueBytes-walk.bytes {
+		return fmt.Errorf("%w: byte count exceeds %d", ErrValueLimit, maxValueBytes)
+	}
+	walk.bytes += count
+	return nil
+}
+
+func (walk *valueWalk) enter(value reflect.Value, count int) error {
+	if err := walk.add(count); err != nil {
+		return err
+	}
+	visit := valueIdentity(value)
+	if visit.ptr == 0 {
+		return nil
+	}
+	if _, ok := walk.active[visit]; ok {
+		return ErrValueCycle
+	}
+	walk.active[visit] = struct{}{}
+	return nil
+}
+
+func (walk *valueWalk) leave(value reflect.Value) {
+	delete(walk.active, valueIdentity(value))
+}
+
+func valueIdentity(value reflect.Value) valueVisit {
+	visit := valueVisit{kind: value.Kind(), ptr: value.Pointer()}
+	if value.Kind() == reflect.Slice {
+		visit.len, visit.cap = value.Len(), value.Cap()
+	}
+	return visit
+}
+
+func newValueWalk() *valueWalk {
+	return &valueWalk{active: map[valueVisit]struct{}{}}
+}
+
 func NormalizeProperties(in map[string]any) (map[string]any, error) {
 	if len(in) == 0 {
 		return map[string]any{}, nil
 	}
 	out := make(map[string]any, len(in))
+	walk := newValueWalk()
+	if err := walk.add(len(in)); err != nil {
+		return nil, err
+	}
 	for key, value := range in {
-		normalized, err := NormalizeValue(value)
+		if err := walk.addBytes(len(key)); err != nil {
+			return nil, fmt.Errorf("property %q: %w", key, err)
+		}
+		normalized, err := normalizeValue(value, 0, walk)
 		if err != nil {
 			return nil, fmt.Errorf("property %q: %w", key, err)
 		}
@@ -257,8 +910,8 @@ func NormalizeProperties(in map[string]any) (map[string]any, error) {
 }
 
 func SortedNodeIDs(graph *GraphState) []uint64 {
-	ids := make([]uint64, 0, len(graph.Nodes))
-	for id := range graph.Nodes {
+	ids := make([]uint64, 0, graph.Nodes.Len())
+	for id := range graph.Nodes.All() {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
@@ -266,8 +919,8 @@ func SortedNodeIDs(graph *GraphState) []uint64 {
 }
 
 func SortedEdgeIDs(graph *GraphState) []uint64 {
-	ids := make([]uint64, 0, len(graph.Edges))
-	for id := range graph.Edges {
+	ids := make([]uint64, 0, graph.Edges.Len())
+	for id := range graph.Edges.All() {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
@@ -305,13 +958,40 @@ func ValidateCreateLabels(labels []string) error {
 	return nil
 }
 
-func stateFilePath(dbPath string) string {
-	return filepath.Join(dbPath, stateFileName)
+type DatabaseFiles struct {
+	Directory string
+	State     string
+	WAL       string
+	WALBase   string
+	IDs       string
 }
 
-func walFilePath(dbPath string) string {
-	return filepath.Join(dbPath, walFileName)
+func DirectoryDatabaseFiles(path string) DatabaseFiles {
+	return DatabaseFiles{
+		Directory: path,
+		State:     filepath.Join(path, stateFileName),
+		WAL:       filepath.Join(path, walFileName),
+		WALBase:   filepath.Join(path, "wal.base"),
+		IDs:       filepath.Join(path, idsFileName),
+	}
 }
+
+func FlatDatabaseFiles(path string) DatabaseFiles {
+	return DatabaseFiles{
+		Directory: filepath.Dir(path),
+		State:     path,
+		WAL:       path + "-wal",
+		WALBase:   path + "-wal.base",
+		IDs:       path + "-ids",
+	}
+}
+
+func stateFilePath(dbPath string) string { return DirectoryDatabaseFiles(dbPath).State }
+func walFilePath(dbPath string) string   { return DirectoryDatabaseFiles(dbPath).WAL }
+func walBaseFilePath(dbPath string) string {
+	return DirectoryDatabaseFiles(dbPath).WALBase
+}
+func idsFilePath(dbPath string) string { return DirectoryDatabaseFiles(dbPath).IDs }
 
 func encodePropertyMap(in map[string]any) (map[string]persistedValue, error) {
 	if len(in) == 0 {

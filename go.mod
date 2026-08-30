@@ -1,3 +1,3 @@
-module github.com/jeffhajewski/latticedb-go
+module github.com/mrchypark/latticedb-go
 
-go 1.22
+go 1.27

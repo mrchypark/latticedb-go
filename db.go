@@ -1,60 +1,203 @@
 package latticedb
 
-import "github.com/jeffhajewski/latticedb-go/internal/engine"
+import (
+	"context"
+	"fmt"
+	"runtime/debug"
 
-var ErrReadOnly = engine.ErrReadOnly
+	"github.com/mrchypark/latticedb-go/internal/engine"
+)
+
+// Version returns the Go module version embedded in the calling binary.
+func Version() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Path == "github.com/mrchypark/latticedb-go" {
+			return info.Main.Version
+		}
+		for _, dependency := range info.Deps {
+			if dependency.Path == "github.com/mrchypark/latticedb-go" {
+				return dependency.Version
+			}
+		}
+	}
+	return "(devel)"
+}
+
+var (
+	ErrReadOnly                       = engine.ErrReadOnly
+	ErrWriteTxActive                  = engine.ErrWriteTxActive
+	ErrManagedTransaction             = engine.ErrManagedTransaction
+	ErrInactiveTx                     = engine.ErrInactiveTx
+	ErrDatabaseLocked                 = engine.ErrDatabaseLocked
+	ErrDatabaseLayoutConflict         = engine.ErrDatabaseLayoutConflict
+	ErrDatabaseClosed                 = engine.ErrDatabaseClosed
+	ErrTransactionsActive             = engine.ErrTransactionsActive
+	ErrWriteConflict                  = engine.ErrWriteConflict
+	ErrRecoveryRequired               = engine.ErrRecoveryRequired
+	ErrResourceLimit                  = engine.ErrResourceLimit
+	ErrAlreadyExists                  = engine.ErrAlreadyExists
+	ErrInvalidArgument                = engine.ErrInvalidArgument
+	ErrVectorIndexMaintenanceRequired = engine.ErrVectorIndexMaintenanceRequired
+	ErrUnsupportedOption              = engine.ErrUnsupportedOption
+	ErrCommitOutcomeUnknown           = engine.ErrCommitOutcomeUnknown
+)
 
 type DB struct {
 	inner *engine.DB
+	path  string
 }
 
 type Tx struct {
 	inner *engine.Tx
 }
 
+// Open opens a directory-backed database or a regular database file previously
+// returned by Serialize.
 func Open(path string, opts OpenOptions) (*DB, error) {
-	inner, err := engine.Open(path, engine.OpenOptions{
-		Create:           opts.Create,
-		ReadOnly:         opts.ReadOnly,
-		CacheSizeMB:      opts.CacheSizeMB,
-		PageSize:         opts.PageSize,
-		EnableVector:     opts.EnableVector,
-		VectorDimensions: opts.VectorDimensions,
+	return OpenContext(context.Background(), path, opts)
+}
+
+func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error) {
+	if opts.DisableWAL {
+		return nil, fmt.Errorf("%w: disabling WAL is unavailable", ErrUnsupportedOption)
+	}
+	inner, err := engine.OpenContext(ctx, path, engine.OpenOptions{
+		Create:                           opts.Create,
+		ReadOnly:                         opts.ReadOnly,
+		DisableLock:                      opts.DisableLock,
+		CacheSizeMB:                      opts.CacheSizeMB,
+		PageSize:                         opts.PageSize,
+		EnableVector:                     opts.EnableVector || opts.EnableVectors,
+		VectorIndexMode:                  engine.VectorIndexMode(opts.VectorIndexMode),
+		VectorDimensions:                 opts.VectorDimensions,
+		Durability:                       engine.DurabilityMode(opts.Durability),
+		WALCheckpointThresholdBytes:      opts.WALCheckpointThresholdBytes,
+		MaxDatabaseSnapshotBytes:         opts.MaxDatabaseSnapshotBytes,
+		VectorIndexBuildMaxWork:          opts.VectorIndexBuildMaxWork,
+		VectorIndexBuildMaxLogicalBytes:  opts.VectorIndexBuildMaxLogicalBytes,
+		DerivedIndexBuildMaxWork:         opts.DerivedIndexBuildMaxWork,
+		DerivedIndexBuildMaxLogicalBytes: opts.DerivedIndexBuildMaxLogicalBytes,
 	})
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
-	return &DB{inner: inner}, nil
+	return &DB{inner: inner, path: path}, nil
+}
+
+// Deserialize opens a database from bytes returned by Serialize.
+func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
+	if opts.DisableWAL {
+		return nil, fmt.Errorf("%w: disabling WAL is unavailable", ErrUnsupportedOption)
+	}
+	inner, err := engine.Deserialize(data, engine.OpenOptions{
+		ReadOnly:                         opts.ReadOnly,
+		CacheSizeMB:                      opts.CacheSizeMB,
+		PageSize:                         opts.PageSize,
+		EnableVector:                     opts.EnableVector || opts.EnableVectors,
+		VectorIndexMode:                  engine.VectorIndexMode(opts.VectorIndexMode),
+		VectorDimensions:                 opts.VectorDimensions,
+		Durability:                       engine.DurabilityMode(opts.Durability),
+		WALCheckpointThresholdBytes:      opts.WALCheckpointThresholdBytes,
+		MaxDatabaseSnapshotBytes:         opts.MaxDatabaseSnapshotBytes,
+		VectorIndexBuildMaxWork:          opts.VectorIndexBuildMaxWork,
+		VectorIndexBuildMaxLogicalBytes:  opts.VectorIndexBuildMaxLogicalBytes,
+		DerivedIndexBuildMaxWork:         opts.DerivedIndexBuildMaxWork,
+		DerivedIndexBuildMaxLogicalBytes: opts.DerivedIndexBuildMaxLogicalBytes,
+	})
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	return &DB{inner: inner, path: "<deserialized>"}, nil
 }
 
 func (db *DB) Close() error {
-	return db.inner.Close()
+	if db == nil || db.inner == nil {
+		return nil
+	}
+	return wrapError(db.inner.Close())
+}
+
+func (db *DB) IsOpen() bool {
+	return db != nil && db.inner != nil && db.inner.IsOpen()
+}
+
+func (db *DB) Path() string {
+	if db == nil {
+		return ""
+	}
+	return db.path
+}
+
+// Serialize returns a standalone database file. Writing the bytes to a regular
+// file produces a path that Open can read and update.
+func (db *DB) Serialize() ([]byte, error) {
+	if db == nil || db.inner == nil {
+		return nil, ErrDatabaseClosed
+	}
+	data, err := db.inner.Serialize()
+	return data, wrapError(err)
+}
+
+func (db *DB) Checkpoint() error {
+	return wrapError(db.inner.Checkpoint())
 }
 
 func (db *DB) Begin(readOnly bool) (*Tx, error) {
 	tx, err := db.inner.Begin(readOnly)
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
 	return &Tx{inner: tx}, nil
 }
 
 func (db *DB) View(fn func(*Tx) error) error {
-	return db.inner.View(func(tx *engine.Tx) error {
-		return fn(&Tx{inner: tx})
+	var callbackErr error
+	err := db.inner.View(func(tx *engine.Tx) error {
+		callbackErr = fn(&Tx{inner: tx})
+		return callbackErr
 	})
+	if callbackErr != nil {
+		return callbackErr
+	}
+	return wrapError(err)
 }
 
 func (db *DB) Update(fn func(*Tx) error) error {
-	return db.inner.Update(func(tx *engine.Tx) error {
-		return fn(&Tx{inner: tx})
+	var callbackErr error
+	err := db.inner.Update(func(tx *engine.Tx) error {
+		callbackErr = fn(&Tx{inner: tx})
+		return callbackErr
 	})
+	if callbackErr != nil {
+		return callbackErr
+	}
+	return wrapError(err)
+}
+
+func (db *DB) UpdateContext(ctx context.Context, fn func(*Tx) error) error {
+	var callbackErr error
+	err := db.inner.UpdateContext(ctx, func(tx *engine.Tx) error {
+		callbackErr = fn(&Tx{inner: tx})
+		return callbackErr
+	})
+	if callbackErr != nil {
+		return callbackErr
+	}
+	return wrapError(err)
 }
 
 func (db *DB) Query(query string, params map[string]Value) (QueryResult, error) {
 	result, err := db.inner.Query(query, params)
 	if err != nil {
-		return QueryResult{}, err
+		return QueryResult{}, wrapError(err)
+	}
+	return convertQueryResult(result), nil
+}
+
+func (db *DB) QueryContext(ctx context.Context, query string, params map[string]Value, opts QueryOptions) (QueryResult, error) {
+	result, err := db.inner.QueryContext(ctx, query, params, engine.QueryOptions{MaxRows: opts.MaxRows, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	if err != nil {
+		return QueryResult{}, wrapError(err)
 	}
 	return convertQueryResult(result), nil
 }
@@ -63,18 +206,22 @@ func (db *DB) VectorSearch(vector []float32, opts VectorSearchOptions) ([]Vector
 	results, err := db.inner.VectorSearch(vector, engine.VectorSearchOptions{
 		K:        opts.K,
 		EfSearch: opts.EfSearch,
+		Exact:    opts.Exact,
+		MaxWork:  opts.MaxWork,
+		MaxBytes: opts.MaxBytes,
 	})
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
-	out := make([]VectorSearchResult, len(results))
-	for i, result := range results {
-		out[i] = VectorSearchResult{
-			NodeID:   result.NodeID,
-			Distance: result.Distance,
-		}
+	return results, nil
+}
+
+func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts VectorSearchOptions) ([]VectorSearchResult, error) {
+	results, err := db.inner.VectorSearchContext(ctx, vector, engine.VectorSearchOptions{K: opts.K, EfSearch: opts.EfSearch, Exact: opts.Exact, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	if err != nil {
+		return nil, wrapError(err)
 	}
-	return out, nil
+	return results, nil
 }
 
 func (db *DB) FTSSearch(query string, opts FTSSearchOptions) ([]FTSSearchResult, error) {
@@ -82,28 +229,46 @@ func (db *DB) FTSSearch(query string, opts FTSSearchOptions) ([]FTSSearchResult,
 		Limit:         opts.Limit,
 		MaxDistance:   opts.MaxDistance,
 		MinTermLength: opts.MinTermLength,
+		MaxWork:       opts.MaxWork,
+		MaxBytes:      opts.MaxBytes,
 	})
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
 	}
-	out := make([]FTSSearchResult, len(results))
-	for i, result := range results {
-		out[i] = FTSSearchResult{
-			NodeID: result.NodeID,
-			Score:  result.Score,
-		}
+	return results, nil
+}
+
+func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearchOptions) ([]FTSSearchResult, error) {
+	results, err := db.inner.FTSSearchContext(ctx, query, engine.FTSSearchOptions{Limit: opts.Limit, MaxDistance: opts.MaxDistance, MinTermLength: opts.MinTermLength, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	if err != nil {
+		return nil, wrapError(err)
 	}
-	return out, nil
+	return results, nil
+}
+
+func (db *DB) ReadStream(stream string, afterSequence uint64, limit uint, timeoutMS uint32) ([]StreamRecord, error) {
+	records, err := db.inner.ReadStream(stream, afterSequence, limit, timeoutMS)
+	return records, wrapError(err)
+}
+
+func (db *DB) GetStreamOffset(stream, consumer string) (uint64, bool, error) {
+	offset, ok, err := db.inner.GetStreamOffset(stream, consumer)
+	return offset, ok, wrapError(err)
+}
+
+func (db *DB) Changes(afterSequence uint64, limit uint, timeoutMS uint32) ([]StreamRecord, error) {
+	records, err := db.inner.Changes(afterSequence, limit, timeoutMS)
+	return records, wrapError(err)
 }
 
 func (db *DB) CacheClear() error {
-	return db.inner.CacheClear()
+	return wrapError(db.inner.CacheClear())
 }
 
 func (db *DB) CacheStats() (QueryCacheStats, error) {
 	stats, err := db.inner.CacheStats()
 	if err != nil {
-		return QueryCacheStats{}, err
+		return QueryCacheStats{}, wrapError(err)
 	}
 	return QueryCacheStats{
 		Entries: stats.Entries,
@@ -112,56 +277,156 @@ func (db *DB) CacheStats() (QueryCacheStats, error) {
 	}, nil
 }
 
+func (db *DB) CreateNodePropertyIndex(label, property string) error {
+	return wrapError(db.inner.CreateNodePropertyIndex(label, property))
+}
+
+func (db *DB) DropNodePropertyIndex(label, property string) error {
+	return wrapError(db.inner.DropNodePropertyIndex(label, property))
+}
+
+func (db *DB) CreateEdgePropertyIndex(edgeType, property string) error {
+	return wrapError(db.inner.CreateEdgePropertyIndex(edgeType, property))
+}
+
+func (db *DB) DropEdgePropertyIndex(edgeType, property string) error {
+	return wrapError(db.inner.DropEdgePropertyIndex(edgeType, property))
+}
+
+func (db *DB) VectorIndexStats() (VectorIndexStats, error) {
+	stats, err := db.inner.VectorIndexStats()
+	if err != nil {
+		return VectorIndexStats{}, wrapError(err)
+	}
+	return VectorIndexStats{
+		LiveEntries:                stats.LiveEntries,
+		IndexEntries:               stats.IndexEntries,
+		Tombstones:                 stats.Tombstones,
+		TombstoneBytes:             stats.TombstoneBytes,
+		TombstoneBytesUntilRebuild: stats.TombstoneBytesUntilRebuild,
+		MutationDebt:               stats.MutationDebt,
+		RebuildThreshold:           stats.RebuildThreshold,
+		DebtUntilRebuild:           stats.DebtUntilRebuild,
+		EstimatedBuildLogicalBytes: stats.EstimatedBuildLogicalBytes,
+		ExactFallbacks:             stats.ExactFallbacks,
+		Rebuilds:                   stats.Rebuilds,
+		RebuildNanoseconds:         stats.RebuildNanoseconds,
+	}, nil
+}
+
+func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
+	return wrapError(db.inner.RebuildVectorIndexContext(ctx))
+}
+
+// Commit makes the transaction inactive when it returns
+// ErrVectorIndexMaintenanceRequired. Rebuild the index, then start a new transaction.
 func (tx *Tx) Commit() error {
-	return tx.inner.Commit()
+	if tx == nil || tx.inner == nil {
+		return ErrInactiveTx
+	}
+	return wrapError(tx.inner.Commit())
+}
+
+// CommitContext makes the transaction inactive when it returns
+// ErrVectorIndexMaintenanceRequired. Rebuild the index, then start a new transaction.
+func (tx *Tx) CommitContext(ctx context.Context) error {
+	if tx == nil || tx.inner == nil {
+		return ErrInactiveTx
+	}
+	return wrapError(tx.inner.CommitContext(ctx))
 }
 
 func (tx *Tx) Rollback() error {
-	return tx.inner.Rollback()
+	if tx == nil || tx.inner == nil {
+		return nil
+	}
+	if !tx.inner.IsActive() {
+		return nil
+	}
+	return wrapError(tx.inner.Rollback())
 }
 
 func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 	node, err := tx.inner.CreateNode(engine.CreateNodeOptions{
-		Labels:     cloneStrings(opts.Labels),
+		Labels:     opts.Labels,
 		Properties: opts.Properties,
 	})
 	if err != nil {
-		return Node{}, err
+		return Node{}, wrapError(err)
 	}
 	return convertNode(node), nil
 }
 
 func (tx *Tx) DeleteNode(nodeID uint64) error {
-	return tx.inner.DeleteNode(nodeID)
+	return wrapError(tx.inner.DeleteNode(nodeID))
 }
 
 func (tx *Tx) NodeExists(nodeID uint64) (bool, error) {
-	return tx.inner.NodeExists(nodeID)
+	exists, err := tx.inner.NodeExists(nodeID)
+	return exists, wrapError(err)
 }
 
 func (tx *Tx) GetNode(nodeID uint64) (*Node, error) {
-	node, err := tx.inner.GetNode(nodeID)
-	if err != nil || node == nil {
-		return nil, err
+	node, ok, err := tx.inner.GetNodeValue(nodeID)
+	if err != nil || !ok {
+		return nil, wrapError(err)
 	}
-	converted := convertNode(*node)
+	converted := convertNode(node)
 	return &converted, nil
 }
 
 func (tx *Tx) SetProperty(nodeID uint64, key string, value Value) error {
-	return tx.inner.SetProperty(nodeID, key, value)
+	return wrapError(tx.inner.SetProperty(nodeID, key, value))
 }
 
 func (tx *Tx) GetProperty(nodeID uint64, key string) (Value, bool, error) {
-	return tx.inner.GetProperty(nodeID, key)
+	value, ok, err := tx.inner.GetProperty(nodeID, key)
+	return value, ok, wrapError(err)
+}
+
+func (tx *Tx) FindNodesByLabelProperty(label, property string, value Value, limit uint) ([]uint64, error) {
+	ids, err := tx.inner.FindNodesByLabelProperty(label, property, value, limit)
+	return ids, wrapError(err)
 }
 
 func (tx *Tx) SetVector(nodeID uint64, key string, vector []float32) error {
-	return tx.inner.SetVector(nodeID, key, vector)
+	return wrapError(tx.inner.SetVector(nodeID, key, vector))
+}
+
+// BatchInsertVectors inserts multiple vector-bearing nodes in a single call.
+func (tx *Tx) BatchInsertVectors(label string, vectors [][]float32) ([]uint64, error) {
+	ids, err := tx.inner.BatchInsertVectors(label, vectors)
+	return ids, wrapError(err)
+}
+
+// Deprecated: use BatchInsertVectors. Earliest removal is v0.6.0.
+func (tx *Tx) BatchInsert(label string, vectors [][]float32) ([]uint64, error) {
+	return tx.BatchInsertVectors(label, vectors)
 }
 
 func (tx *Tx) FTSIndex(nodeID uint64, text string) error {
-	return tx.inner.FTSIndex(nodeID, text)
+	return wrapError(tx.inner.FTSIndex(nodeID, text))
+}
+
+func (tx *Tx) FTSIndexContext(ctx context.Context, nodeID uint64, text string) error {
+	return wrapError(tx.inner.FTSIndexContext(ctx, nodeID, text))
+}
+
+func (tx *Tx) PublishStream(stream, kind string, payload Value) error {
+	return wrapError(tx.inner.PublishStream(stream, kind, payload))
+}
+
+func (tx *Tx) PublishStreamGetSequence(stream, kind string, payload Value) (uint64, error) {
+	sequence, err := tx.inner.PublishStreamGetSequence(stream, kind, payload)
+	return sequence, wrapError(err)
+}
+
+func (tx *Tx) SetStreamOffset(stream, consumer string, sequence uint64) error {
+	return wrapError(tx.inner.SetStreamOffset(stream, consumer, sequence))
+}
+
+func (tx *Tx) TrimStream(stream string, beforeSequence uint64) error {
+	return wrapError(tx.inner.TrimStream(stream, beforeSequence))
 }
 
 func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts CreateEdgeOptions) (Edge, error) {
@@ -169,27 +434,69 @@ func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts
 		Properties: opts.Properties,
 	})
 	if err != nil {
-		return Edge{}, err
+		return Edge{}, wrapError(err)
 	}
 	return convertEdge(edge), nil
 }
 
 func (tx *Tx) GetEdgeProperty(edgeID uint64, key string) (Value, bool, error) {
-	return tx.inner.GetEdgeProperty(edgeID, key)
+	value, ok, err := tx.inner.GetEdgeProperty(edgeID, key)
+	return value, ok, wrapError(err)
+}
+
+func (tx *Tx) FindEdgesByTypeProperty(edgeType, property string, value Value, limit uint) ([]uint64, error) {
+	ids, err := tx.inner.FindEdgesByTypeProperty(edgeType, property, value, limit)
+	return ids, wrapError(err)
 }
 
 func (tx *Tx) SetEdgeProperty(edgeID uint64, key string, value Value) error {
-	return tx.inner.SetEdgeProperty(edgeID, key, value)
+	return wrapError(tx.inner.SetEdgeProperty(edgeID, key, value))
 }
 
 func (tx *Tx) RemoveEdgeProperty(edgeID uint64, key string) error {
-	return tx.inner.RemoveEdgeProperty(edgeID, key)
+	return wrapError(tx.inner.RemoveEdgeProperty(edgeID, key))
 }
 
 func (tx *Tx) GetOutgoingEdges(nodeID uint64) ([]Edge, error) {
 	edges, err := tx.inner.GetOutgoingEdges(nodeID)
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
+	}
+	out := make([]Edge, len(edges))
+	for i, edge := range edges {
+		out[i] = convertEdge(edge)
+	}
+	return out, nil
+}
+
+func (tx *Tx) GetIncomingEdges(nodeID uint64) ([]Edge, error) {
+	edges, err := tx.inner.GetIncomingEdges(nodeID)
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	out := make([]Edge, len(edges))
+	for i, edge := range edges {
+		out[i] = convertEdge(edge)
+	}
+	return out, nil
+}
+
+func (tx *Tx) GetOutgoingEdgesByType(nodeID uint64, edgeType string, limit uint) ([]Edge, error) {
+	edges, err := tx.inner.GetOutgoingEdgesByType(nodeID, edgeType, limit)
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	out := make([]Edge, len(edges))
+	for i, edge := range edges {
+		out[i] = convertEdge(edge)
+	}
+	return out, nil
+}
+
+func (tx *Tx) GetIncomingEdgesByType(nodeID uint64, edgeType string, limit uint) ([]Edge, error) {
+	edges, err := tx.inner.GetIncomingEdgesByType(nodeID, edgeType, limit)
+	if err != nil {
+		return nil, wrapError(err)
 	}
 	out := make([]Edge, len(edges))
 	for i, edge := range edges {
@@ -201,8 +508,8 @@ func (tx *Tx) GetOutgoingEdges(nodeID uint64) ([]Edge, error) {
 func convertNode(node engine.Node) Node {
 	return Node{
 		ID:         node.ID,
-		Labels:     cloneStrings(node.Labels),
-		Properties: cloneValueMap(node.Properties),
+		Labels:     node.Labels,
+		Properties: node.Properties,
 	}
 }
 
@@ -212,37 +519,13 @@ func convertEdge(edge engine.Edge) Edge {
 		SourceID:   edge.SourceID,
 		TargetID:   edge.TargetID,
 		Type:       edge.Type,
-		Properties: cloneValueMap(edge.Properties),
+		Properties: edge.Properties,
 	}
 }
 
 func convertQueryResult(result engine.QueryResult) QueryResult {
-	rows := make([]map[string]Value, len(result.Rows))
-	for i, row := range result.Rows {
-		rows[i] = cloneValueMap(row)
-	}
 	return QueryResult{
-		Columns: cloneStrings(result.Columns),
-		Rows:    rows,
+		Columns: result.Columns,
+		Rows:    result.Rows,
 	}
-}
-
-func cloneValueMap(in map[string]any) map[string]Value {
-	if len(in) == 0 {
-		return map[string]Value{}
-	}
-	out := make(map[string]Value, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func cloneStrings(in []string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]string, len(in))
-	copy(out, in)
-	return out
 }

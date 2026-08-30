@@ -1,0 +1,299 @@
+package latticedb
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+	"time"
+)
+
+func TestLargePropertyChangefeedUsesBoundedSummaries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large-changefeed.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldValue := bytes.Repeat([]byte{'a'}, 1<<20)
+	newValue := bytes.Repeat([]byte{'b'}, 1<<20)
+	var nodeID uint64
+	if err := db.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]Value{"payload": oldValue}})
+		nodeID = node.ID
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(nodeID, "payload", newValue) }); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(path, "wal.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() >= 4<<20 {
+		t.Fatalf("large property change WAL = %d bytes", info.Size())
+	}
+	changes, err := db.Changes(0, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBoundedPropertyChange(t, changes[len(changes)-1], nodeID)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := SimulateCrash(path); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		value, ok, err := tx.GetProperty(nodeID, "payload")
+		if err == nil && (!ok || !bytes.Equal(value.([]byte), newValue)) {
+			t.Fatal("recovered graph property differs")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	changes, err = db.Changes(0, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertBoundedPropertyChange(t, changes[len(changes)-1], nodeID)
+}
+
+func assertBoundedPropertyChange(t *testing.T, record StreamRecord, nodeID uint64) {
+	t.Helper()
+	payload, ok := record.Payload.(map[string]any)
+	if !ok || record.Kind != "node.property_set" || payload["node_id"] != int64(nodeID) {
+		t.Fatalf("unexpected property change = %#v", record)
+	}
+	for _, key := range []string{"old_value", "new_value"} {
+		summary, ok := payload[key].(map[string]any)
+		if !ok || summary["__lattice_value_omitted"] != true || summary["type"] != "bytes" {
+			t.Fatalf("%s summary = %#v", key, payload[key])
+		}
+	}
+}
+
+func TestStreamChangefeedWALStaysBoundedAcrossCheckpoints(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bounded-stream-wal.ltdb")
+	db, err := Open(path, OpenOptions{Create: true, WALCheckpointThresholdBytes: 8 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nodeID uint64
+	if err := db.Update(func(tx *Tx) error {
+		if _, err := tx.PublishStreamGetSequence("events", "first", int64(1)); err != nil {
+			return err
+		}
+		if err := tx.PublishStream("events", "second", int64(2)); err != nil {
+			return err
+		}
+		if err := tx.SetStreamOffset("events", "worker", 2); err != nil {
+			return err
+		}
+		if err := tx.TrimStream("events", 1); err != nil {
+			return err
+		}
+		node, err := tx.CreateNode(CreateNodeOptions{})
+		nodeID = node.ID
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for value := int64(1); value <= 200; value++ {
+		if err := db.Update(func(tx *Tx) error { return tx.SetProperty(nodeID, "value", value) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info, err := os.Stat(filepath.Join(path, "wal.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > 16<<10 {
+		t.Fatalf("WAL grew to %d bytes", info.Size())
+	}
+	t.Logf("WAL after 200 graph commits: %d bytes", info.Size())
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := SimulateCrash(path); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	records, err := db.ReadStream("events", 0, 10, 0)
+	if err != nil || len(records) != 1 || records[0].Sequence != 2 || records[0].Payload != int64(2) {
+		t.Fatalf("recovered stream = %#v, %v", records, err)
+	}
+	if offset, ok, err := db.GetStreamOffset("events", "worker"); err != nil || !ok || offset != 2 {
+		t.Fatalf("recovered offset = %d, %v, %v", offset, ok, err)
+	}
+	changes, err := db.Changes(0, 300, 0)
+	if err != nil || len(changes) != 201 || !hasStreamChange(changes, "node.property_set", nodeID, "value") {
+		t.Fatalf("recovered changes = %d, %v", len(changes), err)
+	}
+}
+
+func TestStreamsCommitRollbackRecoveryAndChangefeed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "streams.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sequence, err := tx.PublishStreamGetSequence("events", "hidden", "no"); err != nil || sequence != 1 {
+		t.Fatalf("rollback publish = (%d, %v)", sequence, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if records, err := db.ReadStream("events", 0, 10, 0); err != nil || len(records) != 0 {
+		t.Fatalf("rolled back records = %#v, %v", records, err)
+	}
+
+	var nodeID uint64
+	if err := db.Update(func(tx *Tx) error {
+		sequence, err := tx.PublishStreamGetSequence("events", "created", map[string]Value{"id": int64(1)})
+		if err != nil || sequence != 1 {
+			return errors.New("unexpected sequence")
+		}
+		if err := tx.PublishStream("events", "updated", "two"); err != nil {
+			return err
+		}
+		node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Person"}, Properties: map[string]Value{"name": "Ada"}})
+		nodeID = node.ID
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	records, err := db.ReadStream("events", 1, 10, 0)
+	if err != nil || len(records) != 1 || records[0].Sequence != 2 || records[0].Kind != "updated" || records[0].Payload != "two" {
+		t.Fatalf("records after cursor = %#v, %v", records, err)
+	}
+	all, err := db.ReadStream("events", 0, 10, 0)
+	if err != nil || len(all) != 2 || !reflect.DeepEqual(all[0].Payload, map[string]any{"id": int64(1)}) {
+		t.Fatalf("all records = %#v, %v", all, err)
+	}
+	changes, err := db.Changes(0, 20, 0)
+	if err != nil || !hasStreamChange(changes, "node.insert", nodeID, "") || !hasStreamChange(changes, "node.property_set", nodeID, "name") {
+		t.Fatalf("changes = %#v, %v", changes, err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.SetStreamOffset("events", "worker-a", 2); err != nil {
+			return err
+		}
+		return tx.TrimStream("events", 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if offset, ok, err := db.GetStreamOffset("events", "worker-a"); err != nil || !ok || offset != 2 {
+		t.Fatalf("live offset = %d, %v, %v", offset, ok, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	offset, ok, err := reopened.GetStreamOffset("events", "worker-a")
+	if err != nil || !ok || offset != 2 {
+		t.Fatalf("offset = %d, %v, %v", offset, ok, err)
+	}
+	records, err = reopened.ReadStream("events", 0, 10, 0)
+	if err != nil || len(records) != 1 || records[0].Sequence != 2 {
+		t.Fatalf("recovered records = %#v, %v", records, err)
+	}
+}
+
+func TestStreamValidationReadOnlyAndWakeup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "streams.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.PublishStream("__lattice_user", "message", "no"); !errors.Is(err, ErrInvalidArgument) {
+			return errors.New("reserved stream was accepted")
+		}
+		if _, err := tx.PublishStreamGetSequence("events", "", "no"); !errors.Is(err, ErrInvalidArgument) {
+			return errors.New("empty kind was accepted")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ReadStream("events", 0, 0, 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("zero limit error = %v", err)
+	}
+	result := make(chan []StreamRecord, 1)
+	errs := make(chan error, 1)
+	go func() {
+		records, err := db.ReadStream("events", 0, 10, 500)
+		if err != nil {
+			errs <- err
+			return
+		}
+		result <- records
+	}()
+	time.Sleep(10 * time.Millisecond)
+	if err := db.Update(func(tx *Tx) error { return tx.PublishStream("events", "message", "wake") }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errs:
+		t.Fatal(err)
+	case records := <-result:
+		if len(records) != 1 || records[0].Payload != "wake" {
+			t.Fatalf("wakeup records = %#v", records)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream waiter did not wake")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.GetStreamOffset("events", "worker"); !errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("closed get offset error = %v", err)
+	}
+	readOnly, err := Open(path, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if err := readOnly.Update(func(tx *Tx) error { return tx.PublishStream("events", "message", "no") }); !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("read-only publish error = %v", err)
+	}
+}
+
+func hasStreamChange(records []StreamRecord, kind string, nodeID uint64, key string) bool {
+	for _, record := range records {
+		if record.Kind != kind {
+			continue
+		}
+		payload, ok := record.Payload.(map[string]any)
+		if !ok || payload["node_id"] != int64(nodeID) {
+			continue
+		}
+		if key == "" || payload["key"] == key {
+			return true
+		}
+	}
+	return false
+}

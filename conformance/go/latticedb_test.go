@@ -1,6 +1,6 @@
 package conformance
 
-import latticedb "github.com/jeffhajewski/latticedb-go"
+import latticedb "github.com/mrchypark/latticedb-go"
 
 func init() {
 	testDriver = driverAdapter{}

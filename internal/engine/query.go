@@ -1,15 +1,18 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
-	"github.com/jeffhajewski/latticedb-go/internal/search"
-	"github.com/jeffhajewski/latticedb-go/internal/store"
+	"github.com/mrchypark/latticedb-go/internal/search"
+	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
 type queryPlan struct {
@@ -27,7 +30,78 @@ type queryPlan struct {
 }
 
 type matchPattern interface {
-	apply(tx *Tx, rows []queryRow) ([]queryRow, error)
+	apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error)
+}
+
+type queryBudget struct {
+	ctx      context.Context
+	maxRows  uint32
+	maxWork  uint32
+	maxBytes uint32
+	work     uint32
+	bytes    uint32
+}
+
+var queryBudgetPool = sync.Pool{New: func() any { return new(queryBudget) }}
+
+func newQueryBudget(ctx context.Context, opts QueryOptions) *queryBudget {
+	if opts.MaxRows == 0 {
+		opts.MaxRows = 1_000_000
+	}
+	if opts.MaxWork == 0 {
+		opts.MaxWork = 10_000_000
+	}
+	if opts.MaxBytes == 0 {
+		opts.MaxBytes = 64 << 20
+	}
+	budget := queryBudgetPool.Get().(*queryBudget)
+	*budget = queryBudget{
+		ctx:      ctx,
+		maxRows:  uint32(min(opts.MaxRows, uint64(^uint32(0)))),
+		maxWork:  uint32(min(opts.MaxWork, uint64(^uint32(0)))),
+		maxBytes: uint32(min(opts.MaxBytes, uint64(^uint32(0)))),
+	}
+	return budget
+}
+
+func releaseQueryBudget(budget *queryBudget) {
+	*budget = queryBudget{}
+	queryBudgetPool.Put(budget)
+}
+
+func (budget *queryBudget) check(work uint64, rows int) error {
+	if budget.ctx != nil {
+		if err := budget.ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if work > uint64(budget.maxWork-budget.work) {
+		return fmt.Errorf("%w: query work exceeds %d", ErrResourceLimit, budget.maxWork)
+	}
+	budget.work += uint32(work)
+	if uint64(rows) > uint64(budget.maxRows) {
+		return fmt.Errorf("%w: query rows exceed %d", ErrResourceLimit, budget.maxRows)
+	}
+	if uint64(rows) > uint64(budget.maxBytes-budget.bytes)/128 {
+		return fmt.Errorf("%w: query temporary bytes exceed %d", ErrResourceLimit, budget.maxBytes)
+	}
+	return nil
+}
+
+func (budget *queryBudget) chargeResult(bytes uint64) error {
+	return budget.chargeBytes(bytes, "result")
+}
+
+func (budget *queryBudget) chargeTemporary(bytes uint64) error {
+	return budget.chargeBytes(bytes, "temporary")
+}
+
+func (budget *queryBudget) chargeBytes(bytes uint64, kind string) error {
+	if bytes > uint64(budget.maxBytes-budget.bytes) {
+		return fmt.Errorf("%w: query %s bytes exceed %d", ErrResourceLimit, kind, budget.maxBytes)
+	}
+	budget.bytes += uint32(bytes)
+	return nil
 }
 
 type nodePattern struct {
@@ -163,16 +237,138 @@ type variableExpr struct {
 
 func parseQuery(query string) (*queryPlan, error) {
 	query = strings.TrimSpace(query)
+	var plan *queryPlan
+	var err error
 	switch {
 	case strings.HasPrefix(query, "MATCH "):
-		return parseMatchQuery(query)
+		plan, err = parseMatchQuery(query)
 	case strings.HasPrefix(query, "CREATE "):
-		return parseCreateQuery(query)
+		plan, err = parseCreateQuery(query)
 	case strings.HasPrefix(query, "UNWIND "):
-		return parseUnwindQuery(query)
+		plan, err = parseUnwindQuery(query)
 	default:
 		return nil, fmt.Errorf("unsupported query %q", query)
 	}
+	if err != nil {
+		return nil, err
+	}
+	if err := plan.validateBindings(); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+type bindingRole uint8
+
+const (
+	bindingNode bindingRole = iota + 1
+	bindingEdge
+	bindingValue
+)
+
+func (plan *queryPlan) validateBindings() error {
+	bindings := map[string]bindingRole{}
+	bind := func(name string, role bindingRole) error {
+		if name == "" {
+			return nil
+		}
+		if !isQueryIdentifier(name) {
+			return fmt.Errorf("invalid binding %q", name)
+		}
+		if existing, ok := bindings[name]; ok && existing != role {
+			return fmt.Errorf("binding %q has conflicting roles", name)
+		}
+		bindings[name] = role
+		return nil
+	}
+	if plan.unwindClause != nil {
+		if err := bind(plan.unwindClause.Var, bindingValue); err != nil {
+			return err
+		}
+	}
+	if plan.createNode != nil {
+		if err := bind(plan.createNode.Var, bindingNode); err != nil {
+			return err
+		}
+	}
+	for _, pattern := range plan.matchPatterns {
+		switch pattern := pattern.(type) {
+		case nodePattern:
+			if err := bind(pattern.Var, bindingNode); err != nil {
+				return err
+			}
+		case edgePattern:
+			for _, item := range []struct {
+				name string
+				role bindingRole
+			}{{pattern.Left.Var, bindingNode}, {pattern.EdgeVar, bindingEdge}, {pattern.Right.Var, bindingNode}} {
+				if err := bind(item.name, item.role); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	require := func(name string, roles ...bindingRole) error {
+		role, ok := bindings[name]
+		if !ok {
+			return fmt.Errorf("unknown binding %q", name)
+		}
+		for _, allowed := range roles {
+			if role == allowed {
+				return nil
+			}
+		}
+		return fmt.Errorf("binding %q has incompatible role", name)
+	}
+	for _, clause := range plan.whereClauses {
+		if err := require(clause.Var, bindingNode, bindingEdge, bindingValue); err != nil {
+			return err
+		}
+	}
+	if plan.setClause != nil {
+		if err := require(plan.setClause.Var, bindingNode, bindingEdge); err != nil {
+			return err
+		}
+	}
+	if plan.createClause != nil {
+		if err := require(plan.createClause.SourceVar, bindingNode); err != nil {
+			return err
+		}
+		if err := require(plan.createClause.TargetVar, bindingNode); err != nil {
+			return err
+		}
+	}
+	if plan.removeClause != nil {
+		for _, item := range plan.removeClause.Items {
+			if err := require(item.Var, bindingNode, bindingEdge); err != nil {
+				return err
+			}
+		}
+	}
+	if plan.deleteClause != nil {
+		for _, name := range plan.deleteClause.Vars {
+			if err := require(name, bindingNode, bindingEdge); err != nil {
+				return err
+			}
+		}
+	}
+	if plan.returnClause != nil {
+		if plan.returnClause.CountAlias != "" && plan.returnClause.CountVar != "*" {
+			if err := require(plan.returnClause.CountVar, bindingNode, bindingEdge, bindingValue); err != nil {
+				return err
+			}
+		}
+		for _, projection := range plan.returnClause.Projections {
+			roles := []bindingRole{bindingNode, bindingEdge}
+			if projection.Kind == projectionValue || projection.Kind == projectionProperty {
+				roles = []bindingRole{bindingNode, bindingEdge, bindingValue}
+			}
+			if err := require(projection.Var, roles...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func parseMatchQuery(query string) (*queryPlan, error) {
@@ -329,18 +525,56 @@ func (plan *queryPlan) mutates() bool {
 	return plan.createNode != nil || plan.setClause != nil || plan.createClause != nil || plan.removeClause != nil || plan.deleteClause != nil
 }
 
-func (plan *queryPlan) execute(tx *Tx, params map[string]any) (QueryResult, error) {
-	rows := []queryRow{{Bindings: map[string]boundValue{}}}
+func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudget) (QueryResult, error) {
+	rows := []queryRow{{}}
 	if plan.unwindClause != nil {
 		var err error
-		rows, err = plan.unwindClause.apply(rows, params)
+		rows, err = plan.unwindClause.apply(rows, params, budget)
 		if err != nil {
 			return QueryResult{}, err
 		}
 	}
 	for _, pattern := range plan.matchPatterns {
 		var err error
-		rows, err = pattern.apply(tx, rows)
+		if node, ok := pattern.(nodePattern); ok {
+			if nodeID, found, lookupErr := plan.bindingNodeID(node.Var, params); lookupErr != nil {
+				return QueryResult{}, lookupErr
+			} else if found {
+				rows = node.applyID(tx, rows, nodeID)
+				if err := budget.check(uint64(len(rows)), len(rows)); err != nil {
+					return QueryResult{}, err
+				}
+				continue
+			}
+			if nodeIDs, found, lookupErr := plan.indexedNodeIDs(tx, node, params, plan.indexedNodeLookupLimit(node), budget); lookupErr != nil {
+				return QueryResult{}, lookupErr
+			} else if found {
+				if err := budget.chargeTemporary(uint64(len(nodeIDs)) * 8); err != nil {
+					return QueryResult{}, err
+				}
+				nextRows := make([]queryRow, 0, len(nodeIDs)*len(rows))
+				for _, nodeID := range nodeIDs {
+					nextRows = append(nextRows, node.applyID(tx, rows, nodeID)...)
+					if err := budget.check(uint64(len(rows)), len(nextRows)); err != nil {
+						return QueryResult{}, err
+					}
+				}
+				rows = nextRows
+				continue
+			}
+		}
+		if edge, ok := pattern.(edgePattern); ok {
+			if edgeIDs, found, lookupErr := plan.indexedEdgeIDs(tx, edge, params); lookupErr != nil {
+				return QueryResult{}, lookupErr
+			} else if found {
+				rows, err = edge.applyIDs(tx, rows, edgeIDs, budget)
+				if err != nil {
+					return QueryResult{}, err
+				}
+				continue
+			}
+		}
+		rows, err = pattern.apply(tx, rows, budget)
 		if err != nil {
 			return QueryResult{}, err
 		}
@@ -349,7 +583,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any) (QueryResult, erro
 	if len(plan.whereClauses) > 0 {
 		for _, clause := range plan.whereClauses {
 			var err error
-			rows, err = clause.apply(rows, params)
+			rows, err = clause.apply(tx, rows, params, budget)
 			if err != nil {
 				return QueryResult{}, err
 			}
@@ -369,12 +603,12 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any) (QueryResult, erro
 		}
 	}
 	if plan.setClause != nil {
-		if err := plan.setClause.apply(rows, params); err != nil {
+		if err := plan.setClause.apply(tx, rows, params); err != nil {
 			return QueryResult{}, err
 		}
 	}
 	if plan.removeClause != nil {
-		if err := plan.removeClause.apply(rows); err != nil {
+		if err := plan.removeClause.apply(tx, rows); err != nil {
 			return QueryResult{}, err
 		}
 	}
@@ -387,13 +621,262 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any) (QueryResult, erro
 	if plan.returnClause == nil {
 		return QueryResult{}, nil
 	}
-	if plan.hasLimit && len(rows) > plan.limit {
-		rows = rows[:plan.limit]
+	result, err := plan.returnClause.render(rows, budget)
+	if err != nil {
+		return QueryResult{}, err
 	}
-	return plan.returnClause.render(rows)
+	if plan.hasLimit && len(result.Rows) > plan.limit {
+		result.Rows = result.Rows[:plan.limit]
+	}
+	return result, nil
 }
 
-func (clause *unwindClause) apply(rows []queryRow, params map[string]any) ([]queryRow, error) {
+func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[string]any, limit uint, budget *queryBudget) ([]uint64, bool, error) {
+	if pattern.Var == "" || len(pattern.Labels) == 0 {
+		return nil, false, nil
+	}
+	for _, clause := range plan.whereClauses {
+		if clause.Kind != whereEquals || clause.Var != pattern.Var {
+			continue
+		}
+		switch clause.Expr.(type) {
+		case literalExpr, paramExpr:
+		default:
+			continue
+		}
+		value, err := clause.Expr.eval(queryRow{}, params)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, label := range pattern.Labels {
+			definition := store.PropertyIndexDefinition{Scope: label, Property: clause.Property}
+			if !tx.graph.NodeProperties.Has(definition) {
+				continue
+			}
+			if limit != ^uint(0) && len(plan.whereClauses) > 1 {
+				ids, err := plan.boundedFilteredNodeIDs(tx, pattern, definition, value, params, limit, budget)
+				return ids, true, err
+			}
+			ids, err := tx.FindNodesByLabelProperty(label, clause.Property, value, limit)
+			if err != nil {
+				return nil, false, err
+			}
+			if alternate, ok := alternateNumericIndexValue(value); ok {
+				more, err := tx.FindNodesByLabelProperty(label, clause.Property, alternate, limit)
+				if err != nil {
+					return nil, false, err
+				}
+				ids = append(ids, more...)
+				slices.Sort(ids)
+				ids = slices.Compact(ids)
+			}
+			return ids, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func (plan *queryPlan) indexedNodeLookupLimit(pattern nodePattern) uint {
+	if !plan.hasLimit || plan.limit == 0 || plan.returnClause == nil || plan.returnClause.CountAlias != "" || len(plan.matchPatterns) != 1 || plan.mutates() {
+		return ^uint(0)
+	}
+	for _, clause := range plan.whereClauses {
+		if clause.Var != pattern.Var {
+			return ^uint(0)
+		}
+		switch clause.Kind {
+		case whereEquals, whereBindingID:
+			switch clause.Expr.(type) {
+			case literalExpr, paramExpr:
+			default:
+				return ^uint(0)
+			}
+		case whereIsNull, whereIsNotNull:
+		default:
+			return ^uint(0)
+		}
+	}
+	return uint(plan.limit)
+}
+
+func (plan *queryPlan) boundedFilteredNodeIDs(tx *Tx, pattern nodePattern, definition store.PropertyIndexDefinition, value any, params map[string]any, limit uint, budget *queryBudget) ([]uint64, error) {
+	normalized, err := store.NormalizeValue(value)
+	if err != nil {
+		return nil, err
+	}
+	expected := make([]any, len(plan.whereClauses))
+	for i, clause := range plan.whereClauses {
+		if clause.Kind == whereEquals || clause.Kind == whereBindingID {
+			expected[i], err = clause.Expr.eval(queryRow{}, params)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	results := make([]uint64, 0, min(limit, 64))
+	var visitErr error
+	visit := func(indexValue any) error {
+		_, err := tx.graph.NodeProperties.Visit(definition, indexValue, func(id uint64) bool {
+			if visitErr = budget.check(1, len(results)); visitErr != nil {
+				return false
+			}
+			if tx.changes != nil {
+				if _, changed := tx.changes.upsertNodes[id]; changed {
+					return true
+				}
+			}
+			node := tx.graph.Nodes.Get(id)
+			if nodeMatchesPropertyIndex(node, definition, indexValue) && plan.nodeMatchesBoundedFilter(node, pattern, expected) {
+				results = insertPropertyIndexID(results, id, limit)
+			}
+			return true
+		})
+		if err != nil {
+			return err
+		}
+		return visitErr
+	}
+	if err := visit(normalized); err != nil {
+		return nil, err
+	}
+	if alternate, ok := alternateNumericIndexValue(normalized); ok {
+		if err := visit(alternate); err != nil {
+			return nil, err
+		}
+	}
+	if tx.changes != nil {
+		for id := range tx.changes.upsertNodes {
+			if err := budget.check(1, len(results)); err != nil {
+				return nil, err
+			}
+			node := tx.graph.Nodes.Get(id)
+			if nodeMatchesQueryProperty(node, definition, normalized) && plan.nodeMatchesBoundedFilter(node, pattern, expected) {
+				results = insertPropertyIndexID(results, id, limit)
+			}
+		}
+	}
+	return results, nil
+}
+
+func (plan *queryPlan) nodeMatchesBoundedFilter(node *store.NodeRecord, pattern nodePattern, expected []any) bool {
+	if node == nil || !store.LabelsMatch(node, pattern.Labels) || !store.PropertiesMatch(node.Properties, pattern.Properties) {
+		return false
+	}
+	binding := boundValue{Node: node}
+	for i, clause := range plan.whereClauses {
+		value, exists := propertyFromBinding(binding, clause.Property)
+		switch clause.Kind {
+		case whereEquals:
+			if !exists || !queryValuesEqual(value, expected[i]) {
+				return false
+			}
+		case whereIsNull:
+			if exists && value != nil {
+				return false
+			}
+		case whereIsNotNull:
+			if !exists || value == nil {
+				return false
+			}
+		case whereBindingID:
+			expectedID, ok := normalizeInt64(expected[i])
+			if !ok || expectedID != int64(node.ID) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func nodeMatchesQueryProperty(node *store.NodeRecord, definition store.PropertyIndexDefinition, value any) bool {
+	if node == nil || !slices.Contains(node.Labels, definition.Scope) {
+		return false
+	}
+	stored, ok := node.Properties[definition.Property]
+	return ok && queryValuesEqual(stored, value)
+}
+
+func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[string]any) ([]uint64, bool, error) {
+	if pattern.EdgeVar == "" || pattern.EdgeType == "" {
+		return nil, false, nil
+	}
+	for _, clause := range plan.whereClauses {
+		if clause.Kind != whereEquals || clause.Var != pattern.EdgeVar {
+			continue
+		}
+		switch clause.Expr.(type) {
+		case literalExpr, paramExpr:
+		default:
+			continue
+		}
+		value, err := clause.Expr.eval(queryRow{}, params)
+		if err != nil {
+			return nil, false, err
+		}
+		definition := store.PropertyIndexDefinition{Scope: pattern.EdgeType, Property: clause.Property}
+		if !tx.graph.EdgeProperties.Has(definition) {
+			continue
+		}
+		ids, err := tx.FindEdgesByTypeProperty(pattern.EdgeType, clause.Property, value, ^uint(0))
+		if err != nil {
+			return nil, false, err
+		}
+		if alternate, ok := alternateNumericIndexValue(value); ok {
+			more, err := tx.FindEdgesByTypeProperty(pattern.EdgeType, clause.Property, alternate, ^uint(0))
+			if err != nil {
+				return nil, false, err
+			}
+			ids = append(ids, more...)
+			slices.Sort(ids)
+			ids = slices.Compact(ids)
+		}
+		return ids, true, nil
+	}
+	return nil, false, nil
+}
+
+func alternateNumericIndexValue(value any) (any, bool) {
+	switch value := value.(type) {
+	case int64:
+		converted := float64(value)
+		return converted, int64(converted) == value
+	case float64:
+		if value >= -9223372036854775808 && value < 9223372036854775808 && value == math.Trunc(value) {
+			return int64(value), true
+		}
+	}
+	return nil, false
+}
+
+func (plan *queryPlan) bindingNodeID(name string, params map[string]any) (uint64, bool, error) {
+	for _, clause := range plan.whereClauses {
+		if clause.Kind != whereBindingID || clause.Var != name {
+			continue
+		}
+		switch clause.Expr.(type) {
+		case literalExpr, paramExpr:
+		default:
+			continue
+		}
+		value, err := clause.Expr.eval(queryRow{}, params)
+		if err != nil {
+			return 0, false, err
+		}
+		id, ok := normalizeInt64(value)
+		if !ok {
+			return 0, false, fmt.Errorf("id comparison requires integer, got %T", value)
+		}
+		if id < 0 {
+			return 0, true, nil
+		}
+		return uint64(id), true, nil
+	}
+	return 0, false, nil
+}
+
+func (clause *unwindClause) apply(rows []queryRow, params map[string]any, budget *queryBudget) ([]queryRow, error) {
 	nextRows := make([]queryRow, 0)
 	for _, row := range rows {
 		value, err := clause.Expr.eval(row, params)
@@ -405,6 +888,9 @@ func (clause *unwindClause) apply(rows []queryRow, params map[string]any) ([]que
 			return nil, fmt.Errorf("UNWIND requires list value, got %T", value)
 		}
 		for _, item := range list {
+			if err := budget.check(1, len(nextRows)+1); err != nil {
+				return nil, err
+			}
 			nextRow := row.clone()
 			nextRow.Bindings[clause.Var] = boundValue{
 				Value:    store.CloneValue(item),
@@ -422,7 +908,7 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
-			continue
+			return nil, fmt.Errorf("empty MATCH pattern in %q", text)
 		}
 		if strings.Contains(part, "->") {
 			pattern, err := parseEdgePattern(part)
@@ -460,6 +946,9 @@ func parseNodePattern(text string) (nodePattern, error) {
 			return nodePattern{}, err
 		}
 		props = parsedProps
+		if strings.TrimSpace(body[propEnd+1:]) != "" {
+			return nodePattern{}, fmt.Errorf("unexpected text after node properties in %q", text)
+		}
 		prefix = strings.TrimSpace(body[:propStart])
 	}
 
@@ -776,14 +1265,25 @@ func parseReturnClause(text string) (*returnClause, error) {
 
 	parts := splitTopLevel(text, ',')
 	projections := make([]projection, 0, len(parts))
+	aliases := map[string]struct{}{}
 	for _, part := range parts {
 		exprText := strings.TrimSpace(part)
+		if exprText == "" {
+			return nil, errors.New("RETURN projection must be non-empty")
+		}
 		alias := exprText
 		pieces := strings.SplitN(exprText, " AS ", 2)
 		if len(pieces) == 2 {
 			exprText = strings.TrimSpace(pieces[0])
 			alias = strings.TrimSpace(pieces[1])
 		}
+		if exprText == "" || alias == "" {
+			return nil, fmt.Errorf("invalid RETURN projection %q", part)
+		}
+		if _, duplicate := aliases[alias]; duplicate {
+			return nil, fmt.Errorf("duplicate RETURN alias %q", alias)
+		}
+		aliases[alias] = struct{}{}
 		if varName, ok := parseBindingIDAccess(exprText); ok {
 			projections = append(projections, projection{
 				Kind:  projectionBindingID,
@@ -814,46 +1314,91 @@ func parseReturnClause(text string) (*returnClause, error) {
 	return &returnClause{Projections: projections}, nil
 }
 
-func (pattern nodePattern) apply(tx *Tx, rows []queryRow) ([]queryRow, error) {
+func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
 	nextRows := make([]queryRow, 0)
-	for _, row := range rows {
-		for _, nodeID := range store.SortedNodeIDs(tx.graph) {
-			node := tx.graph.Nodes[nodeID]
-			if !store.LabelsMatch(node, pattern.Labels) {
-				continue
+	var nodeIDs []uint64
+	if len(pattern.Labels) == 0 {
+		nodeIDs = store.SortedNodeIDs(tx.graph)
+	} else {
+		nodeIDs = tx.graph.Labels.Get(pattern.Labels[0])
+		for _, label := range pattern.Labels[1:] {
+			if ids := tx.graph.Labels.Get(label); len(ids) < len(nodeIDs) {
+				nodeIDs = ids
 			}
-			if !store.PropertiesMatch(node.Properties, pattern.Properties) {
-				continue
-			}
-			if pattern.Var != "" {
-				if existing, ok := row.Bindings[pattern.Var]; ok {
-					if existing.Node == nil || existing.Node.ID != node.ID {
-						continue
-					}
-					nextRows = append(nextRows, row)
-					continue
-				}
-			}
-			nextRow := row.clone()
-			if pattern.Var != "" {
-				nextRow.Bindings[pattern.Var] = boundValue{Node: node}
-			}
-			nextRows = append(nextRows, nextRow)
+		}
+	}
+	if err := budget.chargeTemporary(uint64(len(nodeIDs)) * 8); err != nil {
+		return nil, err
+	}
+	for _, nodeID := range nodeIDs {
+		nextRows = pattern.appendNodeRows(rows, tx.graph.Nodes.Get(nodeID), nextRows)
+		if err := budget.check(uint64(len(rows)), len(nextRows)); err != nil {
+			return nil, err
 		}
 	}
 	return nextRows, nil
 }
 
-func (pattern edgePattern) apply(tx *Tx, rows []queryRow) ([]queryRow, error) {
+func (pattern nodePattern) applyID(tx *Tx, rows []queryRow, nodeID uint64) []queryRow {
+	node := tx.graph.Nodes.Get(nodeID)
+	if node == nil {
+		return nil
+	}
+	return pattern.appendNodeRows(rows, node, nil)
+}
+
+func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecord, nextRows []queryRow) []queryRow {
+	for _, row := range rows {
+		if !store.LabelsMatch(node, pattern.Labels) {
+			continue
+		}
+		if !store.PropertiesMatch(node.Properties, pattern.Properties) {
+			continue
+		}
+		if pattern.Var != "" {
+			if existing, ok := row.Bindings[pattern.Var]; ok {
+				if existing.Node == nil || existing.Node.ID != node.ID {
+					continue
+				}
+				nextRows = append(nextRows, row)
+				continue
+			}
+		}
+		nextRow := row.clone()
+		if pattern.Var != "" {
+			nextRow.Bindings[pattern.Var] = boundValue{Node: node}
+		}
+		nextRows = append(nextRows, nextRow)
+	}
+	return nextRows
+}
+
+func (pattern edgePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
+	var edgeIDs []uint64
+	if pattern.EdgeType == "" {
+		edgeIDs = store.SortedEdgeIDs(tx.graph)
+	} else {
+		edgeIDs = tx.graph.EdgeTypes.Get(pattern.EdgeType)
+	}
+	return pattern.applyIDs(tx, rows, edgeIDs, budget)
+}
+
+func (pattern edgePattern) applyIDs(tx *Tx, rows []queryRow, edgeIDs []uint64, budget *queryBudget) ([]queryRow, error) {
+	if err := budget.chargeTemporary(uint64(len(edgeIDs)) * 8); err != nil {
+		return nil, err
+	}
 	nextRows := make([]queryRow, 0)
 	for _, row := range rows {
-		for _, edgeID := range store.SortedEdgeIDs(tx.graph) {
-			edge := tx.graph.Edges[edgeID]
+		for _, edgeID := range edgeIDs {
+			if err := budget.check(1, len(nextRows)); err != nil {
+				return nil, err
+			}
+			edge := tx.graph.Edges.Get(edgeID)
 			if pattern.EdgeType != "" && edge.Type != pattern.EdgeType {
 				continue
 			}
-			source := tx.graph.Nodes[edge.SourceID]
-			target := tx.graph.Nodes[edge.TargetID]
+			source := tx.graph.Nodes.Get(edge.SourceID)
+			target := tx.graph.Nodes.Get(edge.TargetID)
 			if source == nil || target == nil {
 				continue
 			}
@@ -888,9 +1433,12 @@ func (pattern edgePattern) apply(tx *Tx, rows []queryRow) ([]queryRow, error) {
 	return nextRows, nil
 }
 
-func (clause *whereClause) apply(rows []queryRow, params map[string]any) ([]queryRow, error) {
-	filtered := make([]queryRow, 0, len(rows))
+func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any, budget *queryBudget) ([]queryRow, error) {
+	filtered := rows[:0]
 	for _, row := range rows {
+		if err := budget.check(1, len(filtered)); err != nil {
+			return nil, err
+		}
 		binding, ok := row.Bindings[clause.Var]
 		if !ok {
 			continue
@@ -902,7 +1450,7 @@ func (clause *whereClause) apply(rows []queryRow, params map[string]any) ([]quer
 			if err != nil {
 				return nil, err
 			}
-			if exists && reflect.DeepEqual(value, expected) {
+			if exists && queryValuesEqual(value, expected) {
 				filtered = append(filtered, row)
 			}
 		case whereIsNull:
@@ -933,17 +1481,9 @@ func (clause *whereClause) apply(rows []queryRow, params map[string]any) ([]quer
 			if err != nil {
 				return nil, err
 			}
-			nextRow := row.clone()
-			nextRow.Order = float64(distance)
-			filtered = append(filtered, nextRow)
+			row.Order = float64(distance)
+			filtered = append(filtered, row)
 		case whereFTS:
-			if !exists {
-				continue
-			}
-			text, ok := value.(string)
-			if !ok {
-				continue
-			}
 			expected, err := clause.Expr.eval(row, params)
 			if err != nil {
 				return nil, err
@@ -952,13 +1492,25 @@ func (clause *whereClause) apply(rows []queryRow, params map[string]any) ([]quer
 			if !ok {
 				return nil, fmt.Errorf("fts comparison requires string, got %T", expected)
 			}
-			score := search.FTSScore(text, search.Tokenize(queryText))
+			terms := search.Tokenize(queryText)
+			var score float32
+			hasIndex := false
+			if binding.Node != nil {
+				if record := tx.graph.FTS.Get(binding.Node.ID); record != nil {
+					hasIndex = true
+					score = search.FTSScoreTokensWithOptions(record.Tokens, terms, 0, 0)
+				}
+			}
+			if !hasIndex && exists {
+				if text, ok := value.(string); ok {
+					score = search.FTSScore(text, terms)
+				}
+			}
 			if score <= 0 {
 				continue
 			}
-			nextRow := row.clone()
-			nextRow.Order = -float64(score)
-			filtered = append(filtered, nextRow)
+			row.Order = -float64(score)
+			filtered = append(filtered, row)
 		case whereBindingID:
 			expected, err := clause.Expr.eval(row, params)
 			if err != nil {
@@ -991,7 +1543,34 @@ func (clause *whereClause) apply(rows []queryRow, params map[string]any) ([]quer
 	return filtered, nil
 }
 
-func (clause *setClause) apply(rows []queryRow, params map[string]any) error {
+func queryValuesEqual(left any, right any) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	leftInt, leftIsInt := left.(int64)
+	rightInt, rightIsInt := right.(int64)
+	if leftIsInt && rightIsInt {
+		return leftInt == rightInt
+	}
+	leftFloat, leftIsFloat := left.(float64)
+	rightFloat, rightIsFloat := right.(float64)
+	switch {
+	case leftIsFloat && rightIsFloat:
+		return leftFloat == rightFloat
+	case leftIsInt && rightIsFloat:
+		return integerEqualsFloat(leftInt, rightFloat)
+	case leftIsFloat && rightIsInt:
+		return integerEqualsFloat(rightInt, leftFloat)
+	default:
+		return reflect.DeepEqual(left, right)
+	}
+}
+
+func integerEqualsFloat(integer int64, floating float64) bool {
+	return floating >= -9223372036854775808 && floating < 9223372036854775808 && floating == math.Trunc(floating) && int64(floating) == integer
+}
+
+func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any) error {
 	for _, row := range rows {
 		binding, ok := row.Bindings[clause.Var]
 		if !ok {
@@ -1009,12 +1588,20 @@ func (clause *setClause) apply(rows []queryRow, params map[string]any) error {
 		case setProperty:
 			switch {
 			case binding.Node != nil:
+				binding.Node, err = tx.writableNode(binding.Node.ID)
+				if err != nil {
+					return err
+				}
 				if normalized == nil {
 					delete(binding.Node.Properties, clause.Property)
 				} else {
 					binding.Node.Properties[clause.Property] = normalized
 				}
 			case binding.Edge != nil:
+				binding.Edge, err = tx.writableEdge(binding.Edge.ID)
+				if err != nil {
+					return err
+				}
 				if normalized == nil {
 					delete(binding.Edge.Properties, clause.Property)
 				} else {
@@ -1030,8 +1617,16 @@ func (clause *setClause) apply(rows []queryRow, params map[string]any) error {
 			}
 			switch {
 			case binding.Node != nil:
+				binding.Node, err = tx.writableNode(binding.Node.ID)
+				if err != nil {
+					return err
+				}
 				binding.Node.Properties = props
 			case binding.Edge != nil:
+				binding.Edge, err = tx.writableEdge(binding.Edge.ID)
+				if err != nil {
+					return err
+				}
 				binding.Edge.Properties = props
 			default:
 				return fmt.Errorf("binding %q is neither node nor edge", clause.Var)
@@ -1043,8 +1638,16 @@ func (clause *setClause) apply(rows []queryRow, params map[string]any) error {
 			}
 			switch {
 			case binding.Node != nil:
+				binding.Node, err = tx.writableNode(binding.Node.ID)
+				if err != nil {
+					return err
+				}
 				mergeMutationProperties(binding.Node.Properties, props)
 			case binding.Edge != nil:
+				binding.Edge, err = tx.writableEdge(binding.Edge.ID)
+				if err != nil {
+					return err
+				}
 				mergeMutationProperties(binding.Edge.Properties, props)
 			default:
 				return fmt.Errorf("binding %q is neither node nor edge", clause.Var)
@@ -1052,6 +1655,7 @@ func (clause *setClause) apply(rows []queryRow, params map[string]any) error {
 		default:
 			return fmt.Errorf("unsupported SET kind %q", clause.Kind)
 		}
+		row.Bindings[clause.Var] = binding
 	}
 	return nil
 }
@@ -1082,26 +1686,36 @@ func (clause *createNodeClause) apply(tx *Tx, rows []queryRow, params map[string
 
 		nextRow := row.clone()
 		if clause.Var != "" {
-			nextRow.Bindings[clause.Var] = boundValue{Node: tx.graph.Nodes[node.ID]}
+			nextRow.Bindings[clause.Var] = boundValue{Node: tx.graph.Nodes.Get(node.ID)}
 		}
 		nextRows = append(nextRows, nextRow)
 	}
 	return nextRows, nil
 }
 
-func (clause *removeClause) apply(rows []queryRow) error {
+func (clause *removeClause) apply(tx *Tx, rows []queryRow) error {
 	for _, row := range rows {
 		for _, item := range clause.Items {
 			binding, ok := row.Bindings[item.Var]
 			if !ok {
-				continue
+				return fmt.Errorf("unknown binding %q", item.Var)
 			}
 			switch {
 			case item.Property != "":
 				switch {
 				case binding.Node != nil:
+					var err error
+					binding.Node, err = tx.writableNode(binding.Node.ID)
+					if err != nil {
+						return err
+					}
 					delete(binding.Node.Properties, item.Property)
 				case binding.Edge != nil:
+					var err error
+					binding.Edge, err = tx.writableEdge(binding.Edge.ID)
+					if err != nil {
+						return err
+					}
 					delete(binding.Edge.Properties, item.Property)
 				default:
 					return fmt.Errorf("binding %q is neither node nor edge", item.Var)
@@ -1110,10 +1724,19 @@ func (clause *removeClause) apply(rows []queryRow) error {
 				if binding.Node == nil {
 					return fmt.Errorf("binding %q is not a node", item.Var)
 				}
+				var err error
+				binding.Node, err = tx.writableNode(binding.Node.ID)
+				if err != nil {
+					return err
+				}
+				if slices.Contains(binding.Node.Labels, item.Label) {
+					tx.graph.Labels.Remove(item.Label, binding.Node.ID)
+				}
 				binding.Node.Labels = removeLabel(binding.Node.Labels, item.Label)
 			default:
 				return fmt.Errorf("invalid REMOVE item for binding %q", item.Var)
 			}
+			row.Bindings[item.Var] = binding
 		}
 	}
 	return nil
@@ -1174,7 +1797,7 @@ func (clause *deleteClause) apply(tx *Tx, rows []queryRow) error {
 	}
 
 	for edgeID := range edgeIDs {
-		delete(tx.graph.Edges, edgeID)
+		tx.deleteEdge(edgeID)
 	}
 	for nodeID := range nodeIDs {
 		if err := tx.DeleteNode(nodeID); err != nil {
@@ -1184,12 +1807,26 @@ func (clause *deleteClause) apply(tx *Tx, rows []queryRow) error {
 	return nil
 }
 
-func (clause *returnClause) render(rows []queryRow) (QueryResult, error) {
+func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryResult, error) {
 	if clause.CountAlias != "" {
+		count := int64(0)
+		for _, row := range rows {
+			if clause.CountVar == "*" {
+				count++
+				continue
+			}
+			binding, ok := row.Bindings[clause.CountVar]
+			if !ok {
+				return QueryResult{}, fmt.Errorf("unknown binding %q", clause.CountVar)
+			}
+			if binding.Node != nil || binding.Edge != nil || binding.HasValue && binding.Value != nil {
+				count++
+			}
+		}
 		return QueryResult{
 			Columns: []string{clause.CountAlias},
 			Rows: []map[string]any{
-				{clause.CountAlias: int64(len(rows))},
+				{clause.CountAlias: count},
 			},
 		}, nil
 	}
@@ -1200,6 +1837,9 @@ func (clause *returnClause) render(rows []queryRow) (QueryResult, error) {
 	}
 
 	for _, row := range rows {
+		if err := budget.chargeResult(64 + uint64(len(clause.Projections))*32); err != nil {
+			return QueryResult{}, err
+		}
 		resultRow := make(map[string]any, len(clause.Projections))
 		for _, projection := range clause.Projections {
 			switch projection.Kind {
@@ -1226,6 +1866,9 @@ func (clause *returnClause) render(rows []queryRow) (QueryResult, error) {
 					resultRow[projection.Alias] = nil
 					continue
 				}
+				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+					return QueryResult{}, err
+				}
 				resultRow[projection.Alias] = store.CloneValue(value)
 			case projectionValue:
 				binding, ok := row.Bindings[projection.Var]
@@ -1233,10 +1876,25 @@ func (clause *returnClause) render(rows []queryRow) (QueryResult, error) {
 					resultRow[projection.Alias] = nil
 					continue
 				}
-				if !binding.HasValue {
-					return QueryResult{}, fmt.Errorf("unsupported value projection for binding %q", projection.Var)
+				switch {
+				case binding.Node != nil:
+					if err := budget.chargeResult(queryPropertyBytes(binding.Node.Properties)); err != nil {
+						return QueryResult{}, err
+					}
+					resultRow[projection.Alias] = publicNode(binding.Node)
+				case binding.Edge != nil:
+					if err := budget.chargeResult(queryPropertyBytes(binding.Edge.Properties)); err != nil {
+						return QueryResult{}, err
+					}
+					resultRow[projection.Alias] = publicEdge(binding.Edge)
+				case binding.HasValue:
+					if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
+						return QueryResult{}, err
+					}
+					resultRow[projection.Alias] = store.CloneValue(binding.Value)
+				default:
+					resultRow[projection.Alias] = nil
 				}
-				resultRow[projection.Alias] = store.CloneValue(binding.Value)
 			default:
 				return QueryResult{}, fmt.Errorf("unsupported projection kind %q", projection.Kind)
 			}
@@ -1244,6 +1902,37 @@ func (clause *returnClause) render(rows []queryRow) (QueryResult, error) {
 		result.Rows = append(result.Rows, resultRow)
 	}
 	return result, nil
+}
+
+func queryPropertyBytes(properties map[string]any) uint64 {
+	bytes := uint64(len(properties)) * 32
+	for key, value := range properties {
+		bytes += uint64(len(key)) + queryValueBytes(value)
+	}
+	return bytes
+}
+
+func queryValueBytes(value any) uint64 {
+	switch value := value.(type) {
+	case nil, bool, int64, float64:
+		return 8
+	case string:
+		return uint64(len(value))
+	case []byte:
+		return uint64(len(value))
+	case []float32:
+		return uint64(len(value)) * 4
+	case []any:
+		bytes := uint64(len(value)) * 16
+		for _, item := range value {
+			bytes += queryValueBytes(item)
+		}
+		return bytes
+	case map[string]any:
+		return queryPropertyBytes(value)
+	default:
+		return 16
+	}
 }
 
 func (expr literalExpr) eval(_ queryRow, _ map[string]any) (any, error) {
@@ -1387,7 +2076,12 @@ func parsePropertyAccess(text string) (string, string, error) {
 	if len(parts) != 2 {
 		return "", "", fmt.Errorf("invalid property access %q", text)
 	}
-	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
+	variable := strings.TrimSpace(parts[0])
+	property := strings.TrimSpace(parts[1])
+	if !isQueryIdentifier(variable) || !isQueryIdentifier(property) {
+		return "", "", fmt.Errorf("invalid property access %q", text)
+	}
+	return variable, property, nil
 }
 
 func parseBindingIDAccess(text string) (string, bool) {
@@ -1396,10 +2090,20 @@ func parseBindingIDAccess(text string) (string, bool) {
 		return "", false
 	}
 	name := strings.TrimSpace(text[len("id(") : len(text)-1])
-	if name == "" {
+	if !isQueryIdentifier(name) {
 		return "", false
 	}
 	return name, true
+}
+
+func isQueryIdentifier(value string) bool {
+	for index, char := range []byte(value) {
+		if char == '_' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || index > 0 && char >= '0' && char <= '9' {
+			continue
+		}
+		return false
+	}
+	return value != ""
 }
 
 func splitOperator(text string, operator string) (string, string, bool) {
@@ -1418,7 +2122,7 @@ func splitOnNextClause(input string, keywords ...string) (string, string, string
 	for i := 0; i < len(input); i++ {
 		switch input[i] {
 		case '"':
-			if i == 0 || input[i-1] != '\\' {
+			if !isEscaped(input, i) {
 				inString = !inString
 			}
 		case '{':
@@ -1496,7 +2200,7 @@ func splitTopLevel(text string, separator rune) []string {
 	for i, r := range text {
 		switch r {
 		case '"':
-			if i == 0 || text[i-1] != '\\' {
+			if !isEscaped(text, i) {
 				inString = !inString
 			}
 		case '{':
@@ -1545,7 +2249,7 @@ func splitTopLevelKeyword(text string, keyword string) []string {
 	for i := 0; i < len(text); i++ {
 		switch text[i] {
 		case '"':
-			if i == 0 || text[i-1] != '\\' {
+			if !isEscaped(text, i) {
 				inString = !inString
 			}
 		case '{':
@@ -1599,7 +2303,7 @@ func findTopLevelRune(text string, target rune) int {
 		}
 		switch r {
 		case '"':
-			if i == 0 || text[i-1] != '\\' {
+			if !isEscaped(text, i) {
 				inString = !inString
 			}
 		case '{':
@@ -1637,7 +2341,7 @@ func findMatchingBrace(text string, start int, open byte, close byte) int {
 	for i := start; i < len(text); i++ {
 		switch text[i] {
 		case '"':
-			if i == 0 || text[i-1] != '\\' {
+			if !isEscaped(text, i) {
 				inString = !inString
 			}
 		case open:
@@ -1793,4 +2497,12 @@ func removeLabel(labels []string, target string) []string {
 		}
 	}
 	return out
+}
+
+func isEscaped(text string, index int) bool {
+	backslashes := 0
+	for index > backslashes && text[index-backslashes-1] == '\\' {
+		backslashes++
+	}
+	return backslashes%2 == 1
 }

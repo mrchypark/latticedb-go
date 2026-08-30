@@ -1,7 +1,7 @@
-module github.com/jeffhajewski/latticedb-go/conformance/go
+module github.com/mrchypark/latticedb-go/conformance/go
 
-go 1.22
+go 1.27
 
-require github.com/jeffhajewski/latticedb-go v0.0.0
+require github.com/mrchypark/latticedb-go v0.0.0
 
-replace github.com/jeffhajewski/latticedb-go => ../..
+replace github.com/mrchypark/latticedb-go => ../..
