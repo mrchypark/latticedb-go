@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"maps"
 	"math"
 	"slices"
 	"testing"
@@ -26,6 +27,10 @@ func TestStringPostingsForkIsolationAcrossPromotion(t *testing.T) {
 	}
 	if keys := slices.Collect(fork.Keys()); len(keys) != 0 {
 		t.Fatalf("empty posting keys = %v", keys)
+	}
+	fork.Add("term", 99)
+	if got := fork.Get("term"); !slices.Equal(got, []uint64{99}) {
+		t.Fatalf("re-added posting = %v", got)
 	}
 	if base.Len("term") != smallPostingLimit {
 		t.Fatal("posting cleanup changed base")
@@ -52,6 +57,71 @@ func TestPagedMapForkIsolationAndHighIDs(t *testing.T) {
 	fork = fork.ForkSet(66, 101)
 	if base.Get(65) != 65 || fork.Get(65) != 100 || fork.Get(66) != 101 || fork.Len() != 5 {
 		t.Fatalf("fork-set state = base %d, values %d/%d, len %d", base.Get(65), fork.Get(65), fork.Get(66), fork.Len())
+	}
+}
+
+func TestPagedMapDifferentialAcrossForks(t *testing.T) {
+	base := NewPagedMap[uint64]()
+	wantBase := map[uint64]uint64{}
+	seed := uint64(1)
+	for range 10_000 {
+		seed = seed*6364136223846793005 + 1
+		id := seed & ((1 << 50) - 1)
+		base.Set(id, seed)
+		wantBase[id] = seed
+	}
+	fork := base.Fork()
+	wantFork := maps.Clone(wantBase)
+	for index := range 5_000 {
+		seed = seed*6364136223846793005 + 1
+		id := seed & ((1 << 50) - 1)
+		fork.CloneShardOnce(id)
+		if index%3 == 0 {
+			fork.Delete(id)
+			delete(wantFork, id)
+		} else {
+			fork.Set(id, seed)
+			wantFork[id] = seed
+		}
+	}
+	collect := func(values PagedMap[uint64]) map[uint64]uint64 {
+		got := make(map[uint64]uint64, values.Len())
+		for id, value := range values.All() {
+			got[id] = value
+		}
+		return got
+	}
+	if got := collect(base); !maps.Equal(got, wantBase) {
+		t.Fatalf("base differs: got %d entries, want %d", len(got), len(wantBase))
+	}
+	if got := collect(fork); !maps.Equal(got, wantFork) {
+		t.Fatalf("fork differs: got %d entries, want %d", len(got), len(wantFork))
+	}
+}
+
+func TestPagedMapDeleteLastPageThenReuseFork(t *testing.T) {
+	for _, ids := range [][]uint64{{1, 64}, {1, 1 << 20}, {1 << 48, 1<<48 + 64}} {
+		base := NewPagedMap[uint64]()
+		base.Set(ids[0], ids[0])
+		fork := base.Fork()
+		fork.CloneShardOnce(ids[0])
+		fork.Delete(ids[0])
+		fork.CloneShardOnce(ids[1])
+		fork.Set(ids[1], ids[1])
+		if !base.Has(ids[0]) || fork.Has(ids[0]) || fork.Get(ids[1]) != ids[1] {
+			t.Fatalf("ids %v: base/fork isolation failed", ids)
+		}
+	}
+	base := NewPagedMap[uint64]()
+	base.Set(1, 1)
+	base.Set(1<<13, 1<<13)
+	fork := base.Fork()
+	fork.CloneShardOnce(1)
+	fork.Delete(1)
+	fork.CloneShardOnce(64)
+	fork.Set(64, 64)
+	if !base.Has(1) || !fork.Has(1<<13) || fork.Get(64) != 64 {
+		t.Fatal("reuse with another live bucket failed")
 	}
 }
 

@@ -54,6 +54,7 @@ const queryCacheEntries = 128
 const maxQueryBytes = 32 << 10
 const idReservationBlock = 1024
 const defaultWALCheckpointThresholdBytes = 64 << 20
+const defaultChangefeedMaxBytes = 64 << 20
 const defaultMaxDatabaseSnapshotBytes = 512 << 20
 const defaultSearchMaxWork = 10_000_000
 const defaultSearchMaxBytes = 64 << 20
@@ -74,6 +75,7 @@ type OpenOptions struct {
 	VectorDimensions                 uint16
 	Durability                       DurabilityMode
 	WALCheckpointThresholdBytes      uint64
+	ChangefeedMaxBytes               uint64
 	MaxDatabaseSnapshotBytes         uint64
 	VectorIndexBuildMaxWork          uint64
 	VectorIndexBuildMaxLogicalBytes  uint64
@@ -210,6 +212,7 @@ type DB struct {
 	dirty                            bool
 	checkpointCount                  uint64
 	walCheckpointThresholdBytes      uint64
+	changefeedMaxBytes               uint64
 	maxDatabaseSnapshotBytes         uint64
 	vectorIndexBuildMaxWork          uint64
 	vectorIndexBuildMaxLogicalBytes  uint64
@@ -305,6 +308,9 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	}
 	if opts.MaxDatabaseSnapshotBytes == 0 {
 		opts.MaxDatabaseSnapshotBytes = defaultMaxDatabaseSnapshotBytes
+	}
+	if opts.ChangefeedMaxBytes == 0 {
+		opts.ChangefeedMaxBytes = min(defaultChangefeedMaxBytes, max(uint64(1), opts.MaxDatabaseSnapshotBytes/8))
 	}
 	if opts.VectorIndexBuildMaxWork == 0 {
 		opts.VectorIndexBuildMaxWork = defaultVectorBuildMaxWork
@@ -452,6 +458,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		vectorDimensions:                 graph.VectorDimensions,
 		queryCache:                       map[string]*queryPlan{},
 		walCheckpointThresholdBytes:      opts.WALCheckpointThresholdBytes,
+		changefeedMaxBytes:               opts.ChangefeedMaxBytes,
 		maxDatabaseSnapshotBytes:         opts.MaxDatabaseSnapshotBytes,
 		vectorIndexBuildMaxWork:          opts.VectorIndexBuildMaxWork,
 		vectorIndexBuildMaxLogicalBytes:  opts.VectorIndexBuildMaxLogicalBytes,

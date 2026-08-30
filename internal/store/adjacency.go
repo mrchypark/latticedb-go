@@ -74,6 +74,7 @@ func (list *EdgeList) Append(id uint64) *EdgeList {
 	}
 	owned := false
 	if result.IsInline() {
+		result.total = len(result.small)
 		result.chunks = NewPagedMap[[]uint64]()
 		for start := 0; start < len(result.small); start += adjacencyChunkSize {
 			end := min(start+adjacencyChunkSize, len(result.small))
@@ -107,6 +108,7 @@ func (list *EdgeList) Remove(id uint64) *EdgeList {
 			if edgeID == id {
 				result.small = append(slices.Clone(result.small[:index]), result.small[index+1:]...)
 				result.count--
+				result.total--
 				return &result
 			}
 		}

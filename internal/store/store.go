@@ -129,8 +129,10 @@ func (postings *StringPostings) Remove(key string, id uint64) {
 	bucket := postings.buckets.Get(hash)
 	if list.len() == 0 {
 		delete(bucket, key)
+		delete(postings.clonedKeys, key)
 		if len(bucket) == 0 {
 			postings.buckets.Delete(hash)
+			delete(postings.clonedHashes, hash)
 		}
 		return
 	}

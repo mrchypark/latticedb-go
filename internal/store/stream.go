@@ -140,29 +140,67 @@ func (store StreamStore) Read(name string, after uint64, limit uint) []StreamRec
 	if sequence > log.first {
 		available -= min(available, sequence-log.first)
 	}
-	out := make([]StreamRecord, 0, min(uint64(limit), available))
-	for uint(len(out)) < limit && available > 0 {
-		chunk := log.chunk(sequence)
-		if chunk == nil {
-			break
-		}
-		if sequence < chunk.records[0].Sequence {
-			sequence = chunk.records[0].Sequence
-		}
-		start := int(sequence - chunk.records[0].Sequence)
-		for _, record := range chunk.records[start:] {
-			if record.Sequence < sequence {
-				continue
-			}
+	take := min(uint64(limit), available)
+	end := sequence + take - 1
+	endChunk := log.chunk(end)
+	if endChunk == nil {
+		return []StreamRecord{}
+	}
+	if sequence >= endChunk.records[0].Sequence {
+		start := int(sequence - endChunk.records[0].Sequence)
+		out := make([]StreamRecord, 0, take)
+		for _, record := range endChunk.records[start : start+int(take)] {
 			out = append(out, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: CloneValue(record.Payload)})
-			available--
-			sequence = record.Sequence + 1
-			if uint(len(out)) == limit {
-				break
-			}
+		}
+		return out
+	}
+	chunks := make([]*streamChunk, 0, (take+streamChunkSize-1)/streamChunkSize+1)
+	for chunk := endChunk; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= sequence; chunk = chunk.previous {
+		chunks = append(chunks, chunk)
+	}
+	slices.Reverse(chunks)
+	out := make([]StreamRecord, 0, take)
+	for _, chunk := range chunks {
+		out = appendStreamRecords(out, chunk.records, sequence, end)
+	}
+	return out
+}
+
+func appendStreamRecords(out []StreamRecord, records []StreamRecord, first, last uint64) []StreamRecord {
+	for _, record := range records {
+		if record.Sequence >= first && record.Sequence <= last {
+			out = append(out, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: CloneValue(record.Payload)})
 		}
 	}
 	return out
+}
+
+func (store StreamStore) StreamBytes(name string) uint64 { return store.streams[name].bytes }
+
+func (store *StreamStore) TrimToBytes(name string, maxBytes uint64) (uint64, bool) {
+	log := store.streams[name]
+	if log.bytes <= maxBytes || log.count == 0 {
+		return 0, false
+	}
+	target := maxBytes / 2
+	var retained uint64
+	through := log.first - 1
+	for chunk := log.tail; chunk != nil; chunk = chunk.previous {
+		for index := len(chunk.records) - 1; index >= 0; index-- {
+			recordBytes := streamRecordBytes(chunk.records[index])
+			if retained != 0 && snapshotAdd(retained, recordBytes) > target {
+				store.Trim(name, chunk.records[index].Sequence)
+				return chunk.records[index].Sequence, true
+			}
+			retained = snapshotAdd(retained, recordBytes)
+			through = chunk.records[index].Sequence - 1
+		}
+	}
+	if through >= log.first {
+		store.Trim(name, through)
+		return through, true
+	}
+	return 0, false
 }
 
 func (store StreamStore) NextSequence(name string) uint64 {
@@ -429,7 +467,7 @@ func buildPersistedStreams(store StreamStore) (persistedStreams, error) {
 		}
 		for index := len(chunks) - 1; index >= 0; index-- {
 			for _, record := range chunks[index].records {
-				if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next {
+				if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next || previous != 0 && record.Sequence != previous+1 {
 					return persistedStreams{}, fmt.Errorf("invalid stream sequence")
 				}
 				if err := ValidateStreamKind(record.Kind); err != nil {
@@ -442,6 +480,9 @@ func buildPersistedStreams(store StreamStore) (persistedStreams, error) {
 				stream.Records = append(stream.Records, persistedStreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: payload})
 				previous = record.Sequence
 			}
+		}
+		if previous != 0 && stream.Next != previous+1 {
+			return persistedStreams{}, fmt.Errorf("invalid stream next sequence")
 		}
 		if stream.Next == 0 {
 			stream.Next = 1
@@ -476,7 +517,7 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 		var previous uint64
 		records := make([]StreamRecord, 0, len(stream.Records))
 		for _, record := range stream.Records {
-			if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next {
+			if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next || previous != 0 && record.Sequence != previous+1 {
 				return StreamStore{}, fmt.Errorf("invalid persisted stream sequence")
 			}
 			if err := ValidateStreamKind(record.Kind); err != nil {
@@ -488,6 +529,9 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 			}
 			records = append(records, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: payload})
 			previous = record.Sequence
+		}
+		if previous != 0 && stream.Next != previous+1 {
+			return StreamStore{}, fmt.Errorf("invalid persisted stream next sequence")
 		}
 		var log streamLog
 		for start := 0; start < len(records); start += int(streamChunkSize) {

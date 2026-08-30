@@ -34,6 +34,8 @@ type OpenOptions struct {
 	VectorDimensions            uint16
 	Durability                  DurabilityMode
 	WALCheckpointThresholdBytes uint64
+	// ChangefeedMaxBytes bounds retained automatic change records. Zero uses 64 MiB.
+	ChangefeedMaxBytes uint64
 	// MaxDatabaseSnapshotBytes is a conservative upper bound for the canonical streamed snapshot payload.
 	MaxDatabaseSnapshotBytes uint64
 	// VectorIndexBuildMaxWork bounds synchronous HNSW distance work.

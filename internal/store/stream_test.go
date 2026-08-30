@@ -18,6 +18,7 @@ func TestStreamDeltaSurvivesWALRecovery(t *testing.T) {
 		t.Fatalf("sequence = %d", sequence)
 	}
 	updated.Streams.SetOffset("events", "worker-a", 1)
+	updated.Streams.SetOffset("offset-only", "worker-b", 42)
 	if err := AppendWALDelta(path, updated, 1, 1, 1, GraphDelta{StreamsChanged: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -37,6 +38,9 @@ func TestStreamDeltaSurvivesWALRecovery(t *testing.T) {
 	}
 	if offset, ok := loaded.Streams.GetOffset("events", "worker-a"); !ok || offset != 1 {
 		t.Fatalf("offset = %d, %v", offset, ok)
+	}
+	if offset, ok := loaded.Streams.GetOffset("offset-only", "worker-b"); !ok || offset != 42 {
+		t.Fatalf("offset-only = %d, %v", offset, ok)
 	}
 }
 
@@ -99,5 +103,25 @@ func TestStreamReadChunkBoundaries(t *testing.T) {
 	}
 	if records := store.Read("events", math.MaxUint64, 2); len(records) != 0 {
 		t.Fatalf("overflow read = %#v", records)
+	}
+}
+
+func TestStreamBulkReadAndByteRetention(t *testing.T) {
+	store := NewStreamStore()
+	for index := range 10_000 {
+		store.Publish("events", "event", int64(index))
+	}
+	records := store.Read("events", 0, 10_000)
+	if len(records) != 10_000 || records[0].Sequence != 1 || records[len(records)-1].Sequence != 10_000 {
+		t.Fatalf("bulk records = first %d last %d len %d", records[0].Sequence, records[len(records)-1].Sequence, len(records))
+	}
+	before := store.StreamBytes("events")
+	through, trimmed := store.TrimToBytes("events", before/2)
+	if !trimmed || through == 0 || store.StreamBytes("events") > before/4+streamRecordBytes(records[len(records)-1]) {
+		t.Fatalf("trim = through %d, bytes %d -> %d", through, before, store.StreamBytes("events"))
+	}
+	retained := store.Read("events", 0, 10_000)
+	if len(retained) == 0 || retained[0].Sequence != through+1 || retained[len(retained)-1].Sequence != 10_000 {
+		t.Fatalf("retained range after %d = %#v", through, retained)
 	}
 }

@@ -60,6 +60,23 @@ func BenchmarkStreamSnapshotAccountingScaling(b *testing.B) {
 	}
 }
 
+func BenchmarkStreamBulkReadScaling(b *testing.B) {
+	for _, size := range []int{1_000, 10_000, 100_000} {
+		store := NewStreamStore()
+		for index := range size {
+			store.Publish("events", "event", int64(index))
+		}
+		b.Run(fmt.Sprintf("entries_%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				if records := store.Read("events", 0, uint(size)); len(records) != size {
+					b.Fatal("short stream read")
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkPagedMapSequentialSet(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
 		b.Run(fmt.Sprintf("entries_%d", size), func(b *testing.B) {

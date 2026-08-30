@@ -68,6 +68,83 @@ func TestLargePropertyChangefeedUsesBoundedSummaries(t *testing.T) {
 	assertBoundedPropertyChange(t, changes[len(changes)-1], nodeID)
 }
 
+func TestAutomaticChangefeedRetentionPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "retained-changefeed.ltdb")
+	db, err := Open(path, OpenOptions{Create: true, ChangefeedMaxBytes: 1 << 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nodeID uint64
+	if err := db.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]Value{"value": int64(0)}})
+		nodeID = node.ID
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for value := int64(1); value <= 100; value++ {
+		if err := db.Update(func(tx *Tx) error { return tx.SetProperty(nodeID, "value", value) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	changes, err := db.Changes(0, 1_000, 0)
+	if err != nil || len(changes) == 0 || changes[0].Sequence == 1 || changes[len(changes)-1].Sequence != 102 {
+		t.Fatalf("retained changes = first/last/len %#v/%#v/%d, %v", changes[0], changes[len(changes)-1], len(changes), err)
+	}
+	first := changes[0].Sequence
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	changes, err = reopened.Changes(0, 1_000, 0)
+	if err != nil || len(changes) == 0 || changes[0].Sequence != first || changes[len(changes)-1].Sequence != 102 {
+		t.Fatalf("recovered retained changes = %#v, %v", changes, err)
+	}
+}
+
+func TestOffsetOnlyStreamCheckpointAndSerialization(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "offset-only.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetStreamOffset("events", "worker", 42) }); err != nil {
+		t.Fatal(err)
+	}
+	serialized, err := db.Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyDB, err := Deserialize(serialized, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offset, ok, err := copyDB.GetStreamOffset("events", "worker"); err != nil || !ok || offset != 42 {
+		t.Fatalf("serialized offset = %d, %v, %v", offset, ok, err)
+	}
+	if err := copyDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if offset, ok, err := reopened.GetStreamOffset("events", "worker"); err != nil || !ok || offset != 42 {
+		t.Fatalf("checkpoint offset = %d, %v, %v", offset, ok, err)
+	}
+}
+
 func assertBoundedPropertyChange(t *testing.T, record StreamRecord, nodeID uint64) {
 	t.Helper()
 	payload, ok := record.Payload.(map[string]any)
