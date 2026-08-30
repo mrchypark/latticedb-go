@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1028,6 +1029,9 @@ func truncateAndSync(file *os.File, offset int64) error {
 }
 
 func syncDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	directory, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open database directory: %w", err)

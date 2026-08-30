@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -793,6 +794,9 @@ func retainCSVGenerations(path string, current string, previous string) {
 }
 
 func syncOutputDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	directory, err := os.Open(path)
 	if err != nil {
 		return err
