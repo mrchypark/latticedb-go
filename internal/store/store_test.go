@@ -23,6 +23,29 @@ func TestStringPostingsForkIsolationAcrossPromotion(t *testing.T) {
 	}
 }
 
+func TestPagedMapForkIsolationAndHighIDs(t *testing.T) {
+	base := NewPagedMap[uint64]()
+	for _, id := range []uint64{1, 64, 65, 1 << 48} {
+		base.Set(id, id)
+	}
+	fork := base.Fork()
+	fork.CloneShardOnce(65)
+	fork.Set(65, 99)
+	fork.CloneShardOnce(1 << 48)
+	fork.Delete(1 << 48)
+	if base.Get(65) != 65 || !base.Has(1<<48) {
+		t.Fatal("fork mutation changed base pages")
+	}
+	if fork.Get(65) != 99 || fork.Has(1<<48) || fork.Len() != 3 {
+		t.Fatalf("fork state = value %d, high %v, len %d", fork.Get(65), fork.Has(1<<48), fork.Len())
+	}
+	fork = base.ForkSet(65, 100)
+	fork = fork.ForkSet(66, 101)
+	if base.Get(65) != 65 || fork.Get(65) != 100 || fork.Get(66) != 101 || fork.Len() != 5 {
+		t.Fatalf("fork-set state = base %d, values %d/%d, len %d", base.Get(65), fork.Get(65), fork.Get(66), fork.Len())
+	}
+}
+
 func idsFromOne(count int) []uint64 {
 	ids := make([]uint64, count)
 	for index := range ids {

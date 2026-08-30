@@ -91,6 +91,59 @@ func TestCommitFailureDoesNotExposeWrites(t *testing.T) {
 	}
 }
 
+func TestReaderStartsDuringWALSync(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	db, err := Open(filepath.Join(t.TempDir(), "concurrent-read.ltdb"), OpenOptions{
+		Create:     true,
+		Durability: DurabilityFull,
+		walSync: func(file *os.File) error {
+			close(started)
+			<-release
+			return file.Sync()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	commitDone := make(chan error, 1)
+	var node Node
+	go func() {
+		commitDone <- db.Update(func(tx *Tx) error {
+			var err error
+			node, err = tx.CreateNode(CreateNodeOptions{})
+			return err
+		})
+	}()
+	<-started
+
+	readDone := make(chan error, 1)
+	go func() {
+		readDone <- db.View(func(tx *Tx) error {
+			exists, err := tx.NodeExists(node.ID)
+			if err == nil && exists {
+				return errors.New("uncommitted node is visible")
+			}
+			return err
+		})
+	}()
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("reader blocked on WAL sync")
+	}
+	close(release)
+	if err := <-commitDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCommitSyncUnknownFencesDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unknown-sync.ltdb")
 	db, err := Open(path, OpenOptions{
@@ -1165,7 +1218,7 @@ func TestReadTransactionKeepsWholeGraphSnapshot(t *testing.T) {
 	if got := read.graph.FTS.Get(first.ID).Text; got != "before" {
 		t.Fatalf("old FTS = %q", got)
 	}
-	if got := read.graph.Outgoing.Get(first.ID); len(got) != 1 || got[0] != edge.ID || read.graph.Edges.Get(edge.ID) == nil {
+	if got := read.graph.Outgoing.Get(first.ID).IDs(); len(got) != 1 || got[0] != edge.ID || read.graph.Edges.Get(edge.ID) == nil {
 		t.Fatalf("old adjacency = %v, edge = %#v", got, read.graph.Edges.Get(edge.ID))
 	}
 	db.mu.RLock()
@@ -1174,7 +1227,7 @@ func TestReadTransactionKeepsWholeGraphSnapshot(t *testing.T) {
 	if got := current.Nodes.Get(first.ID).Properties["vector"].([]float32); got[0] != 0 || got[1] != 1 {
 		t.Fatalf("current vector = %v", got)
 	}
-	if current.FTS.Get(first.ID).Text != "after" || current.Edges.Get(edge.ID) != nil || len(current.Outgoing.Get(first.ID)) != 0 {
+	if current.FTS.Get(first.ID).Text != "after" || current.Edges.Get(edge.ID) != nil || current.Outgoing.Get(first.ID).Len() != 0 {
 		t.Fatalf("current graph did not publish atomically")
 	}
 }

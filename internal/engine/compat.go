@@ -31,11 +31,17 @@ func (tx *Tx) DeleteEdge(sourceID, targetID uint64, edgeType string) error {
 	if _, err := tx.requireNode(targetID); err != nil {
 		return err
 	}
-	for _, edgeID := range tx.graph.Outgoing.Get(sourceID) {
-		edge := tx.graph.Edges.Get(edgeID)
-		if edge != nil && edge.TargetID == targetID && edge.Type == edgeType {
-			tx.deleteEdge(edgeID)
-			return nil
+	outgoing := tx.graph.Outgoing.Get(sourceID)
+	for chunk := range outgoing.Chunks() {
+		for _, edgeID := range chunk {
+			if outgoing.IsRemoved(edgeID) {
+				continue
+			}
+			edge := tx.graph.Edges.Get(edgeID)
+			if edge != nil && edge.TargetID == targetID && edge.Type == edgeType {
+				tx.deleteEdge(edgeID)
+				return nil
+			}
 		}
 	}
 	return fmt.Errorf("edge %d-[%s]->%d not found", sourceID, edgeType, targetID)

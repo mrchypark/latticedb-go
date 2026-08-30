@@ -350,18 +350,18 @@ type GraphState struct {
 	VectorDimensions uint16
 	SnapshotBytes    uint64
 	AppMetadata      map[string][]byte
-	Nodes            ShardMap[*NodeRecord]
-	Edges            ShardMap[*EdgeRecord]
-	FTS              ShardMap[*FTSRecord]
-	Outgoing         ShardMap[[]uint64]
-	Incoming         ShardMap[[]uint64]
+	Nodes            PagedMap[*NodeRecord]
+	Edges            PagedMap[*EdgeRecord]
+	FTS              PagedMap[*FTSRecord]
+	Outgoing         PagedMap[EdgeList]
+	Incoming         PagedMap[EdgeList]
 	Labels           StringPostings
 	EdgeTypes        StringPostings
 	FTSTokens        StringPostings
 	NodeProperties   PropertyIndexes
 	EdgeProperties   PropertyIndexes
 	VectorIndex      VectorIndex
-	VectorTombstones ShardMap[[]float32]
+	VectorTombstones PagedMap[[]float32]
 	VectorMutations  uint64
 	// DerivedIndexWork/LogicalBytes are rebuilt on recovery and maintained by mutations.
 	DerivedIndexWork         uint64
@@ -373,7 +373,7 @@ type GraphState struct {
 type VectorIndex struct {
 	EntryID  uint64
 	MaxLevel int
-	Nodes    ShardMap[*VectorIndexNode]
+	Nodes    PagedMap[*VectorIndexNode]
 }
 
 type VectorIndexNode struct {
@@ -382,7 +382,7 @@ type VectorIndexNode struct {
 }
 
 func NewVectorIndex() VectorIndex {
-	return VectorIndex{Nodes: ShardMap[*VectorIndexNode]{root: new([shardFanout]*shardBucket[*VectorIndexNode]), shardShift: 3}}
+	return VectorIndex{Nodes: NewPagedMap[*VectorIndexNode]()}
 }
 
 func (index VectorIndex) Fork() VectorIndex {
@@ -541,18 +541,18 @@ func NewGraphState() *GraphState {
 	return &GraphState{
 		SnapshotBytes:    4096,
 		AppMetadata:      map[string][]byte{},
-		Nodes:            NewShardMap[*NodeRecord](),
-		Edges:            NewShardMap[*EdgeRecord](),
-		FTS:              NewShardMap[*FTSRecord](),
-		Outgoing:         NewShardMap[[]uint64](),
-		Incoming:         NewShardMap[[]uint64](),
+		Nodes:            NewPagedMap[*NodeRecord](),
+		Edges:            NewPagedMap[*EdgeRecord](),
+		FTS:              NewPagedMap[*FTSRecord](),
+		Outgoing:         NewPagedMap[EdgeList](),
+		Incoming:         NewPagedMap[EdgeList](),
 		Labels:           NewStringPostings(),
 		EdgeTypes:        NewStringPostings(),
 		FTSTokens:        NewStringPostings(),
 		NodeProperties:   NewPropertyIndexes(),
 		EdgeProperties:   NewPropertyIndexes(),
 		VectorIndex:      NewVectorIndex(),
-		VectorTombstones: NewShardMap[[]float32](),
+		VectorTombstones: NewPagedMap[[]float32](),
 		Streams:          NewStreamStore(),
 	}
 }
@@ -592,10 +592,26 @@ func CloneGraphState(graph *GraphState) *GraphState {
 		}
 	}
 	for id, edges := range graph.Outgoing.All() {
-		cloned.Outgoing.Set(id, slices.Clone(edges))
+		var list EdgeList
+		for chunk := range edges.Chunks() {
+			for _, edgeID := range chunk {
+				if !edges.IsRemoved(edgeID) {
+					list = list.Append(edgeID)
+				}
+			}
+		}
+		cloned.Outgoing.Set(id, list)
 	}
 	for id, edges := range graph.Incoming.All() {
-		cloned.Incoming.Set(id, slices.Clone(edges))
+		var list EdgeList
+		for chunk := range edges.Chunks() {
+			for _, edgeID := range chunk {
+				if !edges.IsRemoved(edgeID) {
+					list = list.Append(edgeID)
+				}
+			}
+		}
+		cloned.Incoming.Set(id, list)
 	}
 	cloned.VectorIndex.EntryID = graph.VectorIndex.EntryID
 	cloned.VectorIndex.MaxLevel = graph.VectorIndex.MaxLevel

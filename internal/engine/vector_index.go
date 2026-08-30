@@ -79,7 +79,7 @@ func rebuildVectorIndexBudget(ctx context.Context, graph *store.GraphState, maxW
 	}
 	target := store.CloneGraphStateShallow(graph)
 	target.VectorIndex = store.NewVectorIndex()
-	target.VectorTombstones = store.NewShardMap[[]float32]()
+	target.VectorTombstones = store.NewPagedMap[[]float32]()
 	target.VectorMutations = 0
 	scratch := &vectorSearchScratch{visited: make(map[uint64]struct{}, vectorIndexConstructionEF*vectorIndexM)}
 	ids := make([]uint64, 0, target.Nodes.Len())

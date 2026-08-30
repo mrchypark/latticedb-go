@@ -38,3 +38,24 @@ func TestStreamDeltaSurvivesWALRecovery(t *testing.T) {
 		t.Fatalf("offset = %d, %v", offset, ok)
 	}
 }
+
+func TestStreamChunkForkTrimAndOffsetIsolation(t *testing.T) {
+	base := NewStreamStore()
+	for index := range 130 {
+		base.Publish("events", "event", int64(index))
+	}
+	fork := base.Fork()
+	fork.Publish("events", "event", int64(130))
+	fork.SetOffset("events", "worker", 100)
+	fork.Trim("events", 64)
+	if records := base.Read("events", 0, 200); len(records) != 130 || records[0].Sequence != 1 {
+		t.Fatalf("base records changed: first=%d len=%d", records[0].Sequence, len(records))
+	}
+	if _, ok := base.GetOffset("events", "worker"); ok {
+		t.Fatal("fork offset changed base")
+	}
+	records := fork.Read("events", 64, 200)
+	if len(records) != 67 || records[0].Sequence != 65 || records[len(records)-1].Sequence != 131 {
+		t.Fatalf("fork records = first %d last %d len %d", records[0].Sequence, records[len(records)-1].Sequence, len(records))
+	}
+}

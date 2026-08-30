@@ -2170,8 +2170,8 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 			return nil, 0, 0, 0, err
 		}
 		graph.EdgeTypes.Add(storedEdge.Type, storedEdge.ID)
-		graph.Outgoing.Set(storedEdge.SourceID, append(graph.Outgoing.Get(storedEdge.SourceID), storedEdge.ID))
-		graph.Incoming.Set(storedEdge.TargetID, append(graph.Incoming.Get(storedEdge.TargetID), storedEdge.ID))
+		graph.Outgoing.Set(storedEdge.SourceID, graph.Outgoing.Get(storedEdge.SourceID).Append(storedEdge.ID))
+		graph.Incoming.Set(storedEdge.TargetID, graph.Incoming.Get(storedEdge.TargetID).Append(storedEdge.ID))
 		maxEdgeID = max(maxEdgeID, storedEdge.ID)
 	}
 	for _, stored := range snapshot.NodeIndexes {

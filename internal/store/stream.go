@@ -27,10 +27,24 @@ type StreamOperation struct {
 	Payload  any
 }
 
+const streamChunkSize = uint64(64)
+
+type streamLog struct {
+	tail  *streamChunk
+	first uint64
+	count uint64
+}
+
+type streamChunk struct {
+	previous *streamChunk
+	skips    []*streamChunk
+	records  []StreamRecord
+}
+
 // StreamStore keeps system streams separate from graph data. Fork shares its
 // immutable state; the first writer copies only the changed stream or offset.
 type StreamStore struct {
-	streams       map[string][]StreamRecord
+	streams       map[string]streamLog
 	next          map[string]uint64
 	offsets       map[string]map[string]uint64
 	streamsCloned bool
@@ -74,7 +88,7 @@ type persistedStreamOperation struct {
 
 func NewStreamStore() StreamStore {
 	return StreamStore{
-		streams: map[string][]StreamRecord{},
+		streams: map[string]streamLog{},
 		next:    map[string]uint64{},
 		offsets: map[string]map[string]uint64{},
 	}
@@ -108,18 +122,39 @@ func (store StreamStore) Fork() StreamStore {
 }
 
 func (store StreamStore) Read(name string, after uint64, limit uint) []StreamRecord {
-	records := store.streams[name]
-	start := 0
-	for start < len(records) && records[start].Sequence <= after {
-		start++
+	log := store.streams[name]
+	if limit == 0 || log.count == 0 {
+		return []StreamRecord{}
 	}
-	end := len(records)
-	if uint64(limit) < uint64(end-start) {
-		end = start + int(limit)
+	sequence := after + 1
+	if sequence == 0 || sequence < log.first {
+		sequence = log.first
 	}
-	out := make([]StreamRecord, 0, end-start)
-	for _, record := range records[start:end] {
-		out = append(out, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: CloneValue(record.Payload)})
+	available := log.count
+	if sequence > log.first {
+		available -= min(available, sequence-log.first)
+	}
+	out := make([]StreamRecord, 0, min(uint64(limit), available))
+	for uint(len(out)) < limit && available > 0 {
+		chunk := log.chunk(sequence)
+		if chunk == nil {
+			break
+		}
+		if sequence < chunk.records[0].Sequence {
+			sequence = chunk.records[0].Sequence
+		}
+		start := int(sequence - chunk.records[0].Sequence)
+		for _, record := range chunk.records[start:] {
+			if record.Sequence < sequence {
+				continue
+			}
+			out = append(out, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: CloneValue(record.Payload)})
+			available--
+			sequence = record.Sequence + 1
+			if uint(len(out)) == limit {
+				break
+			}
+		}
 	}
 	return out
 }
@@ -143,14 +178,27 @@ func (store *StreamStore) Publish(name, kind string, payload any) uint64 {
 		sequence = 1
 	}
 	store.next[name] = sequence + 1
-	store.streams[name] = append(store.streams[name], StreamRecord{Sequence: sequence, Kind: kind, Payload: CloneValue(payload)})
+	log := store.streams[name]
+	record := StreamRecord{Sequence: sequence, Kind: kind, Payload: CloneValue(payload)}
+	if log.tail == nil || len(log.tail.records) == int(streamChunkSize) {
+		log.tail = newStreamChunk(log.tail, []StreamRecord{record})
+	} else {
+		records := make([]StreamRecord, len(log.tail.records)+1)
+		copy(records, log.tail.records)
+		records[len(log.tail.records)] = record
+		log.tail = &streamChunk{previous: log.tail.previous, skips: log.tail.skips, records: records}
+	}
+	if log.count == 0 {
+		log.first = sequence
+	}
+	log.count++
+	store.streams[name] = log
 	return sequence
 }
 
 func (store *StreamStore) SetOffset(name, consumer string, sequence uint64) {
-	store.cloneStream(name)
 	if store.next[name] == 0 {
-		store.streams[name] = nil
+		store.cloneStream(name)
 		store.next[name] = 1
 	}
 	store.cloneOffset(name)
@@ -159,12 +207,71 @@ func (store *StreamStore) SetOffset(name, consumer string, sequence uint64) {
 
 func (store *StreamStore) Trim(name string, through uint64) {
 	store.cloneStream(name)
-	records := store.streams[name]
-	index := 0
-	for index < len(records) && records[index].Sequence <= through {
-		index++
+	log := store.streams[name]
+	if log.count == 0 || through < log.first {
+		return
 	}
-	store.streams[name] = slices.Clone(records[index:])
+	last := log.first + log.count - 1
+	trimmedThrough := min(through, last)
+	chunks := make([]*streamChunk, 0, (log.count+streamChunkSize-1)/streamChunkSize)
+	for chunk := log.tail; chunk != nil && chunk.records[len(chunk.records)-1].Sequence > trimmedThrough; chunk = chunk.previous {
+		chunks = append(chunks, chunk)
+	}
+	var tail *streamChunk
+	for index := len(chunks) - 1; index >= 0; index-- {
+		records := chunks[index].records
+		start := 0
+		for start < len(records) && records[start].Sequence <= trimmedThrough {
+			start++
+		}
+		if start < len(records) {
+			tail = newStreamChunk(tail, slices.Clone(records[start:]))
+		}
+	}
+	removed := trimmedThrough - log.first + 1
+	log.count -= removed
+	log.first = trimmedThrough + 1
+	if log.count == 0 {
+		log.first = 0
+	}
+	log.tail = tail
+	store.streams[name] = log
+}
+
+func newStreamChunk(previous *streamChunk, records []StreamRecord) *streamChunk {
+	chunk := &streamChunk{previous: previous, records: records}
+	if previous == nil {
+		return chunk
+	}
+	chunk.skips = append(chunk.skips, previous)
+	for level := 1; ; level++ {
+		ancestor := chunk.skips[level-1]
+		if len(ancestor.skips) < level {
+			break
+		}
+		chunk.skips = append(chunk.skips, ancestor.skips[level-1])
+	}
+	return chunk
+}
+
+func (log streamLog) chunk(sequence uint64) *streamChunk {
+	chunk := log.tail
+	if chunk == nil || sequence > chunk.records[len(chunk.records)-1].Sequence {
+		return nil
+	}
+	for level := len(chunk.skips) - 1; level >= 0; level-- {
+		if level >= len(chunk.skips) {
+			continue
+		}
+		candidate := chunk.skips[level]
+		if candidate.records[len(candidate.records)-1].Sequence >= sequence {
+			chunk = candidate
+		}
+	}
+	if sequence < chunk.records[0].Sequence {
+		return nil
+	}
+	return chunk
 }
 
 func BuildPersistedStreamOperations(operations []StreamOperation) ([]persistedStreamOperation, error) {
@@ -246,7 +353,6 @@ func (store *StreamStore) cloneStream(name string) {
 		store.clonedStreams = map[string]struct{}{}
 	}
 	if _, ok := store.clonedStreams[name]; !ok {
-		store.streams[name] = slices.Clone(store.streams[name])
 		store.clonedStreams[name] = struct{}{}
 	}
 }
@@ -279,22 +385,28 @@ func buildPersistedStreams(store StreamStore) (persistedStreams, error) {
 		if err := ValidateStreamName(name, true); err != nil {
 			return persistedStreams{}, err
 		}
-		records := store.streams[name]
-		stream := persistedStream{Name: name, Next: store.next[name], Records: make([]persistedStreamRecord, 0, len(records))}
+		log := store.streams[name]
+		stream := persistedStream{Name: name, Next: store.next[name], Records: make([]persistedStreamRecord, 0, log.count)}
 		var previous uint64
-		for _, record := range records {
-			if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next {
-				return persistedStreams{}, fmt.Errorf("invalid stream sequence")
+		chunks := make([]*streamChunk, 0, (log.count+streamChunkSize-1)/streamChunkSize)
+		for chunk := log.tail; chunk != nil; chunk = chunk.previous {
+			chunks = append(chunks, chunk)
+		}
+		for index := len(chunks) - 1; index >= 0; index-- {
+			for _, record := range chunks[index].records {
+				if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next {
+					return persistedStreams{}, fmt.Errorf("invalid stream sequence")
+				}
+				if err := ValidateStreamKind(record.Kind); err != nil {
+					return persistedStreams{}, err
+				}
+				payload, err := encodeValue(record.Payload)
+				if err != nil {
+					return persistedStreams{}, err
+				}
+				stream.Records = append(stream.Records, persistedStreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: payload})
+				previous = record.Sequence
 			}
-			if err := ValidateStreamKind(record.Kind); err != nil {
-				return persistedStreams{}, err
-			}
-			payload, err := encodeValue(record.Payload)
-			if err != nil {
-				return persistedStreams{}, err
-			}
-			stream.Records = append(stream.Records, persistedStreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: payload})
-			previous = record.Sequence
 		}
 		if stream.Next == 0 {
 			stream.Next = 1
@@ -342,7 +454,16 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 			records = append(records, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: payload})
 			previous = record.Sequence
 		}
-		store.streams[stream.Name] = records
+		var log streamLog
+		for start := 0; start < len(records); start += int(streamChunkSize) {
+			end := min(start+int(streamChunkSize), len(records))
+			log.tail = newStreamChunk(log.tail, slices.Clone(records[start:end]))
+		}
+		if len(records) != 0 {
+			log.first = records[0].Sequence
+			log.count = uint64(len(records))
+		}
+		store.streams[stream.Name] = log
 		store.next[stream.Name] = stream.Next
 	}
 	for _, offset := range state.Offsets {
@@ -353,7 +474,7 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 			return StreamStore{}, err
 		}
 		if _, exists := store.streams[offset.Stream]; !exists {
-			store.streams[offset.Stream] = nil
+			store.streams[offset.Stream] = streamLog{}
 			store.next[offset.Stream] = 1
 		}
 		if store.offsets[offset.Stream] == nil {
@@ -369,10 +490,12 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 
 func streamStoreBytes(store StreamStore) uint64 {
 	var size uint64
-	for name, records := range store.streams {
+	for name, log := range store.streams {
 		size = snapshotAdd(size, uint64(len(name))+64)
-		for _, record := range records {
-			size = snapshotAdd(size, snapshotAdd(uint64(len(record.Kind))+48, estimateValueBytes(record.Payload)))
+		for chunk := log.tail; chunk != nil; chunk = chunk.previous {
+			for _, record := range chunk.records {
+				size = snapshotAdd(size, snapshotAdd(uint64(len(record.Kind))+48, estimateValueBytes(record.Payload)))
+			}
 		}
 	}
 	for stream, consumers := range store.offsets {

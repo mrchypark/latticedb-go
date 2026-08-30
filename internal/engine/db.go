@@ -1772,21 +1772,30 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	}
 
 	tx.db.mu.Lock()
-	defer tx.db.mu.Unlock()
-
 	if tx.db.closed {
+		tx.db.mu.Unlock()
 		return ErrDatabaseClosed
 	}
 	if tx.db.readOnly {
+		tx.db.mu.Unlock()
 		return ErrReadOnly
 	}
+	if tx.db.recoveryRequired {
+		tx.db.mu.Unlock()
+		return ErrRecoveryRequired
+	}
 	if tx.db.commitID != tx.changes.baseCommitID {
+		tx.db.mu.Unlock()
 		return ErrWriteConflict
 	}
-
 	if tx.db.commitID == ^uint64(0) {
+		tx.db.mu.Unlock()
 		return errors.New("commit id space exhausted")
 	}
+	nextCommitID := tx.db.commitID + 1
+	nextNodeID, nextEdgeID, wal := tx.db.nextNodeID, tx.db.nextEdgeID, tx.db.wal
+	tx.db.mu.Unlock()
+
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1798,7 +1807,6 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		}
 		tx.changefeedApplied = true
 	}
-	nextCommitID := tx.db.commitID + 1
 	delta := store.GraphDelta{
 		UpsertNodes:       mapKeys(tx.changes.upsertNodes),
 		DeleteNodes:       mapKeys(tx.changes.deleteNodes),
@@ -1830,20 +1838,24 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	tx.graph.SnapshotBytes = snapshotBytes
 	var err error
 	if tx.base == nil {
-		err = tx.db.wal.AppendSnapshot(tx.graph, tx.db.nextNodeID, tx.db.nextEdgeID, nextCommitID)
+		err = wal.AppendSnapshot(tx.graph, nextNodeID, nextEdgeID, nextCommitID)
 	} else {
-		err = tx.db.wal.AppendDelta(tx.graph, tx.db.nextNodeID, tx.db.nextEdgeID, nextCommitID, delta)
+		err = wal.AppendDelta(tx.graph, nextNodeID, nextEdgeID, nextCommitID, delta)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrCommitOutcomeUnknown) {
+			tx.db.mu.Lock()
 			tx.db.recoveryRequired = true
+			tx.db.mu.Unlock()
 		}
 		return err
 	}
+	tx.db.mu.Lock()
 	tx.db.graph = tx.graph
 	tx.db.commitID = nextCommitID
 	tx.db.dirty = true
 	tx.db.notifyStreamsLocked()
+	tx.db.mu.Unlock()
 	return nil
 }
 
@@ -2050,11 +2062,21 @@ func (tx *Tx) DeleteNode(nodeID uint64) error {
 		tx.graph.FTS.Delete(nodeID)
 		tx.markDelete(&tx.changes.upsertFTS, &tx.changes.deleteFTS, tx.base != nil && tx.base.FTS.Get(nodeID) != nil, nodeID)
 	}
-	for _, edgeID := range tx.graph.Outgoing.Get(nodeID) {
-		tx.deleteEdge(edgeID)
+	outgoing := tx.graph.Outgoing.Get(nodeID)
+	for chunk := range outgoing.Chunks() {
+		for _, edgeID := range chunk {
+			if !outgoing.IsRemoved(edgeID) {
+				tx.deleteEdge(edgeID)
+			}
+		}
 	}
-	for _, edgeID := range tx.graph.Incoming.Get(nodeID) {
-		tx.deleteEdge(edgeID)
+	incoming := tx.graph.Incoming.Get(nodeID)
+	for chunk := range incoming.Chunks() {
+		for _, edgeID := range chunk {
+			if !incoming.IsRemoved(edgeID) {
+				tx.deleteEdge(edgeID)
+			}
+		}
 	}
 	tx.ensureOutgoingWritable(nodeID)
 	tx.ensureIncomingWritable(nodeID)
@@ -2334,8 +2356,8 @@ func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts
 	tx.graph.Edges.Set(id, record)
 	tx.graph.EdgeTypes.Add(edgeType, id)
 	tx.markUpsert(&tx.changes.upsertEdges, &tx.changes.deleteEdges, id)
-	tx.graph.Outgoing.Set(sourceID, append(slices.Clone(tx.graph.Outgoing.Get(sourceID)), id))
-	tx.graph.Incoming.Set(targetID, append(slices.Clone(tx.graph.Incoming.Get(targetID)), id))
+	tx.graph.Outgoing.Set(sourceID, tx.graph.Outgoing.Get(sourceID).Append(id))
+	tx.graph.Incoming.Set(targetID, tx.graph.Incoming.Get(targetID).Append(id))
 	return publicEdge(record), nil
 }
 
@@ -2469,10 +2491,19 @@ func (tx *Tx) GetOutgoingEdges(nodeID uint64) ([]Edge, error) {
 		return nil, err
 	}
 	outgoing := tx.graph.Outgoing.Get(nodeID)
-	results := make([]Edge, 0, len(outgoing))
-	for _, edgeID := range outgoing {
-		edge := tx.graph.Edges.Get(edgeID)
-		results = append(results, publicEdge(edge))
+	results := make([]Edge, 0, outgoing.Len())
+	if outgoing.IsInline() {
+		for _, edgeID := range outgoing.InlineIDs() {
+			results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+		}
+		return results, nil
+	}
+	for chunk := range outgoing.Chunks() {
+		for _, edgeID := range chunk {
+			if !outgoing.IsRemoved(edgeID) {
+				results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+			}
+		}
 	}
 	return results, nil
 }
@@ -2482,9 +2513,19 @@ func (tx *Tx) GetIncomingEdges(nodeID uint64) ([]Edge, error) {
 		return nil, err
 	}
 	incoming := tx.graph.Incoming.Get(nodeID)
-	results := make([]Edge, 0, len(incoming))
-	for _, edgeID := range incoming {
-		results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+	results := make([]Edge, 0, incoming.Len())
+	if incoming.IsInline() {
+		for _, edgeID := range incoming.InlineIDs() {
+			results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+		}
+		return results, nil
+	}
+	for chunk := range incoming.Chunks() {
+		for _, edgeID := range chunk {
+			if !incoming.IsRemoved(edgeID) {
+				results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+			}
+		}
 	}
 	return results, nil
 }
@@ -2503,22 +2544,28 @@ func (tx *Tx) GetIncomingEdgesByType(nodeID uint64, edgeType string, limit uint)
 	return tx.edgesByType(tx.graph.Incoming.Get(nodeID), edgeType, limit), nil
 }
 
-func (tx *Tx) edgesByType(edgeIDs []uint64, edgeType string, limit uint) []Edge {
+func (tx *Tx) edgesByType(edgeIDs store.EdgeList, edgeType string, limit uint) []Edge {
 	typedIDs := tx.graph.EdgeTypes.Get(edgeType)
-	results := make([]Edge, 0, min(len(edgeIDs), len(typedIDs)))
-	for i, j := 0, 0; i < len(edgeIDs) && j < len(typedIDs); {
-		switch {
-		case edgeIDs[i] < typedIDs[j]:
-			i++
-		case edgeIDs[i] > typedIDs[j]:
-			j++
-		default:
-			results = append(results, publicEdge(tx.graph.Edges.Get(edgeIDs[i])))
-			if limit != 0 && uint(len(results)) == limit {
+	results := make([]Edge, 0, min(edgeIDs.Len(), len(typedIDs)))
+	typedIndex := 0
+	for chunk := range edgeIDs.Chunks() {
+		for _, edgeID := range chunk {
+			if edgeIDs.IsRemoved(edgeID) {
+				continue
+			}
+			for typedIndex < len(typedIDs) && typedIDs[typedIndex] < edgeID {
+				typedIndex++
+			}
+			if typedIndex == len(typedIDs) {
 				return results
 			}
-			i++
-			j++
+			if typedIDs[typedIndex] == edgeID {
+				results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+				if limit != 0 && uint(len(results)) == limit {
+					return results
+				}
+				typedIndex++
+			}
 		}
 	}
 	return results
@@ -2535,17 +2582,8 @@ func (tx *Tx) deleteEdge(edgeID uint64) {
 	tx.graph.Edges.Delete(edgeID)
 	tx.graph.EdgeTypes.Remove(edge.Type, edgeID)
 	tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, tx.base != nil && tx.base.Edges.Get(edgeID) != nil, edgeID)
-	tx.graph.Outgoing.Set(edge.SourceID, removeEdgeID(tx.graph.Outgoing.Get(edge.SourceID), edgeID))
-	tx.graph.Incoming.Set(edge.TargetID, removeEdgeID(tx.graph.Incoming.Get(edge.TargetID), edgeID))
-}
-
-func removeEdgeID(ids []uint64, remove uint64) []uint64 {
-	for i, id := range ids {
-		if id == remove {
-			return append(slices.Clone(ids[:i]), ids[i+1:]...)
-		}
-	}
-	return ids
+	tx.graph.Outgoing.Set(edge.SourceID, tx.graph.Outgoing.Get(edge.SourceID).Remove(edgeID))
+	tx.graph.Incoming.Set(edge.TargetID, tx.graph.Incoming.Get(edge.TargetID).Remove(edgeID))
 }
 
 func (tx *Tx) ensureWritable() error {
