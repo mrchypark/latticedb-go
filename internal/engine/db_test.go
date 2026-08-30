@@ -46,6 +46,9 @@ func TestCommitFailureDoesNotExposeWrites(t *testing.T) {
 	if err := tx.Commit(); err == nil {
 		t.Fatalf("expected commit to fail")
 	}
+	if _, err := tx.CreateNode(CreateNodeOptions{}); !errors.Is(err, ErrInactiveTx) {
+		t.Fatalf("mutation after failed commit = %v, want ErrInactiveTx", err)
+	}
 
 	if err := db.View(func(view *Tx) error {
 		exists, err := view.NodeExists(node.ID)
@@ -60,8 +63,8 @@ func TestCommitFailureDoesNotExposeWrites(t *testing.T) {
 		t.Fatalf("view after failed commit: %v", err)
 	}
 
-	if err := tx.Rollback(); err != nil {
-		t.Fatalf("rollback failed commit: %v", err)
+	if err := tx.Rollback(); !errors.Is(err, ErrInactiveTx) {
+		t.Fatalf("rollback after failed commit = %v, want ErrInactiveTx", err)
 	}
 
 	if err := db.Close(); err != nil {

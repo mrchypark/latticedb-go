@@ -359,8 +359,7 @@ func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
 	return wrapError(db.inner.RebuildVectorIndexContext(ctx))
 }
 
-// Commit makes the transaction inactive when it returns
-// ErrVectorIndexMaintenanceRequired. Rebuild the index, then start a new transaction.
+// Commit makes the transaction inactive, whether it succeeds or fails.
 func (tx *Tx) Commit() error {
 	if tx == nil || tx.inner == nil {
 		return ErrInactiveTx
@@ -368,8 +367,7 @@ func (tx *Tx) Commit() error {
 	return wrapError(tx.inner.Commit())
 }
 
-// CommitContext makes the transaction inactive when it returns
-// ErrVectorIndexMaintenanceRequired. Rebuild the index, then start a new transaction.
+// CommitContext makes the transaction inactive, whether it succeeds or fails.
 func (tx *Tx) CommitContext(ctx context.Context) error {
 	if tx == nil || tx.inner == nil {
 		return ErrInactiveTx

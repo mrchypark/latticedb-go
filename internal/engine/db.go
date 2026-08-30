@@ -1731,11 +1731,9 @@ func (tx *Tx) CommitContext(ctx context.Context) error {
 	if tx.managed {
 		return ErrManagedTransaction
 	}
-	return tx.commitInternalContext(ctx)
-}
-
-func (tx *Tx) commitInternal() error {
-	return tx.commitInternalContext(nil)
+	err := tx.commitInternalContext(ctx)
+	tx.finish()
+	return err
 }
 
 func (tx *Tx) commitInternalContext(ctx context.Context) error {
@@ -1743,7 +1741,6 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		return ErrInactiveTx
 	}
 	if tx.readOnly {
-		tx.finish()
 		return nil
 	}
 	if ctx != nil {
@@ -1766,9 +1763,6 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	}
 	if tx.db.enableVector && !tx.db.disableVectorIndex && !tx.vectorIndexApplied {
 		if err := tx.applyVectorIndexChanges(); err != nil {
-			if errors.Is(err, ErrVectorIndexMaintenanceRequired) {
-				tx.finish()
-			}
 			return err
 		}
 		tx.vectorIndexApplied = true
@@ -1850,7 +1844,6 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	tx.db.commitID = nextCommitID
 	tx.db.dirty = true
 	tx.db.notifyStreamsLocked()
-	tx.finish()
 	return nil
 }
 
