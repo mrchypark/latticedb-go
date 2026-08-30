@@ -68,7 +68,7 @@ func (snapshot *Snapshot) Backup(path string) error {
 	if err != nil {
 		return err
 	}
-	for _, source := range []string{snapshot.files.State, snapshot.files.WAL, snapshot.files.WALBase, snapshot.files.IDs, snapshot.files.State + ".lock", snapshot.files.State + ".layout"} {
+	for _, source := range []string{snapshot.files.Directory, snapshot.files.State, snapshot.files.WAL, snapshot.files.WALBase, snapshot.files.IDs, snapshot.files.State + ".lock", snapshot.files.State + ".layout"} {
 		canonicalSource, err := canonicalSnapshotPath(source)
 		if err != nil {
 			return err

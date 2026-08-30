@@ -48,6 +48,8 @@ type DB struct {
 	path  string
 }
 
+// Tx is a single-owner transaction handle. Its methods must not be called
+// concurrently; use separate read transactions for concurrent work.
 type Tx struct {
 	inner *engine.Tx
 }

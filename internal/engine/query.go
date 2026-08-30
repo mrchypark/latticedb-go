@@ -665,7 +665,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 }
 
 func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[string]any, limit uint, budget *queryBudget) ([]uint64, bool, error) {
-	if tx.queryIndexesDisabled {
+	if tx.queryIndexesDisabled || hasGraphChanges(tx.changes) {
 		return nil, false, nil
 	}
 	if pattern.Var == "" || len(pattern.Labels) == 0 {
@@ -835,7 +835,7 @@ func nodeMatchesQueryProperty(node *store.NodeRecord, definition store.PropertyI
 }
 
 func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[string]any) ([]uint64, bool, error) {
-	if tx.queryIndexesDisabled {
+	if tx.queryIndexesDisabled || hasGraphChanges(tx.changes) {
 		return nil, false, nil
 	}
 	if pattern.EdgeVar == "" || pattern.EdgeType == "" {

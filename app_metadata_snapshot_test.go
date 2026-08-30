@@ -243,6 +243,21 @@ func TestParameterizedPatternsAndOrderBy(t *testing.T) {
 	if err != nil || len(ordered.Rows) != 3 || ordered.Rows[0]["n.id"] != "one" || ordered.Rows[1]["n.id"] != "two" || ordered.Rows[2]["n.id"] != "zero" {
 		t.Fatalf("ordered result=%+v err=%v", ordered, err)
 	}
+	if err := db.CreateNodePropertyIndex("Item", "id"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Query("CREATE (:Item {id: 'same-tx'})", nil); err != nil {
+		t.Fatal(err)
+	}
+	matched, err = tx.Query("MATCH (n:Item {id: $id}) RETURN n.id", map[string]Value{"id": "same-tx"})
+	if err != nil || len(matched.Rows) != 1 || matched.Rows[0]["n.id"] != "same-tx" {
+		t.Fatalf("same-transaction indexed read result=%+v err=%v", matched, err)
+	}
 }
 
 func TestStreamCommitWakesReaderAfterMetadataReadYourWrites(t *testing.T) {
@@ -293,7 +308,8 @@ func TestStreamCommitWakesReaderAfterMetadataReadYourWrites(t *testing.T) {
 
 func TestSnapshotPinsGenerationWhileWritersContinue(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "source.ltdb"), OpenOptions{Create: true})
+	sourcePath := filepath.Join(dir, "source.ltdb")
+	db, err := Open(sourcePath, OpenOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,6 +333,9 @@ func TestSnapshotPinsGenerationWhileWritersContinue(t *testing.T) {
 	}
 	if err := db.Close(); !errors.Is(err, ErrSnapshotActive) || !db.IsOpen() {
 		t.Fatalf("close with snapshot = %v, open=%t", err, db.IsOpen())
+	}
+	if err := snapshot.Backup(sourcePath); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("backup over source = %v", err)
 	}
 
 	backupPath := filepath.Join(dir, "backup.ltdb")
