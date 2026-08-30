@@ -21,6 +21,15 @@ func TestStringPostingsForkIsolationAcrossPromotion(t *testing.T) {
 	if !slices.Equal(base.Get("term"), idsFromOne(smallPostingLimit)) {
 		t.Fatal("fork mutation changed base postings")
 	}
+	for id := uint64(2); id <= smallPostingLimit+1; id++ {
+		fork.Remove("term", id)
+	}
+	if keys := slices.Collect(fork.Keys()); len(keys) != 0 {
+		t.Fatalf("empty posting keys = %v", keys)
+	}
+	if base.Len("term") != smallPostingLimit {
+		t.Fatal("posting cleanup changed base")
+	}
 }
 
 func TestPagedMapForkIsolationAndHighIDs(t *testing.T) {

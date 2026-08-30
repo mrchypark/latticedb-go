@@ -1,6 +1,7 @@
 package store
 
 import (
+	"math"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -57,5 +58,40 @@ func TestStreamChunkForkTrimAndOffsetIsolation(t *testing.T) {
 	records := fork.Read("events", 64, 200)
 	if len(records) != 67 || records[0].Sequence != 65 || records[len(records)-1].Sequence != 131 {
 		t.Fatalf("fork records = first %d last %d len %d", records[0].Sequence, records[len(records)-1].Sequence, len(records))
+	}
+}
+
+func TestStreamOffsetWithoutRecordsPersists(t *testing.T) {
+	store := NewStreamStore()
+	store.SetOffset("events", "worker", 42)
+	state, err := buildPersistedStreams(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := decodePersistedStreams(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offset, ok := restored.GetOffset("events", "worker"); !ok || offset != 42 {
+		t.Fatalf("offset = %d, %v", offset, ok)
+	}
+}
+
+func TestStreamReadChunkBoundaries(t *testing.T) {
+	store := NewStreamStore()
+	for index := range 130 {
+		store.Publish("events", "event", int64(index))
+	}
+	for _, after := range []uint64{0, 63, 64, 65, 127, 128, 129} {
+		records := store.Read("events", after, 2)
+		if len(records) == 0 || records[0].Sequence != after+1 {
+			t.Fatalf("after %d: records = %#v", after, records)
+		}
+	}
+	if records := store.Read("events", 130, 2); len(records) != 0 {
+		t.Fatalf("tail read = %#v", records)
+	}
+	if records := store.Read("events", math.MaxUint64, 2); len(records) != 0 {
+		t.Fatalf("overflow read = %#v", records)
 	}
 }

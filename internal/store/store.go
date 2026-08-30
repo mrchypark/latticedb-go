@@ -114,7 +114,8 @@ func (postings *StringPostings) Add(key string, id uint64) {
 }
 
 func (postings *StringPostings) Remove(key string, id uint64) {
-	list := postings.buckets.Get(hashString(key))[key]
+	hash := hashString(key)
+	list := postings.buckets.Get(hash)[key]
 	if !list.has(id) {
 		return
 	}
@@ -125,7 +126,15 @@ func (postings *StringPostings) Remove(key string, id uint64) {
 	} else {
 		delete(list.small, id)
 	}
-	postings.buckets.Get(hashString(key))[key] = list
+	bucket := postings.buckets.Get(hash)
+	if list.len() == 0 {
+		delete(bucket, key)
+		if len(bucket) == 0 {
+			postings.buckets.Delete(hash)
+		}
+		return
+	}
+	bucket[key] = list
 }
 
 func (postings *StringPostings) writable(key string) postingList {
@@ -274,6 +283,20 @@ func (m *ShardMap[V]) Delete(id uint64) {
 	if _, exists := m.root[bucket][shard][id]; exists {
 		delete(m.root[bucket][shard], id)
 		m.length--
+		if len(m.root[bucket][shard]) == 0 {
+			m.root[bucket][shard] = nil
+			if m.clonedShards != nil && !m.activeCloned {
+				m.active = slices.Clone(m.active)
+				m.activeCloned = true
+			}
+			index := uint16(bucket)<<8 | uint16(shard)
+			for activeIndex, active := range m.active {
+				if active == index {
+					m.active = slices.Delete(m.active, activeIndex, activeIndex+1)
+					break
+				}
+			}
+		}
 	}
 }
 

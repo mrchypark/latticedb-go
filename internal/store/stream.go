@@ -126,8 +126,11 @@ func (store StreamStore) Read(name string, after uint64, limit uint) []StreamRec
 	if limit == 0 || log.count == 0 {
 		return []StreamRecord{}
 	}
+	if after >= log.first+log.count-1 {
+		return []StreamRecord{}
+	}
 	sequence := after + 1
-	if sequence == 0 || sequence < log.first {
+	if sequence < log.first {
 		sequence = log.first
 	}
 	available := log.count
@@ -207,6 +210,9 @@ func (store *StreamStore) SetOffset(name, consumer string, sequence uint64) {
 
 func (store *StreamStore) Trim(name string, through uint64) {
 	store.cloneStream(name)
+	if store.next[name] == 0 {
+		store.next[name] = 1
+	}
 	log := store.streams[name]
 	if log.count == 0 || through < log.first {
 		return
@@ -375,9 +381,9 @@ func (store *StreamStore) cloneOffset(name string) {
 }
 
 func buildPersistedStreams(store StreamStore) (persistedStreams, error) {
-	state := persistedStreams{Streams: make([]persistedStream, 0, len(store.streams))}
-	names := make([]string, 0, len(store.streams))
-	for name := range store.streams {
+	state := persistedStreams{Streams: make([]persistedStream, 0, len(store.next))}
+	names := make([]string, 0, len(store.next))
+	for name := range store.next {
 		names = append(names, name)
 	}
 	slices.Sort(names)

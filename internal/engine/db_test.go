@@ -2179,6 +2179,28 @@ func TestQueryNumericAndNullEquality(t *testing.T) {
 	}
 }
 
+func TestQuerySingleQuotedStructuralCharacters(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "single-quoted-query.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	value := "a,b) RETURN value AND more"
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"text": value}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Query("MATCH (n) WHERE n.text = 'a,b) RETURN value AND more' RETURN count(n) AS count", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("count = %v, want 1", result.Rows[0]["count"])
+	}
+}
+
 func TestQuerySemanticValidationFailsClosed(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "query-semantics.ltdb"), OpenOptions{Create: true})
 	if err != nil {

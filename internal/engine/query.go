@@ -2321,42 +2321,35 @@ func splitOperator(text string, operator string) (string, string, bool) {
 }
 
 func splitOnNextClause(input string, keywords ...string) (string, string, string) {
-	inString := false
+	var quote byte
 	braceDepth := 0
 	bracketDepth := 0
 	parenDepth := 0
 	for i := 0; i < len(input); i++ {
+		if scanQueryString(input, i, &quote) {
+			continue
+		}
 		switch input[i] {
-		case '"':
-			if !isEscaped(input, i) {
-				inString = !inString
-			}
 		case '{':
-			if !inString {
-				braceDepth++
-			}
+			braceDepth++
 		case '}':
-			if !inString && braceDepth > 0 {
+			if braceDepth > 0 {
 				braceDepth--
 			}
 		case '[':
-			if !inString {
-				bracketDepth++
-			}
+			bracketDepth++
 		case ']':
-			if !inString && bracketDepth > 0 {
+			if bracketDepth > 0 {
 				bracketDepth--
 			}
 		case '(':
-			if !inString {
-				parenDepth++
-			}
+			parenDepth++
 		case ')':
-			if !inString && parenDepth > 0 {
+			if parenDepth > 0 {
 				parenDepth--
 			}
 		}
-		if inString || braceDepth != 0 || bracketDepth != 0 || parenDepth != 0 {
+		if braceDepth != 0 || bracketDepth != 0 || parenDepth != 0 {
 			continue
 		}
 		for _, keyword := range keywords {
@@ -2398,44 +2391,37 @@ func trimEnclosed(text string, open byte, close byte) (string, error) {
 func splitTopLevel(text string, separator rune) []string {
 	parts := make([]string, 0)
 	start := 0
-	inString := false
+	var quote byte
 	braceDepth := 0
 	bracketDepth := 0
 	parenDepth := 0
 
 	for i, r := range text {
+		if scanQueryString(text, i, &quote) {
+			continue
+		}
 		switch r {
-		case '"':
-			if !isEscaped(text, i) {
-				inString = !inString
-			}
 		case '{':
-			if !inString {
-				braceDepth++
-			}
+			braceDepth++
 		case '}':
-			if !inString && braceDepth > 0 {
+			if braceDepth > 0 {
 				braceDepth--
 			}
 		case '[':
-			if !inString {
-				bracketDepth++
-			}
+			bracketDepth++
 		case ']':
-			if !inString && bracketDepth > 0 {
+			if bracketDepth > 0 {
 				bracketDepth--
 			}
 		case '(':
-			if !inString {
-				parenDepth++
-			}
+			parenDepth++
 		case ')':
-			if !inString && parenDepth > 0 {
+			if parenDepth > 0 {
 				parenDepth--
 			}
 		}
 
-		if r == separator && !inString && braceDepth == 0 && bracketDepth == 0 && parenDepth == 0 {
+		if r == separator && braceDepth == 0 && bracketDepth == 0 && parenDepth == 0 {
 			parts = append(parts, strings.TrimSpace(text[start:i]))
 			start = i + 1
 		}
@@ -2447,44 +2433,37 @@ func splitTopLevel(text string, separator rune) []string {
 func splitTopLevelKeyword(text string, keyword string) []string {
 	parts := make([]string, 0)
 	start := 0
-	inString := false
+	var quote byte
 	braceDepth := 0
 	bracketDepth := 0
 	parenDepth := 0
 
 	for i := 0; i < len(text); i++ {
+		if scanQueryString(text, i, &quote) {
+			continue
+		}
 		switch text[i] {
-		case '"':
-			if !isEscaped(text, i) {
-				inString = !inString
-			}
 		case '{':
-			if !inString {
-				braceDepth++
-			}
+			braceDepth++
 		case '}':
-			if !inString && braceDepth > 0 {
+			if braceDepth > 0 {
 				braceDepth--
 			}
 		case '[':
-			if !inString {
-				bracketDepth++
-			}
+			bracketDepth++
 		case ']':
-			if !inString && bracketDepth > 0 {
+			if bracketDepth > 0 {
 				bracketDepth--
 			}
 		case '(':
-			if !inString {
-				parenDepth++
-			}
+			parenDepth++
 		case ')':
-			if !inString && parenDepth > 0 {
+			if parenDepth > 0 {
 				parenDepth--
 			}
 		}
 
-		if inString || braceDepth != 0 || bracketDepth != 0 || parenDepth != 0 {
+		if braceDepth != 0 || bracketDepth != 0 || parenDepth != 0 {
 			continue
 		}
 		if strings.HasPrefix(text[i:], keyword) {
@@ -2499,41 +2478,34 @@ func splitTopLevelKeyword(text string, keyword string) []string {
 }
 
 func findTopLevelRune(text string, target rune) int {
-	inString := false
+	var quote byte
 	braceDepth := 0
 	bracketDepth := 0
 	parenDepth := 0
 	for i, r := range text {
-		if !inString && braceDepth == 0 && bracketDepth == 0 && parenDepth == 0 && r == target {
+		if scanQueryString(text, i, &quote) {
+			continue
+		}
+		if braceDepth == 0 && bracketDepth == 0 && parenDepth == 0 && r == target {
 			return i
 		}
 		switch r {
-		case '"':
-			if !isEscaped(text, i) {
-				inString = !inString
-			}
 		case '{':
-			if !inString {
-				braceDepth++
-			}
+			braceDepth++
 		case '}':
-			if !inString && braceDepth > 0 {
+			if braceDepth > 0 {
 				braceDepth--
 			}
 		case '[':
-			if !inString {
-				bracketDepth++
-			}
+			bracketDepth++
 		case ']':
-			if !inString && bracketDepth > 0 {
+			if bracketDepth > 0 {
 				bracketDepth--
 			}
 		case '(':
-			if !inString {
-				parenDepth++
-			}
+			parenDepth++
 		case ')':
-			if !inString && parenDepth > 0 {
+			if parenDepth > 0 {
 				parenDepth--
 			}
 		}
@@ -2543,27 +2515,37 @@ func findTopLevelRune(text string, target rune) int {
 
 func findMatchingBrace(text string, start int, open byte, close byte) int {
 	depth := 0
-	inString := false
+	var quote byte
 	for i := start; i < len(text); i++ {
+		if scanQueryString(text, i, &quote) {
+			continue
+		}
 		switch text[i] {
-		case '"':
-			if !isEscaped(text, i) {
-				inString = !inString
-			}
 		case open:
-			if !inString {
-				depth++
-			}
+			depth++
 		case close:
-			if !inString {
-				depth--
-				if depth == 0 {
-					return i
-				}
+			depth--
+			if depth == 0 {
+				return i
 			}
 		}
 	}
 	return -1
+}
+
+func scanQueryString(text string, index int, quote *byte) bool {
+	char := text[index]
+	if *quote == 0 {
+		if (char == '\'' || char == '"') && !isEscaped(text, index) {
+			*quote = char
+			return true
+		}
+		return false
+	}
+	if char == *quote && !isEscaped(text, index) {
+		*quote = 0
+	}
+	return true
 }
 
 func bindingMatchesNode(row queryRow, name string, node *store.NodeRecord) bool {
