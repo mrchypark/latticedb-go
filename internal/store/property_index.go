@@ -129,6 +129,11 @@ func (indexes *PropertyIndexes) Remove(definition PropertyIndexDefinition, value
 	removePosting(&list, id)
 	if list.len() == 0 {
 		delete(bucket, key)
+		delete(data.clonedValues, key)
+		if len(bucket) == 0 {
+			data.values.Delete(hashed)
+			delete(data.clonedHashes, hashed)
+		}
 	} else {
 		bucket[key] = list
 	}

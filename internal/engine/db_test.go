@@ -1227,7 +1227,7 @@ func TestReadTransactionKeepsWholeGraphSnapshot(t *testing.T) {
 	if got := current.Nodes.Get(first.ID).Properties["vector"].([]float32); got[0] != 0 || got[1] != 1 {
 		t.Fatalf("current vector = %v", got)
 	}
-	if current.FTS.Get(first.ID).Text != "after" || current.Edges.Get(edge.ID) != nil || current.Outgoing.Get(first.ID).Len() != 0 {
+	if current.FTS.Get(first.ID).Text != "after" || current.Edges.Get(edge.ID) != nil || current.Outgoing.Has(first.ID) || current.Incoming.Has(second.ID) {
 		t.Fatalf("current graph did not publish atomically")
 	}
 }

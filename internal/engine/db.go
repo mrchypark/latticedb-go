@@ -2589,8 +2589,18 @@ func (tx *Tx) deleteEdge(edgeID uint64) {
 	tx.graph.Edges.Delete(edgeID)
 	tx.graph.EdgeTypes.Remove(edge.Type, edgeID)
 	tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, tx.base != nil && tx.base.Edges.Get(edgeID) != nil, edgeID)
-	tx.graph.Outgoing.Set(edge.SourceID, tx.graph.Outgoing.Get(edge.SourceID).Remove(edgeID))
-	tx.graph.Incoming.Set(edge.TargetID, tx.graph.Incoming.Get(edge.TargetID).Remove(edgeID))
+	outgoing := tx.graph.Outgoing.Get(edge.SourceID).Remove(edgeID)
+	if outgoing.Len() == 0 {
+		tx.graph.Outgoing.Delete(edge.SourceID)
+	} else {
+		tx.graph.Outgoing.Set(edge.SourceID, outgoing)
+	}
+	incoming := tx.graph.Incoming.Get(edge.TargetID).Remove(edgeID)
+	if incoming.Len() == 0 {
+		tx.graph.Incoming.Delete(edge.TargetID)
+	} else {
+		tx.graph.Incoming.Set(edge.TargetID, incoming)
+	}
 }
 
 func (tx *Tx) ensureWritable() error {

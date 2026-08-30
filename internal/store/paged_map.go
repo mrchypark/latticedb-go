@@ -10,6 +10,9 @@ const (
 	pagedMapFanout         = 128
 	pagedMapSlots          = 64
 	pagedMapActiveOverflow = uint8(255)
+	pagedMapClonedRoot     = uint8(1 << 0)
+	pagedMapClonedBucket   = uint8(1 << 1)
+	pagedMapClonedPage     = uint8(1 << 2)
 )
 
 type valuePage[V any] struct {
@@ -30,9 +33,7 @@ type PagedMap[V any] struct {
 	smallActiveLen uint8
 	root0Cloned    bool
 	rootsCloned    bool
-	clonedRoots    map[uint64]struct{}
-	clonedBuckets  map[uint64]struct{}
-	clonedPages    map[uint64]struct{}
+	cloned         map[uint64]uint8
 }
 
 func NewPagedMap[V any]() PagedMap[V] {
@@ -189,13 +190,11 @@ func (m PagedMap[V]) ForkSet(id uint64, value V) PagedMap[V] {
 
 func (m *PagedMap[V]) CloneShardOnce(id uint64) {
 	key := id >> 6
-	if _, cloned := m.clonedPages[key]; cloned && m.pageByKey(key) != nil {
+	if m.cloned[key]&pagedMapClonedPage != 0 && m.pageByKey(key) != nil {
 		return
 	}
-	if m.clonedPages == nil {
-		m.clonedRoots = map[uint64]struct{}{}
-		m.clonedBuckets = map[uint64]struct{}{}
-		m.clonedPages = map[uint64]struct{}{}
+	if m.cloned == nil {
+		m.cloned = map[uint64]uint8{}
 	}
 	high, bucket, shard := pageIndexes(key)
 	if high == 0 && !m.root0Cloned {
@@ -210,25 +209,25 @@ func (m *PagedMap[V]) CloneShardOnce(id uint64) {
 			m.roots = maps.Clone(m.roots)
 			m.rootsCloned = true
 		}
-		if _, cloned := m.clonedRoots[high]; !cloned {
+		if m.cloned[high]&pagedMapClonedRoot == 0 {
 			if source := m.roots[high]; source != nil {
 				root := new(pageRoot[V])
 				*root = *source
 				m.roots[high] = root
 			}
-			m.clonedRoots[high] = struct{}{}
+			m.cloned[high] |= pagedMapClonedRoot
 		}
 	}
 	bucketKey := high<<8 | uint64(bucket)
 	root := m.root(high)
 	if root != nil {
-		if _, cloned := m.clonedBuckets[bucketKey]; !cloned {
+		if m.cloned[bucketKey]&pagedMapClonedBucket == 0 {
 			if source := root[bucket]; source != nil {
 				clonedBucket := new(pageBucket[V])
 				*clonedBucket = *source
 				root[bucket] = clonedBucket
 			}
-			m.clonedBuckets[bucketKey] = struct{}{}
+			m.cloned[bucketKey] |= pagedMapClonedBucket
 		}
 		if bucket := root[bucket]; bucket != nil {
 			if source := bucket[shard]; source != nil {
@@ -238,7 +237,7 @@ func (m *PagedMap[V]) CloneShardOnce(id uint64) {
 			}
 		}
 	}
-	m.clonedPages[key] = struct{}{}
+	m.cloned[key] |= pagedMapClonedPage
 }
 
 func (m *PagedMap[V]) page(id uint64) (*valuePage[V], uint) {

@@ -2,8 +2,10 @@ package store
 
 import (
 	"fmt"
+	"runtime"
 	"slices"
 	"testing"
+	"unsafe"
 )
 
 func benchmarkStreamStore(size int) StreamStore {
@@ -232,6 +234,19 @@ func BenchmarkGraphAdjacencyForkAppend(b *testing.B) {
 				fork.Set(1, append(slices.Clone(fork.Get(1)), uint64(size+1)))
 			}
 		})
+	}
+}
+
+func BenchmarkAdjacencyOneEdgePerNodeMemory(b *testing.B) {
+	const nodes = 10_000
+	b.ReportAllocs()
+	b.ReportMetric(float64(unsafe.Sizeof(EdgeList{})), "raw-B/list")
+	for range b.N {
+		lists := make([]*EdgeList, nodes)
+		for node := range lists {
+			lists[node] = lists[node].Append(uint64(node + 1))
+		}
+		runtime.KeepAlive(lists)
 	}
 }
 

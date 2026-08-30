@@ -57,6 +57,46 @@ func TestPropertyIndexesTypedValuesAndForkIsolation(t *testing.T) {
 	}
 }
 
+func TestPropertyIndexReclaimsHistoricalValues(t *testing.T) {
+	indexes := NewPropertyIndexes()
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "version"}
+	if !indexes.Create(definition) {
+		t.Fatal("create property index")
+	}
+	for value := int64(0); value < 100_000; value++ {
+		if err := indexes.Add(definition, value, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := indexes.Remove(definition, value, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := indexes.definitions[definition].values.Len(); got != 0 {
+		t.Fatalf("retained empty value buckets = %d, want 0", got)
+	}
+}
+
+func TestPropertyIndexReaddAfterEmptyBucketPreservesForkIsolation(t *testing.T) {
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "version"}
+	base := NewPropertyIndexes()
+	base.Create(definition)
+	if err := base.Add(definition, int64(1), 1); err != nil {
+		t.Fatal(err)
+	}
+	fork := base.Fork()
+	if err := fork.Remove(definition, int64(1), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := fork.Add(definition, int64(1), 2); err != nil {
+		t.Fatal(err)
+	}
+	baseIDs, _, _ := base.Lookup(definition, int64(1))
+	forkIDs, _, _ := fork.Lookup(definition, int64(1))
+	if !slices.Equal(baseIDs, []uint64{1}) || !slices.Equal(forkIDs, []uint64{2}) {
+		t.Fatalf("fork isolation = base %v, fork %v", baseIDs, forkIDs)
+	}
+}
+
 func TestPropertyIndexRebuildChargesSparseScans(t *testing.T) {
 	snapshot := persistedState{DatabaseID: "00000000000000000000000000000001", NextNodeID: 1_001}
 	for id := uint64(1); id <= 1_000; id++ {

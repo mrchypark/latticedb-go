@@ -1,6 +1,41 @@
 package store
 
-import "testing"
+import (
+	"testing"
+	"unsafe"
+)
+
+var adjacencyAllocationSink PagedMap[*EdgeList]
+
+func TestAdjacencyLayoutBudget(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit layout guard")
+	}
+	if got := unsafe.Sizeof(PagedMap[uint64]{}); got > 56 {
+		t.Fatalf("PagedMap size = %d, want <= 56", got)
+	}
+	if got := unsafe.Sizeof(EdgeList{}); got > 152 {
+		t.Fatalf("EdgeList size = %d, want <= 152", got)
+	}
+}
+
+func TestGraphAdjacencyForkAppendAllocationBudget(t *testing.T) {
+	var list *EdgeList
+	for id := uint64(1); id <= 1_000; id++ {
+		list = list.Append(id)
+	}
+	base := NewPagedMap[*EdgeList]()
+	base.Set(1, list)
+	allocations := testing.AllocsPerRun(100, func() {
+		fork := base.Fork()
+		fork.CloneShardOnce(1)
+		fork.Set(1, fork.Get(1).Append(1_001))
+		adjacencyAllocationSink = fork
+	})
+	if allocations > 10 {
+		t.Fatalf("fork+append allocations = %.0f, want <= 10", allocations)
+	}
+}
 
 func TestEdgeListInlineChurnDoesNotCreateChunkGaps(t *testing.T) {
 	var list *EdgeList
