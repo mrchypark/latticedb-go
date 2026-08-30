@@ -91,6 +91,27 @@ func BenchmarkPagedMapSequentialSet(b *testing.B) {
 	}
 }
 
+func BenchmarkPagedMapAllScaling(b *testing.B) {
+	for _, size := range []int{1, 1_000, 10_000} {
+		values := NewPagedMap[uint64]()
+		for id := 1; id <= size; id++ {
+			values.Set(uint64(id), uint64(id))
+		}
+		b.Run(fmt.Sprintf("entries_%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				var count int
+				for range values.All() {
+					count++
+				}
+				if count != size {
+					b.Fatal("short paged map iteration")
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkSequentialMapForkSet(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
 		paged := NewPagedMap[uint64]()
