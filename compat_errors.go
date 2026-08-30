@@ -144,6 +144,7 @@ func classifyError(err error) (ErrorCode, bool) {
 		return ErrorIO, true
 	case errors.Is(err, engine.ErrInvalidArgument),
 		errors.Is(err, engine.ErrTransactionsActive),
+		errors.Is(err, engine.ErrSnapshotActive),
 		errors.Is(err, engine.ErrManagedTransaction):
 		return ErrorInvalidArg, true
 	case errors.Is(err, os.ErrNotExist):

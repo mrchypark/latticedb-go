@@ -349,6 +349,7 @@ type GraphState struct {
 	DatabaseID       string
 	VectorDimensions uint16
 	SnapshotBytes    uint64
+	AppMetadata      map[string][]byte
 	Nodes            ShardMap[*NodeRecord]
 	Edges            ShardMap[*EdgeRecord]
 	FTS              ShardMap[*FTSRecord]
@@ -414,6 +415,7 @@ type persistedState struct {
 	CommitID         uint64                             `json:"commit_id"`
 	NextNodeID       uint64                             `json:"next_node_id"`
 	NextEdgeID       uint64                             `json:"next_edge_id"`
+	AppMetadata      []persistedAppMetadata             `json:"app_metadata,omitempty"`
 	Nodes            []persistedNode                    `json:"nodes"`
 	Edges            []persistedEdge                    `json:"edges"`
 	FTS              []persistedFTS                     `json:"fts,omitempty"`
@@ -457,6 +459,7 @@ type persistedDelta struct {
 	DeleteEdges       []uint64                           `json:"delete_edges,omitempty"`
 	UpsertFTS         []persistedFTS                     `json:"upsert_fts,omitempty"`
 	DeleteFTS         []uint64                           `json:"delete_fts,omitempty"`
+	AppMetadata       []persistedAppMetadataChange       `json:"app_metadata,omitempty"`
 	Streams           *persistedStreams                  `json:"streams,omitempty"`
 	StreamOperations  []persistedStreamOperation         `json:"stream_operations,omitempty"`
 	CreateNodeIndexes []persistedPropertyIndexDefinition `json:"create_node_indexes,omitempty"`
@@ -472,12 +475,30 @@ type GraphDelta struct {
 	DeleteEdges       []uint64
 	UpsertFTS         []uint64
 	DeleteFTS         []uint64
+	AppMetadata       []AppMetadataChange
 	StreamsChanged    bool
 	StreamOperations  []StreamOperation
 	CreateNodeIndexes []PropertyIndexDefinition
 	DropNodeIndexes   []PropertyIndexDefinition
 	CreateEdgeIndexes []PropertyIndexDefinition
 	DropEdgeIndexes   []PropertyIndexDefinition
+}
+
+type AppMetadataChange struct {
+	Key    []byte
+	Value  []byte
+	Delete bool
+}
+
+type persistedAppMetadata struct {
+	Key   []byte `json:"key"`
+	Value []byte `json:"value"`
+}
+
+type persistedAppMetadataChange struct {
+	Key    []byte `json:"key"`
+	Value  []byte `json:"value,omitempty"`
+	Delete bool   `json:"delete,omitempty"`
 }
 
 type persistedNode struct {
@@ -519,6 +540,7 @@ type persistedValue struct {
 func NewGraphState() *GraphState {
 	return &GraphState{
 		SnapshotBytes:    4096,
+		AppMetadata:      map[string][]byte{},
 		Nodes:            NewShardMap[*NodeRecord](),
 		Edges:            NewShardMap[*EdgeRecord](),
 		FTS:              NewShardMap[*FTSRecord](),
@@ -540,6 +562,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 	cloned.DatabaseID = graph.DatabaseID
 	cloned.VectorDimensions = graph.VectorDimensions
 	cloned.SnapshotBytes = graph.SnapshotBytes
+	cloned.AppMetadata = CloneAppMetadata(graph.AppMetadata)
 	cloned.DerivedIndexWork = graph.DerivedIndexWork
 	cloned.DerivedIndexLogicalBytes = graph.DerivedIndexLogicalBytes
 	for id, node := range graph.Nodes.All() {
@@ -616,6 +639,7 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 		DatabaseID:               graph.DatabaseID,
 		VectorDimensions:         graph.VectorDimensions,
 		SnapshotBytes:            graph.SnapshotBytes,
+		AppMetadata:              graph.AppMetadata,
 		Nodes:                    graph.Nodes.Fork(),
 		Edges:                    graph.Edges.Fork(),
 		FTS:                      graph.FTS.Fork(),
@@ -633,6 +657,14 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 		DerivedIndexLogicalBytes: graph.DerivedIndexLogicalBytes,
 		Streams:                  graph.Streams.Fork(),
 	}
+}
+
+func CloneAppMetadata(metadata map[string][]byte) map[string][]byte {
+	cloned := make(map[string][]byte, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = slices.Clone(value)
+	}
+	return cloned
 }
 
 func ClonePropertyMap(in map[string]any) map[string]any {

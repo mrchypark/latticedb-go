@@ -26,20 +26,26 @@ var ErrLoadResourceLimit = errors.New("database load resource limit exceeded")
 var ErrDerivedIndexResourceLimit = errors.New("derived index resource limit exceeded")
 
 const (
-	stateMagic        = "LATTICEDB"
-	idsMagic          = "LATTICEIDS"
-	storageVersion    = 2
-	walHeaderSize     = 64
-	walDatabaseIDAt   = 32
-	maxWALFrameBytes  = 1 << 30
-	maxStateFileBytes = 1 << 30
-	maxIDsFileBytes   = 64 << 10
-	stateHeaderSize   = 64
-	stateVersion      = 3
+	stateMagic             = "LATTICEDB"
+	idsMagic               = "LATTICEIDS"
+	storageVersion         = 2
+	walHeaderSize          = 64
+	walDatabaseIDAt        = 32
+	maxWALFrameBytes       = 1 << 30
+	maxStateFileBytes      = 1 << 30
+	maxIDsFileBytes        = 64 << 10
+	stateHeaderSize        = 64
+	stateVersion           = 4
+	legacyStateVersion     = 3
+	walVersion             = 3
+	legacyWALVersion       = 2
+	maxAppMetadataKeyBytes = 1<<16 - 1
 )
 
-var walMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '2', 0}
-var stateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '3'}
+var walMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '3', 0}
+var legacyWALMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '2', 0}
+var stateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '4'}
+var legacyStateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '3'}
 
 type WALWriter struct {
 	file          *os.File
@@ -61,9 +67,9 @@ func OpenWALWriterFiles(files DatabaseFiles, fullSync bool, syncFn func(*os.File
 		return nil, fmt.Errorf("open WAL writer: %w", err)
 	}
 	var header [walHeaderSize]byte
-	if _, err := file.ReadAt(header[:], 0); err != nil || string(header[:8]) != string(walMagic[:]) {
+	if _, err := file.ReadAt(header[:], 0); err != nil || !validCurrentWALHeader(header[:]) {
 		_ = file.Close()
-		return nil, errors.New("WAL writer requires v2 base snapshot")
+		return nil, errors.New("WAL writer requires current base snapshot")
 	}
 	offset, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
@@ -250,7 +256,7 @@ func DeserializeGraphState(data []byte, maxCanonicalBytes, maxDerivedWork, maxDe
 		return nil, 0, 0, 0, errors.New("invalid state header")
 	}
 	header := data[:stateHeaderSize]
-	if string(header[:8]) != string(stateBinaryMagic[:]) || binary.BigEndian.Uint16(header[8:10]) != stateVersion || binary.BigEndian.Uint16(header[10:12]) != stateHeaderSize {
+	if !validStateHeader(header) {
 		return nil, 0, 0, 0, errors.New("invalid state header")
 	}
 	payloadLength := binary.BigEndian.Uint64(header[20:28])
@@ -630,7 +636,21 @@ func syncCheckpointDirectory(dbPath, prefix string, fault CheckpointFault) error
 }
 
 func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
-	if _, err := fmt.Fprintf(output, `{"database_id":%q,"vector_dimensions":%d,"commit_id":%d,"next_node_id":%d,"next_edge_id":%d,"nodes":[`, graph.DatabaseID, graph.VectorDimensions, commitID, nextNodeID, nextEdgeID); err != nil {
+	metadata, err := buildPersistedAppMetadata(graph.AppMetadata)
+	if err != nil {
+		return err
+	}
+	metadataData, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(output, `{"database_id":%q,"vector_dimensions":%d,"commit_id":%d,"next_node_id":%d,"next_edge_id":%d,"app_metadata":`, graph.DatabaseID, graph.VectorDimensions, commitID, nextNodeID, nextEdgeID); err != nil {
+		return err
+	}
+	if _, err := output.Write(metadataData); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(output, `,"nodes":[`); err != nil {
 		return err
 	}
 	for index, nodeID := range SortedNodeIDs(graph) {
@@ -852,12 +872,12 @@ func appendWALRecord(files DatabaseFiles, databaseID string, commitID uint64, pa
 		return fmt.Errorf("seek wal: %w", err)
 	}
 	if offset > 0 {
-		var magic [8]byte
-		if _, err := file.ReadAt(magic[:], 0); err != nil {
+		var existingHeader [walHeaderSize]byte
+		if _, err := file.ReadAt(existingHeader[:], 0); err != nil {
 			_ = file.Close()
 			return fmt.Errorf("read wal header: %w", err)
 		}
-		if magic != walMagic {
+		if !validCurrentWALHeader(existingHeader[:]) {
 			_ = file.Close()
 			record := append(header[:], payload...)
 			return rewriteWAL(files, record)
@@ -1059,7 +1079,7 @@ func loadCheckpointSnapshotFilesContext(ctx context.Context, files DatabaseFiles
 	if _, err := io.ReadFull(file, magic[:]); err != nil {
 		return nil, err
 	}
-	if magic == stateBinaryMagic {
+	if magic == stateBinaryMagic || magic == legacyStateBinaryMagic {
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
@@ -1109,7 +1129,7 @@ func loadBinaryCheckpointContext(ctx context.Context, file *os.File, maxCanonica
 	if _, err := io.ReadFull(file, header[:]); err != nil {
 		return nil, err
 	}
-	if string(header[:8]) != string(stateBinaryMagic[:]) || binary.BigEndian.Uint16(header[8:10]) != stateVersion || binary.BigEndian.Uint16(header[10:12]) != stateHeaderSize {
+	if !validStateHeader(header[:]) {
 		return nil, errors.New("invalid state header")
 	}
 	payloadLength := binary.BigEndian.Uint64(header[20:28])
@@ -1158,6 +1178,15 @@ func encodeStateHeader(databaseID string, commitID uint64, payloadLength uint64,
 	return header, nil
 }
 
+func validStateHeader(header []byte) bool {
+	if len(header) < stateHeaderSize || binary.BigEndian.Uint16(header[10:12]) != stateHeaderSize {
+		return false
+	}
+	magic := string(header[:8])
+	version := binary.BigEndian.Uint16(header[8:10])
+	return magic == string(stateBinaryMagic[:]) && version == stateVersion || magic == string(legacyStateBinaryMagic[:]) && version == legacyStateVersion
+}
+
 func loadLatestWALSnapshot(dbPath string) (*persistedState, error) {
 	return loadLatestWALSnapshotFilesContext(context.Background(), DirectoryDatabaseFiles(dbPath), maxWALFrameBytes)
 }
@@ -1191,7 +1220,7 @@ func loadLatestWALSnapshotFilesContextWithBase(ctx context.Context, files Databa
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("rewind wal: %w", err)
 	}
-	if magic == walMagic {
+	if magic == walMagic || magic == legacyWALMagic {
 		return loadLatestWALV2ContextWithBase(ctx, file, maxCanonicalBytes, base)
 	}
 	return loadLatestLegacyWALContext(ctx, file, maxCanonicalBytes)
@@ -1208,7 +1237,7 @@ func WALFilesReadyForAppend(files DatabaseFiles) bool {
 	}
 	defer file.Close()
 	var header [walHeaderSize]byte
-	if _, err := io.ReadFull(file, header[:]); err != nil || string(header[:8]) != string(walMagic[:]) || binary.BigEndian.Uint16(header[8:10]) != storageVersion || binary.BigEndian.Uint16(header[10:12]) != walHeaderSize {
+	if _, err := io.ReadFull(file, header[:]); err != nil || !validCurrentWALHeader(header[:]) {
 		return false
 	}
 	payloadLength := binary.BigEndian.Uint64(header[20:28])
@@ -1291,7 +1320,7 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 			}
 			return nil, fmt.Errorf("read wal header: %w", err)
 		}
-		if string(header[:8]) != string(walMagic[:]) || binary.BigEndian.Uint16(header[8:10]) != storageVersion || binary.BigEndian.Uint16(header[10:12]) != walHeaderSize {
+		if !validWALHeader(header[:]) {
 			return nil, errors.New("invalid WAL frame header")
 		}
 		payloadLength := binary.BigEndian.Uint64(header[20:28])
@@ -1377,6 +1406,7 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 type walAccumulator struct {
 	state    persistedState
 	streams  StreamStore
+	metadata map[string]persistedAppMetadata
 	nodes    map[uint64]persistedNode
 	edges    map[uint64]persistedEdge
 	fts      map[uint64]persistedFTS
@@ -1396,10 +1426,14 @@ func newWALAccumulator(state persistedState) (*walAccumulator, error) {
 	accumulator := &walAccumulator{
 		state:    state,
 		streams:  graph.Streams,
+		metadata: make(map[string]persistedAppMetadata, len(state.AppMetadata)),
 		nodes:    make(map[uint64]persistedNode, len(state.Nodes)),
 		edges:    make(map[uint64]persistedEdge, len(state.Edges)),
 		fts:      make(map[uint64]persistedFTS, len(state.FTS)),
 		incident: make(map[uint64]uint64),
+	}
+	for _, entry := range state.AppMetadata {
+		accumulator.metadata[string(entry.Key)] = persistedAppMetadata{Key: slices.Clone(entry.Key), Value: slices.Clone(entry.Value)}
 	}
 	for _, node := range state.Nodes {
 		accumulator.nodes[node.ID] = node
@@ -1431,6 +1465,17 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 	if delta.Streams != nil && len(delta.StreamOperations) != 0 {
 		return errors.New("WAL delta mixes full and incremental streams")
 	}
+	seenMetadata := make(map[string]struct{}, len(delta.AppMetadata))
+	for _, change := range delta.AppMetadata {
+		if len(change.Key) == 0 || len(change.Key) > maxAppMetadataKeyBytes || change.Delete && len(change.Value) != 0 {
+			return errors.New("invalid WAL application metadata change")
+		}
+		key := string(change.Key)
+		if _, exists := seenMetadata[key]; exists {
+			return errors.New("duplicate WAL application metadata change")
+		}
+		seenMetadata[key] = struct{}{}
+	}
 	var streams StreamStore
 	if delta.Streams != nil {
 		if _, err := decodePersistedStreams(*delta.Streams); err != nil {
@@ -1441,6 +1486,14 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 		streams, err = ApplyPersistedStreamOperations(accumulator.streams, delta.StreamOperations)
 		if err != nil {
 			return fmt.Errorf("apply stream operations: %w", err)
+		}
+	}
+	for _, change := range delta.AppMetadata {
+		key := string(change.Key)
+		if change.Delete {
+			delete(accumulator.metadata, key)
+		} else {
+			accumulator.metadata[key] = persistedAppMetadata{Key: slices.Clone(change.Key), Value: slices.Clone(change.Value)}
 		}
 	}
 	if err := applyPropertyIndexDelta(&accumulator.state.NodeIndexes, delta.CreateNodeIndexes, delta.DropNodeIndexes); err != nil {
@@ -1595,6 +1648,16 @@ func validateUniqueDeltaIDs[T any](deletes []uint64, upserts []T, id func(T) uin
 
 func (accumulator *walAccumulator) persistedState() persistedState {
 	state := accumulator.state
+	state.AppMetadata = make([]persistedAppMetadata, 0, len(accumulator.metadata))
+	metadataKeys := make([]string, 0, len(accumulator.metadata))
+	for key := range accumulator.metadata {
+		metadataKeys = append(metadataKeys, key)
+	}
+	slices.Sort(metadataKeys)
+	for _, key := range metadataKeys {
+		entry := accumulator.metadata[key]
+		state.AppMetadata = append(state.AppMetadata, persistedAppMetadata{Key: slices.Clone(entry.Key), Value: slices.Clone(entry.Value)})
+	}
 	state.Streams, _ = buildPersistedStreams(accumulator.streams)
 	state.Nodes = state.Nodes[:0]
 	state.Edges = state.Edges[:0]
@@ -1630,11 +1693,17 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		CommitID:         commitID,
 		NextNodeID:       nextNodeID,
 		NextEdgeID:       nextEdgeID,
+		AppMetadata:      nil,
 		Nodes:            make([]persistedNode, 0, graph.Nodes.Len()),
 		Edges:            make([]persistedEdge, 0, graph.Edges.Len()),
 		FTS:              make([]persistedFTS, 0, graph.FTS.Len()),
 		NodeIndexes:      persistedPropertyIndexes(graph.NodeProperties),
 		EdgeIndexes:      persistedPropertyIndexes(graph.EdgeProperties),
+	}
+	var err error
+	snapshot.AppMetadata, err = buildPersistedAppMetadata(graph.AppMetadata)
+	if err != nil {
+		return persistedState{}, err
 	}
 	streams, err := buildPersistedStreams(graph.Streams)
 	if err != nil {
@@ -1678,6 +1747,22 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 	return snapshot, nil
 }
 
+func buildPersistedAppMetadata(metadata map[string][]byte) ([]persistedAppMetadata, error) {
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		if len(key) == 0 || len(key) > maxAppMetadataKeyBytes {
+			return nil, errors.New("invalid application metadata key length")
+		}
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	persisted := make([]persistedAppMetadata, 0, len(keys))
+	for _, key := range keys {
+		persisted = append(persisted, persistedAppMetadata{Key: []byte(key), Value: slices.Clone(metadata[key])})
+	}
+	return persisted, nil
+}
+
 func persistedPropertyIndexes(indexes PropertyIndexes) []persistedPropertyIndexDefinition {
 	definitions := make([]persistedPropertyIndexDefinition, 0)
 	for definition := range indexes.Definitions() {
@@ -1705,6 +1790,21 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		DeleteEdges: slices.Clone(changes.DeleteEdges),
 		DeleteFTS:   slices.Clone(changes.DeleteFTS),
 	}
+	seenMetadata := make(map[string]struct{}, len(changes.AppMetadata))
+	for _, change := range changes.AppMetadata {
+		if len(change.Key) == 0 || len(change.Key) > maxAppMetadataKeyBytes {
+			return persistedDelta{}, errors.New("invalid application metadata key length")
+		}
+		key := string(change.Key)
+		if _, exists := seenMetadata[key]; exists {
+			return persistedDelta{}, errors.New("duplicate application metadata change")
+		}
+		seenMetadata[key] = struct{}{}
+		delta.AppMetadata = append(delta.AppMetadata, persistedAppMetadataChange{Key: slices.Clone(change.Key), Value: slices.Clone(change.Value), Delete: change.Delete})
+	}
+	slices.SortFunc(delta.AppMetadata, func(left, right persistedAppMetadataChange) int {
+		return bytes.Compare(left.Key, right.Key)
+	})
 	slices.Sort(delta.DeleteNodes)
 	slices.Sort(delta.DeleteEdges)
 	slices.Sort(delta.DeleteFTS)
@@ -1773,6 +1873,9 @@ func persistedPropertyIndexDefinitions(definitions []PropertyIndexDefinition) []
 
 func EstimateSnapshotBytes(graph *GraphState) (uint64, error) {
 	size := uint64(4096)
+	for key, value := range graph.AppMetadata {
+		size = snapshotAdd(size, appMetadataSnapshotBytes(key, value))
+	}
 	for _, node := range graph.Nodes.All() {
 		recordSize, err := nodeSnapshotBytes(node)
 		if err != nil {
@@ -1802,6 +1905,24 @@ func ApplyDeltaSnapshotBytes(base *GraphState, graph *GraphState, changes GraphD
 		}
 		size = snapshotAdd(size-oldSize, newSize)
 		return nil
+	}
+	for _, change := range changes.AppMetadata {
+		key := string(change.Key)
+		oldSize := uint64(0)
+		if old, exists := base.AppMetadata[key]; exists {
+			oldSize = appMetadataSnapshotBytes(key, old)
+		}
+		newSize := uint64(0)
+		if !change.Delete {
+			value, exists := graph.AppMetadata[key]
+			if !exists {
+				return 0, errors.New("application metadata delta value is missing")
+			}
+			newSize = appMetadataSnapshotBytes(key, value)
+		}
+		if err := adjust(oldSize, newSize); err != nil {
+			return 0, err
+		}
 	}
 	for _, id := range changes.UpsertNodes {
 		oldSize, newSize := uint64(0), uint64(0)
@@ -1883,6 +2004,10 @@ func ApplyDeltaSnapshotBytes(base *GraphState, graph *GraphState, changes GraphD
 		}
 	}
 	return size, nil
+}
+
+func appMetadataSnapshotBytes(key string, value []byte) uint64 {
+	return snapshotAdd(snapshotAdd(64, uint64(len(key))), uint64(len(value)))
 }
 
 func nodeSnapshotBytes(node *NodeRecord) (uint64, error) {
@@ -1970,6 +2095,16 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 		graph.DatabaseID = snapshot.DatabaseID
 	}
 	graph.VectorDimensions = snapshot.VectorDimensions
+	for _, entry := range snapshot.AppMetadata {
+		if len(entry.Key) == 0 || len(entry.Key) > maxAppMetadataKeyBytes {
+			return nil, 0, 0, 0, errors.New("invalid stored application metadata key length")
+		}
+		key := string(entry.Key)
+		if _, exists := graph.AppMetadata[key]; exists {
+			return nil, 0, 0, 0, errors.New("duplicate stored application metadata key")
+		}
+		graph.AppMetadata[key] = slices.Clone(entry.Value)
+	}
 	var maxNodeID uint64
 	for index, storedNode := range snapshot.Nodes {
 		if index&255 == 0 {
@@ -2292,13 +2427,26 @@ func encodeWALHeaderFields(databaseID string, commitID uint64, payloadLength uin
 	}
 	var header [walHeaderSize]byte
 	copy(header[:8], walMagic[:])
-	binary.BigEndian.PutUint16(header[8:10], storageVersion)
+	binary.BigEndian.PutUint16(header[8:10], walVersion)
 	binary.BigEndian.PutUint16(header[10:12], walHeaderSize)
 	binary.BigEndian.PutUint64(header[12:20], commitID)
 	binary.BigEndian.PutUint64(header[20:28], payloadLength)
 	binary.BigEndian.PutUint32(header[28:32], checksum)
 	copy(header[walDatabaseIDAt:walHeaderSize], databaseID)
 	return header, nil
+}
+
+func validCurrentWALHeader(header []byte) bool {
+	return len(header) >= walHeaderSize && string(header[:8]) == string(walMagic[:]) && binary.BigEndian.Uint16(header[8:10]) == walVersion && binary.BigEndian.Uint16(header[10:12]) == walHeaderSize
+}
+
+func validWALHeader(header []byte) bool {
+	if len(header) < walHeaderSize || binary.BigEndian.Uint16(header[10:12]) != walHeaderSize {
+		return false
+	}
+	magic := string(header[:8])
+	version := binary.BigEndian.Uint16(header[8:10])
+	return magic == string(walMagic[:]) && version == walVersion || magic == string(legacyWALMagic[:]) && version == legacyWALVersion
 }
 
 func validateWALPayloadSize(size int) error {

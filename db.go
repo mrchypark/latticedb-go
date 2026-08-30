@@ -32,6 +32,7 @@ var (
 	ErrDatabaseLayoutConflict         = engine.ErrDatabaseLayoutConflict
 	ErrDatabaseClosed                 = engine.ErrDatabaseClosed
 	ErrTransactionsActive             = engine.ErrTransactionsActive
+	ErrSnapshotActive                 = engine.ErrSnapshotActive
 	ErrWriteConflict                  = engine.ErrWriteConflict
 	ErrRecoveryRequired               = engine.ErrRecoveryRequired
 	ErrResourceLimit                  = engine.ErrResourceLimit
@@ -49,6 +50,11 @@ type DB struct {
 
 type Tx struct {
 	inner *engine.Tx
+}
+
+// Snapshot is one fixed committed database generation.
+type Snapshot struct {
+	inner *engine.Snapshot
 }
 
 // Open opens a directory-backed database or a regular database file previously
@@ -140,6 +146,39 @@ func (db *DB) Serialize() ([]byte, error) {
 
 func (db *DB) Checkpoint() error {
 	return wrapError(db.inner.Checkpoint())
+}
+
+// BeginSnapshot pins one committed generation while database writes continue.
+// Only one Snapshot may be active for a DB.
+func (db *DB) BeginSnapshot() (*Snapshot, error) {
+	if db == nil || db.inner == nil {
+		return nil, ErrDatabaseClosed
+	}
+	snapshot, err := db.inner.BeginSnapshot()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	return &Snapshot{inner: snapshot}, nil
+}
+
+// Backup writes the frozen generation as a standalone regular database file.
+func (snapshot *Snapshot) Backup(path string) error {
+	if snapshot == nil || snapshot.inner == nil {
+		return ErrDatabaseClosed
+	}
+	return wrapError(snapshot.inner.Backup(path))
+}
+
+// Close releases the frozen generation. Close is idempotent.
+func (snapshot *Snapshot) Close() error {
+	if snapshot == nil || snapshot.inner == nil {
+		return nil
+	}
+	if err := snapshot.inner.Close(); err != nil {
+		return wrapError(err)
+	}
+	snapshot.inner = nil
+	return nil
 }
 
 func (db *DB) Begin(readOnly bool) (*Tx, error) {

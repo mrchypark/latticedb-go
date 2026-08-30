@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ type queryPlan struct {
 	removeClause  *removeClause
 	deleteClause  *deleteClause
 	returnClause  *returnClause
+	orderClauses  []orderClause
 	hasLimit      bool
 	limit         int
 }
@@ -105,9 +107,10 @@ func (budget *queryBudget) chargeBytes(bytes uint64, kind string) error {
 }
 
 type nodePattern struct {
-	Var        string
-	Labels     []string
-	Properties map[string]any
+	Var           string
+	Labels        []string
+	Properties    map[string]any
+	PropertyExprs map[string]valueExpr
 }
 
 type edgePattern struct {
@@ -193,6 +196,13 @@ type projection struct {
 	Var      string
 	Property string
 	Alias    string
+}
+
+type orderClause struct {
+	Kind     projectionKind
+	Var      string
+	Property string
+	Desc     bool
 }
 
 type projectionKind string
@@ -368,6 +378,11 @@ func (plan *queryPlan) validateBindings() error {
 			}
 		}
 	}
+	for _, clause := range plan.orderClauses {
+		if err := require(clause.Var, bindingNode, bindingEdge, bindingValue); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -379,7 +394,11 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 		return nil, err
 	}
 
-	plan := &queryPlan{matchPatterns: patterns}
+	inlineWhere, err := patternPropertyClauses(patterns)
+	if err != nil {
+		return nil, err
+	}
+	plan := &queryPlan{matchPatterns: patterns, whereClauses: inlineWhere}
 
 	switch nextKeyword {
 	case " WHERE ":
@@ -388,7 +407,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 		if err != nil {
 			return nil, err
 		}
-		plan.whereClauses = whereClauses
+		plan.whereClauses = append(plan.whereClauses, whereClauses...)
 		nextKeyword = whereNext
 		tail = afterWhere
 	case " RETURN ", " SET ", " CREATE ", " REMOVE ", " DELETE ", "":
@@ -398,17 +417,17 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 
 	switch nextKeyword {
 	case " RETURN ":
-		returnText, limitText, hasLimit := splitLimitClause(tail)
+		returnText, orderClauses, hasLimit, limit, err := parseReturnTail(tail)
+		if err != nil {
+			return nil, err
+		}
 		returnClause, err := parseReturnClause(returnText)
 		if err != nil {
 			return nil, err
 		}
 		plan.returnClause = returnClause
+		plan.orderClauses = orderClauses
 		if hasLimit {
-			limit, err := parseLimitValue(limitText)
-			if err != nil {
-				return nil, err
-			}
 			plan.hasLimit = true
 			plan.limit = limit
 		}
@@ -464,7 +483,10 @@ func parseUnwindQuery(query string) (*queryPlan, error) {
 		return nil, fmt.Errorf("unsupported terminal clause %q", nextKeyword)
 	}
 
-	returnText, limitText, hasLimit := splitLimitClause(afterVar)
+	returnText, orderClauses, hasLimit, limit, err := parseReturnTail(afterVar)
+	if err != nil {
+		return nil, err
+	}
 	returnClause, err := parseReturnClause(returnText)
 	if err != nil {
 		return nil, err
@@ -476,12 +498,9 @@ func parseUnwindQuery(query string) (*queryPlan, error) {
 			Var:  varName,
 		},
 		returnClause: returnClause,
+		orderClauses: orderClauses,
 	}
 	if hasLimit {
-		limit, err := parseLimitValue(limitText)
-		if err != nil {
-			return nil, err
-		}
 		plan.hasLimit = true
 		plan.limit = limit
 	}
@@ -501,17 +520,17 @@ func parseCreateQuery(query string) (*queryPlan, error) {
 	case "":
 		return plan, nil
 	case " RETURN ":
-		returnText, limitText, hasLimit := splitLimitClause(tail)
+		returnText, orderClauses, hasLimit, limit, err := parseReturnTail(tail)
+		if err != nil {
+			return nil, err
+		}
 		returnClause, err := parseReturnClause(returnText)
 		if err != nil {
 			return nil, err
 		}
 		plan.returnClause = returnClause
+		plan.orderClauses = orderClauses
 		if hasLimit {
-			limit, err := parseLimitValue(limitText)
-			if err != nil {
-				return nil, err
-			}
 			plan.hasLimit = true
 			plan.limit = limit
 		}
@@ -621,6 +640,20 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	if plan.returnClause == nil {
 		return QueryResult{}, nil
 	}
+	if len(plan.orderClauses) != 0 {
+		slices.SortStableFunc(rows, func(left, right queryRow) int {
+			for _, clause := range plan.orderClauses {
+				comparison := compareOrderValues(clause.value(left), clause.value(right))
+				if clause.Desc {
+					comparison = -comparison
+				}
+				if comparison != 0 {
+					return comparison
+				}
+			}
+			return compareRowBindings(left, right)
+		})
+	}
 	result, err := plan.returnClause.render(rows, budget)
 	if err != nil {
 		return QueryResult{}, err
@@ -632,6 +665,9 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 }
 
 func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[string]any, limit uint, budget *queryBudget) ([]uint64, bool, error) {
+	if tx.queryIndexesDisabled {
+		return nil, false, nil
+	}
 	if pattern.Var == "" || len(pattern.Labels) == 0 {
 		return nil, false, nil
 	}
@@ -799,6 +835,9 @@ func nodeMatchesQueryProperty(node *store.NodeRecord, definition store.PropertyI
 }
 
 func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[string]any) ([]uint64, bool, error) {
+	if tx.queryIndexesDisabled {
+		return nil, false, nil
+	}
 	if pattern.EdgeVar == "" || pattern.EdgeType == "" {
 		return nil, false, nil
 	}
@@ -927,6 +966,40 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 	return patterns, nil
 }
 
+func patternPropertyClauses(patterns []matchPattern) ([]*whereClause, error) {
+	var clauses []*whereClause
+	appendNode := func(pattern nodePattern) error {
+		if len(pattern.PropertyExprs) != 0 && pattern.Var == "" {
+			return errors.New("parameterized MATCH properties require a node binding")
+		}
+		keys := make([]string, 0, len(pattern.PropertyExprs))
+		for key := range pattern.PropertyExprs {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			clauses = append(clauses, &whereClause{Kind: whereEquals, Var: pattern.Var, Property: key, Expr: pattern.PropertyExprs[key]})
+		}
+		return nil
+	}
+	for _, item := range patterns {
+		switch pattern := item.(type) {
+		case nodePattern:
+			if err := appendNode(pattern); err != nil {
+				return nil, err
+			}
+		case edgePattern:
+			if err := appendNode(pattern.Left); err != nil {
+				return nil, err
+			}
+			if err := appendNode(pattern.Right); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return clauses, nil
+}
+
 func parseNodePattern(text string) (nodePattern, error) {
 	body, err := trimEnclosed(text, '(', ')')
 	if err != nil {
@@ -934,6 +1007,7 @@ func parseNodePattern(text string) (nodePattern, error) {
 	}
 
 	props := map[string]any{}
+	propertyExprs := map[string]valueExpr{}
 	propStart := findTopLevelRune(body, '{')
 	prefix := strings.TrimSpace(body)
 	if propStart >= 0 {
@@ -941,11 +1015,17 @@ func parseNodePattern(text string) (nodePattern, error) {
 		if propEnd < 0 {
 			return nodePattern{}, fmt.Errorf("unterminated node property map in %q", text)
 		}
-		parsedProps, err := parsePropertyLiteralMap(body[propStart+1 : propEnd])
+		parsedProps, err := parsePropertyExprMap(body[propStart+1 : propEnd])
 		if err != nil {
 			return nodePattern{}, err
 		}
-		props = parsedProps
+		for key, expr := range parsedProps {
+			if literal, ok := expr.(literalExpr); ok {
+				props[key] = literal.Value
+			} else {
+				propertyExprs[key] = expr
+			}
+		}
 		if strings.TrimSpace(body[propEnd+1:]) != "" {
 			return nodePattern{}, fmt.Errorf("unexpected text after node properties in %q", text)
 		}
@@ -953,7 +1033,7 @@ func parseNodePattern(text string) (nodePattern, error) {
 	}
 
 	segments := strings.Split(prefix, ":")
-	pattern := nodePattern{Properties: props}
+	pattern := nodePattern{Properties: props, PropertyExprs: propertyExprs}
 	if len(segments) > 0 {
 		first := strings.TrimSpace(segments[0])
 		if first != "" {
@@ -1312,6 +1392,138 @@ func parseReturnClause(text string) (*returnClause, error) {
 		})
 	}
 	return &returnClause{Projections: projections}, nil
+}
+
+func parseReturnTail(text string) (string, []orderClause, bool, int, error) {
+	returnText, keyword, tail := splitOnNextClause(text, " ORDER BY ", " LIMIT ")
+	switch keyword {
+	case "":
+		return returnText, nil, false, 0, nil
+	case " LIMIT ":
+		limit, err := parseLimitValue(tail)
+		return returnText, nil, true, limit, err
+	case " ORDER BY ":
+		orderText, limitText, hasLimit := splitLimitClause(tail)
+		clauses, err := parseOrderClauses(orderText)
+		if err != nil {
+			return "", nil, false, 0, err
+		}
+		if !hasLimit {
+			return returnText, clauses, false, 0, nil
+		}
+		limit, err := parseLimitValue(limitText)
+		return returnText, clauses, true, limit, err
+	default:
+		panic("unreachable")
+	}
+}
+
+func parseOrderClauses(text string) ([]orderClause, error) {
+	parts := splitTopLevel(text, ',')
+	clauses := make([]orderClause, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		clause := orderClause{}
+		switch {
+		case strings.HasSuffix(part, " DESC"):
+			clause.Desc = true
+			part = strings.TrimSpace(strings.TrimSuffix(part, " DESC"))
+		case strings.HasSuffix(part, " ASC"):
+			part = strings.TrimSpace(strings.TrimSuffix(part, " ASC"))
+		}
+		if name, ok := parseBindingIDAccess(part); ok {
+			clause.Kind = projectionBindingID
+			clause.Var = name
+		} else if strings.Contains(part, ".") {
+			name, property, err := parsePropertyAccess(part)
+			if err != nil {
+				return nil, err
+			}
+			clause.Kind = projectionProperty
+			clause.Var = name
+			clause.Property = property
+		} else if isQueryIdentifier(part) {
+			clause.Kind = projectionValue
+			clause.Var = part
+		} else {
+			return nil, fmt.Errorf("invalid ORDER BY expression %q", part)
+		}
+		clauses = append(clauses, clause)
+	}
+	if len(clauses) == 0 {
+		return nil, errors.New("ORDER BY expression must be non-empty")
+	}
+	return clauses, nil
+}
+
+func (clause orderClause) value(row queryRow) any {
+	binding, ok := row.Bindings[clause.Var]
+	if !ok {
+		return nil
+	}
+	switch clause.Kind {
+	case projectionBindingID:
+		value, _ := bindingID(binding)
+		return value
+	case projectionProperty:
+		value, _ := propertyFromBinding(binding, clause.Property)
+		return value
+	case projectionValue:
+		if binding.HasValue {
+			return binding.Value
+		}
+		return bindingIDValue(binding)
+	default:
+		return nil
+	}
+}
+
+func bindingIDValue(binding boundValue) any {
+	value, ok := bindingID(binding)
+	if !ok {
+		return nil
+	}
+	return value
+}
+
+func compareOrderValues(left, right any) int {
+	if left == nil {
+		if right == nil {
+			return 0
+		}
+		return 1
+	}
+	if right == nil {
+		return -1
+	}
+	if leftInt, ok := normalizeInt64(left); ok {
+		if rightInt, ok := normalizeInt64(right); ok {
+			return cmp.Compare(leftInt, rightInt)
+		}
+	}
+	if leftFloat, ok := left.(float64); ok {
+		if rightFloat, ok := right.(float64); ok {
+			return cmp.Compare(leftFloat, rightFloat)
+		}
+	}
+	if leftString, ok := left.(string); ok {
+		if rightString, ok := right.(string); ok {
+			return strings.Compare(leftString, rightString)
+		}
+	}
+	if leftBool, ok := left.(bool); ok {
+		if rightBool, ok := right.(bool); ok {
+			switch {
+			case leftBool == rightBool:
+				return 0
+			case !leftBool:
+				return -1
+			default:
+				return 1
+			}
+		}
+	}
+	return strings.Compare(fmt.Sprint(left), fmt.Sprint(right))
 }
 
 func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
@@ -1991,8 +2203,8 @@ func parseValueExpr(text string) (valueExpr, error) {
 			return nil, err
 		}
 		return mapLiteralExpr{Entries: entries}, nil
-	case strings.HasPrefix(text, "\""):
-		unquoted, err := strconv.Unquote(text)
+	case strings.HasPrefix(text, "\"") || strings.HasPrefix(text, "'"):
+		unquoted, err := unquoteQueryString(text)
 		if err != nil {
 			return nil, err
 		}
@@ -2011,30 +2223,24 @@ func parseValueExpr(text string) (valueExpr, error) {
 	}
 }
 
-func parsePropertyLiteralMap(text string) (map[string]any, error) {
-	out := make(map[string]any)
-	if strings.TrimSpace(text) == "" {
-		return out, nil
+func unquoteQueryString(text string) (string, error) {
+	if strings.HasPrefix(text, "\"") {
+		return strconv.Unquote(text)
 	}
-	for _, part := range splitTopLevel(text, ',') {
-		key, rawValue, err := splitPropertyAssignment(part)
-		if err != nil {
-			return nil, err
-		}
-		expr, err := parseValueExpr(rawValue)
-		if err != nil {
-			return nil, err
-		}
-		literal, ok := expr.(literalExpr)
-		if !ok {
-			return nil, fmt.Errorf("MATCH properties require literal values, got %q", rawValue)
-		}
-		if _, exists := out[key]; exists {
-			return nil, fmt.Errorf("duplicate map key %q", key)
-		}
-		out[key] = literal.Value
+	if len(text) < 2 || text[len(text)-1] != '\'' {
+		return "", fmt.Errorf("unterminated string literal %q", text)
 	}
-	return out, nil
+	remaining := text[1 : len(text)-1]
+	var value strings.Builder
+	for remaining != "" {
+		char, _, tail, err := strconv.UnquoteChar(remaining, '\'')
+		if err != nil {
+			return "", err
+		}
+		value.WriteRune(char)
+		remaining = tail
+	}
+	return value.String(), nil
 }
 
 func parsePropertyExprMap(text string) (map[string]valueExpr, error) {

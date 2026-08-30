@@ -24,6 +24,7 @@ var (
 	ErrInactiveTx                     = errors.New("transaction is inactive")
 	ErrDatabaseClosed                 = errors.New("database is closed")
 	ErrTransactionsActive             = errors.New("database has active transactions")
+	ErrSnapshotActive                 = errors.New("database has an active snapshot")
 	ErrWriteConflict                  = errors.New("write transaction conflicts with current commit")
 	ErrRecoveryRequired               = errors.New("database requires close and recovery")
 	ErrResourceLimit                  = errors.New("resource limit exceeded")
@@ -224,6 +225,7 @@ type DB struct {
 	wal                              *store.WALWriter
 	temporary                        bool
 	streamNotify                     chan struct{}
+	activeSnapshot                   bool
 }
 
 type Tx struct {
@@ -238,6 +240,8 @@ type Tx struct {
 	vectorIndexApplied     bool
 	propertyIndexesApplied bool
 	changefeedApplied      bool
+	appMetadataWritable    bool
+	queryIndexesDisabled   bool
 }
 
 type txChanges struct {
@@ -247,6 +251,7 @@ type txChanges struct {
 	deleteEdges       map[uint64]struct{}
 	upsertFTS         map[uint64]struct{}
 	deleteFTS         map[uint64]struct{}
+	appMetadata       map[string]appMetadataChange
 	createNodeIndexes map[store.PropertyIndexDefinition]struct{}
 	dropNodeIndexes   map[store.PropertyIndexDefinition]struct{}
 	createEdgeIndexes map[store.PropertyIndexDefinition]struct{}
@@ -254,6 +259,16 @@ type txChanges struct {
 	streamsChanged    bool
 	streamOperations  []store.StreamOperation
 	baseCommitID      uint64
+}
+
+func newTxChanges(baseCommitID uint64) *txChanges {
+	return &txChanges{
+		baseCommitID:      baseCommitID,
+		createNodeIndexes: map[store.PropertyIndexDefinition]struct{}{},
+		dropNodeIndexes:   map[store.PropertyIndexDefinition]struct{}{},
+		createEdgeIndexes: map[store.PropertyIndexDefinition]struct{}{},
+		dropEdgeIndexes:   map[store.PropertyIndexDefinition]struct{}{},
+	}
 }
 
 func Open(path string, opts OpenOptions) (*DB, error) {
@@ -467,6 +482,9 @@ func (db *DB) Close() error {
 	}
 	if db.activeTx.Load() != 0 {
 		return ErrTransactionsActive
+	}
+	if db.activeSnapshot {
+		return ErrSnapshotActive
 	}
 	var closeErr error
 	if !db.readOnly {
@@ -700,13 +718,7 @@ func (db *DB) Begin(readOnly bool) (*Tx, error) {
 	if !readOnly {
 		base = graph
 		graph = store.CloneGraphStateShallow(graph)
-		changes = &txChanges{
-			baseCommitID:      db.commitID,
-			createNodeIndexes: map[store.PropertyIndexDefinition]struct{}{},
-			dropNodeIndexes:   map[store.PropertyIndexDefinition]struct{}{},
-			createEdgeIndexes: map[store.PropertyIndexDefinition]struct{}{},
-			dropEdgeIndexes:   map[store.PropertyIndexDefinition]struct{}{},
-		}
+		changes = newTxChanges(db.commitID)
 	}
 	db.activeTx.Add(1)
 
@@ -1800,6 +1812,7 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		DeleteEdges:       mapKeys(tx.changes.deleteEdges),
 		UpsertFTS:         mapKeys(tx.changes.upsertFTS),
 		DeleteFTS:         mapKeys(tx.changes.deleteFTS),
+		AppMetadata:       persistedAppMetadataChanges(tx.changes.appMetadata),
 		CreateNodeIndexes: propertyIndexKeys(tx.changes.createNodeIndexes),
 		DropNodeIndexes:   propertyIndexKeys(tx.changes.dropNodeIndexes),
 		CreateEdgeIndexes: propertyIndexKeys(tx.changes.createEdgeIndexes),

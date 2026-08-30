@@ -333,7 +333,7 @@ func TestWALRejectsOversizedDeclaredLengthWithoutAllocation(t *testing.T) {
 	path := t.TempDir()
 	header := make([]byte, walHeaderSize)
 	copy(header, walMagic[:])
-	binary.BigEndian.PutUint16(header[8:10], storageVersion)
+	binary.BigEndian.PutUint16(header[8:10], walVersion)
 	binary.BigEndian.PutUint16(header[10:12], walHeaderSize)
 	binary.BigEndian.PutUint64(header[20:28], maxWALFrameBytes+1)
 	if err := os.WriteFile(walFilePath(path), header, 0o600); err != nil {
@@ -341,6 +341,89 @@ func TestWALRejectsOversizedDeclaredLengthWithoutAllocation(t *testing.T) {
 	}
 	if _, _, _, _, err := LoadGraphState(path); err == nil {
 		t.Fatal("expected oversized WAL frame to fail")
+	}
+}
+
+func TestAppMetadataWALDeltaIsIncremental(t *testing.T) {
+	path := t.TempDir()
+	graph := NewGraphState()
+	if err := EnsureDatabaseID(graph); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckpointGraphStateAndWAL(path, graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	large := bytes.Repeat([]byte("x"), 1<<20)
+	graph.AppMetadata["large"] = large
+	if err := AppendWALDelta(path, graph, 1, 1, 1, GraphDelta{AppMetadata: []AppMetadataChange{{Key: []byte("large"), Value: large}}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(walFilePath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph.AppMetadata["small"] = []byte("value")
+	if err := AppendWALDelta(path, graph, 1, 1, 2, GraphDelta{AppMetadata: []AppMetadataChange{{Key: []byte("small"), Value: []byte("value")}}}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(walFilePath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if growth := after.Size() - before.Size(); growth > 4096 {
+		t.Fatalf("small metadata update grew WAL by %d bytes", growth)
+	}
+	recovered, _, _, commitID, err := LoadGraphState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commitID != 2 || !bytes.Equal(recovered.AppMetadata["large"], large) || string(recovered.AppMetadata["small"]) != "value" {
+		t.Fatal("incremental metadata WAL did not recover both values")
+	}
+}
+
+func TestLegacyStateAndWALHeadersRemainReadable(t *testing.T) {
+	graph := NewGraphState()
+	serialized, err := SerializeGraphState(graph, 1, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(serialized[:8], legacyStateBinaryMagic[:])
+	binary.BigEndian.PutUint16(serialized[8:10], legacyStateVersion)
+	if _, _, _, _, err := DeserializeGraphState(serialized, maxStateFileBytes, ^uint64(0), ^uint64(0)); err != nil {
+		t.Fatalf("legacy state header: %v", err)
+	}
+
+	path := t.TempDir()
+	if err := AppendWALCommit(path, graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	wal, err := os.ReadFile(walFilePath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(wal[:8], legacyWALMagic[:])
+	binary.BigEndian.PutUint16(wal[8:10], legacyWALVersion)
+	if err := os.WriteFile(walFilePath(path), wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := LoadGraphState(path); err != nil {
+		t.Fatalf("legacy WAL header: %v", err)
+	}
+}
+
+func TestStoredAppMetadataRejectsDuplicateKeys(t *testing.T) {
+	graph := NewGraphState()
+	if err := EnsureDatabaseID(graph); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := buildPersistedState(graph, 1, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.AppMetadata = []persistedAppMetadata{{Key: []byte("same")}, {Key: []byte("same")}}
+	if _, _, _, _, err := decodePersistedState(snapshot); err == nil {
+		t.Fatal("duplicate metadata keys were accepted")
 	}
 }
 
