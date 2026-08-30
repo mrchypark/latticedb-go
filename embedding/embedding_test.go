@@ -1,6 +1,7 @@
 package embedding
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"math"
@@ -46,6 +47,20 @@ func TestHashDefaultsAndValidation(t *testing.T) {
 	}
 	if _, err := Hash("hello", maxDimensions+1); err == nil {
 		t.Fatal("Hash oversized dimensions succeeded")
+	}
+}
+
+func TestHashSupportsUnicodeWords(t *testing.T) {
+	left, err := Hash("안녕하세요 세계", 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := Hash("데이터베이스 검색", 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(left, make([]float32, 32)) || reflect.DeepEqual(left, right) {
+		t.Fatalf("unicode hashes are not distinct: %v / %v", left, right)
 	}
 }
 
@@ -133,11 +148,38 @@ func TestClientEmbedsConcurrently(t *testing.T) {
 			t.Fatal("concurrent Embed calls were serialized")
 		}
 	}
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("Close blocked on active Embed calls")
+	}
 	close(release)
 	for range 2 {
 		if err := <-results; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestClientEmbedContextCancelsRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.EmbedContext(ctx, "hello"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("EmbedContext error = %v", err)
 	}
 }
 

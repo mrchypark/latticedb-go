@@ -33,6 +33,7 @@ type streamLog struct {
 	tail  *streamChunk
 	first uint64
 	count uint64
+	bytes uint64
 }
 
 type streamChunk struct {
@@ -52,6 +53,7 @@ type StreamStore struct {
 	offsetsCloned bool
 	clonedStreams map[string]struct{}
 	clonedOffsets map[string]struct{}
+	logicalBytes  uint64
 }
 
 type persistedStreams struct {
@@ -115,9 +117,10 @@ func errorsNewStreamName() error { return fmt.Errorf("invalid stream name, kind,
 
 func (store StreamStore) Fork() StreamStore {
 	return StreamStore{
-		streams: store.streams,
-		next:    store.next,
-		offsets: store.offsets,
+		streams:      store.streams,
+		next:         store.next,
+		offsets:      store.offsets,
+		logicalBytes: store.logicalBytes,
 	}
 }
 
@@ -175,6 +178,7 @@ func (store StreamStore) GetOffset(name, consumer string) (uint64, bool) {
 }
 
 func (store *StreamStore) Publish(name, kind string, payload any) uint64 {
+	newStream := store.next[name] == 0
 	store.cloneStream(name)
 	sequence := store.next[name]
 	if sequence == 0 {
@@ -183,6 +187,7 @@ func (store *StreamStore) Publish(name, kind string, payload any) uint64 {
 	store.next[name] = sequence + 1
 	log := store.streams[name]
 	record := StreamRecord{Sequence: sequence, Kind: kind, Payload: CloneValue(payload)}
+	recordBytes := streamRecordBytes(record)
 	if log.tail == nil || len(log.tail.records) == int(streamChunkSize) {
 		log.tail = newStreamChunk(log.tail, []StreamRecord{record})
 	} else {
@@ -195,6 +200,11 @@ func (store *StreamStore) Publish(name, kind string, payload any) uint64 {
 		log.first = sequence
 	}
 	log.count++
+	log.bytes = snapshotAdd(log.bytes, recordBytes)
+	store.logicalBytes = snapshotAdd(store.logicalBytes, recordBytes)
+	if newStream {
+		store.logicalBytes = snapshotAdd(store.logicalBytes, uint64(len(name))+64)
+	}
 	store.streams[name] = log
 	return sequence
 }
@@ -203,15 +213,21 @@ func (store *StreamStore) SetOffset(name, consumer string, sequence uint64) {
 	if store.next[name] == 0 {
 		store.cloneStream(name)
 		store.next[name] = 1
+		store.logicalBytes = snapshotAdd(store.logicalBytes, uint64(len(name))+64)
 	}
+	_, existed := store.offsets[name][consumer]
 	store.cloneOffset(name)
 	store.offsets[name][consumer] = sequence
+	if !existed {
+		store.logicalBytes = snapshotAdd(store.logicalBytes, uint64(len(name)+len(consumer))+48)
+	}
 }
 
 func (store *StreamStore) Trim(name string, through uint64) {
 	store.cloneStream(name)
 	if store.next[name] == 0 {
 		store.next[name] = 1
+		store.logicalBytes = snapshotAdd(store.logicalBytes, uint64(len(name))+64)
 	}
 	log := store.streams[name]
 	if log.count == 0 || through < log.first {
@@ -224,6 +240,7 @@ func (store *StreamStore) Trim(name string, through uint64) {
 		chunks = append(chunks, chunk)
 	}
 	var tail *streamChunk
+	var retainedBytes uint64
 	for index := len(chunks) - 1; index >= 0; index-- {
 		records := chunks[index].records
 		start := 0
@@ -231,7 +248,11 @@ func (store *StreamStore) Trim(name string, through uint64) {
 			start++
 		}
 		if start < len(records) {
-			tail = newStreamChunk(tail, slices.Clone(records[start:]))
+			retained := slices.Clone(records[start:])
+			tail = newStreamChunk(tail, retained)
+			for _, record := range retained {
+				retainedBytes = snapshotAdd(retainedBytes, streamRecordBytes(record))
+			}
 		}
 	}
 	removed := trimmedThrough - log.first + 1
@@ -241,6 +262,14 @@ func (store *StreamStore) Trim(name string, through uint64) {
 		log.first = 0
 	}
 	log.tail = tail
+	if store.logicalBytes == ^uint64(0) || log.bytes > store.logicalBytes {
+		log.bytes = retainedBytes
+		store.streams[name] = log
+		store.logicalBytes = calculateStreamStoreBytes(*store)
+		return
+	}
+	store.logicalBytes = snapshotAdd(store.logicalBytes-log.bytes, retainedBytes)
+	log.bytes = retainedBytes
 	store.streams[name] = log
 }
 
@@ -469,6 +498,9 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 			log.first = records[0].Sequence
 			log.count = uint64(len(records))
 		}
+		for _, record := range records {
+			log.bytes = snapshotAdd(log.bytes, streamRecordBytes(record))
+		}
 		store.streams[stream.Name] = log
 		store.next[stream.Name] = stream.Next
 	}
@@ -491,10 +523,15 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 		}
 		store.offsets[offset.Stream][offset.Consumer] = offset.Sequence
 	}
+	store.logicalBytes = calculateStreamStoreBytes(store)
 	return store, nil
 }
 
 func streamStoreBytes(store StreamStore) uint64 {
+	return store.logicalBytes
+}
+
+func calculateStreamStoreBytes(store StreamStore) uint64 {
 	var size uint64
 	for name, log := range store.streams {
 		size = snapshotAdd(size, uint64(len(name))+64)
@@ -510,4 +547,8 @@ func streamStoreBytes(store StreamStore) uint64 {
 		}
 	}
 	return size
+}
+
+func streamRecordBytes(record StreamRecord) uint64 {
+	return snapshotAdd(uint64(len(record.Kind))+48, estimateValueBytes(record.Payload))
 }

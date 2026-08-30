@@ -59,6 +59,9 @@ func TestStreamChunkForkTrimAndOffsetIsolation(t *testing.T) {
 	if len(records) != 67 || records[0].Sequence != 65 || records[len(records)-1].Sequence != 131 {
 		t.Fatalf("fork records = first %d last %d len %d", records[0].Sequence, records[len(records)-1].Sequence, len(records))
 	}
+	if streamStoreBytes(base) != calculateStreamStoreBytes(base) || streamStoreBytes(fork) != calculateStreamStoreBytes(fork) {
+		t.Fatal("incremental stream size accounting drifted")
+	}
 }
 
 func TestStreamOffsetWithoutRecordsPersists(t *testing.T) {
@@ -74,6 +77,9 @@ func TestStreamOffsetWithoutRecordsPersists(t *testing.T) {
 	}
 	if offset, ok := restored.GetOffset("events", "worker"); !ok || offset != 42 {
 		t.Fatalf("offset = %d, %v", offset, ok)
+	}
+	if streamStoreBytes(restored) != calculateStreamStoreBytes(restored) {
+		t.Fatal("restored stream size accounting drifted")
 	}
 }
 

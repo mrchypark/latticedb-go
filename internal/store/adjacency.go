@@ -20,18 +20,33 @@ type EdgeList struct {
 	total   int
 }
 
-func (list EdgeList) Len() int { return list.count }
+func (list *EdgeList) Len() int {
+	if list == nil {
+		return 0
+	}
+	return list.count
+}
 
-func (list EdgeList) IsInline() bool { return list.chunks.root0 == nil && list.chunks.roots == nil }
+func (list *EdgeList) IsInline() bool {
+	return list == nil || list.chunks.root0 == nil && list.chunks.roots == nil
+}
 
-func (list EdgeList) InlineIDs() []uint64 { return list.small }
+func (list *EdgeList) InlineIDs() []uint64 {
+	if list == nil {
+		return nil
+	}
+	return list.small
+}
 
-func (list EdgeList) HasRemovals() bool { return list.removed.Len() != 0 }
+func (list *EdgeList) HasRemovals() bool { return list != nil && list.removed.Len() != 0 }
 
-func (list EdgeList) IsRemoved(id uint64) bool { return list.removed.Has(id) }
+func (list *EdgeList) IsRemoved(id uint64) bool { return list != nil && list.removed.Has(id) }
 
-func (list EdgeList) Chunks() iter.Seq[[]uint64] {
+func (list *EdgeList) Chunks() iter.Seq[[]uint64] {
 	return func(yield func([]uint64) bool) {
+		if list == nil {
+			return
+		}
 		if list.IsInline() {
 			if len(list.small) != 0 {
 				yield(list.small)
@@ -46,64 +61,75 @@ func (list EdgeList) Chunks() iter.Seq[[]uint64] {
 	}
 }
 
-func (list EdgeList) Append(id uint64) EdgeList {
-	if list.IsInline() && len(list.small) < adjacencyInlineLimit {
-		list.small = append(slices.Clone(list.small), id)
-		list.count++
-		list.total++
-		return list
+func (list *EdgeList) Append(id uint64) *EdgeList {
+	result := EdgeList{}
+	if list != nil {
+		result = *list
+	}
+	if result.IsInline() && len(result.small) < adjacencyInlineLimit {
+		result.small = append(slices.Clone(result.small), id)
+		result.count++
+		result.total++
+		return &result
 	}
 	owned := false
-	if list.IsInline() {
-		list.chunks = NewPagedMap[[]uint64]()
-		for start := 0; start < len(list.small); start += adjacencyChunkSize {
-			end := min(start+adjacencyChunkSize, len(list.small))
-			list.chunks.Set(uint64(start/adjacencyChunkSize), list.small[start:end])
+	if result.IsInline() {
+		result.chunks = NewPagedMap[[]uint64]()
+		for start := 0; start < len(result.small); start += adjacencyChunkSize {
+			end := min(start+adjacencyChunkSize, len(result.small))
+			result.chunks.Set(uint64(start/adjacencyChunkSize), result.small[start:end])
 		}
-		list.small = nil
+		result.small = nil
 		owned = true
 	}
-	chunk := uint64(list.total / adjacencyChunkSize)
-	ids := list.chunks.Get(chunk)
-	updated := make([]uint64, len(ids)+1)
-	copy(updated, ids)
-	updated[len(ids)] = id
+	chunk := uint64(result.total / adjacencyChunkSize)
+	ids := result.chunks.Get(chunk)
+	updatedIDs := make([]uint64, len(ids)+1)
+	copy(updatedIDs, ids)
+	updatedIDs[len(ids)] = id
 	if owned {
-		list.chunks.Set(chunk, updated)
+		result.chunks.Set(chunk, updatedIDs)
 	} else {
-		list.chunks = list.chunks.ForkSet(chunk, updated)
+		result.chunks = result.chunks.ForkSet(chunk, updatedIDs)
 	}
-	list.count++
-	list.total++
-	return list
+	result.count++
+	result.total++
+	return &result
 }
 
-func (list EdgeList) Remove(id uint64) EdgeList {
-	if list.IsInline() {
-		for index, edgeID := range list.small {
+func (list *EdgeList) Remove(id uint64) *EdgeList {
+	if list == nil {
+		return nil
+	}
+	result := *list
+	if result.IsInline() {
+		for index, edgeID := range result.small {
 			if edgeID == id {
-				list.small = append(slices.Clone(list.small[:index]), list.small[index+1:]...)
-				list.count--
-				return list
+				result.small = append(slices.Clone(result.small[:index]), result.small[index+1:]...)
+				result.count--
+				return &result
 			}
 		}
 		return list
 	}
-	if list.removed.Has(id) {
+	if result.removed.Has(id) {
 		return list
 	}
-	list.removed = list.removed.Fork()
-	list.removed.CloneShardOnce(id)
-	list.removed.Set(id, struct{}{})
-	list.count--
-	if list.removed.Len() > adjacencyChunkSize && list.removed.Len() > list.count {
-		list = list.compact()
+	result.removed = result.removed.Fork()
+	result.removed.CloneShardOnce(id)
+	result.removed.Set(id, struct{}{})
+	result.count--
+	if result.removed.Len() > adjacencyChunkSize && result.removed.Len() > result.count {
+		return result.compact()
 	}
-	return list
+	return &result
 }
 
-func (list EdgeList) All() iter.Seq[uint64] {
+func (list *EdgeList) All() iter.Seq[uint64] {
 	return func(yield func(uint64) bool) {
+		if list == nil {
+			return
+		}
 		if list.IsInline() {
 			for _, id := range list.small {
 				if !yield(id) {
@@ -123,16 +149,16 @@ func (list EdgeList) All() iter.Seq[uint64] {
 	}
 }
 
-func (list EdgeList) IDs() []uint64 {
-	ids := make([]uint64, 0, list.count)
+func (list *EdgeList) IDs() []uint64 {
+	ids := make([]uint64, 0, list.Len())
 	for id := range list.All() {
 		ids = append(ids, id)
 	}
 	return ids
 }
 
-func (list EdgeList) compact() EdgeList {
-	compacted := EdgeList{}
+func (list *EdgeList) compact() *EdgeList {
+	var compacted *EdgeList
 	for id := range list.All() {
 		compacted = compacted.Append(id)
 	}

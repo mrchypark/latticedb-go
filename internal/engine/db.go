@@ -2544,7 +2544,7 @@ func (tx *Tx) GetIncomingEdgesByType(nodeID uint64, edgeType string, limit uint)
 	return tx.edgesByType(tx.graph.Incoming.Get(nodeID), edgeType, limit), nil
 }
 
-func (tx *Tx) edgesByType(edgeIDs store.EdgeList, edgeType string, limit uint) []Edge {
+func (tx *Tx) edgesByType(edgeIDs *store.EdgeList, edgeType string, limit uint) []Edge {
 	typedIDs := tx.graph.EdgeTypes.Get(edgeType)
 	results := make([]Edge, 0, min(edgeIDs.Len(), len(typedIDs)))
 	typedIndex := 0

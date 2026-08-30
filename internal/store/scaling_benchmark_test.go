@@ -42,6 +42,24 @@ func BenchmarkStreamScaling(b *testing.B) {
 	}
 }
 
+func BenchmarkStreamSnapshotAccountingScaling(b *testing.B) {
+	for _, size := range []int{1_000, 10_000} {
+		base := NewGraphState()
+		base.Streams = benchmarkStreamStore(size)
+		base.SnapshotBytes, _ = EstimateSnapshotBytes(base)
+		updated := CloneGraphStateShallow(base)
+		updated.Streams.Publish("events", "event", int64(size))
+		b.Run(fmt.Sprintf("entries_%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				if _, err := ApplyDeltaSnapshotBytes(base, updated, GraphDelta{StreamsChanged: true}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkPagedMapSequentialSet(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
 		b.Run(fmt.Sprintf("entries_%d", size), func(b *testing.B) {
@@ -85,7 +103,7 @@ func BenchmarkSequentialMapForkSet(b *testing.B) {
 
 func BenchmarkAdjacencyAppendScaling(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
-		var chunked EdgeList
+		var chunked *EdgeList
 		flat := make([]uint64, size)
 		for index := range size {
 			id := uint64(index + 1)
@@ -107,9 +125,41 @@ func BenchmarkAdjacencyAppendScaling(b *testing.B) {
 	}
 }
 
+func BenchmarkGraphAdjacencyForkAppend(b *testing.B) {
+	for _, size := range []int{1_000, 10_000} {
+		var list *EdgeList
+		flat := make([]uint64, size)
+		for index := range size {
+			id := uint64(index + 1)
+			list = list.Append(id)
+			flat[index] = id
+		}
+		paged := NewPagedMap[*EdgeList]()
+		paged.Set(1, list)
+		sharded := NewShardMap[[]uint64]()
+		sharded.Set(1, flat)
+		b.Run(fmt.Sprintf("paged_chunked_%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				fork := paged.Fork()
+				fork.CloneShardOnce(1)
+				fork.Set(1, fork.Get(1).Append(uint64(size+1)))
+			}
+		})
+		b.Run(fmt.Sprintf("sharded_flat_%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				fork := sharded.Fork()
+				fork.CloneShardOnce(1)
+				fork.Set(1, append(slices.Clone(fork.Get(1)), uint64(size+1)))
+			}
+		})
+	}
+}
+
 func BenchmarkAdjacencyReadScaling(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
-		var chunked EdgeList
+		var chunked *EdgeList
 		flat := make([]uint64, size)
 		for index := range size {
 			id := uint64(index + 1)
@@ -153,7 +203,7 @@ func BenchmarkAdjacencyReadScaling(b *testing.B) {
 
 func BenchmarkAdjacencyLookupRequestScaling(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
-		var chunked EdgeList
+		var chunked *EdgeList
 		flat := make([]uint64, size)
 		paged := NewPagedMap[*EdgeRecord]()
 		sharded := NewShardMap[*EdgeRecord]()

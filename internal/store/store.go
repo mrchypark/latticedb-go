@@ -376,8 +376,8 @@ type GraphState struct {
 	Nodes            PagedMap[*NodeRecord]
 	Edges            PagedMap[*EdgeRecord]
 	FTS              PagedMap[*FTSRecord]
-	Outgoing         PagedMap[EdgeList]
-	Incoming         PagedMap[EdgeList]
+	Outgoing         PagedMap[*EdgeList]
+	Incoming         PagedMap[*EdgeList]
 	Labels           StringPostings
 	EdgeTypes        StringPostings
 	FTSTokens        StringPostings
@@ -567,8 +567,8 @@ func NewGraphState() *GraphState {
 		Nodes:            NewPagedMap[*NodeRecord](),
 		Edges:            NewPagedMap[*EdgeRecord](),
 		FTS:              NewPagedMap[*FTSRecord](),
-		Outgoing:         NewPagedMap[EdgeList](),
-		Incoming:         NewPagedMap[EdgeList](),
+		Outgoing:         NewPagedMap[*EdgeList](),
+		Incoming:         NewPagedMap[*EdgeList](),
 		Labels:           NewStringPostings(),
 		EdgeTypes:        NewStringPostings(),
 		FTSTokens:        NewStringPostings(),
@@ -615,7 +615,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 		}
 	}
 	for id, edges := range graph.Outgoing.All() {
-		var list EdgeList
+		var list *EdgeList
 		for chunk := range edges.Chunks() {
 			for _, edgeID := range chunk {
 				if !edges.IsRemoved(edgeID) {
@@ -626,7 +626,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 		cloned.Outgoing.Set(id, list)
 	}
 	for id, edges := range graph.Incoming.All() {
-		var list EdgeList
+		var list *EdgeList
 		for chunk := range edges.Chunks() {
 			for _, edgeID := range chunk {
 				if !edges.IsRemoved(edgeID) {

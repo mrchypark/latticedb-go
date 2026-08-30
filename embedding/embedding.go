@@ -3,6 +3,7 @@ package embedding
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +12,11 @@ import (
 	"math/bits"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -66,8 +70,15 @@ func Hash(text string, dimensions uint16) ([]float32, error) {
 
 	vector := make([]float32, dimensions)
 	var lower [64]byte
+	unicodeText := false
+
+asciiTokens:
 	for offset := 0; offset < len(text); {
 		for offset < len(text) && !hashWordByte(text[offset]) {
+			if text[offset] >= utf8.RuneSelf {
+				unicodeText = true
+				break asciiTokens
+			}
 			offset++
 		}
 		start := offset
@@ -82,15 +93,11 @@ func Hash(text string, dimensions uint16) ([]float32, error) {
 			lower[index] = lowerASCII(text[start+index])
 		}
 		token := lower[:length]
-		if hashStopWord(token) {
-			continue
-		}
-		hash := wyhash(0, token)
-		if hash>>63 == 0 {
-			vector[hash%uint64(dimensions)]++
-		} else {
-			vector[hash%uint64(dimensions)]--
-		}
+		addHashToken(vector, token)
+	}
+	if unicodeText {
+		clear(vector)
+		hashUnicodeTokens(vector, text)
 	}
 
 	var squared float32
@@ -104,6 +111,44 @@ func Hash(text string, dimensions uint16) ([]float32, error) {
 		}
 	}
 	return vector, nil
+}
+
+func hashUnicodeTokens(vector []float32, text string) {
+	start := -1
+	for index, char := range text {
+		if unicode.IsLetter(char) || unicode.IsNumber(char) || char == '_' {
+			if start < 0 {
+				start = index
+			}
+			continue
+		}
+		if start >= 0 {
+			addUnicodeHashToken(vector, text[start:index])
+			start = -1
+		}
+	}
+	if start >= 0 {
+		addUnicodeHashToken(vector, text[start:])
+	}
+}
+
+func addUnicodeHashToken(vector []float32, token string) {
+	if utf8.RuneCountInString(token) < 2 {
+		return
+	}
+	addHashToken(vector, []byte(strings.ToLower(token)))
+}
+
+func addHashToken(vector []float32, token []byte) {
+	if hashStopWord(token) {
+		return
+	}
+	hash := wyhash(0, token)
+	if hash>>63 == 0 {
+		vector[hash%uint64(len(vector))]++
+	} else {
+		vector[hash%uint64(len(vector))]--
+	}
 }
 
 // HashEmbed is a compatibility alias for Hash.
@@ -144,23 +189,33 @@ func (client *Client) Close() error {
 
 // Embed requests one vector from the configured endpoint.
 func (client *Client) Embed(text string) ([]float32, error) {
+	return client.EmbedContext(context.Background(), text)
+}
+
+// EmbedContext requests one vector and allows the caller to cancel the HTTP request.
+func (client *Client) EmbedContext(ctx context.Context, text string) ([]float32, error) {
 	if client == nil {
 		return nil, ErrClosed
 	}
 	if text == "" {
 		return nil, errors.New("embedding text is empty")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	client.mu.RLock()
-	defer client.mu.RUnlock()
 	if client.closed {
+		client.mu.RUnlock()
 		return nil, ErrClosed
 	}
+	httpClient := client.client
+	client.mu.RUnlock()
 
 	body, err := json.Marshal(client.request(text))
 	if err != nil {
 		return nil, fmt.Errorf("encode embedding request: %w", err)
 	}
-	request, err := http.NewRequest(http.MethodPost, client.config.Endpoint, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, client.config.Endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create embedding request: %w", err)
 	}
@@ -168,7 +223,7 @@ func (client *Client) Embed(text string) ([]float32, error) {
 	if client.config.APIKey != "" {
 		request.Header.Set("Authorization", "Bearer "+client.config.APIKey)
 	}
-	response, err := client.client.Do(request)
+	response, err := httpClient.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("embedding request: %w", err)
 	}
@@ -210,7 +265,7 @@ func (client *Client) parse(data []byte) ([]float32, error) {
 				Embedding []float32 `json:"embedding"`
 			} `json:"data"`
 		}
-		if err := json.Unmarshal(data, &response); err != nil || len(response.Data) == 0 || response.Data[0].Embedding == nil {
+		if err := json.Unmarshal(data, &response); err != nil || len(response.Data) != 1 || len(response.Data[0].Embedding) == 0 {
 			return nil, errors.New("invalid OpenAI embedding response")
 		}
 		return response.Data[0].Embedding, nil
@@ -218,7 +273,7 @@ func (client *Client) parse(data []byte) ([]float32, error) {
 	var response struct {
 		Embedding []float32 `json:"embedding"`
 	}
-	if err := json.Unmarshal(data, &response); err != nil || response.Embedding == nil {
+	if err := json.Unmarshal(data, &response); err != nil || len(response.Embedding) == 0 {
 		return nil, errors.New("invalid Ollama embedding response")
 	}
 	return response.Embedding, nil
