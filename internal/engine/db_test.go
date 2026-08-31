@@ -2228,6 +2228,449 @@ func TestQueryQuotedOperatorsAreNotStructural(t *testing.T) {
 	}
 }
 
+func TestAnonymousParameterizedMatchSupportsTraversal(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "anonymous-match.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		alice, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Alice"}})
+		if err != nil {
+			return err
+		}
+		bob, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Bob"}})
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateEdge(alice.ID, bob.ID, "KNOWS", CreateEdgeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	params := map[string]any{"name": "Alice"}
+	result, err := db.Query("MATCH ({name: $name})-[:KNOWS]->(b) RETURN b.name", params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["b.name"] != "Bob" {
+		t.Fatalf("anonymous traversal result = %#v", result.Rows)
+	}
+	result, err = db.Query("MATCH ({name: $name}) RETURN count(*) AS count", params)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("anonymous node result = %#v, %v", result.Rows, err)
+	}
+}
+
+func TestMatchPathSyntaxNormalizesToExistingTraversal(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "path-syntax.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		alice, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Alice"}})
+		if err != nil {
+			return err
+		}
+		bob, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Bob"}})
+		if err != nil {
+			return err
+		}
+		carol, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Carol"}})
+		if err != nil {
+			return err
+		}
+		if _, err = tx.CreateEdge(alice.ID, bob.ID, "KNOWS", CreateEdgeOptions{Properties: map[string]any{"since": int64(2024)}}); err != nil {
+			return err
+		}
+		_, err = tx.CreateEdge(bob.ID, carol.ID, "KNOWS", CreateEdgeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	queries := []string{
+		`MATCH (b {name: "Bob"})<-[r:KNOWS]-(a) RETURN a.name AS name`,
+		`MATCH (a)-[:KNOWS {since: $since}]->(b) RETURN b.name AS name`,
+		`MATCH (a {name: "Alice"})-[:KNOWS]->()-[:KNOWS]->(c) RETURN c.name AS name`,
+	}
+	for _, query := range queries {
+		result, err := db.Query(query, map[string]any{"since": int64(2024)})
+		if err != nil {
+			t.Fatalf("Query(%q): %v", query, err)
+		}
+		want := "Alice"
+		if strings.Contains(query, "since") {
+			want = "Bob"
+		} else if strings.Contains(query, "->()") {
+			want = "Carol"
+		}
+		if len(result.Rows) != 1 || result.Rows[0]["name"] != want {
+			t.Fatalf("Query(%q) = %#v, want %q", query, result.Rows, want)
+		}
+	}
+}
+
+func TestReturnAliasAndParameterizedPagination(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "pagination.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for _, value := range []int64{3, 1, 2} {
+			if _, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"value": value}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.Query("MATCH (n) RETURN n.value AS value ORDER BY value SKIP $skip LIMIT $limit", map[string]any{"skip": 1, "limit": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["value"] != int64(2) {
+		t.Fatalf("paginated rows = %#v", result.Rows)
+	}
+	for _, params := range []map[string]any{{"skip": -1, "limit": 1}, {"skip": 0, "limit": "one"}} {
+		if _, err := db.Query("MATCH (n) RETURN n.value SKIP $skip LIMIT $limit", params); err == nil {
+			t.Fatalf("pagination unexpectedly accepted %#v", params)
+		}
+	}
+}
+
+func TestMutationCompositionReturnsUpdatedBindings(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "mutation-return.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Source"}, Properties: map[string]any{"old": true}}); err != nil {
+			return err
+		}
+		_, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Target"}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.Query("MATCH (n:Source) SET n.a = 1, n.b = 2 RETURN n.a AS a, n.b AS b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["a"] != int64(1) || result.Rows[0]["b"] != int64(2) {
+		t.Fatalf("SET RETURN rows = %#v", result.Rows)
+	}
+	result, err = db.Query("MATCH (n:Source) REMOVE n.old RETURN n.old AS old", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["old"] != nil {
+		t.Fatalf("REMOVE RETURN rows = %#v", result.Rows)
+	}
+	result, err = db.Query("MATCH (a:Source), (b:Target) CREATE (a)-[r:LINK {weight: 1}]->(b) RETURN id(r) AS edge", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["edge"] == nil {
+		t.Fatalf("CREATE RETURN rows = %#v", result.Rows)
+	}
+}
+
+func TestBooleanWherePredicatesAndComparisons(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "where-predicate.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for _, props := range []map[string]any{
+			{"name": "ten", "age": int64(10), "active": true},
+			{"name": "twenty", "age": int64(20), "active": false, "admin": true},
+			{"name": "thirty", "age": int64(30)},
+		} {
+			if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Person"}, Properties: props}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		where string
+		want  []string
+	}{
+		{"n.age >= 20 AND n.age < 30", []string{"twenty"}},
+		{"n.age <> 20", []string{"ten", "thirty"}},
+		{"n.active = true OR n.admin = true", []string{"ten", "twenty"}},
+		{"NOT (n.active = true OR n.age >= 30)", []string{"twenty"}},
+		{"NOT n.admin = true", nil},
+	}
+	for _, test := range tests {
+		result, err := db.Query("MATCH (n:Person) WHERE "+test.where+" RETURN n.name AS name ORDER BY name", nil)
+		if err != nil {
+			t.Fatalf("WHERE %s: %v", test.where, err)
+		}
+		got := make([]string, len(result.Rows))
+		for index, row := range result.Rows {
+			got[index] = row["name"].(string)
+		}
+		if !slices.Equal(got, test.want) {
+			t.Fatalf("WHERE %s = %v, want %v", test.where, got, test.want)
+		}
+	}
+}
+
+func TestMixedNumericComparisonPreservesIntegerPrecision(t *testing.T) {
+	tests := []struct {
+		left  any
+		right any
+		want  int
+	}{
+		{int64(9_007_199_254_740_993), float64(9_007_199_254_740_992), 1},
+		{int64(1), 1.5, -1},
+		{int64(-1), -1.5, 1},
+	}
+	for _, test := range tests {
+		got, ok := compareQueryValues(test.left, test.right)
+		if !ok || got != test.want {
+			t.Fatalf("compareQueryValues(%v, %v) = %d, %v; want %d, true", test.left, test.right, got, ok, test.want)
+		}
+	}
+}
+
+func TestCypherCompatibilitySyntaxBatch(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "cypher-compatibility.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, query := range []string{
+		"CREATE\t(:Item {name: 'Alpha', kind: 'first', text: 'A  B'})\n;",
+		"CREATE (:Item {name: 'Beta', kind: 'second'});",
+	} {
+		if _, err := db.Query(query, nil); err != nil {
+			t.Fatalf("Query(%q): %v", query, err)
+		}
+	}
+	result, err := db.Query("MATCH\n(n:Item)\nWHERE n.text = 'A  B'\nRETURN n.name AS name;", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["name"] != "Alpha" {
+		t.Fatalf("normalized query result = %#v, %v", result.Rows, err)
+	}
+
+	result, err = db.Query("MATCH (a:Item {name: 'Alpha'}), (b:Item {name: 'Beta'}) CREATE (a)<-[r:LINK]-(b) RETURN id(r) AS edge;", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["edge"] == nil {
+		t.Fatalf("incoming CREATE result = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (a:Item {name: 'Alpha'})<-[r:LINK]-(b:Item) RETURN b.name AS name", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["name"] != "Beta" {
+		t.Fatalf("incoming edge result = %#v, %v", result.Rows, err)
+	}
+
+	result, err = db.Query("MATCH (n:Item {name: 'Alpha'}) SET n:Active RETURN n.name AS name", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["name"] != "Alpha" {
+		t.Fatalf("SET label result = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Active) RETURN count(n) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("SET label count = %#v, %v", result.Rows, err)
+	}
+
+	predicateTests := []struct {
+		where string
+		args  map[string]any
+		want  []string
+	}{
+		{"n.kind IN $kinds", map[string]any{"kinds": []any{"second"}}, []string{"Beta"}},
+		{"n.name STARTS WITH $text", map[string]any{"text": "Al"}, []string{"Alpha"}},
+		{"n.name ENDS WITH $text", map[string]any{"text": "ta"}, []string{"Beta"}},
+		{"n.name CONTAINS $text", map[string]any{"text": "ph"}, []string{"Alpha"}},
+	}
+	for _, test := range predicateTests {
+		result, err := db.Query("MATCH (n:Item) WHERE "+test.where+" RETURN n.name AS name ORDER BY name", test.args)
+		if err != nil {
+			t.Fatalf("WHERE %s: %v", test.where, err)
+		}
+		got := make([]string, len(result.Rows))
+		for index, row := range result.Rows {
+			got[index] = row["name"].(string)
+		}
+		if !slices.Equal(got, test.want) {
+			t.Fatalf("WHERE %s = %v, want %v", test.where, got, test.want)
+		}
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.name STARTS WITH 'Al' OR n.name ENDS WITH 'ta' RETURN n.name AS name ORDER BY name", nil)
+	if err != nil || len(result.Rows) != 2 {
+		t.Fatalf("combined string predicate rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE NOT (n.kind IN $kinds) RETURN n.name", map[string]any{"kinds": []any{"missing", nil}})
+	if err != nil || len(result.Rows) != 0 {
+		t.Fatalf("NULL IN predicate rows = %#v, %v", result.Rows, err)
+	}
+	if _, err := db.Query("MATCH (n:Item) WHERE n.kind IN $kinds RETURN n", map[string]any{"kinds": "first"}); err == nil {
+		t.Fatal("IN accepted a non-list parameter")
+	}
+
+	if _, err := db.Query("MATCH (n:Active) DETACH DELETE n;", nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err = db.Query("MATCH ()-[r]->() RETURN count(r) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("DETACH DELETE edge count = %#v, %v", result.Rows, err)
+	}
+}
+
+func TestAdditionalCypherSyntaxBatch(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "additional-cypher.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		var nodes []Node
+		for _, props := range []map[string]any{
+			{"id": int64(1), "name": "Alpha", "min": int64(1), "value": int64(2), "group": "same", "numeric": int64(1), "nested": []any{int64(1), map[string]any{"value": int64(2)}}, "bucket": "all"},
+			{"id": int64(2), "name": "Beta", "min": int64(3), "value": int64(2), "group": "same", "numeric": float64(1), "nested": []any{float64(1), map[string]any{"value": float64(2)}}, "bucket": "all"},
+			{"id": int64(3), "name": "Gamma", "min": int64(0), "value": int64(0), "group": "other", "numeric": float64(2), "bucket": "all"},
+		} {
+			node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: props})
+			if err != nil {
+				return err
+			}
+			nodes = append(nodes, node)
+		}
+		if _, err := tx.CreateEdge(nodes[0].ID, nodes[1].ID, "LINK", CreateEdgeOptions{}); err != nil {
+			return err
+		}
+		if _, err := tx.CreateEdge(nodes[0].ID, nodes[0].ID, "LINK", CreateEdgeOptions{}); err != nil {
+			return err
+		}
+		_, err := tx.CreateEdge(nodes[0].ID, nodes[0].ID, "SELF", CreateEdgeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNodePropertyIndex("Item", "bucket"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.Query("MATCH (n:Item) WHERE n.min <= n.value RETURN n.id AS id ORDER BY id", nil)
+	if err != nil || len(result.Rows) != 2 || result.Rows[0]["id"] != int64(1) || result.Rows[1]["id"] != int64(3) {
+		t.Fatalf("property comparison rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item {id: 1}) SET n.copy = n.name RETURN n.copy AS copy", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["copy"] != "Alpha" {
+		t.Fatalf("property SET rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (a:Item {id: 1}), (b:Item {id: 2}) CREATE (a)-[r:WEIGHTED {weight: b.value}]->(b) RETURN r.weight AS weight", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["weight"] != int64(2) {
+		t.Fatalf("property CREATE rows = %#v, %v", result.Rows, err)
+	}
+
+	result, err = db.Query("UNWIND $items AS item CREATE (n:Item {id: item.id}) RETURN n.id AS id ORDER BY id", map[string]any{"items": []any{map[string]any{"id": int64(4)}, map[string]any{"id": int64(5)}}})
+	if err != nil || len(result.Rows) != 2 || result.Rows[0]["id"] != int64(4) || result.Rows[1]["id"] != int64(5) {
+		t.Fatalf("UNWIND CREATE rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted SET n.selected = true RETURN DISTINCT n.id AS id ORDER BY id", map[string]any{"ids": []any{int64(1), int64(1), int64(2)}})
+	if err != nil || len(result.Rows) != 2 || result.Rows[0]["id"] != int64(1) || result.Rows[1]["id"] != int64(2) {
+		t.Fatalf("UNWIND MATCH SET rows = %#v, %v", result.Rows, err)
+	}
+	if _, err := db.Query("UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted REMOVE n.selected", map[string]any{"ids": []any{int64(2)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Query("UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted DELETE n", map[string]any{"ids": []any{int64(4), int64(5)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err = db.Query("MATCH (a:Item)-[:LINK]-(b:Item) RETURN a.id AS a, b.id AS b ORDER BY a, b", nil)
+	if err != nil || len(result.Rows) != 3 || result.Rows[0]["a"] != int64(1) || result.Rows[0]["b"] != int64(1) || result.Rows[1]["b"] != int64(2) || result.Rows[2]["a"] != int64(2) {
+		t.Fatalf("undirected rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (a:Item)-[:LINK]-(a) RETURN count(*) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("undirected repeated binding count = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (a:Item)-[:LINK]-(b:Item) RETURN DISTINCT a.id AS id ORDER BY id SKIP 1 LIMIT 1", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["id"] != int64(2) {
+		t.Fatalf("DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.numeric IS NOT NULL RETURN DISTINCT n.numeric AS numeric ORDER BY numeric", nil)
+	if err != nil || len(result.Rows) != 2 {
+		t.Fatalf("numeric DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.nested IS NOT NULL RETURN DISTINCT n.nested AS nested", nil)
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("nested numeric DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) RETURN DISTINCT n.absent AS absent", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["absent"] != nil {
+		t.Fatalf("nil DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.bucket = 'all' RETURN DISTINCT n.group AS group LIMIT 2", nil)
+	if err != nil || len(result.Rows) != 2 {
+		t.Fatalf("indexed DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+
+	mutation := "MATCH (a:Item)-[:WEIGHTED]-(b:Item) SET a.marked = true RETURN a.marked AS a, b.marked AS b"
+	if _, err := db.QueryContext(context.Background(), mutation, nil, QueryOptions{MaxRows: 1}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("undirected row budget error = %v, want ErrResourceLimit", err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.marked IS NOT NULL RETURN count(n) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("budget failure persisted mutation: %#v, %v", result.Rows, err)
+	}
+	result, err = db.QueryContext(context.Background(), mutation, nil, QueryOptions{MaxRows: 2})
+	if err != nil || len(result.Rows) != 2 {
+		t.Fatalf("undirected mutation rows = %#v, %v", result.Rows, err)
+	}
+	for _, row := range result.Rows {
+		if row["a"] != true || row["b"] != true {
+			t.Fatalf("stale mutation binding row = %#v", row)
+		}
+	}
+	result, err = db.Query("MATCH (a:Item)-[:WEIGHTED]-(b:Item) SET a.x = 1, b.y = a.x RETURN b.y AS y", nil)
+	if err != nil || len(result.Rows) != 2 || result.Rows[0]["y"] != int64(1) || result.Rows[1]["y"] != int64(1) {
+		t.Fatalf("stale SET expression rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.QueryContext(context.Background(), "MATCH (a:Item)-[:SELF]-(b:Item) RETURN a.id AS a, b.id AS b", nil, QueryOptions{MaxRows: 1})
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("undirected self-loop rows = %#v, %v", result.Rows, err)
+	}
+}
+
+func TestUnsupportedCreatePatternFailsBeforeMutation(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "partial-create.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, query := range []string{
+		"CREATE (a:Person {name: $a})-[e:KNOWS]->(b:Person {name: $b})",
+		"CREATE (:Person)-[:KNOWS]->(:Person)",
+	} {
+		if _, err := db.Query(query, map[string]any{"a": "Alice", "b": "Bob"}); err == nil {
+			t.Fatalf("unsupported create pattern unexpectedly succeeded: %s", query)
+		}
+	}
+	result, err := db.Query("MATCH (n) RETURN count(n) AS count", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("unsupported CREATE partially mutated graph: %#v", result.Rows)
+	}
+}
+
 func TestQuerySemanticValidationFailsClosed(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "query-semantics.ltdb"), OpenOptions{Create: true})
 	if err != nil {

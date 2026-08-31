@@ -11,7 +11,7 @@ var testRecoveryHarness RecoveryHarness
 func currentRecoveryHarness(t *testing.T) RecoveryHarness {
 	t.Helper()
 	if testRecoveryHarness == nil {
-		t.Skip("conformance recovery harness not configured")
+		t.Fatal("conformance recovery harness not configured")
 	}
 	return testRecoveryHarness
 }

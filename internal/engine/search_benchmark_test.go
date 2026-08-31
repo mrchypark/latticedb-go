@@ -40,6 +40,7 @@ func BenchmarkFTSSearchScaling(b *testing.B) {
 			for _, benchmark := range queries {
 				b.Run(benchmark.name, func(b *testing.B) {
 					b.ReportAllocs()
+					benchmark.opts.MaxWork = ^uint64(0)
 					for range b.N {
 						if _, err := db.FTSSearch(benchmark.query, benchmark.opts); err != nil {
 							b.Fatal(err)

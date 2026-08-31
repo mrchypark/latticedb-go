@@ -28,11 +28,6 @@ const (
 	ExportFormatDOT   ExportFormat = "dot"
 )
 
-type exportedGraph struct {
-	Nodes []exportedNode `json:"nodes"`
-	Edges []exportedEdge `json:"edges"`
-}
-
 type csvManifest struct {
 	Generation string `json:"generation"`
 	Nodes      string `json:"nodes"`
@@ -79,9 +74,17 @@ func ExportGraph(graph *store.GraphState, format ExportFormat, outputPath string
 }
 
 func ExportGraphContext(ctx context.Context, graph *store.GraphState, format ExportFormat, outputPath string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	unlock, err := acquireExportLockContext(ctx, outputPath)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	switch format {
 	case ExportFormatJSON:
 		return exportJSONContext(ctx, graph, outputPath)
@@ -202,23 +205,15 @@ func SimulateCrash(dbPath string) error {
 	return store.SimulateCrash(dbPath)
 }
 
-func exportJSON(graph *store.GraphState, outputPath string) ([]byte, error) {
-	return exportJSONContext(context.Background(), graph, outputPath)
-}
-
 func exportJSONContext(ctx context.Context, graph *store.GraphState, outputPath string) ([]byte, error) {
 	data, err := DumpGraphContext(ctx, graph)
 	if err != nil {
 		return nil, err
 	}
-	if err := writeAtomicContext(ctx, outputPath, data); err != nil {
+	if _, err := writeAtomicContext(ctx, outputPath, data); err != nil {
 		return nil, err
 	}
 	return data, nil
-}
-
-func exportJSONL(graph *store.GraphState, outputPath string) ([]byte, error) {
-	return exportJSONLContext(context.Background(), graph, outputPath)
 }
 
 func exportJSONLContext(ctx context.Context, graph *store.GraphState, outputPath string) ([]byte, error) {
@@ -227,14 +222,10 @@ func exportJSONLContext(ctx context.Context, graph *store.GraphState, outputPath
 		return nil, err
 	}
 	data := output.Bytes()
-	if err := writeAtomicContext(ctx, outputPath, data); err != nil {
+	if _, err := writeAtomicContext(ctx, outputPath, data); err != nil {
 		return nil, err
 	}
 	return data, nil
-}
-
-func exportJSONLTo(graph *store.GraphState, output io.Writer) error {
-	return exportJSONLContextTo(context.Background(), graph, output)
 }
 
 func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output io.Writer) error {
@@ -293,24 +284,15 @@ func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output i
 }
 
 func exportCSV(ctx context.Context, graph *store.GraphState, outputPath string) ([]byte, error) {
-	unlock, err := acquireExportLockContext(ctx, outputPath)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	base := strings.TrimSuffix(outputPath, filepath.Ext(outputPath))
-	nodesPath := base + "_nodes.csv"
-	edgesPath := base + "_edges.csv"
-	generationsPath := base + "_csv_generations"
+	generationsPath := outputPath + "_generations"
 	if err := os.MkdirAll(generationsPath, 0o700); err != nil {
 		return nil, err
 	}
-	var previous csvManifest
-	if data, err := os.ReadFile(outputPath); err == nil {
-		_ = json.Unmarshal(data, &previous)
+	if err := removeStaleCSVBuilds(generationsPath); err != nil {
+		return nil, err
 	}
 	buildingPath, err := os.MkdirTemp(generationsPath, ".building-")
 	if err != nil {
@@ -335,7 +317,7 @@ func exportCSV(ctx context.Context, graph *store.GraphState, outputPath string) 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := os.Rename(buildingPath, generationPath); err != nil {
+	if err := replaceOutput(buildingPath, generationPath); err != nil {
 		return nil, err
 	}
 	generationNodes = filepath.Join(generationPath, "nodes.csv")
@@ -356,18 +338,16 @@ func exportCSV(ctx context.Context, graph *store.GraphState, outputPath string) 
 	if err != nil {
 		return nil, err
 	}
-	if err := writeAtomicContext(ctx, outputPath, manifest); err != nil {
+	published, err := writeAtomicContext(ctx, outputPath, manifest)
+	if published {
+		generationPublished = true
+	}
+	if err != nil {
 		return nil, err
 	}
-	generationPublished = true
-	_ = publishCompatibility(generationNodes, nodesPath)
-	_ = publishCompatibility(generationEdges, edgesPath)
-	retainCSVGenerations(generationsPath, manifestValue.Generation, previous.Generation)
+	// ponytail: generations remain immutable because readers have no lease;
+	// add explicit reader leases before reclaiming them automatically.
 	return manifest, nil
-}
-
-func exportDOT(graph *store.GraphState, outputPath string) ([]byte, error) {
-	return exportDOTContext(context.Background(), graph, outputPath)
 }
 
 func exportDOTContext(ctx context.Context, graph *store.GraphState, outputPath string) ([]byte, error) {
@@ -377,14 +357,10 @@ func exportDOTContext(ctx context.Context, graph *store.GraphState, outputPath s
 	}
 
 	data := []byte(builder.String())
-	if err := writeAtomicContext(ctx, outputPath, data); err != nil {
+	if _, err := writeAtomicContext(ctx, outputPath, data); err != nil {
 		return nil, err
 	}
 	return data, nil
-}
-
-func exportDOTTo(graph *store.GraphState, output io.Writer) error {
-	return exportDOTContextTo(context.Background(), graph, output)
 }
 
 func exportDOTContextTo(ctx context.Context, graph *store.GraphState, output io.Writer) error {
@@ -447,41 +423,6 @@ func (writer contextOutputWriter) Write(value []byte) (int, error) {
 		err = writer.ctx.Err()
 	}
 	return written, err
-}
-
-func marshalExportGraph(graph *store.GraphState) ([]byte, error) {
-	exported := exportedGraph{
-		Nodes: make([]exportedNode, 0, graph.Nodes.Len()),
-		Edges: make([]exportedEdge, 0, graph.Edges.Len()),
-	}
-
-	for _, nodeID := range store.SortedNodeIDs(graph) {
-		node := graph.Nodes.Get(nodeID)
-		props, err := exportPropertyMap(node.Properties)
-		if err != nil {
-			return nil, err
-		}
-		exported.Nodes = append(exported.Nodes, exportedNode{
-			ID:         strconv.FormatUint(node.ID, 10),
-			Labels:     sortedLabels(node.Labels),
-			Properties: props,
-		})
-	}
-	for _, edgeID := range sortedCanonicalEdgeIDs(graph) {
-		edge := graph.Edges.Get(edgeID)
-		props, err := exportPropertyMap(edge.Properties)
-		if err != nil {
-			return nil, err
-		}
-		exported.Edges = append(exported.Edges, exportedEdge{
-			ID:         strconv.FormatUint(edge.ID, 10),
-			Source:     strconv.FormatUint(edge.SourceID, 10),
-			Target:     strconv.FormatUint(edge.TargetID, 10),
-			Type:       edge.Type,
-			Properties: props,
-		})
-	}
-	return json.Marshal(exported)
 }
 
 func sortedCanonicalEdgeIDs(graph *store.GraphState) []uint64 {
@@ -586,10 +527,6 @@ func exportValue(value any) (exportedValue, error) {
 	return exportedValue{}, fmt.Errorf("unsupported export value type %T", value)
 }
 
-func writeNodesCSV(graph *store.GraphState, path string) error {
-	return writeNodesCSVContext(context.Background(), graph, path)
-}
-
 func writeNodesCSVContext(ctx context.Context, graph *store.GraphState, path string) error {
 	file, tempPath, err := createTempOutput(path)
 	if err != nil {
@@ -618,19 +555,19 @@ func writeNodesCSVContext(ctx context.Context, graph *store.GraphState, path str
 		if err != nil {
 			return err
 		}
+		labels, err := json.Marshal(sortedLabels(node.Labels))
+		if err != nil {
+			return err
+		}
 		if err := writer.Write([]string{
 			strconv.FormatUint(node.ID, 10),
-			strings.Join(node.Labels, "|"),
+			string(labels),
 			string(propsJSON),
 		}); err != nil {
 			return err
 		}
 	}
 	return finishCSVOutput(file, writer, tempPath, path)
-}
-
-func writeEdgesCSV(graph *store.GraphState, path string) error {
-	return writeEdgesCSVContext(context.Background(), graph, path)
 }
 
 func writeEdgesCSVContext(ctx context.Context, graph *store.GraphState, path string) error {
@@ -674,29 +611,25 @@ func writeEdgesCSVContext(ctx context.Context, graph *store.GraphState, path str
 	return finishCSVOutput(file, writer, tempPath, path)
 }
 
-func writeAtomic(path string, data []byte) error {
-	return writeAtomicContext(context.Background(), path, data)
-}
-
-func writeAtomicContext(ctx context.Context, path string, data []byte) error {
+func writeAtomicContext(ctx context.Context, path string, data []byte) (bool, error) {
 	file, tempPath, err := createTempOutput(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer os.Remove(tempPath)
 	if _, err := (contextOutputWriter{ctx: ctx, output: file}).Write(data); err != nil {
 		_ = file.Close()
-		return err
+		return false, err
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return err
+		return false, err
 	}
 	if err := file.Close(); err != nil {
-		return err
+		return false, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	return publishTempOutput(tempPath, path)
 }
@@ -723,74 +656,35 @@ func finishCSVOutput(file *os.File, writer *csv.Writer, tempPath string, path st
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return publishTempOutput(tempPath, path)
+	_, err := publishTempOutput(tempPath, path)
+	return err
 }
 
-func publishTempOutput(tempPath string, path string) error {
-	if err := os.Rename(tempPath, path); err != nil {
-		return err
-	}
-	return syncOutputDirectory(filepath.Dir(path))
+func publishTempOutput(tempPath string, path string) (bool, error) {
+	return publishTempOutputWithSync(tempPath, path, syncOutputDirectory)
 }
 
-func publishLink(source string, path string) error {
-	temp, err := os.CreateTemp(filepath.Dir(path), ".latticedb-export-link-*.tmp")
-	if err != nil {
-		return err
+func publishTempOutputWithSync(tempPath string, path string, syncDirectory func(string) error) (bool, error) {
+	if err := replaceOutput(tempPath, path); err != nil {
+		return false, err
 	}
-	tempPath := temp.Name()
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	defer os.Remove(tempPath)
-	if err := os.Remove(tempPath); err != nil {
-		return err
-	}
-	if err := os.Link(source, tempPath); err != nil {
-		return err
-	}
-	return publishTempOutput(tempPath, path)
+	return true, syncDirectory(filepath.Dir(path))
 }
 
-func publishCompatibility(source string, path string) error {
-	if err := publishLink(source, path); err == nil {
-		return nil
-	}
-	input, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	defer input.Close()
-	output, tempPath, err := createTempOutput(path)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tempPath)
-	if _, err := io.Copy(output, input); err != nil {
-		_ = output.Close()
-		return err
-	}
-	if err := output.Sync(); err != nil {
-		_ = output.Close()
-		return err
-	}
-	if err := output.Close(); err != nil {
-		return err
-	}
-	return publishTempOutput(tempPath, path)
-}
-
-func retainCSVGenerations(path string, current string, previous string) {
+func removeStaleCSVBuilds(path string) error {
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		return
+		return err
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() && strings.HasPrefix(name, "generation-") && name != current && name != previous {
-			_ = os.RemoveAll(filepath.Join(path, name))
+		if entry.IsDir() && strings.HasPrefix(name, ".building-") {
+			if err := os.RemoveAll(filepath.Join(path, name)); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 func syncOutputDirectory(path string) error {

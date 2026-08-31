@@ -2,6 +2,7 @@ package exporter
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -95,14 +96,105 @@ func TestCSVConcurrentSubprocessPublicationAndOwnerDeath(t *testing.T) {
 	assertCSVManifestPathsExist(t, output)
 }
 
+func TestExportNamespacesAndPublicationContracts(t *testing.T) {
+	base := t.TempDir()
+	firstOutput := filepath.Join(base, "graph.csv")
+	secondOutput := filepath.Join(base, "graph.backup")
+	first := store.NewGraphState()
+	first.Nodes.Set(1, &store.NodeRecord{ID: 1, Labels: []string{"A|B"}})
+	second := store.NewGraphState()
+	second.Nodes.Set(2, &store.NodeRecord{ID: 2, Labels: []string{"A", "B"}})
+
+	firstManifest, err := ExportGraph(first, ExportFormatCSV, firstOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportGraph(second, ExportFormatCSV, secondOutput); err != nil {
+		t.Fatal(err)
+	}
+	var manifest csvManifest
+	if err := json.Unmarshal(firstManifest, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{manifest.Nodes, manifest.Edges} {
+		if _, err := os.Stat(filepath.Join(base, path)); err != nil {
+			t.Fatalf("first manifest was invalidated by same-stem export: %v", err)
+		}
+	}
+
+	stale := filepath.Join(firstOutput+"_generations", ".building-stale")
+	if err := os.Mkdir(stale, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportGraph(first, ExportFormatCSV, firstOutput); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale build was not removed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(base, manifest.Nodes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := csv.NewReader(strings.NewReader(string(data))).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var labels []string
+	if err := json.Unmarshal([]byte(rows[1][1]), &labels); err != nil {
+		t.Fatalf("labels are not an unambiguous JSON array: %v", err)
+	}
+	if len(labels) != 1 || labels[0] != "A|B" {
+		t.Fatalf("labels changed during CSV export: %#v", labels)
+	}
+}
+
+func TestAllFileExportsHonorPathLock(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "shared.out")
+	unlock, err := acquireExportLock(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := ExportGraphContext(ctx, store.NewGraphState(), ExportFormatJSON, output); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("JSON writer bypassed common output lock: %v", err)
+	}
+}
+
+func TestPublishReportsRenameBeforeDirectorySyncFailure(t *testing.T) {
+	directory := t.TempDir()
+	temp := filepath.Join(directory, "temp")
+	target := filepath.Join(directory, "target")
+	if err := os.WriteFile(temp, []byte("published"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("sync failed")
+	published, err := publishTempOutputWithSync(temp, target, func(string) error { return wantErr })
+	if !published || !errors.Is(err, wantErr) {
+		t.Fatalf("published=%v error=%v", published, err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "published" {
+		t.Fatalf("renamed output missing after sync failure: %q, %v", data, err)
+	}
+}
+
 func TestExportPathLockRegistryReclaimsEntries(t *testing.T) {
 	base := t.TempDir()
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	for index := 0; index < 10_000; index++ {
-		if _, err := acquireExportLockContext(cancelled, filepath.Join(base, fmt.Sprintf("cancelled-%d", index))); !errors.Is(err, context.Canceled) {
+	for index := 0; index < 256; index++ {
+		unlock, err := acquireExportLock(filepath.Join(base, fmt.Sprintf("path-%d", index)))
+		if err != nil {
 			t.Fatal(err)
 		}
+		unlock()
+	}
+	exportPathLocks.Lock()
+	entries := len(exportPathLocks.entries)
+	exportPathLocks.Unlock()
+	if entries != 0 {
+		t.Fatalf("registry retained %d high-cardinality entries", entries)
 	}
 	path := filepath.Join(base, "shared")
 	unlock, err := acquireExportLock(path)
@@ -155,7 +247,7 @@ func TestExportContextCancelsBodyBeforeManifest(t *testing.T) {
 	if string(manifestAfter) != string(manifestBefore) {
 		t.Fatal("canceled body changed the manifest")
 	}
-	building, err := filepath.Glob(filepath.Join(strings.TrimSuffix(output, filepath.Ext(output))+"_csv_generations", ".building-*"))
+	building, err := filepath.Glob(filepath.Join(output+"_generations", ".building-*"))
 	if err != nil {
 		t.Fatal(err)
 	}

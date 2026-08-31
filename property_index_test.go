@@ -290,6 +290,21 @@ func TestPropertyIndexTracksQueryLabelPropertyAndEntityRemoval(t *testing.T) {
 	if _, err := db.Query("MATCH (n:Tracked) WHERE id(n) = $id REMOVE n:Tracked", map[string]Value{"id": labelID}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Query("MATCH (n) WHERE id(n) = $id SET n:Tracked", map[string]Value{"id": labelID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		ids, err := tx.FindNodesByLabelProperty("Tracked", "key", "label", 1)
+		if err != nil || !slices.Equal(ids, []uint64{uint64(labelID)}) {
+			t.Fatalf("restored label lookup = %v, %v", ids, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Query("MATCH (n:Tracked) WHERE id(n) = $id REMOVE n:Tracked", map[string]Value{"id": labelID}); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, mutation := range []string{
 		"CREATE (n:Tracked {key: \"property\"}) RETURN id(n) AS id",

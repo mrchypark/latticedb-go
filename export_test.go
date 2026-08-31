@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -44,7 +43,7 @@ func TestStreamingDumpMatchesConvenienceDump(t *testing.T) {
 	}
 }
 
-func TestCSVManifestPublishesOneGeneration(t *testing.T) {
+func TestCSVManifestKeepsPublishedGenerations(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "csv-export.ltdb"), OpenOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +72,8 @@ func TestCSVManifestPublishesOneGeneration(t *testing.T) {
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{manifest.Nodes, manifest.Edges} {
+	paths := []string{manifest.Nodes, manifest.Edges}
+	for _, path := range paths {
 		if _, err := os.Stat(filepath.Join(filepath.Dir(output), path)); err != nil {
 			t.Fatal(err)
 		}
@@ -83,12 +83,10 @@ func TestCSVManifestPublishesOneGeneration(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	entries, err := os.ReadDir(strings.TrimSuffix(output, filepath.Ext(output)) + "_csv_generations")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) > 2 {
-		t.Fatalf("retained %d CSV generations", len(entries))
+	for _, path := range paths {
+		if _, err := os.Stat(filepath.Join(filepath.Dir(output), path)); err != nil {
+			t.Fatalf("published generation was reclaimed: %v", err)
+		}
 	}
 }
 

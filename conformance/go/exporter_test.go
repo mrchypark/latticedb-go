@@ -21,7 +21,7 @@ var testExporter Exporter
 func currentExporter(t *testing.T) Exporter {
 	t.Helper()
 	if testExporter == nil {
-		t.Skip("conformance exporter adapter not configured")
+		t.Fatal("conformance exporter adapter not configured")
 	}
 	return testExporter
 }
