@@ -91,6 +91,29 @@ func TestCommitFailureDoesNotExposeWrites(t *testing.T) {
 	}
 }
 
+func TestOpenCleansAbandonedDirectoryTempFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cleanup.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	abandoned := filepath.Join(path, ".wal-abandoned.tmp")
+	if err := os.WriteFile(abandoned, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := os.Stat(abandoned); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned temp still exists: %v", err)
+	}
+}
+
 func TestReaderStartsDuringWALSync(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -2158,7 +2181,15 @@ func TestQueryNumericAndNullEquality(t *testing.T) {
 	}
 	defer db.Close()
 	if err := db.Update(func(tx *Tx) error {
-		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"number": int64(1), "nothing": nil}})
+		first, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"number": int64(1), "nothing": nil, "nested": map[string]any{"scores": []any{int64(1)}}}})
+		if err != nil {
+			return err
+		}
+		second, err := tx.CreateNode(CreateNodeOptions{})
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateEdge(first.ID, second.ID, "SCORED", CreateEdgeOptions{Properties: map[string]any{"nested": map[string]any{"score": int64(1)}}})
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -2170,12 +2201,51 @@ func TestQueryNumericAndNullEquality(t *testing.T) {
 	if result.Rows[0]["count"] != int64(1) {
 		t.Fatalf("numeric count = %v", result.Rows[0]["count"])
 	}
+	result, err = db.Query("MATCH (n {number: 1.0}) RETURN count(n) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("inline numeric count = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n {nested: $nested}) RETURN count(n) AS count", map[string]any{"nested": map[string]any{"scores": []any{float64(1)}}})
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("nested node numeric count = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH ()-[r:SCORED {nested: $nested}]->() RETURN count(r) AS count", map[string]any{"nested": map[string]any{"score": float64(1)}})
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("nested edge numeric count = %#v, %v", result.Rows, err)
+	}
 	result, err = db.Query("MATCH (n) WHERE n.nothing = null RETURN count(n) AS count", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Rows[0]["count"] != int64(0) {
 		t.Fatalf("null equality count = %v", result.Rows[0]["count"])
+	}
+}
+
+func TestQueryFTSHonorsTokenizationBudgets(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-fts-budget.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"text": strings.Repeat("alpha ", 100)}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query := "MATCH (n) WHERE n.text @@ $query RETURN n"
+	if result, err := db.QueryContext(context.Background(), query, map[string]any{"query": "!!!"}, QueryOptions{MaxBytes: 256}); err != nil || len(result.Rows) != 0 {
+		t.Fatalf("query punctuation-only FTS rows = %#v, %v", result.Rows, err)
+	}
+	if _, err := db.QueryContext(context.Background(), query, map[string]any{"query": strings.Repeat("alpha ", 100)}, QueryOptions{MaxBytes: 128}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("query FTS token byte error = %v", err)
+	}
+	if _, err := db.QueryContext(context.Background(), query, map[string]any{"query": "alpha"}, QueryOptions{MaxWork: 20}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("query FTS fallback work error = %v", err)
+	}
+	if _, err := db.QueryContext(&cancelAfterChecks{limit: 10}, query, map[string]any{"query": strings.Repeat("alpha ", 1_000)}, QueryOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("query FTS mid-tokenization cancellation = %v", err)
 	}
 }
 
@@ -2596,6 +2666,10 @@ func TestAdditionalCypherSyntaxBatch(t *testing.T) {
 	if err != nil || len(result.Rows) != 3 || result.Rows[0]["a"] != int64(1) || result.Rows[0]["b"] != int64(1) || result.Rows[1]["b"] != int64(2) || result.Rows[2]["a"] != int64(2) {
 		t.Fatalf("undirected rows = %#v, %v", result.Rows, err)
 	}
+	result, err = db.Query("MATCH ()-[r:WEIGHTED {weight: 2.0}]->() RETURN count(r) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("inline edge numeric count = %#v, %v", result.Rows, err)
+	}
 	result, err = db.Query("MATCH (a:Item)-[:LINK]-(a) RETURN count(*) AS count", nil)
 	if err != nil || result.Rows[0]["count"] != int64(1) {
 		t.Fatalf("undirected repeated binding count = %#v, %v", result.Rows, err)
@@ -2645,6 +2719,9 @@ func TestAdditionalCypherSyntaxBatch(t *testing.T) {
 	result, err = db.QueryContext(context.Background(), "MATCH (a:Item)-[:SELF]-(b:Item) RETURN a.id AS a, b.id AS b", nil, QueryOptions{MaxRows: 1})
 	if err != nil || len(result.Rows) != 1 {
 		t.Fatalf("undirected self-loop rows = %#v, %v", result.Rows, err)
+	}
+	if _, err := db.QueryContext(context.Background(), "UNWIND $items AS item MATCH (n:Item) WHERE n.bucket = 'all' RETURN item", map[string]any{"items": []any{int64(1), int64(2)}}, QueryOptions{MaxRows: 2}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("indexed cartesian row budget error = %v, want ErrResourceLimit", err)
 	}
 }
 

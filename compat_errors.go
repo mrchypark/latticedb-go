@@ -143,6 +143,8 @@ func classifyError(err error) (ErrorCode, bool) {
 	case errors.Is(err, engine.ErrRecoveryRequired):
 		return ErrorIO, true
 	case errors.Is(err, engine.ErrInvalidArgument),
+		errors.Is(err, engine.ErrDatabaseClosed),
+		errors.Is(err, engine.ErrInactiveTx),
 		errors.Is(err, engine.ErrTransactionsActive),
 		errors.Is(err, engine.ErrSnapshotActive),
 		errors.Is(err, engine.ErrManagedTransaction):

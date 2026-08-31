@@ -10,7 +10,11 @@ func (db *DB) BeginRead() (*Tx, error)  { return db.Begin(true) }
 func (db *DB) BeginWrite() (*Tx, error) { return db.Begin(false) }
 
 func (db *DB) GetNodesByLabel(label string) ([]NodeID, error) {
-	return db.inner.GetNodesByLabel(label)
+	if db == nil || db.inner == nil {
+		return nil, wrapError(ErrDatabaseClosed)
+	}
+	ids, err := db.inner.GetNodesByLabel(label)
+	return ids, wrapError(err)
 }
 
 func (db *DB) FTSSearchFuzzy(query string, opts FTSSearchOptions) ([]FTSSearchResult, error) {
@@ -21,7 +25,10 @@ func (tx *Tx) IsReadOnly() bool { return tx != nil && tx.inner != nil && tx.inne
 func (tx *Tx) IsActive() bool   { return tx != nil && tx.inner != nil && tx.inner.IsActive() }
 
 func (tx *Tx) DeleteEdge(sourceID, targetID NodeID, edgeType string) error {
-	return tx.inner.DeleteEdge(sourceID, targetID, edgeType)
+	if tx == nil || tx.inner == nil {
+		return wrapError(ErrInactiveTx)
+	}
+	return wrapError(tx.inner.DeleteEdge(sourceID, targetID, edgeType))
 }
 
 func (tx *Tx) Query(query string, params map[string]Value) (QueryResult, error) {

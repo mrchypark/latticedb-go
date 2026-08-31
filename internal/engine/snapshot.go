@@ -77,7 +77,21 @@ func (snapshot *Snapshot) Backup(path string) error {
 			return fmt.Errorf("%w: backup path belongs to the source database", ErrInvalidArgument)
 		}
 	}
-	return store.CheckpointGraphStateFiles(store.FlatDatabaseFiles(target), snapshot.graph, snapshot.nextNodeID, snapshot.nextEdgeID, snapshot.commitID)
+	targetFiles := store.FlatDatabaseFiles(target)
+	for _, sidecar := range []string{targetFiles.State, targetFiles.WAL, targetFiles.WALBase, targetFiles.IDs, target + ".layout"} {
+		if _, err := os.Lstat(sidecar); err == nil {
+			return fmt.Errorf("%w: backup destination already exists", ErrInvalidArgument)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	if err := store.CreateCheckpointGraphStateFiles(targetFiles, snapshot.graph, snapshot.nextNodeID, snapshot.nextEdgeID, snapshot.commitID); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%w: backup destination already exists", ErrInvalidArgument)
+		}
+		return err
+	}
+	return nil
 }
 
 func canonicalSnapshotPath(path string) (string, error) {

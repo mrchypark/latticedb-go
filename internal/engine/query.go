@@ -101,6 +101,10 @@ func (budget *queryBudget) chargeTemporary(bytes uint64) error {
 	return budget.chargeBytes(bytes, "temporary")
 }
 
+func (budget *queryBudget) releaseTemporary(bytes uint64) {
+	budget.bytes -= uint32(min(bytes, uint64(budget.bytes)))
+}
+
 func (budget *queryBudget) chargeBytes(bytes uint64, kind string) error {
 	if bytes > uint64(budget.maxBytes-budget.bytes) {
 		return fmt.Errorf("%w: query %s bytes exceed %d", ErrResourceLimit, kind, budget.maxBytes)
@@ -733,8 +737,8 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 			if nodeID, found, lookupErr := plan.bindingNodeID(node.Var, params); lookupErr != nil {
 				return QueryResult{}, lookupErr
 			} else if found {
-				rows = node.applyID(tx, rows, nodeID)
-				if err := budget.check(uint64(len(rows)), len(rows)); err != nil {
+				rows, err = node.applyID(tx, rows, nodeID, nil, budget)
+				if err != nil {
 					return QueryResult{}, err
 				}
 				continue
@@ -745,10 +749,10 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 				if err := budget.chargeTemporary(uint64(len(nodeIDs)) * 8); err != nil {
 					return QueryResult{}, err
 				}
-				nextRows := make([]queryRow, 0, len(nodeIDs)*len(rows))
+				nextRows := make([]queryRow, 0)
 				for _, nodeID := range nodeIDs {
-					nextRows = append(nextRows, node.applyID(tx, rows, nodeID)...)
-					if err := budget.check(uint64(len(rows)), len(nextRows)); err != nil {
+					nextRows, err = node.applyID(tx, rows, nodeID, nextRows, budget)
+					if err != nil {
 						return QueryResult{}, err
 					}
 				}
@@ -1001,7 +1005,7 @@ func (plan *queryPlan) boundedFilteredNodeIDs(tx *Tx, pattern nodePattern, defin
 }
 
 func (plan *queryPlan) nodeMatchesBoundedFilter(node *store.NodeRecord, pattern nodePattern, expected []any) bool {
-	if node == nil || !store.LabelsMatch(node, pattern.Labels) || !store.PropertiesMatch(node.Properties, pattern.Properties) {
+	if node == nil || !store.LabelsMatch(node, pattern.Labels) || !queryPropertiesMatch(node.Properties, pattern.Properties) {
 		return false
 	}
 	binding := boundValue{Node: node}
@@ -2011,28 +2015,32 @@ func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) (
 		return nil, err
 	}
 	for _, nodeID := range nodeIDs {
-		nextRows = pattern.appendNodeRows(rows, tx.graph.Nodes.Get(nodeID), nextRows)
-		if err := budget.check(uint64(len(rows)), len(nextRows)); err != nil {
+		var err error
+		nextRows, err = pattern.appendNodeRows(rows, tx.graph.Nodes.Get(nodeID), nextRows, budget)
+		if err != nil {
 			return nil, err
 		}
 	}
 	return nextRows, nil
 }
 
-func (pattern nodePattern) applyID(tx *Tx, rows []queryRow, nodeID uint64) []queryRow {
+func (pattern nodePattern) applyID(tx *Tx, rows []queryRow, nodeID uint64, nextRows []queryRow, budget *queryBudget) ([]queryRow, error) {
 	node := tx.graph.Nodes.Get(nodeID)
 	if node == nil {
-		return nil
+		return nextRows, nil
 	}
-	return pattern.appendNodeRows(rows, node, nil)
+	return pattern.appendNodeRows(rows, node, nextRows, budget)
 }
 
-func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecord, nextRows []queryRow) []queryRow {
+func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecord, nextRows []queryRow, budget *queryBudget) ([]queryRow, error) {
 	for _, row := range rows {
+		if err := budget.check(1, len(nextRows)); err != nil {
+			return nil, err
+		}
 		if !store.LabelsMatch(node, pattern.Labels) {
 			continue
 		}
-		if !store.PropertiesMatch(node.Properties, pattern.Properties) {
+		if !queryPropertiesMatch(node.Properties, pattern.Properties) {
 			continue
 		}
 		if pattern.Var != "" {
@@ -2040,9 +2048,15 @@ func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecor
 				if existing.Node == nil || existing.Node.ID != node.ID {
 					continue
 				}
+				if err := budget.check(0, len(nextRows)+1); err != nil {
+					return nil, err
+				}
 				nextRows = append(nextRows, row)
 				continue
 			}
+		}
+		if err := budget.check(0, len(nextRows)+1); err != nil {
+			return nil, err
 		}
 		nextRow := row.clone()
 		if pattern.Var != "" {
@@ -2050,7 +2064,7 @@ func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecor
 		}
 		nextRows = append(nextRows, nextRow)
 	}
-	return nextRows
+	return nextRows, nil
 }
 
 func (pattern edgePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
@@ -2077,7 +2091,7 @@ func (pattern edgePattern) applyIDs(tx *Tx, rows []queryRow, edgeIDs []uint64, b
 			if pattern.EdgeType != "" && edge.Type != pattern.EdgeType {
 				continue
 			}
-			if !store.PropertiesMatch(edge.Properties, pattern.Properties) {
+			if !queryPropertiesMatch(edge.Properties, pattern.Properties) {
 				continue
 			}
 			source := tx.graph.Nodes.Get(edge.SourceID)
@@ -2113,8 +2127,8 @@ func (pattern edgePattern) appendEdgeRow(row queryRow, edge *store.EdgeRecord, l
 	if pattern.Left.Var != "" && pattern.Left.Var == pattern.Right.Var && left.ID != right.ID {
 		return rows, nil
 	}
-	if !store.LabelsMatch(left, pattern.Left.Labels) || !store.PropertiesMatch(left.Properties, pattern.Left.Properties) ||
-		!store.LabelsMatch(right, pattern.Right.Labels) || !store.PropertiesMatch(right.Properties, pattern.Right.Properties) ||
+	if !store.LabelsMatch(left, pattern.Left.Labels) || !queryPropertiesMatch(left.Properties, pattern.Left.Properties) ||
+		!store.LabelsMatch(right, pattern.Right.Labels) || !queryPropertiesMatch(right.Properties, pattern.Right.Properties) ||
 		!bindingMatchesNode(row, pattern.Left.Var, left) || !bindingMatchesNode(row, pattern.Right.Var, right) {
 		return rows, nil
 	}
@@ -2187,20 +2201,39 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 			if !ok {
 				return nil, fmt.Errorf("fts comparison requires string, got %T", expected)
 			}
-			terms := search.Tokenize(queryText)
+			terms, termBytes, err := tokenizeQueryText(queryText, budget)
+			if err != nil {
+				return nil, err
+			}
+			if len(terms) == 0 {
+				budget.releaseTemporary(termBytes)
+				continue
+			}
 			var score float32
 			hasIndex := false
 			if binding.Node != nil {
 				if record := tx.graph.FTS.Get(binding.Node.ID); record != nil {
 					hasIndex = true
-					score = search.FTSScoreTokensWithOptions(record.Tokens, terms, 0, 0)
+					score, err = scoreQueryFTSTokens(record.Tokens, terms, budget)
+					if err != nil {
+						return nil, err
+					}
 				}
 			}
 			if !hasIndex && exists {
 				if text, ok := value.(string); ok {
-					score = search.FTSScore(text, terms)
+					tokens, tokenBytes, err := tokenizeQueryText(text, budget)
+					if err != nil {
+						return nil, err
+					}
+					score, err = scoreQueryFTSTokens(tokens, terms, budget)
+					budget.releaseTemporary(tokenBytes)
+					if err != nil {
+						return nil, err
+					}
 				}
 			}
+			budget.releaseTemporary(termBytes)
 			if score <= 0 {
 				continue
 			}
@@ -2223,6 +2256,42 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 		})
 	}
 	return filtered, nil
+}
+
+func tokenizeQueryText(text string, budget *queryBudget) ([]string, uint64, error) {
+	if err := budget.check(uint64(len(text)), 0); err != nil {
+		return nil, 0, err
+	}
+	tokens, err := search.TokenizeContextWithLimit(budget.ctx, text, uint64(budget.maxBytes-budget.bytes))
+	if errors.Is(err, search.ErrTokenizationLimit) {
+		return nil, 0, fmt.Errorf("%w: query FTS tokenization exceeds memory budget", ErrResourceLimit)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	logicalBytes := saturatingMul(uint64(len(tokens)), 24)
+	for _, token := range tokens {
+		logicalBytes = saturatingAdd(logicalBytes, uint64(len(token)))
+	}
+	if err := budget.chargeTemporary(logicalBytes); err != nil {
+		return nil, 0, err
+	}
+	return tokens, logicalBytes, nil
+}
+
+func scoreQueryFTSTokens(tokens, terms []string, budget *queryBudget) (float32, error) {
+	var score float32
+	for _, term := range terms {
+		for _, token := range tokens {
+			if err := budget.check(1, 0); err != nil {
+				return 0, err
+			}
+			if token == term {
+				score++
+			}
+		}
+	}
+	return score, nil
 }
 
 func (clause *whereClause) eval(row queryRow, params map[string]any) (predicateTruth, error) {
@@ -2435,9 +2504,34 @@ func queryValuesEqual(left any, right any) bool {
 		return integerEqualsFloat(leftInt, rightFloat)
 	case leftIsFloat && rightIsInt:
 		return integerEqualsFloat(rightInt, leftFloat)
-	default:
-		return reflect.DeepEqual(left, right)
 	}
+	if leftList, ok := left.([]any); ok {
+		rightList, ok := right.([]any)
+		if !ok || len(leftList) != len(rightList) {
+			return false
+		}
+		for index := range leftList {
+			if !queryValuesEqual(leftList[index], rightList[index]) {
+				return false
+			}
+		}
+		return true
+	}
+	if leftMap, ok := left.(map[string]any); ok {
+		rightMap, ok := right.(map[string]any)
+		return ok && len(leftMap) == len(rightMap) && queryPropertiesMatch(leftMap, rightMap)
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+func queryPropertiesMatch(properties, required map[string]any) bool {
+	for key, expected := range required {
+		actual, ok := properties[key]
+		if !ok || !queryValuesEqual(actual, expected) {
+			return false
+		}
+	}
+	return true
 }
 
 func integerEqualsFloat(integer int64, floating float64) bool {

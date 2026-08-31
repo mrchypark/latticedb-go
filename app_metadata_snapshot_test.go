@@ -337,6 +337,17 @@ func TestSnapshotPinsGenerationWhileWritersContinue(t *testing.T) {
 	if err := snapshot.Backup(sourcePath); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("backup over source = %v", err)
 	}
+	occupiedPath := filepath.Join(dir, "occupied.ltdb")
+	occupied, err := Open(occupiedPath, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := occupied.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Backup(occupiedPath); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("backup over existing database = %v", err)
+	}
 
 	backupPath := filepath.Join(dir, "backup.ltdb")
 	backupDone := make(chan error, 1)
@@ -386,6 +397,61 @@ func TestSnapshotPinsGenerationWhileWritersContinue(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConcurrentBackupsPublishExactlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	snapshots := make([]*Snapshot, 0, 2)
+	for index := range 2 {
+		db, err := Open(filepath.Join(dir, fmt.Sprintf("source-%d.ltdb", index)), OpenOptions{Create: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.Query("CREATE (:Item {source: $source})", map[string]Value{"source": int64(index)}); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := db.BeginSnapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer snapshot.Close()
+		snapshots = append(snapshots, snapshot)
+	}
+	target := filepath.Join(dir, "backup.ltdb")
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, snapshot := range snapshots {
+		go func() {
+			<-start
+			results <- snapshot.Backup(target)
+		}()
+	}
+	close(start)
+	succeeded, rejected := 0, 0
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrInvalidArgument):
+			rejected++
+		default:
+			t.Fatalf("backup error = %v", err)
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("backup results: success=%d rejected=%d", succeeded, rejected)
+	}
+	backup, err := Open(target, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	result, err := backup.Query("MATCH (n:Item) RETURN count(n) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("published backup rows = %#v, %v", result.Rows, err)
 	}
 }
 

@@ -256,6 +256,18 @@ func TestDirectSearchResourceBounds(t *testing.T) {
 	if _, err := db.FTSSearch("common", FTSSearchOptions{MaxWork: 10}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("FTS work error = %v", err)
 	}
+	if _, err := db.FTSSearch(strings.Repeat("term ", 100), FTSSearchOptions{Limit: 1, MaxBytes: 128}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("FTS tokenization byte error = %v", err)
+	}
+	if results, err := db.FTSSearch("!!!", FTSSearchOptions{Limit: 1, MaxBytes: 256}); err != nil || len(results) != 0 {
+		t.Fatalf("punctuation-only FTS results = %#v, %v", results, err)
+	}
+	if _, err := db.FTSSearch(strings.Repeat("!", 100), FTSSearchOptions{MaxWork: 1}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("FTS input scan work error = %v", err)
+	}
+	if _, err := db.FTSSearchContext(&cancelAfterChecks{}, strings.Repeat("term ", 1_000), FTSSearchOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-tokenization cancellation error = %v", err)
+	}
 	if _, err := db.VectorSearch(make([]float32, 16), VectorSearchOptions{K: 65, EfSearch: 1, MaxWork: 100}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("ANN fallback work error = %v", err)
 	}
@@ -290,12 +302,19 @@ func TestANNExactFallbackSharesSingleByteBudget(t *testing.T) {
 	}
 }
 
-type cancelAfterChecks struct{ checks atomic.Int32 }
+type cancelAfterChecks struct {
+	checks atomic.Int32
+	limit  int32
+}
 
 func (*cancelAfterChecks) Deadline() (time.Time, bool) { return time.Time{}, false }
 func (*cancelAfterChecks) Done() <-chan struct{}       { return nil }
 func (ctx *cancelAfterChecks) Err() error {
-	if ctx.checks.Add(1) >= 3 {
+	limit := ctx.limit
+	if limit == 0 {
+		limit = 3
+	}
+	if ctx.checks.Add(1) >= limit {
 		return context.Canceled
 	}
 	return nil

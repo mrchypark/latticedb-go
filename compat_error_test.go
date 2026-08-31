@@ -75,6 +75,37 @@ func TestCriticalSentinelWrappingPreservesRetrySemantics(t *testing.T) {
 	}
 }
 
+func TestCompatibilityMethodsReturnStructuredErrors(t *testing.T) {
+	var latticeErr *Error
+	if _, err := Open(t.TempDir(), OpenOptions{Create: true, DisableWAL: true}); !errors.As(err, &latticeErr) || !errors.Is(err, ErrUnsupportedOption) {
+		t.Fatalf("DisableWAL Open error = %v", err)
+	}
+	if _, err := Deserialize(nil, OpenOptions{DisableWAL: true}); !errors.As(err, &latticeErr) || !errors.Is(err, ErrUnsupportedOption) {
+		t.Fatalf("DisableWAL Deserialize error = %v", err)
+	}
+	var db *DB
+	if _, err := db.GetNodesByLabel("Person"); !errors.As(err, &latticeErr) || !errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("nil GetNodesByLabel error = %v", err)
+	}
+	var tx *Tx
+	if err := tx.DeleteEdge(1, 2, "KNOWS"); !errors.As(err, &latticeErr) || !errors.Is(err, ErrInactiveTx) {
+		t.Fatalf("nil DeleteEdge error = %v", err)
+	}
+	opened, err := Open(t.TempDir(), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = opened.Close() })
+	read, err := opened.BeginRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Rollback()
+	if err := read.DeleteEdge(1, 2, "KNOWS"); !errors.As(err, &latticeErr) || !errors.Is(err, ErrReadOnly) {
+		t.Fatalf("read-only DeleteEdge error = %v", err)
+	}
+}
+
 func TestManagedCallbacksPreserveErrorIdentity(t *testing.T) {
 	db, err := Open(t.TempDir(), OpenOptions{Create: true})
 	if err != nil {

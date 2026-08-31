@@ -30,6 +30,95 @@ func TestDecodePersistedStateContextCancelsFTSRebuild(t *testing.T) {
 	}
 }
 
+func TestCleanupDatabaseTempFilesScopesFlatDatabases(t *testing.T) {
+	dir := t.TempDir()
+	flat := FlatDatabaseFiles(filepath.Join(dir, "one.ltdb"))
+	scoped, err := os.CreateTemp(dir, databaseTempPattern(flat, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scoped.Close(); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(dir, ".state-other.tmp")
+	if err := os.WriteFile(legacy, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupDatabaseTempFiles(flat, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(scoped.Name()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("scoped temp still exists: %v", err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("flat cleanup removed another database temp: %v", err)
+	}
+	colliding := FlatDatabaseFiles(filepath.Join(dir, "one.ltdb-state-other"))
+	other, err := os.CreateTemp(dir, databaseTempPattern(colliding, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupDatabaseTempFiles(flat, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(other.Name()); err != nil {
+		t.Fatalf("flat cleanup removed prefix-colliding database temp: %v", err)
+	}
+
+	directory := DirectoryDatabaseFiles(filepath.Join(dir, "directory"))
+	if err := os.MkdirAll(directory.Directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy = filepath.Join(directory.Directory, ".wal-abandoned.tmp")
+	if err := os.WriteFile(legacy, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupDatabaseTempFiles(directory, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("directory legacy temp still exists: %v", err)
+	}
+}
+
+func TestCreateCheckpointGraphStateFilesPublishesOnce(t *testing.T) {
+	files := FlatDatabaseFiles(filepath.Join(t.TempDir(), "backup.ltdb"))
+	first, second := NewGraphState(), NewGraphState()
+	first.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"source": "first"}})
+	second.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"source": "second"}})
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for index, graph := range []*GraphState{first, second} {
+		go func() {
+			<-start
+			results <- CreateCheckpointGraphStateFiles(files, graph, 2, 1, uint64(index+1))
+		}()
+	}
+	close(start)
+	succeeded, existed := 0, 0
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, os.ErrExist):
+			existed++
+		default:
+			t.Fatalf("publish error = %v", err)
+		}
+	}
+	if succeeded != 1 || existed != 1 {
+		t.Fatalf("publish results: success=%d exists=%d", succeeded, existed)
+	}
+	graph, _, _, _, err := LoadGraphStateFilesContext(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0))
+	if err != nil || graph.Nodes.Get(1) == nil {
+		t.Fatalf("published backup is unreadable: graph=%#v err=%v", graph, err)
+	}
+}
+
 type cancelLoadAfterChecks struct {
 	checks atomic.Int32
 	limit  int32

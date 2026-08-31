@@ -184,6 +184,9 @@ func tokenizationLogicalBytes(ctx context.Context, text string) (uint64, error) 
 			inToken = false
 		}
 	}
+	if tokens == 0 {
+		return 0, ctx.Err()
+	}
 	bytes := searchAddSaturated(256, searchMultiplySaturated(tokens, 64))
 	bytes = searchAddSaturated(bytes, searchMultiplySaturated(lowercaseBytes, 4))
 	return bytes, ctx.Err()
