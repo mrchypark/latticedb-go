@@ -71,8 +71,12 @@ func TestPropertyIndexReclaimsHistoricalValues(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := indexes.definitions[definition].values.Len(); got != 0 {
+	data := indexes.definitions[definition]
+	if got := data.values.Len(); got != 0 {
 		t.Fatalf("retained empty value buckets = %d, want 0", got)
+	}
+	if got := len(data.values.clonedShards); got != 0 {
+		t.Fatalf("retained cloned shard markers = %d, want 0", got)
 	}
 }
 

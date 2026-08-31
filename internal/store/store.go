@@ -315,6 +315,7 @@ func (m *ShardMap[V]) Delete(id uint64) {
 		delete(m.root[bucket].values[shard], id)
 		m.length--
 		if len(m.root[bucket].values[shard]) == 0 {
+			delete(m.clonedShards, uint16(bucket)<<8|uint16(shard))
 			m.root[bucket].values[shard] = nil
 			m.root[bucket].active[shard/64] &^= uint64(1) << (shard % 64)
 			if m.smallCount <= uint8(len(m.smallActive)) {
