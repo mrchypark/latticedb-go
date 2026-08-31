@@ -3038,11 +3038,8 @@ func parseValueExpr(text string) (valueExpr, error) {
 		}
 		return literalExpr{Value: unquoted}, nil
 	default:
-		if i, err := strconv.ParseInt(text, 10, 64); err == nil {
-			return literalExpr{Value: i}, nil
-		}
-		if f, err := strconv.ParseFloat(text, 64); err == nil {
-			return literalExpr{Value: f}, nil
+		if number, ok := parseQueryNumber(text); ok {
+			return literalExpr{Value: number}, nil
 		}
 		if strings.Contains(text, ".") {
 			name, property, err := parsePropertyAccess(text)
@@ -3053,6 +3050,49 @@ func parseValueExpr(text string) (valueExpr, error) {
 		}
 		return variableExpr{Name: text}, nil
 	}
+}
+
+func parseQueryNumber(text string) (any, bool) {
+	index := 0
+	if index < len(text) && (text[index] == '+' || text[index] == '-') {
+		index++
+	}
+	digits := 0
+	for index < len(text) && text[index] >= '0' && text[index] <= '9' {
+		index++
+		digits++
+	}
+	hasDot := index < len(text) && text[index] == '.'
+	if hasDot {
+		index++
+		for index < len(text) && text[index] >= '0' && text[index] <= '9' {
+			index++
+			digits++
+		}
+	}
+	hasExponent := index < len(text) && (text[index] == 'e' || text[index] == 'E')
+	if hasExponent {
+		index++
+		if index < len(text) && (text[index] == '+' || text[index] == '-') {
+			index++
+		}
+		exponentStart := index
+		for index < len(text) && text[index] >= '0' && text[index] <= '9' {
+			index++
+		}
+		if exponentStart == index {
+			return nil, false
+		}
+	}
+	if digits == 0 || index != len(text) {
+		return nil, false
+	}
+	if !hasDot && !hasExponent {
+		value, err := strconv.ParseInt(text, 10, 64)
+		return value, err == nil
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	return value, err == nil
 }
 
 func unquoteQueryString(text string) (string, error) {

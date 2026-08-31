@@ -210,68 +210,71 @@ The following must hold:
 
 ## Query Semantics
 
-LatticeDB implements a deliberately small, case-sensitive Cypher subset. It does not claim full openCypher compatibility. The executable syntax inventory is `TestQueryGrammarMatrix`; the extracted conformance suite separately verifies runtime semantics.
+LatticeDB implements a deliberately small, case-sensitive Cypher subset. It does not claim full openCypher compatibility. [`internal/engine/testdata/query_grammar.ebnf`](../internal/engine/testdata/query_grammar.ebnf) is the canonical grammar, `TestQueryGrammarMatrix` is the executable syntax inventory, and `TestSupportedCypherGrammarContract` locks both to the parser surface so parser changes require an explicit grammar and boundary-case audit. The extracted conformance suite separately verifies runtime semantics.
 
 ### Supported Cypher Subset
 
-Keywords are uppercase. Bindings, property names, labels, relationship types, aliases, and parameters use unquoted ASCII identifiers matching `[A-Za-z_][A-Za-z0-9_]*`.
+Structural keywords are uppercase. Bindings, property names, labels, relationship types, aliases, and parameters use unquoted ASCII identifiers matching `[A-Za-z_][A-Za-z0-9_]*`; keywords are not reserved when they occur in an identifier position. Integers are signed base-10 values, and floats use decimal or scientific notation. Strings may use single or double quotes with Go-style escapes.
 
+<!-- BEGIN supported-cypher-grammar -->
 ```text
-query         = (match-query | create-node-query | unwind-query) [";"]
-match-query   = MATCH patterns [WHERE predicates]
-                [RETURN return-tail | SET assignments [RETURN return-tail] |
-                 CREATE edge-create [RETURN return-tail] |
-                 REMOVE removals [RETURN return-tail] | DELETE bindings]
+query          = (match-query | create-node-query | unwind-query) [";"]
+match-query    = MATCH patterns [WHERE predicates] [match-terminal]
+match-terminal = RETURN return-tail
+                | SET assignments [RETURN return-tail]
+                | CREATE edge-create [RETURN return-tail]
+                | REMOVE removals [RETURN return-tail]
+                | [DETACH] DELETE bindings
 create-node-query
-              = CREATE node-pattern [RETURN return-tail]
-unwind-query  = UNWIND value AS binding RETURN return-tail
-              | UNWIND value AS binding CREATE node-pattern [RETURN return-tail]
-              | UNWIND value AS binding match-query
+                = CREATE node-pattern [RETURN return-tail]
+unwind-query   = UNWIND value AS binding RETURN return-tail
+                | UNWIND value AS binding CREATE node-pattern [RETURN return-tail]
+                | UNWIND value AS binding match-query
 
-patterns      = pattern {"," pattern}
-pattern       = node-pattern | node-pattern {relationship node-pattern}
-relationship  = "-[" [binding] [":" type] [properties] "]->"
-              | "<-[" [binding] [":" type] [properties] "]-"
-              | "-[" [binding] [":" type] [properties] "]-"
-node-pattern  = "(" [binding] {":" label} [properties] ")"
-properties    = "{" [property ":" value {"," property ":" value}] "}"
+patterns       = pattern {"," pattern}
+pattern        = node-pattern | node-pattern {relationship node-pattern}
+relationship   = "-[" [binding] [":" type] [properties] "]->"
+                | "<-[" [binding] [":" type] [properties] "]-"
+                | "-[" [binding] [":" type] [properties] "]-"
+node-pattern   = "(" [binding] {":" label} [properties] ")"
+properties     = "{" [property ":" expression {"," property ":" expression}] "}"
 
-predicates    = and-expression {OR and-expression}
-and-expression
-              = not-expression {AND not-expression}
-not-expression
-              = [NOT] ("(" predicates ")" | predicate)
-predicate     = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
-              | property-access IN parameter
-              | property-access (STARTS WITH | ENDS WITH | CONTAINS) value
-              | id-access "=" value
-              | property-access IS NULL
-              | property-access IS NOT NULL
-              | property-access "<=>" value
-              | property-access "@@" value
+predicates     = and-expression {OR and-expression}
+and-expression = not-expression {AND not-expression}
+not-expression = [NOT] ("(" predicates ")" | predicate)
+predicate      = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
+                | property-access IN expression
+                | property-access (STARTS WITH | ENDS WITH | CONTAINS) expression
+                | id-access "=" expression
+                | property-access IS NULL
+                | property-access IS NOT NULL
+                | property-access "<=>" expression
+                | property-access "@@" expression
 
-assignments   = assignment {"," assignment}
-assignment    = property-access "=" expression
-              | binding "=" expression
-              | binding "+=" expression
-              | binding ":" label
-edge-create   = "(" binding ")-[" [binding] ":" type [properties] "]->(" binding ")"
-              | "(" binding ")<-[" [binding] ":" type [properties] "]-(" binding ")"
-removals      = (property-access | binding ":" label)
-                {"," (property-access | binding ":" label)}
-bindings      = binding {"," binding}
+assignments    = assignment {"," assignment}
+assignment     = property-access "=" expression
+                | binding "=" expression
+                | binding "+=" expression
+                | binding ":" label
+edge-create    = "(" binding ")-[" [binding] ":" type [properties] "]->(" binding ")"
+                | "(" binding ")<-[" [binding] ":" type [properties] "]-(" binding ")"
+removals       = (property-access | binding ":" label)
+                 {"," (property-access | binding ":" label)}
+bindings       = binding {"," binding}
 
-return-tail   = [DISTINCT] (count-return | projection {"," projection})
-                [ORDER BY order {"," order}]
-                [SKIP pagination] [LIMIT pagination]
-count-return  = "count(" ("*" | binding) ")" [AS alias]
-projection    = (binding | property-access | id-access) [AS alias]
-order         = (binding | property-access | id-access | alias) [ASC | DESC]
-pagination    = non-negative-integer | parameter
+return-tail    = [DISTINCT] (count-return | projection {"," projection})
+                 [ORDER BY order {"," order}]
+                 [SKIP pagination] [LIMIT pagination]
+count-return   = "count(" ("*" | binding) ")" [AS alias]
+projection     = (binding | property-access | id-access) [AS alias]
+order          = (binding | property-access | id-access | alias) [ASC | DESC]
+pagination     = non-negative-integer | parameter
 
-value         = null | true | false | integer | float | string | parameter | map
-expression    = value | binding | property-access
+value          = null | true | false | integer | float | string | parameter | map
+map            = "{" [property ":" expression {"," property ":" expression}] "}"
+expression     = value | binding | property-access
 ```
+<!-- END supported-cypher-grammar -->
 
 Fixed-length `MATCH` paths may be incoming, outgoing, or undirected; relationship creation remains directed. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, list literals, and backtick identifiers remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
 
@@ -281,6 +284,8 @@ An undirected relationship produces one row per matching orientation. A non-self
 
 - Query parameters accept the same logical value model as direct property APIs.
 - ASCII whitespace outside string literals is interchangeable, so multiline and tab-indented queries are accepted without changing string contents.
+- Query comments are not supported.
+- Binary predicates and `SET` assignment operators require surrounding whitespace after normalization; compact spellings such as `n.age=1` are not supported.
 - One optional trailing semicolon is accepted; multiple statements remain invalid.
 - Query results return the same logical value model, including nested values.
 - Explicit `RETURN ... AS alias` controls the output column name.
@@ -288,6 +293,7 @@ An undirected relationship produces one row per matching orientation. A non-self
 - `LIMIT` applies to the produced rows for a `RETURN` clause.
 - `SKIP` is applied after ordering and before `LIMIT`.
 - `DISTINCT` removes duplicate projected rows before `SKIP` and `LIMIT`.
+- With `RETURN DISTINCT`, every `ORDER BY` expression must also be projected.
 - `SKIP` and `LIMIT` accept a non-negative integer literal or parameter; other runtime parameter values are execution errors.
 - `LIMIT 0` returns zero rows.
 - Negative `LIMIT` values are invalid.
@@ -297,11 +303,12 @@ An undirected relationship produces one row per matching orientation. A non-self
 ### Property Access
 
 - Property access on a node or edge may return `NULL`.
-- Bound node, edge, and map properties may be used as mutation values or the right side of predicates; a missing property evaluates to `NULL`.
+- Bound node, edge, and map properties may be used in property maps, as mutation values, or on the right side of predicates; a missing property evaluates to `NULL`.
+- An expression may only reference a binding available at its evaluation point. In particular, an `UNWIND` source and a newly created node or relationship cannot reference the binding they are about to introduce.
 - `IS NULL` and `IS NOT NULL` operate on the resulting query value, not on direct-storage presence metadata.
 - Boolean predicates use three-valued logic; only `true` rows pass `WHERE`, and comparisons involving `NULL` or a missing property remain unknown under `NOT`.
 - Ordered comparisons accept numeric values, including mixed integers and floats, or two strings. Incomparable values do not pass `WHERE`.
-- `IN` accepts a list parameter and follows three-valued logic when a list contains `NULL`.
+- `IN` accepts any supported expression that evaluates to a list and follows three-valued logic when the list contains `NULL`.
 - `STARTS WITH`, `ENDS WITH`, and `CONTAINS` compare strings without case folding.
 
 ### Mutation Semantics

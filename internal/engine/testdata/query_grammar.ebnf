@@ -1,0 +1,55 @@
+query          = (match-query | create-node-query | unwind-query) [";"]
+match-query    = MATCH patterns [WHERE predicates] [match-terminal]
+match-terminal = RETURN return-tail
+                | SET assignments [RETURN return-tail]
+                | CREATE edge-create [RETURN return-tail]
+                | REMOVE removals [RETURN return-tail]
+                | [DETACH] DELETE bindings
+create-node-query
+                = CREATE node-pattern [RETURN return-tail]
+unwind-query   = UNWIND value AS binding RETURN return-tail
+                | UNWIND value AS binding CREATE node-pattern [RETURN return-tail]
+                | UNWIND value AS binding match-query
+
+patterns       = pattern {"," pattern}
+pattern        = node-pattern | node-pattern {relationship node-pattern}
+relationship   = "-[" [binding] [":" type] [properties] "]->"
+                | "<-[" [binding] [":" type] [properties] "]-"
+                | "-[" [binding] [":" type] [properties] "]-"
+node-pattern   = "(" [binding] {":" label} [properties] ")"
+properties     = "{" [property ":" expression {"," property ":" expression}] "}"
+
+predicates     = and-expression {OR and-expression}
+and-expression = not-expression {AND not-expression}
+not-expression = [NOT] ("(" predicates ")" | predicate)
+predicate      = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
+                | property-access IN expression
+                | property-access (STARTS WITH | ENDS WITH | CONTAINS) expression
+                | id-access "=" expression
+                | property-access IS NULL
+                | property-access IS NOT NULL
+                | property-access "<=>" expression
+                | property-access "@@" expression
+
+assignments    = assignment {"," assignment}
+assignment     = property-access "=" expression
+                | binding "=" expression
+                | binding "+=" expression
+                | binding ":" label
+edge-create    = "(" binding ")-[" [binding] ":" type [properties] "]->(" binding ")"
+                | "(" binding ")<-[" [binding] ":" type [properties] "]-(" binding ")"
+removals       = (property-access | binding ":" label)
+                 {"," (property-access | binding ":" label)}
+bindings       = binding {"," binding}
+
+return-tail    = [DISTINCT] (count-return | projection {"," projection})
+                 [ORDER BY order {"," order}]
+                 [SKIP pagination] [LIMIT pagination]
+count-return   = "count(" ("*" | binding) ")" [AS alias]
+projection     = (binding | property-access | id-access) [AS alias]
+order          = (binding | property-access | id-access | alias) [ASC | DESC]
+pagination     = non-negative-integer | parameter
+
+value          = null | true | false | integer | float | string | parameter | map
+map            = "{" [property ":" expression {"," property ":" expression}] "}"
+expression     = value | binding | property-access
