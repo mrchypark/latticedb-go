@@ -2263,6 +2263,190 @@ func TestAnonymousParameterizedMatchSupportsTraversal(t *testing.T) {
 	}
 }
 
+func TestMatchPathSyntaxNormalizesToExistingTraversal(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "path-syntax.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		alice, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Alice"}})
+		if err != nil {
+			return err
+		}
+		bob, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Bob"}})
+		if err != nil {
+			return err
+		}
+		carol, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Carol"}})
+		if err != nil {
+			return err
+		}
+		if _, err = tx.CreateEdge(alice.ID, bob.ID, "KNOWS", CreateEdgeOptions{Properties: map[string]any{"since": int64(2024)}}); err != nil {
+			return err
+		}
+		_, err = tx.CreateEdge(bob.ID, carol.ID, "KNOWS", CreateEdgeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	queries := []string{
+		`MATCH (b {name: "Bob"})<-[r:KNOWS]-(a) RETURN a.name AS name`,
+		`MATCH (a)-[:KNOWS {since: $since}]->(b) RETURN b.name AS name`,
+		`MATCH (a {name: "Alice"})-[:KNOWS]->()-[:KNOWS]->(c) RETURN c.name AS name`,
+	}
+	for _, query := range queries {
+		result, err := db.Query(query, map[string]any{"since": int64(2024)})
+		if err != nil {
+			t.Fatalf("Query(%q): %v", query, err)
+		}
+		want := "Alice"
+		if strings.Contains(query, "since") {
+			want = "Bob"
+		} else if strings.Contains(query, "->()") {
+			want = "Carol"
+		}
+		if len(result.Rows) != 1 || result.Rows[0]["name"] != want {
+			t.Fatalf("Query(%q) = %#v, want %q", query, result.Rows, want)
+		}
+	}
+}
+
+func TestReturnAliasAndParameterizedPagination(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "pagination.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for _, value := range []int64{3, 1, 2} {
+			if _, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"value": value}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.Query("MATCH (n) RETURN n.value AS value ORDER BY value SKIP $skip LIMIT $limit", map[string]any{"skip": 1, "limit": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["value"] != int64(2) {
+		t.Fatalf("paginated rows = %#v", result.Rows)
+	}
+	for _, params := range []map[string]any{{"skip": -1, "limit": 1}, {"skip": 0, "limit": "one"}} {
+		if _, err := db.Query("MATCH (n) RETURN n.value SKIP $skip LIMIT $limit", params); err == nil {
+			t.Fatalf("pagination unexpectedly accepted %#v", params)
+		}
+	}
+}
+
+func TestMutationCompositionReturnsUpdatedBindings(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "mutation-return.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Source"}, Properties: map[string]any{"old": true}}); err != nil {
+			return err
+		}
+		_, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Target"}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.Query("MATCH (n:Source) SET n.a = 1, n.b = 2 RETURN n.a AS a, n.b AS b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["a"] != int64(1) || result.Rows[0]["b"] != int64(2) {
+		t.Fatalf("SET RETURN rows = %#v", result.Rows)
+	}
+	result, err = db.Query("MATCH (n:Source) REMOVE n.old RETURN n.old AS old", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["old"] != nil {
+		t.Fatalf("REMOVE RETURN rows = %#v", result.Rows)
+	}
+	result, err = db.Query("MATCH (a:Source), (b:Target) CREATE (a)-[r:LINK {weight: 1}]->(b) RETURN id(r) AS edge", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["edge"] == nil {
+		t.Fatalf("CREATE RETURN rows = %#v", result.Rows)
+	}
+}
+
+func TestBooleanWherePredicatesAndComparisons(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "where-predicate.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for _, props := range []map[string]any{
+			{"name": "ten", "age": int64(10), "active": true},
+			{"name": "twenty", "age": int64(20), "active": false, "admin": true},
+			{"name": "thirty", "age": int64(30)},
+		} {
+			if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Person"}, Properties: props}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		where string
+		want  []string
+	}{
+		{"n.age >= 20 AND n.age < 30", []string{"twenty"}},
+		{"n.age <> 20", []string{"ten", "thirty"}},
+		{"n.active = true OR n.admin = true", []string{"ten", "twenty"}},
+		{"NOT (n.active = true OR n.age >= 30)", []string{"twenty"}},
+		{"NOT n.admin = true", nil},
+	}
+	for _, test := range tests {
+		result, err := db.Query("MATCH (n:Person) WHERE "+test.where+" RETURN n.name AS name ORDER BY name", nil)
+		if err != nil {
+			t.Fatalf("WHERE %s: %v", test.where, err)
+		}
+		got := make([]string, len(result.Rows))
+		for index, row := range result.Rows {
+			got[index] = row["name"].(string)
+		}
+		if !slices.Equal(got, test.want) {
+			t.Fatalf("WHERE %s = %v, want %v", test.where, got, test.want)
+		}
+	}
+}
+
+func TestMixedNumericComparisonPreservesIntegerPrecision(t *testing.T) {
+	tests := []struct {
+		left  any
+		right any
+		want  int
+	}{
+		{int64(9_007_199_254_740_993), float64(9_007_199_254_740_992), 1},
+		{int64(1), 1.5, -1},
+		{int64(-1), -1.5, 1},
+	}
+	for _, test := range tests {
+		got, ok := compareQueryValues(test.left, test.right)
+		if !ok || got != test.want {
+			t.Fatalf("compareQueryValues(%v, %v) = %d, %v; want %d, true", test.left, test.right, got, ok, test.want)
+		}
+	}
+}
+
 func TestUnsupportedCreatePatternFailsBeforeMutation(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "partial-create.ltdb"), OpenOptions{Create: true})
 	if err != nil {

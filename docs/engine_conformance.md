@@ -219,25 +219,33 @@ Keywords are uppercase. Bindings, property names, labels, relationship types, al
 ```text
 query         = match-query | create-node-query | unwind-query
 match-query   = MATCH patterns [WHERE predicates]
-                [RETURN return-tail | SET assignment | CREATE edge-create |
-                 REMOVE removals | DELETE bindings]
+                [RETURN return-tail | SET assignments [RETURN return-tail] |
+                 CREATE edge-create [RETURN return-tail] |
+                 REMOVE removals [RETURN return-tail] | DELETE bindings]
 create-node-query
               = CREATE node-pattern [RETURN return-tail]
 unwind-query  = UNWIND value AS binding RETURN return-tail
 
 patterns      = pattern {"," pattern}
-pattern       = node-pattern | node-pattern "-[" [binding] [":" type] "]->" node-pattern
+pattern       = node-pattern | node-pattern {relationship node-pattern}
+relationship  = "-[" [binding] [":" type] [properties] "]->"
+              | "<-[" [binding] [":" type] [properties] "]-"
 node-pattern  = "(" [binding] {":" label} [properties] ")"
 properties    = "{" [property ":" value {"," property ":" value}] "}"
 
-predicates    = predicate {AND predicate}
-predicate     = property-access "=" value
+predicates    = and-expression {OR and-expression}
+and-expression
+              = not-expression {AND not-expression}
+not-expression
+              = [NOT] ("(" predicates ")" | predicate)
+predicate     = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") value
               | id-access "=" value
               | property-access IS NULL
               | property-access IS NOT NULL
               | property-access "<=>" value
               | property-access "@@" value
 
+assignments   = assignment {"," assignment}
 assignment    = property-access "=" value
               | binding "=" value
               | binding "+=" value
@@ -247,15 +255,17 @@ removals      = (property-access | binding ":" label)
 bindings      = binding {"," binding}
 
 return-tail   = (count-return | projection {"," projection})
-                [ORDER BY order {"," order}] [LIMIT non-negative-integer]
+                [ORDER BY order {"," order}]
+                [SKIP pagination] [LIMIT pagination]
 count-return  = "count(" ("*" | binding) ")" [AS alias]
 projection    = (binding | property-access | id-access) [AS alias]
-order         = (binding | property-access | id-access) [ASC | DESC]
+order         = (binding | property-access | id-access | alias) [ASC | DESC]
+pagination    = non-negative-integer | parameter
 
 value         = null | true | false | integer | float | string | parameter | map
 ```
 
-Only outgoing `->` relationships, equality/NULL/search predicates joined by `AND`, and one terminal mutation clause are supported. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, `OR`, comparisons other than `=`, variable-length paths, `SKIP`, `DETACH DELETE`, list literals, backtick identifiers, and ordering by a return alias are rejected. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
+Fixed-length paths may mix incoming and outgoing relationships. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, `DETACH DELETE`, list literals, and backtick identifiers remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
 
 ### General Rules
 
@@ -264,6 +274,8 @@ Only outgoing `->` relationships, equality/NULL/search predicates joined by `AND
 - Explicit `RETURN ... AS alias` controls the output column name.
 - Portable code should use explicit aliases for result column names.
 - `LIMIT` applies to the produced rows for a `RETURN` clause.
+- `SKIP` is applied after ordering and before `LIMIT`.
+- `SKIP` and `LIMIT` accept a non-negative integer literal or parameter; other runtime parameter values are execution errors.
 - `LIMIT 0` returns zero rows.
 - Negative `LIMIT` values are invalid.
 - Without an explicit alias, the current derived-name behavior is not a required cross-engine compatibility guarantee.
@@ -273,6 +285,8 @@ Only outgoing `->` relationships, equality/NULL/search predicates joined by `AND
 
 - Property access on a node or edge may return `NULL`.
 - `IS NULL` and `IS NOT NULL` operate on the resulting query value, not on direct-storage presence metadata.
+- Boolean predicates use three-valued logic; only `true` rows pass `WHERE`, and comparisons involving `NULL` or a missing property remain unknown under `NOT`.
+- Ordered comparisons accept numeric values, including mixed integers and floats, or two strings. Incomparable values do not pass `WHERE`.
 
 ### Mutation Semantics
 
@@ -282,9 +296,11 @@ The following behaviors are part of the contract:
 - `SET target.prop = expr` updates or removes a property depending on whether `expr` evaluates to non-`NULL` or `NULL`
 - `SET target = {...}` replaces the property map on the target
 - `SET target += {...}` merges into the property map on the target
+- Multiple comma-separated `SET` items execute in source order.
 - `REMOVE target.prop` removes a property
 - `REMOVE target:Label` removes a label
-- On mutation queries with `RETURN`, `LIMIT` truncates the returned rows but does not suppress earlier statement side effects.
+- `SET`, `REMOVE`, and relationship `CREATE` may be followed by `RETURN`; a created relationship binding is available to that projection.
+- On mutation queries with `RETURN`, `SKIP` and `LIMIT` truncate the returned rows but do not suppress earlier statement side effects.
 - mutation against a bound edge variable targets the matched stable edge instance, not all parallel edges with the same endpoints
 
 ### Search Operators Inside Queries
