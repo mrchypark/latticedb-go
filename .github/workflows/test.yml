@@ -25,6 +25,17 @@ jobs:
         working-directory: conformance/go
       - run: go test -race ./...
         if: runner.os == 'Linux'
+      - run: go test -race ./...
+        working-directory: conformance/go
+        if: runner.os == 'Linux'
+      - name: Cross-compile portable targets
+        if: runner.os == 'Linux'
+        run: |
+          GOOS=solaris GOARCH=amd64 go test -c -o /tmp/latticedb-solaris.test .
+          GOOS=aix GOARCH=ppc64 go test -c -o /tmp/latticedb-aix.test .
+          GOOS=plan9 GOARCH=amd64 go test -c -o /tmp/latticedb-plan9.test .
+          GOOS=js GOARCH=wasm go test -c -o /tmp/latticedb-wasm.test .
+          GOOS=wasip1 GOARCH=wasm go test -c -o /tmp/latticedb-wasi.test .
       - run: go test -race ./internal/engine -run '^TestConcurrentVectorReadersRebuildAndCancellation$' -count=20
         if: runner.os == 'Linux'
       - run: go test -race ./internal/exporter -run 'Test(CSVConcurrentSubprocessPublicationAndOwnerDeath|ExportPathLockRegistryReclaimsEntries)$' -count=20

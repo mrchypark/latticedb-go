@@ -408,7 +408,6 @@ func TestConformanceLabelOrderAndUnlabeledNodes(t *testing.T) {
 func TestConformanceMissingVsNullAndNestedRoundTrip(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "values.ltdb")
 	db := openDB(t, dbPath, OpenOptions{Create: true})
-	defer closeDB(t, db)
 
 	var nodeID uint64
 	err := db.Update(func(tx Tx) error {
@@ -664,6 +663,15 @@ func TestConformanceDirectionalTraversalAndUnknownRelationshipTypes(t *testing.T
 	requireSingleIntResult(t, result, "count", 1)
 
 	result, err = db.Query(
+		"MATCH (:Person {name: $name})-[:KNOWS]->(b:Person) RETURN count(b) AS count",
+		map[string]Value{"name": "Alice"},
+	)
+	if err != nil {
+		t.Fatalf("query anonymous parameterized start node: %v", err)
+	}
+	requireSingleIntResult(t, result, "count", 1)
+
+	result, err = db.Query(
 		"MATCH (a:Person {name: \"Bob\"})-[:KNOWS]->(b:Person {name: \"Alice\"}) RETURN count(b) AS count",
 		nil,
 	)
@@ -757,6 +765,16 @@ func TestConformanceQueryCreateNodeWithLabelsAndProperties(t *testing.T) {
 	if err != nil {
 		t.Fatalf("validate created node: %v", err)
 	}
+
+	unsupported := "CREATE (a:Profile {name: $a})-[:REL]->(b:Profile {name: $b})"
+	if _, err := db.Query(unsupported, map[string]Value{"a": "A", "b": "B"}); err == nil {
+		t.Fatal("unsupported compound CREATE unexpectedly succeeded")
+	}
+	result, err = db.Query("MATCH (n) RETURN count(n) AS count", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireSingleIntResult(t, result, "count", 1)
 }
 
 func TestConformanceQueryLimitZeroAndNegativeValues(t *testing.T) {
@@ -1594,7 +1612,7 @@ func openDB(t *testing.T, path string, opts OpenOptions) Database {
 func currentDriver(t *testing.T) Driver {
 	t.Helper()
 	if testDriver == nil {
-		t.Skip("conformance driver adapter not configured")
+		t.Fatal("conformance driver adapter not configured")
 	}
 	return testDriver
 }

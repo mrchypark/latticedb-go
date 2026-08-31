@@ -7,7 +7,7 @@ An embedded graph database written entirely in Go. It provides transactional gra
 LatticeDB Go requires Go 1.27 or newer.
 
 ```sh
-go get github.com/mrchypark/latticedb-go@v0.1.0
+go get github.com/mrchypark/latticedb-go@v0.1.1
 ```
 
 ## Quick start
@@ -66,6 +66,8 @@ func main() {
 - Only one online snapshot may be active per database. Writers can continue after the snapshot generation is captured.
 
 The detailed behavioral contract is documented in [docs/engine_conformance.md](docs/engine_conformance.md), with the value model in [docs/value_model.md](docs/value_model.md).
+
+CSV export returns and atomically publishes a JSON manifest whose `nodes` and `edges` paths point into `<output>_generations`. Published generations remain immutable and are not reclaimed automatically because readers do not hold leases.
 
 ## Development
 

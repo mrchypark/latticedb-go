@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -14,7 +15,62 @@ import (
 	"testing"
 )
 
-func TestConformanceCrashRecoveryCommittedGraphAndAbortedTail(t *testing.T) {
+func TestConformanceProcessDeathRecoversCommittedWAL(t *testing.T) {
+	if dbPath := os.Getenv("LATTICEDB_CRASH_DB"); dbPath != "" {
+		db := openDB(t, dbPath, OpenOptions{Create: true})
+		var committedID uint64
+		if err := db.Update(func(tx Tx) error {
+			node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Committed"}})
+			if err == nil {
+				committedID = node.ID
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		uncommitted := beginTx(t, db, false)
+		ghost, err := uncommitted.CreateNode(CreateNodeOptions{Labels: []string{"Ghost"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, err := json.Marshal([2]uint64{committedID, ghost.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(os.Getenv("LATTICEDB_CRASH_IDS"), ids, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		os.Exit(0) // Deliberately bypass transaction rollback and database Close.
+	}
+
+	base := t.TempDir()
+	dbPath := filepath.Join(base, "process-death.ltdb")
+	idsPath := filepath.Join(base, "ids.json")
+	command := exec.Command(os.Args[0], "-test.run=^TestConformanceProcessDeathRecoversCommittedWAL$")
+	command.Env = append(os.Environ(), "LATTICEDB_CRASH_DB="+dbPath, "LATTICEDB_CRASH_IDS="+idsPath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("crash helper: %v\n%s", err, output)
+	}
+	data, err := os.ReadFile(idsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids [2]uint64
+	if err := json.Unmarshal(data, &ids); err != nil {
+		t.Fatal(err)
+	}
+	db := openDB(t, dbPath, OpenOptions{})
+	defer closeDB(t, db)
+	if err := db.View(func(tx Tx) error {
+		requireNodeExists(t, tx, ids[0], true)
+		requireNodeExists(t, tx, ids[1], false)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConformanceCrashRecoveryCommittedGraphAndRolledBackTransaction(t *testing.T) {
 	recovery := currentRecoveryHarness(t)
 
 	dbPath := filepath.Join(t.TempDir(), "crash_graph.ltdb")
@@ -169,7 +225,7 @@ func TestConformanceCrashRecoveryCommittedGraphAndAbortedTail(t *testing.T) {
 	}
 }
 
-func TestConformanceCrashRecoveryCommittedNodePropertyUpdateWinsOverAbortedUpdate(t *testing.T) {
+func TestConformanceCrashRecoveryCommittedNodePropertyUpdateWinsOverRolledBackUpdate(t *testing.T) {
 	recovery := currentRecoveryHarness(t)
 
 	dbPath := filepath.Join(t.TempDir(), "crash_node_property_update.ltdb")
@@ -500,11 +556,11 @@ func TestConformanceExportAndDumpInvariants(t *testing.T) {
 	validateJSONLExport(t, jsonlPath)
 
 	csvPath := filepath.Join(t.TempDir(), "graph.csv")
-	if _, err := exporter.Export(dbPath, ExportFormatCSV, csvPath); err != nil {
+	manifest, err := exporter.Export(dbPath, ExportFormatCSV, csvPath)
+	if err != nil {
 		t.Fatalf("export csv: %v", err)
 	}
-	nodesCSV := strings.TrimSuffix(csvPath, ".csv") + "_nodes.csv"
-	edgesCSV := strings.TrimSuffix(csvPath, ".csv") + "_edges.csv"
+	nodesCSV, edgesCSV := csvManifestPaths(t, csvPath, manifest)
 	if lines := countNonEmptyLinesFile(t, nodesCSV); lines != 3 {
 		t.Fatalf("unexpected node csv line count %d", lines)
 	}
@@ -694,11 +750,25 @@ func TestConformanceTypedExportPreservesLogicalValueKinds(t *testing.T) {
 	requireTypedValueKinds(t, readSingleJSONLNodeProperties(t, jsonlPath))
 
 	csvPath := filepath.Join(t.TempDir(), "typed.csv")
-	if _, err := exporter.Export(dbPath, ExportFormatCSV, csvPath); err != nil {
+	manifest, err := exporter.Export(dbPath, ExportFormatCSV, csvPath)
+	if err != nil {
 		t.Fatalf("export typed csv: %v", err)
 	}
-	nodesCSV := strings.TrimSuffix(csvPath, ".csv") + "_nodes.csv"
+	nodesCSV, _ := csvManifestPaths(t, csvPath, manifest)
 	requireTypedValueKinds(t, readSingleCSVNodeProperties(t, nodesCSV))
+}
+
+func csvManifestPaths(t *testing.T, outputPath string, data []byte) (string, string) {
+	t.Helper()
+	var manifest struct {
+		Nodes string `json:"nodes"`
+		Edges string `json:"edges"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("unmarshal CSV manifest: %v", err)
+	}
+	base := filepath.Dir(outputPath)
+	return filepath.Join(base, manifest.Nodes), filepath.Join(base, manifest.Edges)
 }
 
 type exportedGraph struct {

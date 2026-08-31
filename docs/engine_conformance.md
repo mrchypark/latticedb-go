@@ -210,7 +210,52 @@ The following must hold:
 
 ## Query Semantics
 
-This document does not attempt to restate the full Cypher subset grammar. It freezes the externally important semantics already exercised by the integration tests.
+LatticeDB implements a deliberately small, case-sensitive Cypher subset. It does not claim full openCypher compatibility. The executable syntax inventory is `TestQueryGrammarMatrix`; the extracted conformance suite separately verifies runtime semantics.
+
+### Supported Cypher Subset
+
+Keywords are uppercase. Bindings, property names, labels, relationship types, aliases, and parameters use unquoted ASCII identifiers matching `[A-Za-z_][A-Za-z0-9_]*`.
+
+```text
+query         = match-query | create-node-query | unwind-query
+match-query   = MATCH patterns [WHERE predicates]
+                [RETURN return-tail | SET assignment | CREATE edge-create |
+                 REMOVE removals | DELETE bindings]
+create-node-query
+              = CREATE node-pattern [RETURN return-tail]
+unwind-query  = UNWIND value AS binding RETURN return-tail
+
+patterns      = pattern {"," pattern}
+pattern       = node-pattern | node-pattern "-[" [binding] [":" type] "]->" node-pattern
+node-pattern  = "(" [binding] {":" label} [properties] ")"
+properties    = "{" [property ":" value {"," property ":" value}] "}"
+
+predicates    = predicate {AND predicate}
+predicate     = property-access "=" value
+              | id-access "=" value
+              | property-access IS NULL
+              | property-access IS NOT NULL
+              | property-access "<=>" value
+              | property-access "@@" value
+
+assignment    = property-access "=" value
+              | binding "=" value
+              | binding "+=" value
+edge-create   = "(" binding ")-[" [binding] ":" type [properties] "]->(" binding ")"
+removals      = (property-access | binding ":" label)
+                {"," (property-access | binding ":" label)}
+bindings      = binding {"," binding}
+
+return-tail   = (count-return | projection {"," projection})
+                [ORDER BY order {"," order}] [LIMIT non-negative-integer]
+count-return  = "count(" ("*" | binding) ")" [AS alias]
+projection    = (binding | property-access | id-access) [AS alias]
+order         = (binding | property-access | id-access) [ASC | DESC]
+
+value         = null | true | false | integer | float | string | parameter | map
+```
+
+Only outgoing `->` relationships, equality/NULL/search predicates joined by `AND`, and one terminal mutation clause are supported. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, `OR`, comparisons other than `=`, variable-length paths, `SKIP`, `DETACH DELETE`, list literals, backtick identifiers, and ordering by a return alias are rejected. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
 
 ### General Rules
 
@@ -326,6 +371,9 @@ Current export behavior establishes several logical invariants worth preserving 
 - canonical dump sorts labels, property keys, and nested map keys lexicographically
 - canonical dump includes stable edge IDs so parallel edges remain distinguishable in state comparisons
 - repeated dumps of unchanged logical state are byte-stable
+- CSV export writes a JSON manifest at the requested output path; its `nodes` and `edges` fields are paths relative to the manifest directory
+- each CSV publication uses an immutable directory under `<output>_generations`, and node labels are encoded as a JSON array in the CSV field
+- published CSV generations are retained because readers have no lease protocol; callers that export repeatedly must manage retention only after they know no reader references an older manifest
 
 ### Import Compatibility Boundary
 

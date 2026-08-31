@@ -2228,6 +2228,64 @@ func TestQueryQuotedOperatorsAreNotStructural(t *testing.T) {
 	}
 }
 
+func TestAnonymousParameterizedMatchSupportsTraversal(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "anonymous-match.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		alice, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Alice"}})
+		if err != nil {
+			return err
+		}
+		bob, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "Bob"}})
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateEdge(alice.ID, bob.ID, "KNOWS", CreateEdgeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	params := map[string]any{"name": "Alice"}
+	result, err := db.Query("MATCH ({name: $name})-[:KNOWS]->(b) RETURN b.name", params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["b.name"] != "Bob" {
+		t.Fatalf("anonymous traversal result = %#v", result.Rows)
+	}
+	result, err = db.Query("MATCH ({name: $name}) RETURN count(*) AS count", params)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("anonymous node result = %#v, %v", result.Rows, err)
+	}
+}
+
+func TestUnsupportedCreatePatternFailsBeforeMutation(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "partial-create.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, query := range []string{
+		"CREATE (a:Person {name: $a})-[e:KNOWS]->(b:Person {name: $b})",
+		"CREATE (:Person)-[:KNOWS]->(:Person)",
+	} {
+		if _, err := db.Query(query, map[string]any{"a": "Alice", "b": "Bob"}); err == nil {
+			t.Fatalf("unsupported create pattern unexpectedly succeeded: %s", query)
+		}
+	}
+	result, err := db.Query("MATCH (n) RETURN count(n) AS count", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("unsupported CREATE partially mutated graph: %#v", result.Rows)
+	}
+}
+
 func TestQuerySemanticValidationFailsClosed(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "query-semantics.ltdb"), OpenOptions{Create: true})
 	if err != nil {

@@ -282,7 +282,7 @@ func (plan *queryPlan) validateBindings() error {
 		if name == "" {
 			return nil
 		}
-		if !isQueryIdentifier(name) {
+		if name[0] != 0 && !isQueryIdentifier(name) {
 			return fmt.Errorf("invalid binding %q", name)
 		}
 		if existing, ok := bindings[name]; ok && existing != role {
@@ -394,10 +394,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 		return nil, err
 	}
 
-	inlineWhere, err := patternPropertyClauses(patterns)
-	if err != nil {
-		return nil, err
-	}
+	inlineWhere := patternPropertyClauses(patterns)
 	plan := &queryPlan{matchPatterns: patterns, whereClauses: inlineWhere}
 
 	switch nextKeyword {
@@ -954,6 +951,12 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 			if err != nil {
 				return nil, err
 			}
+			if pattern.Left.Var == "" && len(pattern.Left.PropertyExprs) != 0 {
+				pattern.Left.Var = fmt.Sprintf("\x00node%d-left", len(patterns))
+			}
+			if pattern.Right.Var == "" && len(pattern.Right.PropertyExprs) != 0 {
+				pattern.Right.Var = fmt.Sprintf("\x00node%d-right", len(patterns))
+			}
 			patterns = append(patterns, pattern)
 			continue
 		}
@@ -961,17 +964,17 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 		if err != nil {
 			return nil, err
 		}
+		if pattern.Var == "" && len(pattern.PropertyExprs) != 0 {
+			pattern.Var = fmt.Sprintf("\x00node%d", len(patterns))
+		}
 		patterns = append(patterns, pattern)
 	}
 	return patterns, nil
 }
 
-func patternPropertyClauses(patterns []matchPattern) ([]*whereClause, error) {
+func patternPropertyClauses(patterns []matchPattern) []*whereClause {
 	var clauses []*whereClause
-	appendNode := func(pattern nodePattern) error {
-		if len(pattern.PropertyExprs) != 0 && pattern.Var == "" {
-			return errors.New("parameterized MATCH properties require a node binding")
-		}
+	appendNode := func(pattern nodePattern) {
 		keys := make([]string, 0, len(pattern.PropertyExprs))
 		for key := range pattern.PropertyExprs {
 			keys = append(keys, key)
@@ -980,24 +983,17 @@ func patternPropertyClauses(patterns []matchPattern) ([]*whereClause, error) {
 		for _, key := range keys {
 			clauses = append(clauses, &whereClause{Kind: whereEquals, Var: pattern.Var, Property: key, Expr: pattern.PropertyExprs[key]})
 		}
-		return nil
 	}
 	for _, item := range patterns {
 		switch pattern := item.(type) {
 		case nodePattern:
-			if err := appendNode(pattern); err != nil {
-				return nil, err
-			}
+			appendNode(pattern)
 		case edgePattern:
-			if err := appendNode(pattern.Left); err != nil {
-				return nil, err
-			}
-			if err := appendNode(pattern.Right); err != nil {
-				return nil, err
-			}
+			appendNode(pattern.Left)
+			appendNode(pattern.Right)
 		}
 	}
-	return clauses, nil
+	return clauses
 }
 
 func parseNodePattern(text string) (nodePattern, error) {
@@ -1042,9 +1038,10 @@ func parseNodePattern(text string) (nodePattern, error) {
 	}
 	for _, segment := range segments[1:] {
 		label := strings.TrimSpace(segment)
-		if label != "" {
-			pattern.Labels = append(pattern.Labels, label)
+		if !isQueryIdentifier(label) {
+			return nodePattern{}, fmt.Errorf("invalid label %q", label)
 		}
+		pattern.Labels = append(pattern.Labels, label)
 	}
 	return pattern, nil
 }
@@ -1076,8 +1073,17 @@ func parseEdgePattern(text string) (edgePattern, error) {
 	if len(edgeSegments) == 2 {
 		pattern.EdgeVar = strings.TrimSpace(edgeSegments[0])
 		pattern.EdgeType = strings.TrimSpace(edgeSegments[1])
+		if pattern.EdgeType == "" {
+			return edgePattern{}, errors.New("edge type must be non-empty after colon")
+		}
 	} else {
 		pattern.EdgeVar = strings.TrimSpace(edgeSegments[0])
+	}
+	if pattern.EdgeVar != "" && !isQueryIdentifier(pattern.EdgeVar) {
+		return edgePattern{}, fmt.Errorf("invalid edge binding %q", pattern.EdgeVar)
+	}
+	if pattern.EdgeType != "" && !isQueryIdentifier(pattern.EdgeType) {
+		return edgePattern{}, fmt.Errorf("invalid edge type %q", pattern.EdgeType)
 	}
 	return pattern, nil
 }
@@ -1223,6 +1229,9 @@ func parseCreateClause(text string) (*createClause, error) {
 			return nil, err
 		}
 		props = parsedProps
+		if strings.TrimSpace(edgeBody[propEnd+1:]) != "" {
+			return nil, fmt.Errorf("unexpected text after CREATE edge properties in %q", text)
+		}
 		edgePrefix = strings.TrimSpace(edgeBody[:propStart])
 	}
 
@@ -1230,11 +1239,19 @@ func parseCreateClause(text string) (*createClause, error) {
 	if len(edgeSegments) != 2 {
 		return nil, fmt.Errorf("invalid CREATE edge pattern %q", text)
 	}
+	edgeVar := strings.TrimSpace(edgeSegments[0])
+	edgeType := strings.TrimSpace(edgeSegments[1])
+	if edgeVar != "" && !isQueryIdentifier(edgeVar) {
+		return nil, fmt.Errorf("invalid CREATE edge binding %q", edgeVar)
+	}
+	if !isQueryIdentifier(edgeType) {
+		return nil, fmt.Errorf("invalid CREATE edge type %q", edgeType)
+	}
 
 	return &createClause{
 		SourceVar: strings.TrimSpace(sourceBody),
 		TargetVar: strings.TrimSpace(targetBody),
-		EdgeType:  strings.TrimSpace(edgeSegments[1]),
+		EdgeType:  edgeType,
 		Props:     props,
 	}, nil
 }
@@ -1258,6 +1275,9 @@ func parseCreateNodeClause(text string) (*createNodeClause, error) {
 			return nil, err
 		}
 		props = parsedProps
+		if strings.TrimSpace(body[propEnd+1:]) != "" {
+			return nil, fmt.Errorf("unexpected text after CREATE node properties in %q", text)
+		}
 		prefix = strings.TrimSpace(body[:propStart])
 	}
 
@@ -1271,9 +1291,10 @@ func parseCreateNodeClause(text string) (*createNodeClause, error) {
 	}
 	for _, segment := range segments[1:] {
 		label := strings.TrimSpace(segment)
-		if label != "" {
-			clause.Labels = append(clause.Labels, label)
+		if !isQueryIdentifier(label) {
+			return nil, fmt.Errorf("invalid label %q", label)
 		}
+		clause.Labels = append(clause.Labels, label)
 	}
 	return clause, nil
 }
@@ -1312,7 +1333,7 @@ func parseRemoveClause(text string) (*removeClause, error) {
 		}
 		varName := strings.TrimSpace(left)
 		label := strings.TrimSpace(right)
-		if varName == "" || label == "" {
+		if varName == "" || !isQueryIdentifier(label) {
 			return nil, fmt.Errorf("invalid REMOVE clause item %q", part)
 		}
 		items = append(items, removeItem{Var: varName, Label: label})
@@ -1339,9 +1360,13 @@ func parseReturnClause(text string) (*returnClause, error) {
 		case !strings.HasPrefix(rest, "AS "):
 			return nil, fmt.Errorf("invalid count return %q", text)
 		}
+		alias := strings.TrimSpace(strings.TrimPrefix(rest, "AS "))
+		if !isQueryIdentifier(alias) {
+			return nil, fmt.Errorf("invalid count alias %q", alias)
+		}
 		return &returnClause{
 			CountVar:   countVar,
-			CountAlias: strings.TrimSpace(strings.TrimPrefix(rest, "AS ")),
+			CountAlias: alias,
 		}, nil
 	}
 
@@ -1358,6 +1383,9 @@ func parseReturnClause(text string) (*returnClause, error) {
 		if len(pieces) == 2 {
 			exprText = strings.TrimSpace(pieces[0])
 			alias = strings.TrimSpace(pieces[1])
+			if !isQueryIdentifier(alias) {
+				return nil, fmt.Errorf("invalid RETURN alias %q", alias)
+			}
 		}
 		if exprText == "" || alias == "" {
 			return nil, fmt.Errorf("invalid RETURN projection %q", part)
@@ -2191,6 +2219,8 @@ func (expr variableExpr) eval(row queryRow, _ map[string]any) (any, error) {
 func parseValueExpr(text string) (valueExpr, error) {
 	text = strings.TrimSpace(text)
 	switch {
+	case text == "":
+		return nil, errors.New("value expression must be non-empty")
 	case text == "null":
 		return literalExpr{Value: nil}, nil
 	case text == "true":
@@ -2198,7 +2228,11 @@ func parseValueExpr(text string) (valueExpr, error) {
 	case text == "false":
 		return literalExpr{Value: false}, nil
 	case strings.HasPrefix(text, "$"):
-		return paramExpr{Name: strings.TrimPrefix(text, "$")}, nil
+		name := strings.TrimPrefix(text, "$")
+		if !isQueryIdentifier(name) {
+			return nil, fmt.Errorf("invalid parameter %q", text)
+		}
+		return paramExpr{Name: name}, nil
 	case strings.HasPrefix(text, "{") && strings.HasSuffix(text, "}"):
 		entries, err := parsePropertyExprMap(strings.TrimSpace(text[1 : len(text)-1]))
 		if err != nil {
@@ -2273,8 +2307,8 @@ func splitPropertyAssignment(text string) (string, string, error) {
 		return "", "", fmt.Errorf("invalid property assignment %q", text)
 	}
 	key = strings.TrimSpace(key)
-	if key == "" {
-		return "", "", errors.New("property key must be non-empty")
+	if !isQueryIdentifier(key) {
+		return "", "", fmt.Errorf("invalid property key %q", key)
 	}
 	return key, strings.TrimSpace(value), nil
 }
@@ -2422,6 +2456,9 @@ func trimEnclosed(text string, open byte, close byte) (string, error) {
 	text = strings.TrimSpace(text)
 	if len(text) < 2 || text[0] != open || text[len(text)-1] != close {
 		return "", fmt.Errorf("expected %c...%c, got %q", open, close, text)
+	}
+	if end := findMatchingBrace(text, 0, open, close); end != len(text)-1 {
+		return "", fmt.Errorf("unexpected text after %c...%c in %q", open, close, text)
 	}
 	return strings.TrimSpace(text[1 : len(text)-1]), nil
 }
