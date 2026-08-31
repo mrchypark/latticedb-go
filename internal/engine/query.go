@@ -139,6 +139,10 @@ const (
 	whereLessEqual    whereKind = "less_equal"
 	whereGreater      whereKind = "greater"
 	whereGreaterEqual whereKind = "greater_equal"
+	whereIn           whereKind = "in"
+	whereStartsWith   whereKind = "starts_with"
+	whereEndsWith     whereKind = "ends_with"
+	whereContains     whereKind = "contains"
 	whereIsNull       whereKind = "is_null"
 	whereIsNotNull    whereKind = "is_not_null"
 	whereVector       whereKind = "vector"
@@ -171,6 +175,7 @@ type setClause struct {
 	Kind     setKind
 	Var      string
 	Property string
+	Label    string
 	Expr     valueExpr
 }
 
@@ -194,6 +199,7 @@ const (
 	setProperty setKind = "property"
 	setReplace  setKind = "replace"
 	setMerge    setKind = "merge"
+	setLabel    setKind = "label"
 )
 
 type removeClause struct {
@@ -276,7 +282,7 @@ type variableExpr struct {
 }
 
 func parseQuery(query string) (*queryPlan, error) {
-	query = strings.TrimSpace(query)
+	query = normalizeQueryText(query)
 	var plan *queryPlan
 	var err error
 	switch {
@@ -296,6 +302,41 @@ func parseQuery(query string) (*queryPlan, error) {
 		return nil, err
 	}
 	return plan, nil
+}
+
+func normalizeQueryText(query string) string {
+	query = strings.TrimSpace(query)
+	if strings.HasSuffix(query, ";") {
+		query = strings.TrimSpace(strings.TrimSuffix(query, ";"))
+	}
+
+	var normalized strings.Builder
+	normalized.Grow(len(query))
+	var quote byte
+	pendingSpace := false
+	for index := 0; index < len(query); index++ {
+		char := query[index]
+		if quote == 0 && isQuerySpace(char) {
+			pendingSpace = normalized.Len() != 0
+			continue
+		}
+		if pendingSpace {
+			normalized.WriteByte(' ')
+			pendingSpace = false
+		}
+		normalized.WriteByte(char)
+		scanQueryString(query, index, &quote)
+	}
+	return normalized.String()
+}
+
+func isQuerySpace(char byte) bool {
+	switch char {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
 }
 
 type bindingRole uint8
@@ -371,7 +412,11 @@ func (plan *queryPlan) validateBindings() error {
 		}
 	}
 	for _, clause := range plan.setClauses {
-		if err := require(clause.Var, bindingNode, bindingEdge); err != nil {
+		roles := []bindingRole{bindingNode, bindingEdge}
+		if clause.Kind == setLabel {
+			roles = []bindingRole{bindingNode}
+		}
+		if err := require(clause.Var, roles...); err != nil {
 			return err
 		}
 	}
@@ -426,7 +471,7 @@ func (plan *queryPlan) validateBindings() error {
 
 func parseMatchQuery(query string) (*queryPlan, error) {
 	rest := strings.TrimSpace(strings.TrimPrefix(query, "MATCH "))
-	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " RETURN ", " SET ", " CREATE ", " REMOVE ", " DELETE ")
+	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " RETURN ", " SET ", " CREATE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
 	patterns, err := parseMatchPatterns(matchText)
 	if err != nil {
 		return nil, err
@@ -437,7 +482,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 
 	switch nextKeyword {
 	case " WHERE ":
-		whereText, whereNext, afterWhere := splitOnNextClause(tail, " RETURN ", " SET ", " CREATE ", " REMOVE ", " DELETE ")
+		whereText, whereNext, afterWhere := splitOnNextClause(tail, " RETURN ", " SET ", " CREATE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
 		predicate, err := parseWherePredicate(whereText)
 		if err != nil {
 			return nil, err
@@ -454,7 +499,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 		}
 		nextKeyword = whereNext
 		tail = afterWhere
-	case " RETURN ", " SET ", " CREATE ", " REMOVE ", " DELETE ", "":
+	case " RETURN ", " SET ", " CREATE ", " REMOVE ", " DETACH DELETE ", " DELETE ", "":
 	default:
 		return nil, fmt.Errorf("unsupported clause after MATCH: %q", nextKeyword)
 	}
@@ -500,7 +545,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 				return nil, err
 			}
 		}
-	case " DELETE ":
+	case " DETACH DELETE ", " DELETE ":
 		deleteClause, err := parseDeleteClause(tail)
 		if err != nil {
 			return nil, err
@@ -1368,6 +1413,27 @@ func parseWhereClause(text string) (*whereClause, error) {
 		}
 		return &whereClause{Kind: whereFTS, Var: varName, Property: property, Expr: expr}, nil
 	}
+	for _, operator := range []struct {
+		Token string
+		Kind  whereKind
+	}{
+		{" STARTS WITH ", whereStartsWith},
+		{" ENDS WITH ", whereEndsWith},
+		{" CONTAINS ", whereContains},
+		{" IN ", whereIn},
+	} {
+		if left, right, ok := splitOperator(text, operator.Token); ok {
+			varName, property, err := parsePropertyAccess(left)
+			if err != nil {
+				return nil, err
+			}
+			expr, err := parseValueExpr(right)
+			if err != nil {
+				return nil, err
+			}
+			return &whereClause{Kind: operator.Kind, Var: varName, Property: property, Expr: expr}, nil
+		}
+	}
 	if left, right, ok := splitOperator(text, " = "); ok {
 		if varName, ok := parseBindingIDAccess(left); ok {
 			expr, err := parseValueExpr(right)
@@ -1412,6 +1478,13 @@ func parseWhereClause(text string) (*whereClause, error) {
 }
 
 func parseSetClause(text string) (*setClause, error) {
+	if !strings.Contains(text, " = ") && !strings.Contains(text, " += ") {
+		left, right, ok := splitOperator(text, ":")
+		if !ok || !isQueryIdentifier(left) || !isQueryIdentifier(right) {
+			return nil, fmt.Errorf("unsupported SET clause %q", text)
+		}
+		return &setClause{Kind: setLabel, Var: left, Label: right}, nil
+	}
 	if left, right, ok := splitOperator(text, " += "); ok {
 		name := strings.TrimSpace(left)
 		if name == "" || strings.Contains(name, ".") {
@@ -1459,64 +1532,31 @@ func parseSetClauses(text string) ([]*setClause, error) {
 }
 
 func parseCreateClause(text string) (*createClause, error) {
-	leftLink := findTopLevelToken(text, "-[")
-	if leftLink <= 0 || text[leftLink-1] != ')' {
+	patterns, err := parsePathPattern(text, 0)
+	if err != nil || len(patterns) != 1 {
 		return nil, fmt.Errorf("unsupported CREATE clause %q", text)
 	}
-	leftEnd := leftLink - 1
-	rightArrow := findTopLevelToken(text, "->")
-	if rightArrow <= leftLink || text[rightArrow-1] != ']' {
-		return nil, fmt.Errorf("unsupported CREATE clause %q", text)
+	pattern := patterns[0].(edgePattern)
+	validEndpoint := func(node nodePattern) bool {
+		return node.Var != "" && node.Var[0] != 0 && len(node.Labels) == 0 && len(node.Properties) == 0 && len(node.PropertyExprs) == 0
 	}
-	rightStart := rightArrow - 1
-
-	sourceBody, err := trimEnclosed(text[:leftEnd+1], '(', ')')
-	if err != nil {
-		return nil, err
-	}
-	targetBody, err := trimEnclosed(text[rightStart+3:], '(', ')')
-	if err != nil {
-		return nil, err
-	}
-
-	edgeBody := strings.TrimSpace(text[leftEnd+3 : rightStart])
-	propStart := findTopLevelRune(edgeBody, '{')
-	props := map[string]valueExpr{}
-	edgePrefix := edgeBody
-	if propStart >= 0 {
-		propEnd := findMatchingBrace(edgeBody, propStart, '{', '}')
-		if propEnd < 0 {
-			return nil, fmt.Errorf("unterminated CREATE property map in %q", text)
-		}
-		parsedProps, err := parsePropertyExprMap(edgeBody[propStart+1 : propEnd])
-		if err != nil {
-			return nil, err
-		}
-		props = parsedProps
-		if strings.TrimSpace(edgeBody[propEnd+1:]) != "" {
-			return nil, fmt.Errorf("unexpected text after CREATE edge properties in %q", text)
-		}
-		edgePrefix = strings.TrimSpace(edgeBody[:propStart])
-	}
-
-	edgeSegments := strings.SplitN(edgePrefix, ":", 2)
-	if len(edgeSegments) != 2 {
+	if !validEndpoint(pattern.Left) || !validEndpoint(pattern.Right) || pattern.EdgeType == "" {
 		return nil, fmt.Errorf("invalid CREATE edge pattern %q", text)
 	}
-	edgeVar := strings.TrimSpace(edgeSegments[0])
-	edgeType := strings.TrimSpace(edgeSegments[1])
-	if edgeVar != "" && !isQueryIdentifier(edgeVar) {
-		return nil, fmt.Errorf("invalid CREATE edge binding %q", edgeVar)
+
+	props := map[string]valueExpr{}
+	for key, value := range pattern.Properties {
+		props[key] = literalExpr{Value: value}
 	}
-	if !isQueryIdentifier(edgeType) {
-		return nil, fmt.Errorf("invalid CREATE edge type %q", edgeType)
+	for key, expr := range pattern.PropertyExprs {
+		props[key] = expr
 	}
 
 	return &createClause{
-		SourceVar: strings.TrimSpace(sourceBody),
-		TargetVar: strings.TrimSpace(targetBody),
-		EdgeVar:   edgeVar,
-		EdgeType:  edgeType,
+		SourceVar: pattern.Left.Var,
+		TargetVar: pattern.Right.Var,
+		EdgeVar:   pattern.EdgeVar,
+		EdgeType:  pattern.EdgeType,
 		Props:     props,
 	}, nil
 }
@@ -1988,41 +2028,18 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 		if !ok {
 			continue
 		}
+		if clause.Kind != whereVector && clause.Kind != whereFTS {
+			match, err := clause.eval(row, params)
+			if err != nil {
+				return nil, err
+			}
+			if match == predicateTrue {
+				filtered = append(filtered, row)
+			}
+			continue
+		}
 		value, exists := propertyFromBinding(binding, clause.Property)
 		switch clause.Kind {
-		case whereEquals:
-			expected, err := clause.Expr.eval(row, params)
-			if err != nil {
-				return nil, err
-			}
-			if exists && queryValuesEqual(value, expected) {
-				filtered = append(filtered, row)
-			}
-		case whereNotEquals:
-			expected, err := clause.Expr.eval(row, params)
-			if err != nil {
-				return nil, err
-			}
-			if exists && value != nil && expected != nil && !queryValuesEqual(value, expected) {
-				filtered = append(filtered, row)
-			}
-		case whereLess, whereLessEqual, whereGreater, whereGreaterEqual:
-			expected, err := clause.Expr.eval(row, params)
-			if err != nil {
-				return nil, err
-			}
-			comparison, comparable := compareQueryValues(value, expected)
-			if exists && comparable && comparisonMatches(clause.Kind, comparison) {
-				filtered = append(filtered, row)
-			}
-		case whereIsNull:
-			if !exists || value == nil {
-				filtered = append(filtered, row)
-			}
-		case whereIsNotNull:
-			if exists && value != nil {
-				filtered = append(filtered, row)
-			}
 		case whereVector:
 			if !exists {
 				continue
@@ -2073,19 +2090,6 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 			}
 			row.Order = -float64(score)
 			filtered = append(filtered, row)
-		case whereBindingID:
-			expected, err := clause.Expr.eval(row, params)
-			if err != nil {
-				return nil, err
-			}
-			expectedID, ok := normalizeInt64(expected)
-			if !ok {
-				return nil, fmt.Errorf("id comparison requires integer, got %T", expected)
-			}
-			gotID, ok := bindingID(binding)
-			if ok && gotID == expectedID {
-				filtered = append(filtered, row)
-			}
 		default:
 			return nil, fmt.Errorf("unsupported WHERE kind %q", clause.Kind)
 		}
@@ -2150,6 +2154,47 @@ func (clause *whereClause) eval(row queryRow, params map[string]any) (predicateT
 			return predicateUnknown, nil
 		}
 		return predicateBool(comparisonMatches(clause.Kind, comparison)), nil
+	case whereIn:
+		expected, err := clause.Expr.eval(row, params)
+		if err != nil || !exists || value == nil || expected == nil {
+			return predicateUnknown, err
+		}
+		items, ok := expected.([]any)
+		if !ok {
+			return predicateUnknown, fmt.Errorf("IN requires list value, got %T", expected)
+		}
+		unknown := false
+		for _, item := range items {
+			if item == nil {
+				unknown = true
+				continue
+			}
+			if queryValuesEqual(value, item) {
+				return predicateTrue, nil
+			}
+		}
+		if unknown {
+			return predicateUnknown, nil
+		}
+		return predicateFalse, nil
+	case whereStartsWith, whereEndsWith, whereContains:
+		expected, err := clause.Expr.eval(row, params)
+		if err != nil || !exists || value == nil || expected == nil {
+			return predicateUnknown, err
+		}
+		actualText, actualOK := value.(string)
+		expectedText, expectedOK := expected.(string)
+		if !actualOK || !expectedOK {
+			return predicateUnknown, nil
+		}
+		switch clause.Kind {
+		case whereStartsWith:
+			return predicateBool(strings.HasPrefix(actualText, expectedText)), nil
+		case whereEndsWith:
+			return predicateBool(strings.HasSuffix(actualText, expectedText)), nil
+		default:
+			return predicateBool(strings.Contains(actualText, expectedText)), nil
+		}
 	default:
 		return predicateUnknown, fmt.Errorf("unsupported boolean WHERE kind %q", clause.Kind)
 	}
@@ -2289,13 +2334,17 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any) e
 		if !ok {
 			continue
 		}
-		value, err := clause.Expr.eval(row, params)
-		if err != nil {
-			return err
-		}
-		normalized, err := store.NormalizeValue(value)
-		if err != nil {
-			return err
+		var normalized any
+		var err error
+		if clause.Kind != setLabel {
+			value, evalErr := clause.Expr.eval(row, params)
+			if evalErr != nil {
+				return evalErr
+			}
+			normalized, err = store.NormalizeValue(value)
+			if err != nil {
+				return err
+			}
 		}
 		switch clause.Kind {
 		case setProperty:
@@ -2364,6 +2413,18 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any) e
 				mergeMutationProperties(binding.Edge.Properties, props)
 			default:
 				return fmt.Errorf("binding %q is neither node nor edge", clause.Var)
+			}
+		case setLabel:
+			if binding.Node == nil {
+				return fmt.Errorf("binding %q is not a node", clause.Var)
+			}
+			binding.Node, err = tx.writableNode(binding.Node.ID)
+			if err != nil {
+				return err
+			}
+			if !slices.Contains(binding.Node.Labels, clause.Label) {
+				binding.Node.Labels = append(binding.Node.Labels, clause.Label)
+				tx.graph.Labels.Add(clause.Label, binding.Node.ID)
 			}
 		default:
 			return fmt.Errorf("unsupported SET kind %q", clause.Kind)

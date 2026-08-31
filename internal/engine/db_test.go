@@ -2447,6 +2447,88 @@ func TestMixedNumericComparisonPreservesIntegerPrecision(t *testing.T) {
 	}
 }
 
+func TestCypherCompatibilitySyntaxBatch(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "cypher-compatibility.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, query := range []string{
+		"CREATE\t(:Item {name: 'Alpha', kind: 'first', text: 'A  B'})\n;",
+		"CREATE (:Item {name: 'Beta', kind: 'second'});",
+	} {
+		if _, err := db.Query(query, nil); err != nil {
+			t.Fatalf("Query(%q): %v", query, err)
+		}
+	}
+	result, err := db.Query("MATCH\n(n:Item)\nWHERE n.text = 'A  B'\nRETURN n.name AS name;", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["name"] != "Alpha" {
+		t.Fatalf("normalized query result = %#v, %v", result.Rows, err)
+	}
+
+	result, err = db.Query("MATCH (a:Item {name: 'Alpha'}), (b:Item {name: 'Beta'}) CREATE (a)<-[r:LINK]-(b) RETURN id(r) AS edge;", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["edge"] == nil {
+		t.Fatalf("incoming CREATE result = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (a:Item {name: 'Alpha'})<-[r:LINK]-(b:Item) RETURN b.name AS name", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["name"] != "Beta" {
+		t.Fatalf("incoming edge result = %#v, %v", result.Rows, err)
+	}
+
+	result, err = db.Query("MATCH (n:Item {name: 'Alpha'}) SET n:Active RETURN n.name AS name", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["name"] != "Alpha" {
+		t.Fatalf("SET label result = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Active) RETURN count(n) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("SET label count = %#v, %v", result.Rows, err)
+	}
+
+	predicateTests := []struct {
+		where string
+		args  map[string]any
+		want  []string
+	}{
+		{"n.kind IN $kinds", map[string]any{"kinds": []any{"second"}}, []string{"Beta"}},
+		{"n.name STARTS WITH $text", map[string]any{"text": "Al"}, []string{"Alpha"}},
+		{"n.name ENDS WITH $text", map[string]any{"text": "ta"}, []string{"Beta"}},
+		{"n.name CONTAINS $text", map[string]any{"text": "ph"}, []string{"Alpha"}},
+	}
+	for _, test := range predicateTests {
+		result, err := db.Query("MATCH (n:Item) WHERE "+test.where+" RETURN n.name AS name ORDER BY name", test.args)
+		if err != nil {
+			t.Fatalf("WHERE %s: %v", test.where, err)
+		}
+		got := make([]string, len(result.Rows))
+		for index, row := range result.Rows {
+			got[index] = row["name"].(string)
+		}
+		if !slices.Equal(got, test.want) {
+			t.Fatalf("WHERE %s = %v, want %v", test.where, got, test.want)
+		}
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.name STARTS WITH 'Al' OR n.name ENDS WITH 'ta' RETURN n.name AS name ORDER BY name", nil)
+	if err != nil || len(result.Rows) != 2 {
+		t.Fatalf("combined string predicate rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE NOT (n.kind IN $kinds) RETURN n.name", map[string]any{"kinds": []any{"missing", nil}})
+	if err != nil || len(result.Rows) != 0 {
+		t.Fatalf("NULL IN predicate rows = %#v, %v", result.Rows, err)
+	}
+	if _, err := db.Query("MATCH (n:Item) WHERE n.kind IN $kinds RETURN n", map[string]any{"kinds": "first"}); err == nil {
+		t.Fatal("IN accepted a non-list parameter")
+	}
+
+	if _, err := db.Query("MATCH (n:Active) DETACH DELETE n;", nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err = db.Query("MATCH ()-[r]->() RETURN count(r) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("DETACH DELETE edge count = %#v, %v", result.Rows, err)
+	}
+}
+
 func TestUnsupportedCreatePatternFailsBeforeMutation(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "partial-create.ltdb"), OpenOptions{Create: true})
 	if err != nil {

@@ -217,7 +217,7 @@ LatticeDB implements a deliberately small, case-sensitive Cypher subset. It does
 Keywords are uppercase. Bindings, property names, labels, relationship types, aliases, and parameters use unquoted ASCII identifiers matching `[A-Za-z_][A-Za-z0-9_]*`.
 
 ```text
-query         = match-query | create-node-query | unwind-query
+query         = (match-query | create-node-query | unwind-query) [";"]
 match-query   = MATCH patterns [WHERE predicates]
                 [RETURN return-tail | SET assignments [RETURN return-tail] |
                  CREATE edge-create [RETURN return-tail] |
@@ -239,6 +239,8 @@ and-expression
 not-expression
               = [NOT] ("(" predicates ")" | predicate)
 predicate     = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") value
+              | property-access IN parameter
+              | property-access (STARTS WITH | ENDS WITH | CONTAINS) value
               | id-access "=" value
               | property-access IS NULL
               | property-access IS NOT NULL
@@ -249,7 +251,9 @@ assignments   = assignment {"," assignment}
 assignment    = property-access "=" value
               | binding "=" value
               | binding "+=" value
+              | binding ":" label
 edge-create   = "(" binding ")-[" [binding] ":" type [properties] "]->(" binding ")"
+              | "(" binding ")<-[" [binding] ":" type [properties] "]-(" binding ")"
 removals      = (property-access | binding ":" label)
                 {"," (property-access | binding ":" label)}
 bindings      = binding {"," binding}
@@ -265,11 +269,13 @@ pagination    = non-negative-integer | parameter
 value         = null | true | false | integer | float | string | parameter | map
 ```
 
-Fixed-length paths may mix incoming and outgoing relationships. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, `DETACH DELETE`, list literals, and backtick identifiers remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
+Fixed-length paths and relationship creation may use incoming or outgoing relationships. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, list literals, and backtick identifiers remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
 
 ### General Rules
 
 - Query parameters accept the same logical value model as direct property APIs.
+- ASCII whitespace outside string literals is interchangeable, so multiline and tab-indented queries are accepted without changing string contents.
+- One optional trailing semicolon is accepted; multiple statements remain invalid.
 - Query results return the same logical value model, including nested values.
 - Explicit `RETURN ... AS alias` controls the output column name.
 - Portable code should use explicit aliases for result column names.
@@ -287,6 +293,8 @@ Fixed-length paths may mix incoming and outgoing relationships. Variable-length 
 - `IS NULL` and `IS NOT NULL` operate on the resulting query value, not on direct-storage presence metadata.
 - Boolean predicates use three-valued logic; only `true` rows pass `WHERE`, and comparisons involving `NULL` or a missing property remain unknown under `NOT`.
 - Ordered comparisons accept numeric values, including mixed integers and floats, or two strings. Incomparable values do not pass `WHERE`.
+- `IN` accepts a list parameter and follows three-valued logic when a list contains `NULL`.
+- `STARTS WITH`, `ENDS WITH`, and `CONTAINS` compare strings without case folding.
 
 ### Mutation Semantics
 
@@ -296,10 +304,12 @@ The following behaviors are part of the contract:
 - `SET target.prop = expr` updates or removes a property depending on whether `expr` evaluates to non-`NULL` or `NULL`
 - `SET target = {...}` replaces the property map on the target
 - `SET target += {...}` merges into the property map on the target
+- `SET target:Label` adds a label idempotently and updates label lookup state.
 - Multiple comma-separated `SET` items execute in source order.
 - `REMOVE target.prop` removes a property
 - `REMOVE target:Label` removes a label
 - `SET`, `REMOVE`, and relationship `CREATE` may be followed by `RETURN`; a created relationship binding is available to that projection.
+- `DELETE` and its explicit `DETACH DELETE` spelling remove incident relationships when deleting a node.
 - On mutation queries with `RETURN`, `SKIP` and `LIMIT` truncate the returned rows but do not suppress earlier statement side effects.
 - mutation against a bound edge variable targets the matched stable edge instance, not all parallel edges with the same endpoints
 

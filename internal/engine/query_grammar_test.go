@@ -35,6 +35,8 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"where comparisons":             `MATCH (n) WHERE n.age <> 1 AND n.age >= 2 AND n.age <= 3 AND n.age > 1 AND n.age < 4 RETURN n`,
 		"where disjunction":             `MATCH (n) WHERE n.active = true OR n.admin = true RETURN n`,
 		"where not and parentheses":     `MATCH (n) WHERE NOT (n.active = true OR n.age < 18) RETURN n`,
+		"where in parameter":            `MATCH (n) WHERE n.kind IN $kinds RETURN n`,
+		"where string predicates":       `MATCH (n) WHERE n.name STARTS WITH "A" OR n.name ENDS WITH $suffix OR n.name CONTAINS "mid" RETURN n`,
 		"return count star":             `MATCH (n) RETURN count(*)`,
 		"return count binding":          `MATCH (n) RETURN count(n) AS count`,
 		"return binding":                `MATCH (n) RETURN n AS node`,
@@ -54,20 +56,25 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"merge properties":              `MATCH (n) SET n += $properties`,
 		"multiple set items":            `MATCH (n) SET n.a = 1, n.b = 2`,
 		"set then return":               `MATCH (n) SET n.name = $name RETURN n.name AS name`,
+		"set label":                     `MATCH (n) SET n:Active RETURN n`,
 		"create edge":                   `MATCH (a), (b) CREATE (a)-[:KNOWS {since: 2024}]->(b)`,
 		"create edge then return":       `MATCH (a), (b) CREATE (a)-[r:KNOWS]->(b) RETURN id(r) AS id`,
+		"create incoming edge":          `MATCH (a), (b) CREATE (a)<-[r:KNOWS]-(b) RETURN id(r) AS id`,
 		"remove property":               `MATCH (n) REMOVE n.name`,
 		"remove then return":            `MATCH (n) REMOVE n.name RETURN n.name AS name`,
 		"remove label":                  `MATCH (n) REMOVE n:Employee`,
 		"remove multiple items":         `MATCH (n) REMOVE n.name, n:Employee`,
 		"delete node":                   `MATCH (n) DELETE n`,
 		"delete edge and nodes":         `MATCH (a)-[r]->(b) DELETE r, a, b`,
+		"detach delete node":            `MATCH (n) DETACH DELETE n`,
 		"unwind parameter":              `UNWIND $items AS item RETURN item AS value`,
 		"unwind count":                  `UNWIND $items AS item RETURN count(item) AS count`,
 		"unwind order and limit":        `UNWIND $items AS item RETURN item ORDER BY item DESC LIMIT 2`,
 		"quoted structural characters":  `MATCH (n {text: 'a,b) RETURN value AND more'}) RETURN n.text`,
 		"escaped double quoted string":  `MATCH (n {text: "a\"b"}) RETURN n.text`,
 		"nested map value":              `CREATE (n {meta: {team: "graph", nested: {active: true}}})`,
+		"trailing semicolon":            `MATCH (n) RETURN n;`,
+		"multiline whitespace":          "MATCH\t(n)\nWHERE n.name = 'A  B'\r\nRETURN n.name;",
 	}
 	for name, query := range accepted {
 		t.Run("accept/"+name, func(t *testing.T) {
@@ -99,7 +106,6 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"negative limit":              `MATCH (n) RETURN n LIMIT -1`,
 		"union":                       `MATCH (n) RETURN n UNION MATCH (m) RETURN m`,
 		"with":                        `MATCH (n) WITH n RETURN n`,
-		"detach delete":               `MATCH (n) DETACH DELETE n`,
 		"unwind without as":           `UNWIND $items RETURN item`,
 		"unwind without return":       `UNWIND $items AS item`,
 		"invalid binding identifier":  `MATCH (bad-name) RETURN bad-name`,
@@ -111,6 +117,7 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"invalid remove label":        `MATCH (n) REMOVE n:Bad-Label`,
 		"empty property value":        `CREATE (n {name:})`,
 		"duplicate property key":      `CREATE (n {name: "Alice", name: "Bob"})`,
+		"multiple semicolons":         `MATCH (n) RETURN n;;`,
 	}
 	for name, query := range rejected {
 		t.Run("reject/"+name, func(t *testing.T) {
