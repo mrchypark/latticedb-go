@@ -225,11 +225,14 @@ match-query   = MATCH patterns [WHERE predicates]
 create-node-query
               = CREATE node-pattern [RETURN return-tail]
 unwind-query  = UNWIND value AS binding RETURN return-tail
+              | UNWIND value AS binding CREATE node-pattern [RETURN return-tail]
+              | UNWIND value AS binding match-query
 
 patterns      = pattern {"," pattern}
 pattern       = node-pattern | node-pattern {relationship node-pattern}
 relationship  = "-[" [binding] [":" type] [properties] "]->"
               | "<-[" [binding] [":" type] [properties] "]-"
+              | "-[" [binding] [":" type] [properties] "]-"
 node-pattern  = "(" [binding] {":" label} [properties] ")"
 properties    = "{" [property ":" value {"," property ":" value}] "}"
 
@@ -238,7 +241,7 @@ and-expression
               = not-expression {AND not-expression}
 not-expression
               = [NOT] ("(" predicates ")" | predicate)
-predicate     = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") value
+predicate     = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
               | property-access IN parameter
               | property-access (STARTS WITH | ENDS WITH | CONTAINS) value
               | id-access "=" value
@@ -248,9 +251,9 @@ predicate     = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") value
               | property-access "@@" value
 
 assignments   = assignment {"," assignment}
-assignment    = property-access "=" value
-              | binding "=" value
-              | binding "+=" value
+assignment    = property-access "=" expression
+              | binding "=" expression
+              | binding "+=" expression
               | binding ":" label
 edge-create   = "(" binding ")-[" [binding] ":" type [properties] "]->(" binding ")"
               | "(" binding ")<-[" [binding] ":" type [properties] "]-(" binding ")"
@@ -258,7 +261,7 @@ removals      = (property-access | binding ":" label)
                 {"," (property-access | binding ":" label)}
 bindings      = binding {"," binding}
 
-return-tail   = (count-return | projection {"," projection})
+return-tail   = [DISTINCT] (count-return | projection {"," projection})
                 [ORDER BY order {"," order}]
                 [SKIP pagination] [LIMIT pagination]
 count-return  = "count(" ("*" | binding) ")" [AS alias]
@@ -267,9 +270,12 @@ order         = (binding | property-access | id-access | alias) [ASC | DESC]
 pagination    = non-negative-integer | parameter
 
 value         = null | true | false | integer | float | string | parameter | map
+expression    = value | binding | property-access
 ```
 
-Fixed-length paths and relationship creation may use incoming or outgoing relationships. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, list literals, and backtick identifiers remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
+Fixed-length `MATCH` paths may be incoming, outgoing, or undirected; relationship creation remains directed. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, list literals, and backtick identifiers remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
+
+An undirected relationship produces one row per matching orientation. A non-self edge can therefore produce two rows when both endpoints are unbound; a self-loop produces one.
 
 ### General Rules
 
@@ -281,6 +287,7 @@ Fixed-length paths and relationship creation may use incoming or outgoing relati
 - Portable code should use explicit aliases for result column names.
 - `LIMIT` applies to the produced rows for a `RETURN` clause.
 - `SKIP` is applied after ordering and before `LIMIT`.
+- `DISTINCT` removes duplicate projected rows before `SKIP` and `LIMIT`.
 - `SKIP` and `LIMIT` accept a non-negative integer literal or parameter; other runtime parameter values are execution errors.
 - `LIMIT 0` returns zero rows.
 - Negative `LIMIT` values are invalid.
@@ -290,6 +297,7 @@ Fixed-length paths and relationship creation may use incoming or outgoing relati
 ### Property Access
 
 - Property access on a node or edge may return `NULL`.
+- Bound node, edge, and map properties may be used as mutation values or the right side of predicates; a missing property evaluates to `NULL`.
 - `IS NULL` and `IS NOT NULL` operate on the resulting query value, not on direct-storage presence metadata.
 - Boolean predicates use three-valued logic; only `true` rows pass `WHERE`, and comparisons involving `NULL` or a missing property remain unknown under `NOT`.
 - Ordered comparisons accept numeric values, including mixed integers and floats, or two strings. Incomparable values do not pass `WHERE`.
@@ -301,6 +309,7 @@ Fixed-length paths and relationship creation may use incoming or outgoing relati
 The following behaviors are part of the contract:
 
 - `CREATE` creates nodes and edges with labels and property maps
+- `UNWIND` may feed `CREATE`, or a `MATCH` followed by its supported mutation clauses.
 - `SET target.prop = expr` updates or removes a property depending on whether `expr` evaluates to non-`NULL` or `NULL`
 - `SET target = {...}` replaces the property map on the target
 - `SET target += {...}` merges into the property map on the target

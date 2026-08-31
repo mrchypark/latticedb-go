@@ -2529,6 +2529,125 @@ func TestCypherCompatibilitySyntaxBatch(t *testing.T) {
 	}
 }
 
+func TestAdditionalCypherSyntaxBatch(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "additional-cypher.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		var nodes []Node
+		for _, props := range []map[string]any{
+			{"id": int64(1), "name": "Alpha", "min": int64(1), "value": int64(2), "group": "same", "numeric": int64(1), "nested": []any{int64(1), map[string]any{"value": int64(2)}}, "bucket": "all"},
+			{"id": int64(2), "name": "Beta", "min": int64(3), "value": int64(2), "group": "same", "numeric": float64(1), "nested": []any{float64(1), map[string]any{"value": float64(2)}}, "bucket": "all"},
+			{"id": int64(3), "name": "Gamma", "min": int64(0), "value": int64(0), "group": "other", "numeric": float64(2), "bucket": "all"},
+		} {
+			node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: props})
+			if err != nil {
+				return err
+			}
+			nodes = append(nodes, node)
+		}
+		if _, err := tx.CreateEdge(nodes[0].ID, nodes[1].ID, "LINK", CreateEdgeOptions{}); err != nil {
+			return err
+		}
+		if _, err := tx.CreateEdge(nodes[0].ID, nodes[0].ID, "LINK", CreateEdgeOptions{}); err != nil {
+			return err
+		}
+		_, err := tx.CreateEdge(nodes[0].ID, nodes[0].ID, "SELF", CreateEdgeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNodePropertyIndex("Item", "bucket"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.Query("MATCH (n:Item) WHERE n.min <= n.value RETURN n.id AS id ORDER BY id", nil)
+	if err != nil || len(result.Rows) != 2 || result.Rows[0]["id"] != int64(1) || result.Rows[1]["id"] != int64(3) {
+		t.Fatalf("property comparison rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item {id: 1}) SET n.copy = n.name RETURN n.copy AS copy", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["copy"] != "Alpha" {
+		t.Fatalf("property SET rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (a:Item {id: 1}), (b:Item {id: 2}) CREATE (a)-[r:WEIGHTED {weight: b.value}]->(b) RETURN r.weight AS weight", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["weight"] != int64(2) {
+		t.Fatalf("property CREATE rows = %#v, %v", result.Rows, err)
+	}
+
+	result, err = db.Query("UNWIND $items AS item CREATE (n:Item {id: item.id}) RETURN n.id AS id ORDER BY id", map[string]any{"items": []any{map[string]any{"id": int64(4)}, map[string]any{"id": int64(5)}}})
+	if err != nil || len(result.Rows) != 2 || result.Rows[0]["id"] != int64(4) || result.Rows[1]["id"] != int64(5) {
+		t.Fatalf("UNWIND CREATE rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted SET n.selected = true RETURN DISTINCT n.id AS id ORDER BY id", map[string]any{"ids": []any{int64(1), int64(1), int64(2)}})
+	if err != nil || len(result.Rows) != 2 || result.Rows[0]["id"] != int64(1) || result.Rows[1]["id"] != int64(2) {
+		t.Fatalf("UNWIND MATCH SET rows = %#v, %v", result.Rows, err)
+	}
+	if _, err := db.Query("UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted REMOVE n.selected", map[string]any{"ids": []any{int64(2)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Query("UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted DELETE n", map[string]any{"ids": []any{int64(4), int64(5)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err = db.Query("MATCH (a:Item)-[:LINK]-(b:Item) RETURN a.id AS a, b.id AS b ORDER BY a, b", nil)
+	if err != nil || len(result.Rows) != 3 || result.Rows[0]["a"] != int64(1) || result.Rows[0]["b"] != int64(1) || result.Rows[1]["b"] != int64(2) || result.Rows[2]["a"] != int64(2) {
+		t.Fatalf("undirected rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (a:Item)-[:LINK]-(a) RETURN count(*) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("undirected repeated binding count = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (a:Item)-[:LINK]-(b:Item) RETURN DISTINCT a.id AS id ORDER BY id SKIP 1 LIMIT 1", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["id"] != int64(2) {
+		t.Fatalf("DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.numeric IS NOT NULL RETURN DISTINCT n.numeric AS numeric ORDER BY numeric", nil)
+	if err != nil || len(result.Rows) != 2 {
+		t.Fatalf("numeric DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.nested IS NOT NULL RETURN DISTINCT n.nested AS nested", nil)
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("nested numeric DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) RETURN DISTINCT n.absent AS absent", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["absent"] != nil {
+		t.Fatalf("nil DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.bucket = 'all' RETURN DISTINCT n.group AS group LIMIT 2", nil)
+	if err != nil || len(result.Rows) != 2 {
+		t.Fatalf("indexed DISTINCT rows = %#v, %v", result.Rows, err)
+	}
+
+	mutation := "MATCH (a:Item)-[:WEIGHTED]-(b:Item) SET a.marked = true RETURN a.marked AS a, b.marked AS b"
+	if _, err := db.QueryContext(context.Background(), mutation, nil, QueryOptions{MaxRows: 1}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("undirected row budget error = %v, want ErrResourceLimit", err)
+	}
+	result, err = db.Query("MATCH (n:Item) WHERE n.marked IS NOT NULL RETURN count(n) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("budget failure persisted mutation: %#v, %v", result.Rows, err)
+	}
+	result, err = db.QueryContext(context.Background(), mutation, nil, QueryOptions{MaxRows: 2})
+	if err != nil || len(result.Rows) != 2 {
+		t.Fatalf("undirected mutation rows = %#v, %v", result.Rows, err)
+	}
+	for _, row := range result.Rows {
+		if row["a"] != true || row["b"] != true {
+			t.Fatalf("stale mutation binding row = %#v", row)
+		}
+	}
+	result, err = db.Query("MATCH (a:Item)-[:WEIGHTED]-(b:Item) SET a.x = 1, b.y = a.x RETURN b.y AS y", nil)
+	if err != nil || len(result.Rows) != 2 || result.Rows[0]["y"] != int64(1) || result.Rows[1]["y"] != int64(1) {
+		t.Fatalf("stale SET expression rows = %#v, %v", result.Rows, err)
+	}
+	result, err = db.QueryContext(context.Background(), "MATCH (a:Item)-[:SELF]-(b:Item) RETURN a.id AS a, b.id AS b", nil, QueryOptions{MaxRows: 1})
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("undirected self-loop rows = %#v, %v", result.Rows, err)
+	}
+}
+
 func TestUnsupportedCreatePatternFailsBeforeMutation(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "partial-create.ltdb"), OpenOptions{Create: true})
 	if err != nil {
