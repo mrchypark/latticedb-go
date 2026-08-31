@@ -107,6 +107,31 @@ func TestPropertyIndexSchemaDeltasRecoverAfterCrash(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.Update(func(tx *Tx) error {
+		return tx.SetProperty(alice.ID, "reopened", true)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.mu.Lock()
+	db.recoveryRequired = true
+	db.mu.Unlock()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("second reopen after partial WAL recovery: %v", err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		value, ok, err := tx.GetProperty(alice.ID, "reopened")
+		if err != nil || !ok || value != true {
+			t.Fatalf("post-recovery commit = %#v, ok=%v, err=%v", value, ok, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPropertyIndexDropWALDeltaIsSchemaSized(t *testing.T) {

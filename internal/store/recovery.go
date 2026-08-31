@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -335,11 +336,60 @@ func loadWALBaseSnapshotFilesContext(ctx context.Context, files DatabaseFiles, m
 	return loadLatestWALV2Context(ctx, file, maxCanonicalBytes)
 }
 
+var databaseTempKinds = []string{"state-payload", "snapshot-payload", "state", "wal-payload", "wal", "ids"}
+
+func databaseTempPattern(files DatabaseFiles, kind string) string {
+	token := sha256.Sum256([]byte(filepath.Base(files.State)))
+	return ".latticedb-" + hex.EncodeToString(token[:]) + "-" + kind + "-*.tmp"
+}
+
+// CleanupDatabaseTempFiles removes checkpoint files abandoned by a crashed writer.
+// Legacy generic names are safe only for directory-backed databases, whose lock owns the directory.
+func CleanupDatabaseTempFiles(files DatabaseFiles, includeLegacy bool) error {
+	entries, err := os.ReadDir(files.Directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	prefixes := make([]string, 0, len(databaseTempKinds)*2)
+	for _, kind := range databaseTempKinds {
+		prefixes = append(prefixes, strings.TrimSuffix(databaseTempPattern(files, kind), "*.tmp"))
+		if includeLegacy {
+			prefixes = append(prefixes, "."+kind+"-")
+		}
+	}
+	removed := false
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") ||
+			!slices.ContainsFunc(prefixes, func(prefix string) bool { return strings.HasPrefix(entry.Name(), prefix) }) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(files.Directory, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		return syncDirectory(files.Directory)
+	}
+	return nil
+}
+
 func CheckpointGraphState(dbPath string, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
 	return CheckpointGraphStateFiles(DirectoryDatabaseFiles(dbPath), graph, nextNodeID, nextEdgeID, commitID)
 }
 
 func CheckpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
+	return checkpointGraphStateFiles(files, graph, nextNodeID, nextEdgeID, commitID, false)
+}
+
+func CreateCheckpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
+	return checkpointGraphStateFiles(files, graph, nextNodeID, nextEdgeID, commitID, true)
+}
+
+func checkpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, noReplace bool) error {
 	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
 		return fmt.Errorf("create db directory: %w", err)
 	}
@@ -347,7 +397,7 @@ func CheckpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeI
 	if err := ensureDatabaseID(graph); err != nil {
 		return err
 	}
-	payload, err := os.CreateTemp(files.Directory, ".state-payload-*.tmp")
+	payload, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "state-payload"))
 	if err != nil {
 		return fmt.Errorf("create temp state payload: %w", err)
 	}
@@ -362,7 +412,7 @@ func CheckpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeI
 		return err
 	}
 
-	temp, err := os.CreateTemp(files.Directory, ".state-*.tmp")
+	temp, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "state"))
 	if err != nil {
 		return fmt.Errorf("create temp state: %w", err)
 	}
@@ -389,10 +439,35 @@ func CheckpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeI
 	if err := syncAndClose(temp); err != nil {
 		return fmt.Errorf("write temp state: %w", err)
 	}
-	if err := os.Rename(tempPath, files.State); err != nil {
+	if noReplace {
+		if err := os.Link(tempPath, files.State); err != nil {
+			return fmt.Errorf("publish temp state: %w", err)
+		}
+		if err := syncDirectory(files.Directory); err != nil {
+			return rollbackCreatedState(files, tempPath, err)
+		}
+		if err := os.Remove(tempPath); err != nil {
+			return rollbackCreatedState(files, tempPath, fmt.Errorf("remove linked temp state: %w", err))
+		}
+		if err := syncDirectory(files.Directory); err != nil {
+			return rollbackCreatedState(files, tempPath, err)
+		}
+		return nil
+	} else if err := os.Rename(tempPath, files.State); err != nil {
 		return fmt.Errorf("rename temp state: %w", err)
 	}
 	return syncDirectory(files.Directory)
+}
+
+func rollbackCreatedState(files DatabaseFiles, tempPath string, cause error) error {
+	var cleanupErrs []error
+	for _, path := range []string{files.State, tempPath} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+	}
+	cleanupErrs = append(cleanupErrs, syncDirectory(files.Directory))
+	return errors.Join(append([]error{cause}, cleanupErrs...)...)
 }
 
 func CheckpointGraphStateAndWAL(dbPath string, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
@@ -426,7 +501,7 @@ func checkpointGraphStateAndWALFiles(files DatabaseFiles, graph *GraphState, nex
 	if err := ensureDatabaseID(graph); err != nil {
 		return err
 	}
-	payload, err := os.CreateTemp(files.Directory, ".snapshot-payload-*.tmp")
+	payload, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "snapshot-payload"))
 	if err != nil {
 		return err
 	}
@@ -472,7 +547,7 @@ func publishStatePayload(files DatabaseFiles, payload *os.File, databaseID strin
 	if err := runCheckpointFault(fault, "state-create", false); err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(files.Directory, ".state-*.tmp")
+	temp, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "state"))
 	if err != nil {
 		return err
 	}
@@ -514,7 +589,7 @@ func publishStatePayload(files DatabaseFiles, payload *os.File, databaseID strin
 }
 
 func rewriteWALStatePayload(files DatabaseFiles, statePayload *os.File, databaseID string, commitID uint64, fault CheckpointFault, targetPath string) error {
-	payload, err := os.CreateTemp(files.Directory, ".wal-payload-*.tmp")
+	payload, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "wal-payload"))
 	if err != nil {
 		return err
 	}
@@ -555,7 +630,7 @@ func rewriteWALStatePayload(files DatabaseFiles, statePayload *os.File, database
 	if err := runCheckpointFault(fault, "wal-create", false); err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(files.Directory, ".wal-*.tmp")
+	temp, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "wal"))
 	if err != nil {
 		return err
 	}
@@ -780,7 +855,7 @@ func RewriteWALSnapshotFiles(files DatabaseFiles, graph *GraphState, nextNodeID 
 	if err := ensureDatabaseID(graph); err != nil {
 		return err
 	}
-	payload, err := os.CreateTemp(files.Directory, ".wal-payload-*.tmp")
+	payload, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "wal-payload"))
 	if err != nil {
 		return err
 	}
@@ -812,7 +887,7 @@ func RewriteWALSnapshotFiles(files DatabaseFiles, graph *GraphState, nextNodeID 
 	if _, err := payload.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(files.Directory, ".wal-*.tmp")
+	temp, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "wal"))
 	if err != nil {
 		return err
 	}
@@ -972,7 +1047,7 @@ func ReserveIDsFiles(files DatabaseFiles, databaseID string, nextNodeID uint64, 
 	if err != nil {
 		return fmt.Errorf("encode id reservation: %w", err)
 	}
-	temp, err := os.CreateTemp(files.Directory, ".ids-*.tmp")
+	temp, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "ids"))
 	if err != nil {
 		return fmt.Errorf("create temp id reservation: %w", err)
 	}
@@ -1252,6 +1327,9 @@ func WALFilesReadyForAppend(files DatabaseFiles) bool {
 	if _, err := io.ReadFull(file, payload); err != nil || crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
 		return false
 	}
+	if !walFramesComplete(file) {
+		return false
+	}
 	var wrapper walPayload
 	if json.Unmarshal(payload, &wrapper) == nil && wrapper.Kind == "checkpoint" {
 		return true
@@ -1261,6 +1339,35 @@ func WALFilesReadyForAppend(files DatabaseFiles) bool {
 	}
 	_, err = loadLatestWALV2(file)
 	return err == nil
+}
+
+func walFramesComplete(file *os.File) bool {
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false
+	}
+	defer func() { _, _ = file.Seek(0, io.SeekStart) }()
+	for offset := int64(0); offset < info.Size(); {
+		if info.Size()-offset < walHeaderSize {
+			return false
+		}
+		var header [walHeaderSize]byte
+		if _, err := io.ReadFull(file, header[:]); err != nil || !validCurrentWALHeader(header[:]) {
+			return false
+		}
+		payloadLength := binary.BigEndian.Uint64(header[20:28])
+		if payloadLength > maxWALFrameBytes || payloadLength > uint64(info.Size()-offset-walHeaderSize) {
+			return false
+		}
+		if _, err := file.Seek(int64(payloadLength), io.SeekCurrent); err != nil {
+			return false
+		}
+		offset += walHeaderSize + int64(payloadLength)
+	}
+	return true
 }
 
 func loadLatestLegacyWAL(file *os.File) (*persistedState, error) {
@@ -2472,7 +2579,7 @@ func rejectOversizedFile(path string, limit int64) error {
 }
 
 func rewriteWAL(files DatabaseFiles, record []byte) error {
-	temp, err := os.CreateTemp(files.Directory, ".wal-*.tmp")
+	temp, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "wal"))
 	if err != nil {
 		return fmt.Errorf("create temp WAL: %w", err)
 	}

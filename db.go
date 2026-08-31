@@ -67,7 +67,7 @@ func Open(path string, opts OpenOptions) (*DB, error) {
 
 func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error) {
 	if opts.DisableWAL {
-		return nil, fmt.Errorf("%w: disabling WAL is unavailable", ErrUnsupportedOption)
+		return nil, wrapError(fmt.Errorf("%w: disabling WAL is unavailable", ErrUnsupportedOption))
 	}
 	inner, err := engine.OpenContext(ctx, path, engine.OpenOptions{
 		Create:                           opts.Create,
@@ -96,7 +96,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 // Deserialize opens a database from bytes returned by Serialize.
 func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 	if opts.DisableWAL {
-		return nil, fmt.Errorf("%w: disabling WAL is unavailable", ErrUnsupportedOption)
+		return nil, wrapError(fmt.Errorf("%w: disabling WAL is unavailable", ErrUnsupportedOption))
 	}
 	inner, err := engine.Deserialize(data, engine.OpenOptions{
 		ReadOnly:                         opts.ReadOnly,

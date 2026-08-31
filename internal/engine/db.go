@@ -346,6 +346,12 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	if flat {
 		files = store.FlatDatabaseFiles(path)
 	}
+	if !opts.ReadOnly && !opts.DisableLock {
+		if err := store.CleanupDatabaseTempFiles(files, !flat); err != nil {
+			_ = lock.close()
+			return nil, err
+		}
+	}
 	if opts.DisableLock {
 		if err := checkLayoutOwner(files.State, flat, ""); err != nil {
 			return nil, err
@@ -1007,8 +1013,24 @@ func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearch
 	if err != nil {
 		return nil, err
 	}
+	if err := budget.add(uint64(len(query))); err != nil {
+		return nil, err
+	}
 	var results []FTSSearchResult
-	terms := search.Tokenize(query)
+	terms, err := search.TokenizeContextWithLimit(ctx, query, budget.maxBytes-budget.bytes)
+	if err != nil {
+		if errors.Is(err, search.ErrTokenizationLimit) {
+			return nil, fmt.Errorf("%w: search query exceeds memory budget", ErrResourceLimit)
+		}
+		return nil, err
+	}
+	logicalBytes := saturatingMul(uint64(len(terms)), 24)
+	for _, term := range terms {
+		logicalBytes = saturatingAdd(logicalBytes, uint64(len(term)))
+	}
+	if err := budget.reserveBytes(logicalBytes); err != nil {
+		return nil, err
+	}
 	if len(terms) == 0 {
 		return []FTSSearchResult{}, nil
 	}
