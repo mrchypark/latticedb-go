@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -33,15 +34,41 @@ func TestSupportedCypherGrammarContract(t *testing.T) {
 		t.Fatalf("docs/engine_conformance.md must contain one %s ... %s block", begin, end)
 	}
 	block := document[start+len(begin) : finish]
-	want := append([]byte("\n```text\n"), grammar...)
-	want = append(want, []byte("```\n")...)
-	if !bytes.Equal(block, want) {
+	if !bytes.Equal(block, markdownGrammarBlock(grammar)) {
 		t.Fatal("documented Cypher grammar differs from the executable grammar contract")
 	}
 
 	digest := cypherParserDigest(t)
 	if digest != auditedCypherParserDigest {
 		t.Fatalf("Cypher parser changed (%s); audit the grammar, accepted/rejected matrix, and runtime conformance before updating auditedCypherParserDigest", digest)
+	}
+}
+
+func markdownGrammarBlock(grammar []byte) []byte {
+	newline := []byte("\n")
+	if bytes.Contains(grammar, []byte("\r\n")) {
+		newline = []byte("\r\n")
+	}
+	var want bytes.Buffer
+	want.Write(newline)
+	want.WriteString("```text")
+	want.Write(newline)
+	want.Write(grammar)
+	want.WriteString("```")
+	want.Write(newline)
+	return want.Bytes()
+}
+
+func TestMarkdownGrammarBlockPreservesLineEndings(t *testing.T) {
+	for _, grammar := range []string{"query = MATCH\n", "query = MATCH\r\n"} {
+		newline := grammar[len(grammar)-1:]
+		if strings.HasSuffix(grammar, "\r\n") {
+			newline = "\r\n"
+		}
+		want := newline + "```text" + newline + grammar + "```" + newline
+		if got := string(markdownGrammarBlock([]byte(grammar))); got != want {
+			t.Fatalf("markdownGrammarBlock(%q) = %q, want %q", grammar, got, want)
+		}
 	}
 }
 
