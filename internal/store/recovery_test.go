@@ -31,6 +31,20 @@ func TestDecodePersistedStateContextCancelsFTSRebuild(t *testing.T) {
 	}
 }
 
+func TestWALAccumulatorCanonicalizesWithoutDerivedIndexes(t *testing.T) {
+	snapshot := persistedState{DatabaseID: "00000000000000000000000000000001", NextNodeID: 1001}
+	for id := uint64(1); id <= 1000; id++ {
+		snapshot.Nodes = append(snapshot.Nodes, persistedNode{ID: id})
+		snapshot.FTS = append(snapshot.FTS, persistedFTS{NodeID: id, Text: "unique token text"})
+	}
+	if _, err := newWALAccumulator(context.Background(), snapshot); err != nil {
+		t.Fatalf("canonical WAL accumulator: %v", err)
+	}
+	if _, _, _, _, err := decodePersistedStateContext(context.Background(), snapshot, ^uint64(0), 1); !errors.Is(err, ErrDerivedIndexResourceLimit) {
+		t.Fatalf("final derived-index decode = %v", err)
+	}
+}
+
 func TestCleanupDatabaseTempFilesScopesFlatDatabases(t *testing.T) {
 	dir := t.TempDir()
 	flat := FlatDatabaseFiles(filepath.Join(dir, "one.ltdb"))
