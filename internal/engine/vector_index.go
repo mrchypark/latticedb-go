@@ -179,7 +179,7 @@ func insertVectorIndexModeBudget(graph *store.GraphState, id uint64, mutable boo
 	graph.VectorTombstones.CloneShardOnce(id)
 	graph.VectorTombstones.Delete(id)
 	level := vectorLevel(id)
-	newNode := &store.VectorIndexNode{Level: level, Neighbors: make([][]uint64, level+1)}
+	newNode := &store.VectorIndexNode{Level: level, Neighbors: make([][]uint64, level+1), Vector: vector}
 	if graph.VectorIndex.Nodes.Len() == 0 {
 		if !mutable {
 			graph.VectorIndex.Nodes.CloneShardOnce(id)
@@ -219,7 +219,7 @@ func insertVectorIndexModeBudget(graph *store.GraphState, id uint64, mutable boo
 		}
 		if len(candidates) > maxNeighbors {
 			var err error
-			candidates, err = selectVectorNeighborsHeuristic(graph, candidates, maxNeighbors, budget)
+			candidates, err = selectVectorNeighborsHeuristic(graph, candidates, maxNeighbors, 0, nil, budget)
 			if err != nil {
 				return err
 			}
@@ -227,7 +227,7 @@ func insertVectorIndexModeBudget(graph *store.GraphState, id uint64, mutable boo
 		newNode.Neighbors[l] = make([]uint64, len(candidates))
 		for i, candidate := range candidates {
 			newNode.Neighbors[l][i] = candidate.id
-			if err := connectVectorNeighbor(graph, candidate.id, id, l, maxNeighbors, mutable, budget); err != nil {
+			if err := connectVectorNeighbor(graph, candidate.id, id, vector, l, maxNeighbors, mutable, budget); err != nil {
 				return err
 			}
 		}
@@ -259,14 +259,14 @@ func tombstoneVectorIndex(graph *store.GraphState, id uint64, vector []float32) 
 	}
 }
 
-func connectVectorNeighbor(graph *store.GraphState, id, neighbor uint64, level, maxNeighbors int, mutable bool, budget *directSearchBudget) error {
+func connectVectorNeighbor(graph *store.GraphState, id, neighbor uint64, neighborVector []float32, level, maxNeighbors int, mutable bool, budget *directSearchBudget) error {
 	node := graph.VectorIndex.Nodes.Get(id)
 	if node == nil || level >= len(node.Neighbors) || slices.Contains(node.Neighbors[level], neighbor) {
 		return nil
 	}
 	copyNode := node
 	if !mutable {
-		copyNode = &store.VectorIndexNode{Level: node.Level, Neighbors: slices.Clone(node.Neighbors)}
+		copyNode = &store.VectorIndexNode{Level: node.Level, Neighbors: slices.Clone(node.Neighbors), Vector: node.Vector}
 		copyNode.Neighbors[level] = slices.Clone(node.Neighbors[level])
 	}
 	if len(copyNode.Neighbors[level]) < maxNeighbors {
@@ -294,17 +294,13 @@ func connectVectorNeighbor(graph *store.GraphState, id, neighbor uint64, level, 
 		}
 		candidates = append(candidates, vectorCandidate{id: candidateID, distance: distance})
 	}
-	neighborVector, exists := vectorForNode(graph, neighbor)
-	if !exists {
-		return nil
-	}
 	distance, err := vectorDistanceWithBudget(vector, neighborVector, budget)
 	if err != nil {
 		return err
 	}
 	candidates = append(candidates, vectorCandidate{id: neighbor, distance: distance})
 	slices.SortFunc(candidates, compareVectorCandidate)
-	selected, err := selectVectorNeighborsHeuristic(graph, candidates, maxNeighbors, budget)
+	selected, err := selectVectorNeighborsHeuristic(graph, candidates, maxNeighbors, neighbor, neighborVector, budget)
 	if err != nil {
 		return err
 	}
@@ -506,6 +502,12 @@ func vectorForNode(graph *store.GraphState, id uint64) ([]float32, bool) {
 }
 
 func vectorForSearchCandidate(graph *store.GraphState, id uint64) ([]float32, bool, bool) {
+	if vector := graph.VectorTombstones.Get(id); vector != nil {
+		return vector, true, false
+	}
+	if indexed := graph.VectorIndex.Nodes.Get(id); indexed != nil && indexed.Vector != nil {
+		return indexed.Vector, true, true
+	}
 	node := graph.Nodes.Get(id)
 	if node != nil {
 		vector, ok := search.FirstVectorProperty(node.Properties)
@@ -514,8 +516,7 @@ func vectorForSearchCandidate(graph *store.GraphState, id uint64) ([]float32, bo
 			return vector, valid, valid
 		}
 	}
-	vector := graph.VectorTombstones.Get(id)
-	return vector, vector != nil, false
+	return nil, false, false
 }
 
 func selectedVector(graph *store.GraphState, node *store.NodeRecord) ([]float32, bool) {
@@ -672,15 +673,19 @@ func vectorLevel(id uint64) int {
 	return min(bits.TrailingZeros64(hash|1<<63), vectorIndexMaxLevel)
 }
 
-func selectVectorNeighborsHeuristic(graph *store.GraphState, candidates []vectorCandidate, limit int, budget *directSearchBudget) ([]vectorCandidate, error) {
+func selectVectorNeighborsHeuristic(graph *store.GraphState, candidates []vectorCandidate, limit int, overrideID uint64, overrideVector []float32, budget *directSearchBudget) ([]vectorCandidate, error) {
 	var selected [vectorIndexM0]vectorCandidate
 	var selectedVectors [vectorIndexM0][]float32
 	var rejected [vectorIndexConstructionEF]vectorCandidate
 	selectedCount, rejectedCount := 0, 0
 	for _, candidate := range candidates {
-		candidateVector, ok := vectorForNode(graph, candidate.id)
-		if !ok {
-			continue
+		candidateVector := overrideVector
+		if overrideVector == nil || candidate.id != overrideID {
+			var ok bool
+			candidateVector, ok = vectorForNode(graph, candidate.id)
+			if !ok {
+				continue
+			}
 		}
 		keep := true
 		for _, neighborVector := range selectedVectors[:selectedCount] {

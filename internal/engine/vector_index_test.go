@@ -78,6 +78,28 @@ func TestVectorIndexRecallAndDeletion(t *testing.T) {
 	}
 }
 
+func TestVectorNeighborPruningUsesUpdatedVector(t *testing.T) {
+	graph := store.NewGraphState()
+	for id, vector := range map[uint64][]float32{
+		1: {0, 0},
+		2: {-1, 0},
+		3: {2, 0},
+		4: {0, 3},
+	} {
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": vector}})
+		graph.VectorIndex.Nodes.Set(id, &store.VectorIndexNode{Level: 0, Neighbors: [][]uint64{nil}, Vector: vector})
+	}
+	graph.VectorIndex.Nodes.Get(1).Neighbors[0] = []uint64{2, 4}
+	graph.VectorIndex.Nodes.Get(3).Vector = []float32{0, 0} // Pre-update cached value.
+
+	if err := connectVectorNeighbor(graph, 1, 3, []float32{2, 0}, 0, 2, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := graph.VectorIndex.Nodes.Get(1).Neighbors[0]; !slices.Equal(got, []uint64{2, 3}) {
+		t.Fatalf("pruned neighbors = %v, want updated-vector selection [2 3]", got)
+	}
+}
+
 func TestVectorSelectionExactANNParityAndCOW(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vector-selection.ltdb")
 	db, err := Open(path, OpenOptions{Create: true, EnableVector: true, VectorDimensions: 2, VectorIndexMode: VectorIndexHNSWSynchronous})

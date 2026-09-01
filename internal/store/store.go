@@ -441,6 +441,7 @@ type VectorIndex struct {
 type VectorIndexNode struct {
 	Level     int
 	Neighbors [][]uint64
+	Vector    []float32
 }
 
 func NewVectorIndex() VectorIndex {
@@ -700,7 +701,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 		}
 	}
 	for id, node := range graph.VectorIndex.Nodes.All() {
-		copyNode := &VectorIndexNode{Level: node.Level, Neighbors: make([][]uint64, len(node.Neighbors))}
+		copyNode := &VectorIndexNode{Level: node.Level, Neighbors: make([][]uint64, len(node.Neighbors)), Vector: slices.Clone(node.Vector)}
 		for level := range node.Neighbors {
 			copyNode.Neighbors[level] = slices.Clone(node.Neighbors[level])
 		}
