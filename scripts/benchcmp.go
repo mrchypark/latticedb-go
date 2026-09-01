@@ -14,6 +14,14 @@ import (
 
 type result map[string]map[string][]float64
 
+type zigResult struct {
+	insertMS float64
+	meanNS   float64
+	p99NS    float64
+	recall   float64
+	memoryMB float64
+}
+
 var cpuSuffix = regexp.MustCompile(`-\d+$`)
 
 func parse(r io.Reader) (result, error) {
@@ -25,6 +33,8 @@ func parse(r io.Reader) (result, error) {
 			continue
 		}
 		name := cpuSuffix.ReplaceAllString(fields[0], "")
+		name = strings.Replace(name, "BenchmarkVectorSearchZigHarness", "BenchmarkVectorSearchClustered128D", 1)
+		name = strings.Replace(name, "BenchmarkVectorIndexBuildZigHarness", "BenchmarkVectorIndexBuildClustered128D", 1)
 		if results[name] == nil {
 			results[name] = map[string][]float64{}
 		}
@@ -36,6 +46,29 @@ func parse(r io.Reader) (result, error) {
 		}
 	}
 	return results, scanner.Err()
+}
+
+func parseZig(r io.Reader) (*zigResult, error) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		parts := strings.Split(scanner.Text(), "│")
+		if len(parts) != 8 || strings.TrimSpace(parts[1]) != "100000" {
+			continue
+		}
+		values := make([]float64, 5)
+		for i, part := range parts[2:7] {
+			value, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(part), "%"), 64)
+			if err != nil {
+				return nil, fmt.Errorf("parse Zig 100K column %d: %w", i+2, err)
+			}
+			values[i] = value
+		}
+		return &zigResult{insertMS: values[0], meanNS: values[1] * 1e3, p99NS: values[2] * 1e3, recall: values[3], memoryMB: values[4]}, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("Zig 100K result not found")
 }
 
 func median(values []float64) float64 {
@@ -109,7 +142,38 @@ func otherMetrics(current, previous map[string][]float64) string {
 	return strings.Join(parts, ", ")
 }
 
-func writeReport(w io.Writer, current, previous result, currentLabel, previousLabel string) {
+func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel string) {
+	goMetrics := current["BenchmarkVectorSearchClustered128D/100K"]
+	if goMetrics == nil {
+		return
+	}
+	fmt.Fprintln(w, "\n## pure-Go vs Zig reference (100K)")
+	fmt.Fprintf(w, "\nZig reference: `%s`\n", zigLabel)
+	fmt.Fprintln(w, "\n| Metric | pure-Go | Zig | pure-Go vs Zig |")
+	fmt.Fprintln(w, "|---|---:|---:|---:|")
+	rows := []struct {
+		label string
+		unit  string
+		zig   float64
+	}{
+		{"Index build / insert (ms)", "index-build-ms", zig.insertMS},
+		{"Mean search (ns)", "mean-ns", zig.meanNS},
+		{"P99 search (ns)", "p99-ns", zig.p99NS},
+	}
+	for _, row := range rows {
+		goValue, ok := value(goMetrics, row.unit)
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(w, "| %s | %.0f | %.0f | %s |\n", row.label, goValue, row.zig, change(goValue, row.zig))
+	}
+	if goRecall, ok := value(goMetrics, "recall@10"); ok {
+		fmt.Fprintf(w, "| Recall@10 | %.1f%% | %.1f%% | %+.1f pp |\n", goRecall, zig.recall, goRecall-zig.recall)
+	}
+	fmt.Fprintf(w, "\nPositive latency/build Δ means pure-Go is slower. Zig reports %.1f MB of index memory; it is not compared with Go B/op because they measure different things. Both run on the same CI runner with the same 128-D clustered workload and HNSW parameters, but the Zig benchmark includes its storage layer.\n", zig.memoryMB)
+}
+
+func writeReport(w io.Writer, current, previous result, currentLabel, previousLabel string, zig *zigResult, zigLabel string) {
 	names := make([]string, 0, len(current))
 	for name := range current {
 		names = append(names, name)
@@ -118,7 +182,10 @@ func writeReport(w io.Writer, current, previous result, currentLabel, previousLa
 
 	fmt.Fprintln(w, "# Performance benchmark report")
 	fmt.Fprintf(w, "\nCurrent: `%s`  \nPrevious: `%s`\n", currentLabel, previousLabel)
-	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K-capped Zig harness, which runs once. Δ is current versus previous; this report does not fail CI on variance.")
+	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; this report does not fail CI on variance.")
+	if zig != nil {
+		writeZigComparison(w, current, zig, zigLabel)
+	}
 	fmt.Fprintln(w, "\n| Benchmark | ns/op current | previous | Δ | B/op current | previous | Δ | allocs/op current | previous | Δ | Other current / previous (Δ) |")
 	fmt.Fprintln(w, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 	for _, name := range names {
@@ -149,6 +216,8 @@ func main() {
 	outputPath := flag.String("output", "", "markdown report path")
 	currentLabel := flag.String("current-label", "current", "current revision label")
 	previousLabel := flag.String("previous-label", "previous", "previous revision label")
+	zigPath := flag.String("zig", "", "Zig vector benchmark output")
+	zigLabel := flag.String("zig-label", "Zig reference", "Zig revision label")
 	flag.Parse()
 
 	current, err := read(*currentPath)
@@ -161,11 +230,25 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	var zig *zigResult
+	if *zigPath != "" {
+		file, openErr := os.Open(*zigPath)
+		if openErr != nil {
+			fmt.Fprintln(os.Stderr, openErr)
+			os.Exit(1)
+		}
+		zig, err = parseZig(file)
+		file.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 	output, err := os.Create(*outputPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	defer output.Close()
-	writeReport(output, current, previous, *currentLabel, *previousLabel)
+	writeReport(output, current, previous, *currentLabel, *previousLabel, zig, *zigLabel)
 }

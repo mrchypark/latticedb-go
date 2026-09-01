@@ -11,11 +11,11 @@ import (
 	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
-// BenchmarkVectorSearchZigHarness mirrors tests/benchmark/vector_benchmark.zig
-// without the Zig storage/buffer-pool layer: 128-D normalized clustered vectors,
+// BenchmarkVectorSearchClustered128D uses the same workload as the upstream Zig
+// benchmark without its storage/buffer-pool layer: 128-D normalized clustered vectors,
 // M=16, M0=32, construction ef=200, search ef=64, and K=10.
-// Select a scale with, for example, -bench='BenchmarkVectorSearchZigHarness/10K$'.
-func BenchmarkVectorSearchZigHarness(b *testing.B) {
+// Select a scale with, for example, -bench='BenchmarkVectorSearchClustered128D/10K$'.
+func BenchmarkVectorSearchClustered128D(b *testing.B) {
 	for _, scale := range []struct {
 		name string
 		n    int
@@ -26,8 +26,9 @@ func BenchmarkVectorSearchZigHarness(b *testing.B) {
 		{"1M", 1_000_000},
 	} {
 		b.Run(scale.name, func(b *testing.B) {
+			graph, queries := zigHarnessGraph(b, scale.n)
 			buildStarted := time.Now()
-			db, queries := zigHarnessDB(b, scale.n)
+			db := zigHarnessIndexedDB(b, graph, scale.n)
 			buildTime := time.Since(buildStarted)
 			recall := zigHarnessRecallAt10(b, db, queries[:10])
 			for _, query := range queries[:10] { // Match the Zig harness warmup.
@@ -40,7 +41,7 @@ func BenchmarkVectorSearchZigHarness(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(128 * 4)
 			b.ResetTimer()
-			b.ReportMetric(float64(buildTime.Nanoseconds())/1e6, "build-ms")
+			b.ReportMetric(float64(buildTime.Nanoseconds())/1e6, "index-build-ms")
 			b.ReportMetric(float64(mean.Nanoseconds()), "mean-ns")
 			b.ReportMetric(recall*100, "recall@10")
 			b.ReportMetric(float64(p99.Nanoseconds()), "p99-ns")
@@ -93,7 +94,7 @@ func TestVectorIndexClusteredRecall(t *testing.T) {
 	}
 }
 
-func BenchmarkVectorIndexBuildZigHarness(b *testing.B) {
+func BenchmarkVectorIndexBuildClustered128D(b *testing.B) {
 	template, _ := zigHarnessGraph(b, 1_000)
 	b.ReportAllocs()
 	for range b.N {
@@ -116,7 +117,11 @@ func BenchmarkVectorIndexBuildZigHarness(b *testing.B) {
 func zigHarnessDB(tb testing.TB, count int) (*DB, [][]float32) {
 	tb.Helper()
 	graph, queries := zigHarnessGraph(tb, count)
+	return zigHarnessIndexedDB(tb, graph, count), queries
+}
 
+func zigHarnessIndexedDB(tb testing.TB, graph *store.GraphState, count int) *DB {
+	tb.Helper()
 	// The production builder uses this mutable path while assembling one fresh index.
 	scratch := &vectorSearchScratch{visited: make(map[uint64]struct{}, vectorIndexConstructionEF*vectorIndexM)}
 	for id := uint64(1); id <= uint64(count); id++ {
@@ -124,7 +129,7 @@ func zigHarnessDB(tb testing.TB, count int) (*DB, [][]float32) {
 			tb.Fatal(err)
 		}
 	}
-	return &DB{graph: graph, enableVector: true, vectorDimensions: 128, queryCache: map[string]*queryPlan{}}, queries
+	return &DB{graph: graph, enableVector: true, vectorDimensions: 128, queryCache: map[string]*queryPlan{}}
 }
 
 func zigHarnessGraph(tb testing.TB, count int) (*store.GraphState, [][]float32) {
