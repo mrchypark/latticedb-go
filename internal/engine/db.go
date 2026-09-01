@@ -56,6 +56,9 @@ const idReservationBlock = 1024
 const defaultWALCheckpointThresholdBytes = 64 << 20
 const defaultChangefeedMaxBytes = 64 << 20
 const defaultMaxDatabaseSnapshotBytes = 512 << 20
+const defaultRecoveryMaxDecodedBytes = 4 << 30
+const defaultRecoveryMaxFrames = 1_000_000
+const defaultRecoveryMaxWork = 1_000_000_000
 const defaultSearchMaxWork = 10_000_000
 const defaultSearchMaxBytes = 64 << 20
 const maxSearchResults = 1_000_000
@@ -77,6 +80,9 @@ type OpenOptions struct {
 	WALCheckpointThresholdBytes      uint64
 	ChangefeedMaxBytes               uint64
 	MaxDatabaseSnapshotBytes         uint64
+	RecoveryMaxDecodedBytes          uint64
+	RecoveryMaxFrames                uint64
+	RecoveryMaxWork                  uint64
 	VectorIndexBuildMaxWork          uint64
 	VectorIndexBuildMaxLogicalBytes  uint64
 	DerivedIndexBuildMaxWork         uint64
@@ -309,6 +315,15 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	if opts.MaxDatabaseSnapshotBytes == 0 {
 		opts.MaxDatabaseSnapshotBytes = defaultMaxDatabaseSnapshotBytes
 	}
+	if opts.RecoveryMaxDecodedBytes == 0 {
+		opts.RecoveryMaxDecodedBytes = defaultRecoveryMaxDecodedBytes
+	}
+	if opts.RecoveryMaxFrames == 0 {
+		opts.RecoveryMaxFrames = defaultRecoveryMaxFrames
+	}
+	if opts.RecoveryMaxWork == 0 {
+		opts.RecoveryMaxWork = defaultRecoveryMaxWork
+	}
 	if opts.ChangefeedMaxBytes == 0 {
 		opts.ChangefeedMaxBytes = min(defaultChangefeedMaxBytes, max(uint64(1), opts.MaxDatabaseSnapshotBytes/8))
 	}
@@ -357,7 +372,11 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 			return nil, err
 		}
 	}
-	graph, nextNodeID, nextEdgeID, commitID, err := store.LoadGraphStateFilesContext(ctx, files, opts.MaxDatabaseSnapshotBytes, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes)
+	graph, nextNodeID, nextEdgeID, commitID, err := store.LoadGraphStateFilesContextWithRecoveryLimits(ctx, files, opts.MaxDatabaseSnapshotBytes, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes, store.RecoveryLimits{
+		MaxDecodedBytes: opts.RecoveryMaxDecodedBytes,
+		MaxFrames:       opts.RecoveryMaxFrames,
+		MaxWork:         opts.RecoveryMaxWork,
+	})
 	if err != nil {
 		if errors.Is(err, store.ErrLoadResourceLimit) || errors.Is(err, store.ErrDerivedIndexResourceLimit) {
 			err = fmt.Errorf("%w: %v", ErrResourceLimit, err)
@@ -555,6 +574,14 @@ func (db *DB) Serialize() ([]byte, error) {
 
 // Deserialize opens a database from bytes returned by Serialize.
 func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
+	maxRecoveryBytes := opts.RecoveryMaxDecodedBytes
+	if maxRecoveryBytes == 0 {
+		maxRecoveryBytes = defaultRecoveryMaxDecodedBytes
+	}
+	maxRecoveryWork := opts.RecoveryMaxWork
+	if maxRecoveryWork == 0 {
+		maxRecoveryWork = defaultRecoveryMaxWork
+	}
 	maxCanonicalBytes := opts.MaxDatabaseSnapshotBytes
 	if maxCanonicalBytes == 0 {
 		maxCanonicalBytes = defaultMaxDatabaseSnapshotBytes
@@ -567,8 +594,14 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 	if maxDerivedBytes == 0 {
 		maxDerivedBytes = defaultDerivedBuildMaxLogicalBytes
 	}
-	graph, nextNodeID, nextEdgeID, commitID, err := store.DeserializeGraphState(data, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes)
+	graph, nextNodeID, nextEdgeID, commitID, err := store.DeserializeGraphStateWithRecoveryLimits(data, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes, store.RecoveryLimits{
+		MaxDecodedBytes: maxRecoveryBytes,
+		MaxWork:         maxRecoveryWork,
+	})
 	if err != nil {
+		if errors.Is(err, store.ErrLoadResourceLimit) || errors.Is(err, store.ErrDerivedIndexResourceLimit) {
+			err = fmt.Errorf("%w: %v", ErrResourceLimit, err)
+		}
 		return nil, err
 	}
 	path, err := os.MkdirTemp("", "latticedb-")
@@ -583,6 +616,11 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 		_ = os.RemoveAll(path)
 		return nil, err
 	}
+	// The generated checkpoint/WAL are an implementation detail; the caller's
+	// recovery budgets have already been enforced on the standalone input.
+	opts.RecoveryMaxDecodedBytes = 0
+	opts.RecoveryMaxFrames = 0
+	opts.RecoveryMaxWork = 0
 	db, err := Open(path, opts)
 	if err != nil {
 		_ = os.RemoveAll(path)

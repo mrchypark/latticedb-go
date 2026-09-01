@@ -190,6 +190,37 @@ func TestLoadGraphStateRecoversLatestCommitFromWAL(t *testing.T) {
 	}
 }
 
+func TestLoadGraphStateRecoveryBudgetsAreCumulative(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery-budget.ltdb")
+	empty := NewGraphState()
+	if err := CheckpointGraphState(path, empty, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	for commit := uint64(1); commit <= 2; commit++ {
+		graph := NewGraphState()
+		graph.DatabaseID = empty.DatabaseID
+		graph.Nodes.Set(commit, &NodeRecord{ID: commit})
+		if err := AppendWALCommit(path, graph, commit+1, 1, commit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := DirectoryDatabaseFiles(path)
+	if _, _, _, _, err := LoadGraphStateFilesContextWithRecoveryLimits(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0), RecoveryLimits{MaxFrames: 2, MaxWork: 10}); err != nil {
+		t.Fatalf("boundary recovery load: %v", err)
+	}
+	for name, limits := range map[string]RecoveryLimits{
+		"frames": {MaxFrames: 1, MaxWork: 10},
+		"work":   {MaxFrames: 2, MaxWork: 1},
+		"bytes":  {MaxFrames: 2, MaxWork: 10, MaxDecodedBytes: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, _, _, err := LoadGraphStateFilesContextWithRecoveryLimits(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0), limits); !errors.Is(err, ErrLoadResourceLimit) {
+				t.Fatalf("recovery error = %v, want ErrLoadResourceLimit", err)
+			}
+		})
+	}
+}
+
 func TestSnapshotEstimatorIsConservativeForStreamedPayload(t *testing.T) {
 	graph := NewGraphState()
 	graph.DatabaseID = "0123456789abcdef0123456789abcdef"
