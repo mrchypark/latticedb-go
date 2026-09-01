@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"container/heap"
 	"context"
 	"fmt"
 	"math/bits"
@@ -32,25 +31,47 @@ type vectorCandidateHeap struct {
 
 func (h vectorCandidateHeap) Len() int { return len(h.items) }
 
-func (h vectorCandidateHeap) Less(i, j int) bool {
-	order := compareVectorCandidate(h.items[i], h.items[j])
+func (h vectorCandidateHeap) before(left, right vectorCandidate) bool {
+	order := compareVectorCandidate(left, right)
 	if h.max {
 		return order > 0
 	}
 	return order < 0
 }
 
-func (h vectorCandidateHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
-
-func (h *vectorCandidateHeap) Push(item any) {
-	h.items = append(h.items, item.(vectorCandidate))
+func (h *vectorCandidateHeap) push(item vectorCandidate) {
+	h.items = append(h.items, item)
+	for index := len(h.items) - 1; index > 0; {
+		parent := (index - 1) / 2
+		if !h.before(h.items[index], h.items[parent]) {
+			break
+		}
+		h.items[index], h.items[parent] = h.items[parent], h.items[index]
+		index = parent
+	}
 }
 
-func (h *vectorCandidateHeap) Pop() any {
+func (h *vectorCandidateHeap) pop() vectorCandidate {
+	item := h.items[0]
 	last := len(h.items) - 1
-	item := h.items[last]
+	h.items[0] = h.items[last]
 	h.items[last] = vectorCandidate{}
 	h.items = h.items[:last]
+	for index := 0; ; {
+		left := 2*index + 1
+		if left >= len(h.items) {
+			break
+		}
+		child := left
+		if right := left + 1; right < len(h.items) && h.before(h.items[right], h.items[left]) {
+			child = right
+		}
+		if !h.before(h.items[child], h.items[index]) {
+			break
+		}
+		h.items[index], h.items[child] = h.items[child], h.items[index]
+		index = child
+	}
 	return item
 }
 
@@ -410,7 +431,7 @@ func vectorSearchLayerBudget(graph *store.GraphState, query []float32, entry uin
 	frontier := vectorCandidateHeap{items: append(scratch.frontier[:0], vectorCandidate{id: entry, distance: distance})}
 	best := vectorCandidateHeap{items: scratch.best[:0], max: true}
 	if entry != exclude && entryEligible {
-		heap.Push(&best, frontier.items[0])
+		best.push(frontier.items[0])
 	}
 	if budget != nil {
 		if uint64(len(scratch.visited)) >= budget.annVisitedLimit {
@@ -420,7 +441,7 @@ func vectorSearchLayerBudget(graph *store.GraphState, query []float32, entry uin
 	scratch.visited[entry] = struct{}{}
 	scratch.visitedCapacity = max(scratch.visitedCapacity, len(scratch.visited))
 	for frontier.Len() > 0 {
-		current := heap.Pop(&frontier).(vectorCandidate)
+		current := frontier.pop()
 		if best.Len() >= ef && current.distance > best.items[0].distance {
 			break
 		}
@@ -463,11 +484,11 @@ func vectorSearchLayerBudget(graph *store.GraphState, query []float32, entry uin
 			}
 			candidate := vectorCandidate{id: id, distance: distance}
 			if best.Len() < ef || distance < best.items[0].distance {
-				heap.Push(&frontier, candidate)
+				frontier.push(candidate)
 				if id != exclude && eligible {
-					heap.Push(&best, candidate)
+					best.push(candidate)
 					if best.Len() > ef {
-						heap.Pop(&best)
+						best.pop()
 					}
 				}
 			}

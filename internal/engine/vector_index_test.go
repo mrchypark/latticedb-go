@@ -721,6 +721,23 @@ func TestVectorSearchScratchReset(t *testing.T) {
 	}
 }
 
+func TestVectorSearchLayerScratchAllocations(t *testing.T) {
+	db := benchmarkSearchDB(1_000, true)
+	query := db.graph.Nodes.Get(500).Properties["embedding"].([]float32)
+	scratch := &vectorSearchScratch{visited: make(map[uint64]struct{})}
+	if results := vectorSearchLayerScratch(db.graph, query, db.graph.VectorIndex.EntryID, 0, vectorIndexSearchEF, 0, scratch); len(results) == 0 {
+		t.Fatal("warmup vector search returned no results")
+	}
+	allocations := testing.AllocsPerRun(20, func() {
+		if results := vectorSearchLayerScratch(db.graph, query, db.graph.VectorIndex.EntryID, 0, vectorIndexSearchEF, 0, scratch); len(results) == 0 {
+			panic("vector search returned no results")
+		}
+	})
+	if allocations > 1 {
+		t.Fatalf("reused vector search allocations = %.0f, want <= 1", allocations)
+	}
+}
+
 func TestVectorSearchRejectsNonFiniteQueryWithoutMutation(t *testing.T) {
 	db := benchmarkSearchDB(10, true)
 	query := make([]float32, 16)
