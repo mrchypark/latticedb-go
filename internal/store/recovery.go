@@ -1480,7 +1480,7 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 				return nil, errors.New("WAL snapshot history regression")
 			}
 			var err error
-			accumulator, err = newWALAccumulator(*wrapper.Snapshot)
+			accumulator, err = newWALAccumulator(ctx, *wrapper.Snapshot)
 			if err != nil {
 				return nil, fmt.Errorf("invalid WAL snapshot: %w", err)
 			}
@@ -1502,7 +1502,7 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 				return nil, errors.New("WAL checkpoint base mismatch")
 			}
 			var err error
-			accumulator, err = newWALAccumulator(*base)
+			accumulator, err = newWALAccumulator(ctx, *base)
 			if err != nil {
 				return nil, fmt.Errorf("invalid WAL checkpoint base: %w", err)
 			}
@@ -1527,19 +1527,20 @@ type walAccumulator struct {
 	incident map[uint64]uint64
 }
 
-func newWALAccumulator(state persistedState) (*walAccumulator, error) {
-	graph, nextNodeID, nextEdgeID, _, err := decodePersistedState(state)
-	if err != nil {
-		return nil, err
+func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulator, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if state.DatabaseID != "" {
+		if err := validateDatabaseID(state.DatabaseID); err != nil {
+			return nil, err
+		}
 	}
 	if state.CommitID == ^uint64(0) {
 		return nil, errors.New("commit ID space exhausted")
 	}
-	state.NextNodeID = nextNodeID
-	state.NextEdgeID = nextEdgeID
 	accumulator := &walAccumulator{
 		state:    state,
-		streams:  graph.Streams,
 		metadata: make(map[string]persistedAppMetadata, len(state.AppMetadata)),
 		nodes:    make(map[uint64]persistedNode, len(state.Nodes)),
 		edges:    make(map[uint64]persistedEdge, len(state.Edges)),
@@ -1547,20 +1548,122 @@ func newWALAccumulator(state persistedState) (*walAccumulator, error) {
 		incident: make(map[uint64]uint64),
 	}
 	for _, entry := range state.AppMetadata {
+		if len(entry.Key) == 0 || len(entry.Key) > maxAppMetadataKeyBytes {
+			return nil, errors.New("invalid stored application metadata key length")
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		key := string(entry.Key)
+		if _, exists := accumulator.metadata[key]; exists {
+			return nil, errors.New("duplicate stored application metadata key")
+		}
 		accumulator.metadata[string(entry.Key)] = persistedAppMetadata{Key: slices.Clone(entry.Key), Value: slices.Clone(entry.Value)}
 	}
-	for _, node := range state.Nodes {
+	var maxNodeID uint64
+	for index, node := range state.Nodes {
+		if index&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		if node.ID == 0 {
+			return nil, errors.New("stored node id must be non-zero")
+		}
+		if _, exists := accumulator.nodes[node.ID]; exists {
+			return nil, fmt.Errorf("duplicate stored node id %d", node.ID)
+		}
+		if _, err := decodePropertyMap(node.Properties); err != nil {
+			return nil, fmt.Errorf("decode node %d properties: %w", node.ID, err)
+		}
 		accumulator.nodes[node.ID] = node
+		maxNodeID = max(maxNodeID, node.ID)
 	}
-	for _, edge := range state.Edges {
+	var maxEdgeID uint64
+	for index, edge := range state.Edges {
+		if index&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		if edge.ID == 0 {
+			return nil, errors.New("stored edge id must be non-zero")
+		}
+		if _, exists := accumulator.edges[edge.ID]; exists {
+			return nil, fmt.Errorf("duplicate stored edge id %d", edge.ID)
+		}
+		if _, ok := accumulator.nodes[edge.SourceID]; !ok {
+			return nil, fmt.Errorf("stored edge %d references missing node", edge.ID)
+		}
+		if _, ok := accumulator.nodes[edge.TargetID]; !ok {
+			return nil, fmt.Errorf("stored edge %d references missing node", edge.ID)
+		}
+		if _, err := decodePropertyMap(edge.Properties); err != nil {
+			return nil, fmt.Errorf("decode edge %d properties: %w", edge.ID, err)
+		}
 		accumulator.edges[edge.ID] = edge
 		accumulator.incident[edge.SourceID]++
 		accumulator.incident[edge.TargetID]++
+		maxEdgeID = max(maxEdgeID, edge.ID)
 	}
-	for _, record := range state.FTS {
+	if err := validatePersistedPropertyIndexes(ctx, state.NodeIndexes, "node"); err != nil {
+		return nil, err
+	}
+	if err := validatePersistedPropertyIndexes(ctx, state.EdgeIndexes, "edge"); err != nil {
+		return nil, err
+	}
+	for index, record := range state.FTS {
+		if index&255 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		if _, ok := accumulator.nodes[record.NodeID]; !ok {
+			return nil, fmt.Errorf("stored FTS record references missing node %d", record.NodeID)
+		}
+		if _, exists := accumulator.fts[record.NodeID]; exists {
+			return nil, fmt.Errorf("duplicate stored FTS node id %d", record.NodeID)
+		}
 		accumulator.fts[record.NodeID] = record
 	}
+	streams, err := decodePersistedStreams(state.Streams)
+	if err != nil {
+		return nil, fmt.Errorf("decode streams: %w", err)
+	}
+	accumulator.streams = streams
+	if state.NextNodeID <= maxNodeID {
+		if maxNodeID == ^uint64(0) {
+			return nil, errors.New("node id space exhausted")
+		}
+		state.NextNodeID = maxNodeID + 1
+	}
+	if state.NextEdgeID <= maxEdgeID {
+		if maxEdgeID == ^uint64(0) {
+			return nil, errors.New("edge id space exhausted")
+		}
+		state.NextEdgeID = maxEdgeID + 1
+	}
+	accumulator.state.NextNodeID = state.NextNodeID
+	accumulator.state.NextEdgeID = state.NextEdgeID
 	return accumulator, nil
+}
+
+func validatePersistedPropertyIndexes(ctx context.Context, indexes []persistedPropertyIndexDefinition, kind string) error {
+	seen := make(map[PropertyIndexDefinition]struct{}, len(indexes))
+	for _, stored := range indexes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		definition := PropertyIndexDefinition{Scope: stored.Scope, Property: stored.Property}
+		if definition.Scope == "" || definition.Property == "" {
+			return fmt.Errorf("stored %s property index has an empty definition", kind)
+		}
+		if _, exists := seen[definition]; exists {
+			return fmt.Errorf("duplicate stored %s property index", kind)
+		}
+		seen[definition] = struct{}{}
+	}
+	return nil
 }
 
 func (accumulator *walAccumulator) apply(delta persistedDelta) error {
