@@ -1454,6 +1454,18 @@ func (db *DB) updatePropertyIndex(node, create bool, scope, property string) err
 	if scope == "" || property == "" {
 		return fmt.Errorf("%w: property index scope and property must be non-empty", ErrInvalidArgument)
 	}
+	var err error
+	if node {
+		err = store.ValidateCreateLabels([]string{scope})
+	} else {
+		err = store.ValidateEdgeType(scope)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if err := store.ValidatePropertyKey(property); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
 	definition := store.PropertyIndexDefinition{Scope: scope, Property: property}
 	return db.Update(func(tx *Tx) error {
 		indexes := &tx.graph.EdgeProperties
@@ -2144,6 +2156,9 @@ func (tx *Tx) SetProperty(nodeID uint64, key string, value any) error {
 	if err := tx.ensureWritable(); err != nil {
 		return err
 	}
+	if err := store.ValidatePropertyKey(key); err != nil {
+		return err
+	}
 	node, err := tx.writableNode(nodeID)
 	if err != nil {
 		return err
@@ -2246,6 +2261,9 @@ func (tx *Tx) SetVector(nodeID uint64, key string, vector []float32) error {
 	if !tx.db.enableVector {
 		return fmt.Errorf("%w: vector support is disabled", ErrUnsupportedOption)
 	}
+	if err := store.ValidatePropertyKey(key); err != nil {
+		return err
+	}
 	if tx.db.vectorDimensions > 0 && len(vector) != int(tx.db.vectorDimensions) {
 		return fmt.Errorf("vector length %d does not match configured dimensions %d", len(vector), tx.db.vectorDimensions)
 	}
@@ -2315,6 +2333,9 @@ func (tx *Tx) FTSIndexContext(ctx context.Context, nodeID uint64, text string) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := store.ValidateFTSText(text); err != nil {
+		return err
+	}
 	if saturatingMul(uint64(len(text)), 2) > tx.db.derivedIndexBuildMaxWork {
 		return fmt.Errorf("%w: FTS text exceeds derived-index build budget", ErrResourceLimit)
 	}
@@ -2354,6 +2375,9 @@ func (tx *Tx) FTSIndexContext(ctx context.Context, nodeID uint64, text string) e
 
 func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts CreateEdgeOptions) (Edge, error) {
 	if err := tx.ensureWritable(); err != nil {
+		return Edge{}, err
+	}
+	if err := store.ValidateEdgeType(edgeType); err != nil {
 		return Edge{}, err
 	}
 	if _, err := tx.requireNode(sourceID); err != nil {
@@ -2491,6 +2515,9 @@ func (tx *Tx) SetEdgeProperty(edgeID uint64, key string, value any) error {
 	if err := tx.ensureWritable(); err != nil {
 		return err
 	}
+	if err := store.ValidatePropertyKey(key); err != nil {
+		return err
+	}
 	edge, err := tx.writableEdge(edgeID)
 	if err != nil {
 		return err
@@ -2505,6 +2532,9 @@ func (tx *Tx) SetEdgeProperty(edgeID uint64, key string, value any) error {
 
 func (tx *Tx) RemoveEdgeProperty(edgeID uint64, key string) error {
 	if err := tx.ensureWritable(); err != nil {
+		return err
+	}
+	if err := store.ValidatePropertyKey(key); err != nil {
 		return err
 	}
 	edge, err := tx.writableEdge(edgeID)
@@ -2611,13 +2641,13 @@ func (tx *Tx) deleteEdge(edgeID uint64) {
 	tx.graph.Edges.Delete(edgeID)
 	tx.graph.EdgeTypes.Remove(edge.Type, edgeID)
 	tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, tx.base != nil && tx.base.Edges.Get(edgeID) != nil, edgeID)
-	outgoing := tx.graph.Outgoing.Get(edge.SourceID).Remove(edgeID)
+	outgoing := tx.graph.Outgoing.Get(edge.SourceID).RemoveKnown(edgeID)
 	if outgoing.Len() == 0 {
 		tx.graph.Outgoing.Delete(edge.SourceID)
 	} else {
 		tx.graph.Outgoing.Set(edge.SourceID, outgoing)
 	}
-	incoming := tx.graph.Incoming.Get(edge.TargetID).Remove(edgeID)
+	incoming := tx.graph.Incoming.Get(edge.TargetID).RemoveKnown(edgeID)
 	if incoming.Len() == 0 {
 		tx.graph.Incoming.Delete(edge.TargetID)
 	} else {

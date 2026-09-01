@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -501,6 +502,26 @@ func TestLegacyStateAndWALHeadersRemainReadable(t *testing.T) {
 	}
 }
 
+func TestLoadBinaryCheckpointRejectsTrailingJSONValue(t *testing.T) {
+	graph := NewGraphState()
+	checkpoint, err := SerializeGraphState(graph, 1, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := append(append([]byte(nil), checkpoint[stateHeaderSize:]...), []byte(`{}`)...)
+	binary.BigEndian.PutUint64(checkpoint[20:28], uint64(len(payload)))
+	binary.BigEndian.PutUint32(checkpoint[28:32], crc32.ChecksumIEEE(payload))
+	checkpoint = append(checkpoint[:stateHeaderSize], payload...)
+
+	path := t.TempDir()
+	if err := os.WriteFile(stateFilePath(path), checkpoint, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCheckpointSnapshot(path); err == nil {
+		t.Fatal("expected binary checkpoint with trailing JSON value to be rejected")
+	}
+}
+
 func TestStoredAppMetadataRejectsDuplicateKeys(t *testing.T) {
 	graph := NewGraphState()
 	if err := EnsureDatabaseID(graph); err != nil {
@@ -538,9 +559,14 @@ func TestWALV2RejectsCommitRegressionAndDatabaseMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gap, err := buildPersistedState(graph, 1, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	for name, second := range map[string]persistedState{
 		"commit regression": first,
+		"commit gap":        gap,
 		"database mismatch": mismatch,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -582,6 +608,34 @@ func TestWALV2ReplaysDeltasWithoutCheckpoint(t *testing.T) {
 	}
 	if commitID != 2 || nextNodeID != 2 || loaded.Nodes.Get(1).Properties["value"] != int64(2) {
 		t.Fatalf("recovered commit=%d next=%d graph=%#v", commitID, nextNodeID, loaded)
+	}
+}
+
+func TestWALV2RejectsCommitGap(t *testing.T) {
+	graph := NewGraphState()
+	snapshot, err := buildPersistedState(graph, 1, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta := persistedDelta{DatabaseID: snapshot.DatabaseID, CommitID: 3, NextNodeID: 1, NextEdgeID: 1}
+	encode := func(payload walPayload, commitID uint64) []byte {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		header, err := encodeWALHeader(snapshot.DatabaseID, commitID, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(header[:], data...)
+	}
+	data := append(encode(walPayload{Kind: "snapshot", Snapshot: &snapshot}, 1), encode(walPayload{Kind: "delta", Delta: &delta}, 3)...)
+	dbPath := t.TempDir()
+	if err := os.WriteFile(walFilePath(dbPath), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := LoadGraphState(dbPath); err == nil {
+		t.Fatal("WAL commit gap was accepted")
 	}
 }
 

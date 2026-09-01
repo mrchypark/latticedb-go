@@ -15,6 +15,14 @@ type StreamRecord struct {
 	Payload  any
 }
 
+// StreamReadResult is one bounded stream read.
+type StreamReadResult struct {
+	Records      []StreamRecord
+	LastSequence uint64
+	ByteLimited  bool
+	bytes        uint64
+}
+
 // StreamOperation describes one ordered, transactional stream mutation for a
 // WAL delta. It is internal to the repository packages despite being exported
 // for the engine package.
@@ -125,12 +133,18 @@ func (store StreamStore) Fork() StreamStore {
 }
 
 func (store StreamStore) Read(name string, after uint64, limit uint) []StreamRecord {
+	return store.ReadBounded(name, after, limit, 0).Records
+}
+
+// ReadBounded returns at most limit records without cloning a record that
+// would exceed maxBytes. A zero maxBytes disables the byte limit.
+func (store StreamStore) ReadBounded(name string, after uint64, limit uint, maxBytes uint64) StreamReadResult {
 	log := store.streams[name]
 	if limit == 0 || log.count == 0 {
-		return []StreamRecord{}
+		return StreamReadResult{Records: []StreamRecord{}}
 	}
 	if after >= log.first+log.count-1 {
-		return []StreamRecord{}
+		return StreamReadResult{Records: []StreamRecord{}}
 	}
 	sequence := after + 1
 	if sequence < log.first {
@@ -141,38 +155,49 @@ func (store StreamStore) Read(name string, after uint64, limit uint) []StreamRec
 		available -= min(available, sequence-log.first)
 	}
 	take := min(uint64(limit), available)
+	if maxBytes != 0 && maxBytes/48 < take {
+		take = maxBytes/48 + 1
+	}
 	end := sequence + take - 1
 	endChunk := log.chunk(end)
 	if endChunk == nil {
-		return []StreamRecord{}
+		return StreamReadResult{Records: []StreamRecord{}}
 	}
+	result := StreamReadResult{Records: make([]StreamRecord, 0, take)}
 	if sequence >= endChunk.records[0].Sequence {
 		start := int(sequence - endChunk.records[0].Sequence)
-		out := make([]StreamRecord, 0, take)
 		for _, record := range endChunk.records[start : start+int(take)] {
-			out = append(out, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: CloneValue(record.Payload)})
+			if !result.append(record, maxBytes) {
+				return result
+			}
 		}
-		return out
+		return result
 	}
 	chunks := make([]*streamChunk, 0, (take+streamChunkSize-1)/streamChunkSize+1)
 	for chunk := endChunk; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= sequence; chunk = chunk.previous {
 		chunks = append(chunks, chunk)
 	}
 	slices.Reverse(chunks)
-	out := make([]StreamRecord, 0, take)
 	for _, chunk := range chunks {
-		out = appendStreamRecords(out, chunk.records, sequence, end)
-	}
-	return out
-}
-
-func appendStreamRecords(out []StreamRecord, records []StreamRecord, first, last uint64) []StreamRecord {
-	for _, record := range records {
-		if record.Sequence >= first && record.Sequence <= last {
-			out = append(out, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: CloneValue(record.Payload)})
+		for _, record := range chunk.records {
+			if record.Sequence >= sequence && record.Sequence <= end && !result.append(record, maxBytes) {
+				return result
+			}
 		}
 	}
-	return out
+	return result
+}
+
+func (result *StreamReadResult) append(record StreamRecord, maxBytes uint64) bool {
+	bytes := streamRecordBytes(record)
+	if maxBytes != 0 && (bytes > maxBytes || result.bytes > maxBytes-bytes) {
+		result.ByteLimited = true
+		return false
+	}
+	result.Records = append(result.Records, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: CloneValue(record.Payload)})
+	result.LastSequence = record.Sequence
+	result.bytes = snapshotAdd(result.bytes, bytes)
+	return true
 }
 
 func (store StreamStore) StreamBytes(name string) uint64 { return store.streams[name].bytes }

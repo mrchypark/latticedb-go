@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"unicode/utf8"
 )
 
 const shardFanout = 256
@@ -846,6 +847,9 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 		}
 		return v, nil
 	case string:
+		if !utf8.ValidString(v) {
+			return nil, errors.New("string contains invalid UTF-8")
+		}
 		if err := walk.addBytes(len(v)); err != nil {
 			return nil, err
 		}
@@ -889,6 +893,9 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 		defer walk.leave(reflect.ValueOf(v))
 		out := make(map[string]any, len(v))
 		for key, item := range v {
+			if !utf8.ValidString(key) {
+				return nil, errors.New("map key contains invalid UTF-8")
+			}
 			if err := walk.addBytes(len(key)); err != nil {
 				return nil, err
 			}
@@ -934,14 +941,18 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 		out := make(map[string]any, rv.Len())
 		iter := rv.MapRange()
 		for iter.Next() {
-			if err := walk.addBytes(len(iter.Key().String())); err != nil {
+			key := iter.Key().String()
+			if !utf8.ValidString(key) {
+				return nil, errors.New("map key contains invalid UTF-8")
+			}
+			if err := walk.addBytes(len(key)); err != nil {
 				return nil, err
 			}
 			normalized, err := normalizeValue(iter.Value().Interface(), depth+1, walk)
 			if err != nil {
 				return nil, err
 			}
-			out[iter.Key().String()] = normalized
+			out[key] = normalized
 		}
 		return out, nil
 	default:
@@ -1006,6 +1017,9 @@ func NormalizeProperties(in map[string]any) (map[string]any, error) {
 		return nil, err
 	}
 	for key, value := range in {
+		if !utf8.ValidString(key) {
+			return nil, fmt.Errorf("property %q: key contains invalid UTF-8", key)
+		}
 		if err := walk.addBytes(len(key)); err != nil {
 			return nil, fmt.Errorf("property %q: %w", key, err)
 		}
@@ -1059,10 +1073,42 @@ func PropertiesMatch(actual map[string]any, required map[string]any) bool {
 }
 
 func ValidateCreateLabels(labels []string) error {
+	seen := make(map[string]struct{}, len(labels))
 	for _, label := range labels {
 		if label == "" {
 			return errors.New("labels must be non-empty")
 		}
+		if !utf8.ValidString(label) {
+			return errors.New("labels must contain valid UTF-8")
+		}
+		if _, ok := seen[label]; ok {
+			return fmt.Errorf("duplicate label %q", label)
+		}
+		seen[label] = struct{}{}
+	}
+	return nil
+}
+
+func ValidateEdgeType(edgeType string) error {
+	if edgeType == "" {
+		return errors.New("edge type must be non-empty")
+	}
+	if !utf8.ValidString(edgeType) {
+		return errors.New("edge type must contain valid UTF-8")
+	}
+	return nil
+}
+
+func ValidatePropertyKey(key string) error {
+	if !utf8.ValidString(key) {
+		return errors.New("property key must contain valid UTF-8")
+	}
+	return nil
+}
+
+func ValidateFTSText(text string) error {
+	if !utf8.ValidString(text) {
+		return errors.New("FTS text must contain valid UTF-8")
 	}
 	return nil
 }

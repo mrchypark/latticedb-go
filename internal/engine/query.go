@@ -715,6 +715,10 @@ func parsePlanReturn(plan *queryPlan, text string) error {
 }
 
 func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudget) (QueryResult, error) {
+	params, err := normalizeQueryParams(params)
+	if err != nil {
+		return QueryResult{}, err
+	}
 	skip, err := paginationValue("SKIP", plan.skipExpr, params)
 	if err != nil {
 		return QueryResult{}, err
@@ -872,6 +876,21 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		result.Rows = result.Rows[:limit]
 	}
 	return result, nil
+}
+
+func normalizeQueryParams(params map[string]any) (map[string]any, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	normalized := make(map[string]any, len(params))
+	for name, value := range params {
+		value, err := store.NormalizeValue(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid query parameter %q: %w", name, err)
+		}
+		normalized[name] = value
+	}
+	return normalized, nil
 }
 
 func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[string]any, limit uint, budget *queryBudget) ([]uint64, bool, error) {
@@ -2068,13 +2087,99 @@ func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecor
 }
 
 func (pattern edgePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
-	var edgeIDs []uint64
-	if pattern.EdgeType == "" {
-		edgeIDs = store.SortedEdgeIDs(tx.graph)
-	} else {
-		edgeIDs = tx.graph.EdgeTypes.Get(pattern.EdgeType)
+	for _, row := range rows {
+		left, _ := boundNode(row, pattern.Left.Var)
+		right, _ := boundNode(row, pattern.Right.Var)
+		if left == nil && right == nil {
+			var edgeIDs []uint64
+			if pattern.EdgeType == "" {
+				edgeIDs = store.SortedEdgeIDs(tx.graph)
+			} else {
+				edgeIDs = tx.graph.EdgeTypes.Get(pattern.EdgeType)
+			}
+			return pattern.applyIDs(tx, rows, edgeIDs, budget)
+		}
 	}
-	return pattern.applyIDs(tx, rows, edgeIDs, budget)
+
+	nextRows := make([]queryRow, 0)
+	for _, row := range rows {
+		left, leftBound := boundNode(row, pattern.Left.Var)
+		right, rightBound := boundNode(row, pattern.Right.Var)
+		if (leftBound && left == nil) || (rightBound && right == nil) {
+			continue
+		}
+		if left != nil {
+			var err error
+			nextRows, err = pattern.applyAdjacent(tx, row, tx.graph.Outgoing.Get(left.ID), false, nextRows, budget)
+			if err != nil {
+				return nil, err
+			}
+			if pattern.Undirected {
+				nextRows, err = pattern.applyAdjacent(tx, row, tx.graph.Incoming.Get(left.ID), true, nextRows, budget)
+				if err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if right != nil {
+			var err error
+			nextRows, err = pattern.applyAdjacent(tx, row, tx.graph.Incoming.Get(right.ID), false, nextRows, budget)
+			if err != nil {
+				return nil, err
+			}
+			if pattern.Undirected {
+				nextRows, err = pattern.applyAdjacent(tx, row, tx.graph.Outgoing.Get(right.ID), true, nextRows, budget)
+				if err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		return nil, nil
+	}
+	return nextRows, nil
+}
+
+func boundNode(row queryRow, name string) (*store.NodeRecord, bool) {
+	if name == "" {
+		return nil, false
+	}
+	binding, ok := row.Bindings[name]
+	if !ok {
+		return nil, false
+	}
+	return binding.Node, true
+}
+
+func (pattern edgePattern) applyAdjacent(tx *Tx, row queryRow, edgeIDs *store.EdgeList, reverse bool, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
+	for edgeID := range edgeIDs.All() {
+		if err := budget.check(1, len(rows)); err != nil {
+			return nil, err
+		}
+		edge := tx.graph.Edges.Get(edgeID)
+		if edge == nil || (reverse && edge.SourceID == edge.TargetID) || (pattern.EdgeType != "" && edge.Type != pattern.EdgeType) || !queryPropertiesMatch(edge.Properties, pattern.Properties) {
+			continue
+		}
+		if pattern.EdgeVar != "" {
+			if existing, ok := row.Bindings[pattern.EdgeVar]; ok && (existing.Edge == nil || existing.Edge.ID != edge.ID) {
+				continue
+			}
+		}
+		left, right := tx.graph.Nodes.Get(edge.SourceID), tx.graph.Nodes.Get(edge.TargetID)
+		if reverse {
+			left, right = right, left
+		}
+		if left == nil || right == nil {
+			continue
+		}
+		var err error
+		rows, err = pattern.appendEdgeRow(row, edge, left, right, rows, budget)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
 }
 
 func (pattern edgePattern) applyIDs(tx *Tx, rows []queryRow, edgeIDs []uint64, budget *queryBudget) ([]queryRow, error) {
@@ -3079,7 +3184,7 @@ func (expr paramExpr) eval(_ queryRow, params map[string]any) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing query parameter %q", expr.Name)
 	}
-	return store.NormalizeValue(value)
+	return value, nil
 }
 
 func (expr variableExpr) eval(row queryRow, _ map[string]any) (any, error) {

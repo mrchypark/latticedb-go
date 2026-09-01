@@ -192,6 +192,25 @@ func TestNormalizeValueRejectsCyclesAndNonFiniteNumbers(t *testing.T) {
 	}
 }
 
+func TestNormalizeValueRejectsInvalidUTF8(t *testing.T) {
+	invalid := string([]byte{0xff})
+	for name, value := range map[string]any{
+		"string":        invalid,
+		"nested string": []any{invalid},
+		"map key":       map[string]any{invalid: "value"},
+		"typed map key": map[string]string{invalid: "value"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NormalizeValue(value); err == nil {
+				t.Fatal("invalid UTF-8 accepted")
+			}
+		})
+	}
+	if _, err := NormalizeProperties(map[string]any{invalid: "value"}); err == nil {
+		t.Fatal("invalid UTF-8 property key accepted")
+	}
+}
+
 func TestNormalizeValueUnsignedBoundsDepthAndSharedValues(t *testing.T) {
 	if ^uint(0)>>63 != 0 {
 		value, err := NormalizeValue(uint(math.MaxInt64))

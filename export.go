@@ -29,6 +29,19 @@ func ExportContext(ctx context.Context, dbPath string, format ExportFormat, outp
 	return db.ExportContext(ctx, format, outputPath)
 }
 
+func ExportFile(dbPath string, format ExportFormat, outputPath string) error {
+	return ExportFileContext(context.Background(), dbPath, format, outputPath)
+}
+
+func ExportFileContext(ctx context.Context, dbPath string, format ExportFormat, outputPath string) error {
+	db, err := OpenContext(ctx, dbPath, OpenOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.ExportFileContext(ctx, format, outputPath)
+}
+
 func Dump(dbPath string) ([]byte, error) {
 	return DumpContext(context.Background(), dbPath)
 }
@@ -52,6 +65,18 @@ func (db *DB) ExportContext(ctx context.Context, format ExportFormat, outputPath
 		return nil, err
 	}
 	return exporter.ExportGraphContext(ctx, graph, exporter.ExportFormat(format), outputPath)
+}
+
+func (db *DB) ExportFile(format ExportFormat, outputPath string) error {
+	return db.ExportFileContext(context.Background(), format, outputPath)
+}
+
+func (db *DB) ExportFileContext(ctx context.Context, format ExportFormat, outputPath string) error {
+	graph, err := db.inner.SnapshotGraph()
+	if err != nil {
+		return err
+	}
+	return exporter.ExportGraphFileContext(ctx, graph, exporter.ExportFormat(format), outputPath)
 }
 
 func (db *DB) Dump() ([]byte, error) {

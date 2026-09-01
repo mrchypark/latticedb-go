@@ -1979,6 +1979,111 @@ func TestFTSIndexDoesNotOverwriteTextProperty(t *testing.T) {
 	}
 }
 
+func TestCanonicalTextValidationAndRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "canonical-text.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := string([]byte{0xff})
+	var first, second Node
+	var edge Edge
+	if err := db.Update(func(tx *Tx) error {
+		var err error
+		first, err = tx.CreateNode(CreateNodeOptions{Labels: []string{"첫", "둘"}, Properties: map[string]any{"키": "값"}})
+		if err != nil {
+			return err
+		}
+		second, err = tx.CreateNode(CreateNodeOptions{})
+		if err != nil {
+			return err
+		}
+		edge, err = tx.CreateEdge(first.ID, second.ID, "관계", CreateEdgeOptions{})
+		if err != nil {
+			return err
+		}
+		return tx.FTSIndex(first.ID, "검색 본문")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*Tx) error{
+		"invalid label": func(tx *Tx) error { _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{invalid}}); return err },
+		"duplicate label": func(tx *Tx) error {
+			_, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"same", "same"}})
+			return err
+		},
+		"invalid edge type": func(tx *Tx) error {
+			_, err := tx.CreateEdge(first.ID, second.ID, invalid, CreateEdgeOptions{})
+			return err
+		},
+		"empty edge type":      func(tx *Tx) error { _, err := tx.CreateEdge(first.ID, second.ID, "", CreateEdgeOptions{}); return err },
+		"invalid property key": func(tx *Tx) error { return tx.SetProperty(first.ID, invalid, "value") },
+		"invalid edge key":     func(tx *Tx) error { return tx.SetEdgeProperty(edge.ID, invalid, "value") },
+		"invalid removal key":  func(tx *Tx) error { return tx.RemoveEdgeProperty(edge.ID, invalid) },
+		"invalid FTS text":     func(tx *Tx) error { return tx.FTSIndex(first.ID, invalid) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := db.Update(mutate); err == nil {
+				t.Fatal("invalid canonical text accepted")
+			}
+		})
+	}
+	if err := db.CreateNodePropertyIndex(invalid, "key"); err == nil {
+		t.Fatal("invalid node index scope accepted")
+	}
+	if err := db.CreateEdgePropertyIndex("관계", invalid); err == nil {
+		t.Fatal("invalid edge index property accepted")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		node, ok, err := tx.GetNodeValue(first.ID)
+		if err != nil {
+			return err
+		}
+		if !ok || !slices.Equal(node.Labels, []string{"첫", "둘"}) || node.Properties["키"] != "값" {
+			t.Fatalf("reopened node = %#v, ok=%v", node, ok)
+		}
+		edges, err := tx.GetOutgoingEdges(first.ID)
+		if err != nil {
+			return err
+		}
+		if len(edges) != 1 || edges[0].ID != edge.ID || edges[0].Type != "관계" {
+			t.Fatalf("reopened edges = %#v", edges)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	results, err := db.FTSSearch("본문", FTSSearchOptions{})
+	if err != nil || len(results) != 1 || results[0].NodeID != first.ID {
+		t.Fatalf("reopened FTS results = %#v, %v", results, err)
+	}
+}
+
+func TestSetVectorRejectsInvalidPropertyKey(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "vector-key.ltdb"), OpenOptions{Create: true, EnableVector: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{})
+		if err != nil {
+			return err
+		}
+		return tx.SetVector(node.ID, string([]byte{0xff}), make([]float32, 128))
+	}); err == nil {
+		t.Fatal("invalid vector property key accepted")
+	}
+}
+
 func TestQueryAndCacheRejectClosedOrOversizedUse(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "limits.ltdb"), OpenOptions{Create: true})
 	if err != nil {
