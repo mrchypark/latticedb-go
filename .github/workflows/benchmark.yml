@@ -1,0 +1,92 @@
+name: benchmark
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GOMAXPROCS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: false
+
+      - name: Download previous main result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          run_id=$(gh run list --workflow benchmark.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+          if [[ -n "$run_id" ]]; then
+            download_dir=$(mktemp -d)
+            if gh run download "$run_id" --name performance-results --dir "$download_dir"; then
+              cp "$download_dir/current.txt" previous/current.txt
+              cp "$download_dir/revision.txt" previous/revision.txt
+            fi
+          fi
+
+      - name: Run benchmarks (maximum scale 100K)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          run_suite() {
+            local repo=$1 output=$2
+            (
+              cd "$repo"
+              go test -run '^$' -bench='^(BenchmarkReadRequests|BenchmarkOutgoingEdges|BenchmarkMatchedScale10K|BenchmarkPropertyEquality10K|BenchmarkPropertyIndexCommonValue10K)$' -benchmem -benchtime=100ms -count=3 .
+              go test -run '^$' -bench='^BenchmarkSingleRecordCommitScaling$/^nodes_(1000|100000)$' -benchmem -benchtime=100ms -count=3 .
+              go test -run '^$' -bench='.' -benchmem -benchtime=100ms -count=3 ./internal/store
+              go test -run '^$' -bench='^(BenchmarkQueryMultiHopSlots|BenchmarkVectorSearchMatched10K|BenchmarkVectorIndexBuildZigHarness)$' -benchmem -benchtime=100ms -count=3 ./internal/engine
+              go test -run '^$' -bench='^(BenchmarkVectorSearchScaling|BenchmarkFTSSearchScaling)$/^records_(1000|10000|100000)$' -benchmem -benchtime=100ms -count=3 ./internal/engine
+              go test -run '^$' -bench='^BenchmarkVectorSearchZigHarness$/^(1K|10K|100K)$' -benchmem -benchtime=1x -count=1 ./internal/engine
+            ) | tee "$output"
+          }
+
+          mkdir -p results
+          run_suite "$GITHUB_WORKSPACE" results/current.txt
+          git rev-parse HEAD > results/revision.txt
+
+          if [[ ! -f previous/current.txt ]]; then
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              BASE_SHA=$(git rev-parse HEAD^)
+            fi
+            baseline_dir="$RUNNER_TEMP/benchmark-baseline"
+            git worktree add --detach "$baseline_dir" "$BASE_SHA"
+            run_suite "$baseline_dir" previous/current.txt
+            printf '%s\n' "$BASE_SHA" > previous/revision.txt
+          fi
+
+      - name: Create comparison report
+        run: |
+          go run ./scripts/benchcmp.go \
+            -current results/current.txt \
+            -previous previous/current.txt \
+            -current-label "$(cat results/revision.txt)" \
+            -previous-label "$(cat previous/revision.txt)" \
+            -output results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload performance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-results
+          path: results
+          retention-days: 90
