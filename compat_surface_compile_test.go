@@ -34,14 +34,14 @@ var (
 )
 
 var compatUpstreamMethods = []any{
-	Version, Open, Deserialize,
+	Version, Open, Deserialize, ExportFile, ExportFileContext,
 	(*DB).Serialize, (*DB).Close, (*DB).IsOpen, (*DB).Path, (*DB).Checkpoint,
 	(*DB).BeginRead, (*DB).BeginWrite, (*DB).Begin, (*DB).View, (*DB).Update,
-	(*DB).Query, (*DB).CacheClear, (*DB).CacheStats,
+	(*DB).Query, (*DB).ExportFile, (*DB).ExportFileContext, (*DB).CacheClear, (*DB).CacheStats,
 	(*DB).CreateNodePropertyIndex, (*DB).DropNodePropertyIndex,
 	(*DB).CreateEdgePropertyIndex, (*DB).DropEdgePropertyIndex,
 	(*DB).GetNodesByLabel, (*DB).VectorSearch, (*DB).FTSSearch,
-	(*DB).FTSSearchFuzzy, (*DB).ReadStream, (*DB).GetStreamOffset, (*DB).Changes,
+	(*DB).FTSSearchFuzzy, (*DB).ReadStream, (*DB).ReadStreamContext, (*DB).GetStreamOffset, (*DB).Changes, (*DB).ChangesContext,
 	(*Tx).IsReadOnly, (*Tx).IsActive, (*Tx).Commit, (*Tx).Rollback,
 	(*Tx).CreateNode, (*Tx).DeleteNode, (*Tx).NodeExists, (*Tx).GetNode,
 	(*Tx).SetProperty, (*Tx).GetProperty, (*Tx).FindNodesByLabelProperty,

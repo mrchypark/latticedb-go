@@ -1228,6 +1228,9 @@ func loadBinaryCheckpointContext(ctx context.Context, file *os.File, maxCanonica
 	if err := decoder.Decode(&snapshot); err != nil {
 		return nil, fmt.Errorf("decode state payload: %w", err)
 	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("state payload has trailing data")
+	}
 	if checksum.Sum32() != binary.BigEndian.Uint32(header[28:32]) {
 		return nil, errors.New("state checksum mismatch")
 	}
@@ -1387,7 +1390,7 @@ func loadLatestLegacyWALContext(ctx context.Context, file *os.File, maxCanonical
 			if decodeErr := json.Unmarshal(trimTrailingNewline(line), &entry); decodeErr != nil {
 				return nil, fmt.Errorf("decode wal: %w", decodeErr)
 			}
-			if latest != nil && entry.CommitID <= latest.CommitID {
+			if latest != nil && (latest.CommitID == ^uint64(0) || entry.CommitID != latest.CommitID+1) {
 				return nil, fmt.Errorf("wal commit id %d does not follow %d", entry.CommitID, latest.CommitID)
 			}
 			entryCopy := entry
@@ -1473,7 +1476,7 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 			if wrapper.Snapshot == nil || wrapper.Snapshot.CommitID != commitID || wrapper.Snapshot.DatabaseID != databaseID {
 				return nil, errors.New("WAL snapshot metadata mismatch")
 			}
-			if accumulator != nil && (databaseID != accumulator.state.DatabaseID || commitID <= accumulator.state.CommitID) {
+			if accumulator != nil && (databaseID != accumulator.state.DatabaseID || accumulator.state.CommitID == ^uint64(0) || commitID != accumulator.state.CommitID+1) {
 				return nil, errors.New("WAL snapshot history regression")
 			}
 			var err error
@@ -1488,7 +1491,7 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 			if accumulator == nil {
 				return nil, errors.New("WAL delta has no base snapshot")
 			}
-			if databaseID != accumulator.state.DatabaseID || commitID <= accumulator.state.CommitID {
+			if databaseID != accumulator.state.DatabaseID || accumulator.state.CommitID == ^uint64(0) || commitID != accumulator.state.CommitID+1 {
 				return nil, errors.New("WAL delta history regression")
 			}
 			if err := accumulator.apply(*wrapper.Delta); err != nil {

@@ -35,7 +35,7 @@ func (tx *Tx) PutAppMetadata(key, value []byte) error {
 	cloned := slices.Clone(value)
 	textKey := string(key)
 	tx.graph.AppMetadata[textKey] = cloned
-	tx.changes.appMetadata[textKey] = appMetadataChange{value: slices.Clone(cloned)}
+	tx.changes.appMetadata[textKey] = appMetadataChange{value: cloned}
 	return nil
 }
 
@@ -57,7 +57,11 @@ func (tx *Tx) ensureAppMetadataWritable() {
 	if tx.appMetadataWritable {
 		return
 	}
-	tx.graph.AppMetadata = store.CloneAppMetadata(tx.graph.AppMetadata)
+	metadata := make(map[string][]byte, len(tx.graph.AppMetadata))
+	for key, value := range tx.graph.AppMetadata {
+		metadata[key] = value
+	}
+	tx.graph.AppMetadata = metadata
 	tx.changes.appMetadata = make(map[string]appMetadataChange)
 	tx.appMetadataWritable = true
 }

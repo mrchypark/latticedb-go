@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"container/heap"
 	"context"
 	"fmt"
 	"math/bits"
@@ -22,6 +23,35 @@ const (
 type vectorCandidate struct {
 	id       uint64
 	distance float64
+}
+
+type vectorCandidateHeap struct {
+	items []vectorCandidate
+	max   bool
+}
+
+func (h vectorCandidateHeap) Len() int { return len(h.items) }
+
+func (h vectorCandidateHeap) Less(i, j int) bool {
+	order := compareVectorCandidate(h.items[i], h.items[j])
+	if h.max {
+		return order > 0
+	}
+	return order < 0
+}
+
+func (h vectorCandidateHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+
+func (h *vectorCandidateHeap) Push(item any) {
+	h.items = append(h.items, item.(vectorCandidate))
+}
+
+func (h *vectorCandidateHeap) Pop() any {
+	last := len(h.items) - 1
+	item := h.items[last]
+	h.items[last] = vectorCandidate{}
+	h.items = h.items[:last]
+	return item
 }
 
 type vectorSearchScratch struct {
@@ -377,10 +407,10 @@ func vectorSearchLayerBudget(graph *store.GraphState, query []float32, entry uin
 	if err != nil {
 		return nil, err
 	}
-	frontier := append(scratch.frontier[:0], vectorCandidate{id: entry, distance: distance})
-	best := scratch.best[:0]
+	frontier := vectorCandidateHeap{items: append(scratch.frontier[:0], vectorCandidate{id: entry, distance: distance})}
+	best := vectorCandidateHeap{items: scratch.best[:0], max: true}
 	if entry != exclude && entryEligible {
-		best = append(best, frontier[0])
+		heap.Push(&best, frontier.items[0])
 	}
 	if budget != nil {
 		if uint64(len(scratch.visited)) >= budget.annVisitedLimit {
@@ -389,11 +419,9 @@ func vectorSearchLayerBudget(graph *store.GraphState, query []float32, entry uin
 	}
 	scratch.visited[entry] = struct{}{}
 	scratch.visitedCapacity = max(scratch.visitedCapacity, len(scratch.visited))
-	for len(frontier) > 0 {
-		current := frontier[0]
-		copy(frontier, frontier[1:])
-		frontier = frontier[:len(frontier)-1]
-		if len(best) >= ef && current.distance > best[len(best)-1].distance {
+	for frontier.Len() > 0 {
+		current := heap.Pop(&frontier).(vectorCandidate)
+		if best.Len() >= ef && current.distance > best.items[0].distance {
 			break
 		}
 		node := graph.VectorIndex.Nodes.Get(current.id)
@@ -403,7 +431,7 @@ func vectorSearchLayerBudget(graph *store.GraphState, query []float32, entry uin
 		for _, id := range node.Neighbors[level] {
 			if budget != nil {
 				if err := budget.add(uint64(len(query))); err != nil {
-					scratch.frontier, scratch.best = frontier, best
+					scratch.frontier, scratch.best = frontier.items, best.items
 					return nil, err
 				}
 			}
@@ -412,7 +440,7 @@ func vectorSearchLayerBudget(graph *store.GraphState, query []float32, entry uin
 			}
 			if budget != nil {
 				if uint64(len(scratch.visited)) >= budget.annVisitedLimit {
-					scratch.frontier, scratch.best = frontier, best
+					scratch.frontier, scratch.best = frontier.items, best.items
 					return nil, fmt.Errorf("%w: search memory exceeds budget", ErrResourceLimit)
 				}
 			}
@@ -430,24 +458,25 @@ func vectorSearchLayerBudget(graph *store.GraphState, query []float32, entry uin
 				distance, err = search.SquaredVectorDistanceContext(budget.ctx, query, vector)
 			}
 			if err != nil {
-				scratch.frontier, scratch.best = frontier, best
+				scratch.frontier, scratch.best = frontier.items, best.items
 				return nil, err
 			}
 			candidate := vectorCandidate{id: id, distance: distance}
-			if len(best) < ef || distance < best[len(best)-1].distance {
-				frontier = insertVectorCandidate(frontier, candidate)
+			if best.Len() < ef || distance < best.items[0].distance {
+				heap.Push(&frontier, candidate)
 				if id != exclude && eligible {
-					best = insertVectorCandidate(best, candidate)
-					if len(best) > ef {
-						best = best[:ef]
+					heap.Push(&best, candidate)
+					if best.Len() > ef {
+						heap.Pop(&best)
 					}
 				}
 			}
 		}
 	}
-	scratch.frontier = frontier
-	scratch.best = best
-	return best, nil
+	slices.SortFunc(best.items, compareVectorCandidate)
+	scratch.frontier = frontier.items
+	scratch.best = best.items
+	return best.items, nil
 }
 
 func vectorForNode(graph *store.GraphState, id uint64) ([]float32, bool) {
@@ -620,14 +649,6 @@ func vectorLevel(id uint64) int {
 	hash = (hash ^ hash>>27) * 0x94d049bb133111eb
 	hash ^= hash >> 31
 	return min(bits.TrailingZeros64(hash|1<<63), vectorIndexMaxLevel)
-}
-
-func insertVectorCandidate(candidates []vectorCandidate, candidate vectorCandidate) []vectorCandidate {
-	index, _ := slices.BinarySearchFunc(candidates, candidate, compareVectorCandidate)
-	candidates = append(candidates, vectorCandidate{})
-	copy(candidates[index+1:], candidates[index:])
-	candidates[index] = candidate
-	return candidates
 }
 
 func selectVectorNeighborsHeuristic(graph *store.GraphState, candidates []vectorCandidate, limit int, budget *directSearchBudget) ([]vectorCandidate, error) {

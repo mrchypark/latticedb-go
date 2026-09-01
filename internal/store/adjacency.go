@@ -117,6 +117,27 @@ func (list *EdgeList) Remove(id uint64) *EdgeList {
 	if result.removed.Has(id) {
 		return list
 	}
+	for chunk := range result.Chunks() {
+		if slices.Contains(chunk, id) {
+			goto found
+		}
+	}
+	return list
+
+found:
+	return list.RemoveKnown(id)
+}
+
+// RemoveKnown skips the chunk membership scan when the caller already proved
+// the edge belongs to this list.
+func (list *EdgeList) RemoveKnown(id uint64) *EdgeList {
+	if list == nil || list.IsInline() {
+		return list.Remove(id)
+	}
+	result := *list
+	if result.removed.Has(id) {
+		return list
+	}
 	result.removed = result.removed.Fork()
 	result.removed.CloneShardOnce(id)
 	result.removed.Set(id, struct{}{})

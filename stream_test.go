@@ -2,6 +2,7 @@ package latticedb
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -376,6 +377,39 @@ func TestStreamValidationReadOnlyAndWakeup(t *testing.T) {
 	defer readOnly.Close()
 	if err := readOnly.Update(func(tx *Tx) error { return tx.PublishStream("events", "message", "no") }); !errors.Is(err, ErrReadOnly) {
 		t.Fatalf("read-only publish error = %v", err)
+	}
+}
+
+func TestReadStreamContextByteLimit(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "stream-bounds.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.PublishStream("events", "message", strings.Repeat("x", 1_024)); err != nil {
+			return err
+		}
+		return tx.PublishStream("events", "message", strings.Repeat("y", 1_024))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.ReadStreamContext(context.Background(), "events", 0, StreamReadOptions{Limit: 2, MaxBytes: 100})
+	if err != nil || len(result.Records) != 0 || result.LastSequence != 0 || !result.ByteLimited {
+		t.Fatalf("small budget result = %#v, %v", result, err)
+	}
+	result, err = db.ReadStreamContext(context.Background(), "events", 0, StreamReadOptions{Limit: 2, MaxBytes: 10_000})
+	if err != nil || len(result.Records) != 1 || result.LastSequence != 1 || !result.ByteLimited {
+		t.Fatalf("partial budget result = %#v, %v", result, err)
+	}
+	legacy, err := db.ReadStream("events", 0, 2, 0)
+	if err != nil || len(legacy) != 2 {
+		t.Fatalf("legacy read = %#v, %v", legacy, err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := db.ReadStreamContext(canceled, "events", 2, StreamReadOptions{Limit: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled read error = %v", err)
 	}
 }
 

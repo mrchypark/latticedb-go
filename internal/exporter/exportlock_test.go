@@ -1,6 +1,7 @@
 package exporter
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -16,6 +17,54 @@ import (
 
 	"github.com/mrchypark/latticedb-go/internal/store"
 )
+
+func TestSingleFileExportsPublishWithoutResultBuffer(t *testing.T) {
+	graph := store.NewGraphState()
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Labels: []string{"Item"}})
+	graph.Nodes.Set(2, &store.NodeRecord{ID: 2})
+	graph.Edges.Set(1, &store.EdgeRecord{ID: 1, SourceID: 1, TargetID: 2, Type: "LINK"})
+
+	for _, format := range []ExportFormat{ExportFormatJSON, ExportFormatJSONL, ExportFormatDOT} {
+		t.Run(string(format), func(t *testing.T) {
+			var want bytes.Buffer
+			if err := ExportGraphContextTo(context.Background(), graph, format, &want); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "graph."+string(format))
+			if err := ExportGraphFileContext(context.Background(), graph, format, path); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(data, want.Bytes()) {
+				t.Fatalf("published output differs:\n%s\n%s", data, want.Bytes())
+			}
+		})
+	}
+}
+
+func TestExportGraphPreservesReturnedBytes(t *testing.T) {
+	graph := store.NewGraphState()
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1})
+	for _, format := range []ExportFormat{ExportFormatJSON, ExportFormatJSONL, ExportFormatDOT} {
+		t.Run(string(format), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "graph."+string(format))
+			data, err := ExportGraph(graph, format, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			written, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(data, written) {
+				t.Fatal("ExportGraph return value no longer matches the published file")
+			}
+		})
+	}
+}
 
 func TestCSVConcurrentSubprocessPublicationAndOwnerDeath(t *testing.T) {
 	if os.Getenv("LATTICEDB_EXPORT_HELPER") != "" {

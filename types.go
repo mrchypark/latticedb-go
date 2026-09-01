@@ -102,6 +102,19 @@ type FTSSearchOptions struct {
 	MaxBytes      uint64
 }
 
+// StreamReadOptions limits records and their logical size. Zero MaxBytes
+// preserves the legacy unbounded byte behavior.
+type StreamReadOptions struct {
+	Limit    uint
+	MaxBytes uint64
+}
+
+type StreamReadResult struct {
+	Records      []StreamRecord
+	LastSequence uint64
+	ByteLimited  bool
+}
+
 type QueryCacheStats struct {
 	Entries uint32
 	Hits    uint64

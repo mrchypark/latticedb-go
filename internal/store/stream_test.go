@@ -127,6 +127,20 @@ func TestStreamBulkReadAndByteRetention(t *testing.T) {
 	}
 }
 
+func TestStreamReadBoundedStopsBeforeOversizedRecord(t *testing.T) {
+	store := NewStreamStore()
+	store.Publish("events", "event", strings.Repeat("x", 1_024))
+	store.Publish("events", "event", "small")
+	result := store.ReadBounded("events", 0, 2, streamRecordBytes(store.streams["events"].tail.records[0])-1)
+	if len(result.Records) != 0 || result.LastSequence != 0 || !result.ByteLimited {
+		t.Fatalf("oversized result = %#v", result)
+	}
+	result = store.ReadBounded("events", 0, 2, streamRecordBytes(store.streams["events"].tail.records[0]))
+	if len(result.Records) != 1 || result.LastSequence != 1 || !result.ByteLimited {
+		t.Fatalf("boundary result = %#v", result)
+	}
+}
+
 func TestStreamByteRetentionRemovesOversizedNewestRecord(t *testing.T) {
 	store := NewStreamStore()
 	store.Publish("events", "event", strings.Repeat("x", 10_000))

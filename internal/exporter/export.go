@@ -99,6 +99,33 @@ func ExportGraphContext(ctx context.Context, graph *store.GraphState, format Exp
 	}
 }
 
+func ExportGraphFileContext(ctx context.Context, graph *store.GraphState, format ExportFormat, outputPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	unlock, err := acquireExportLockContext(ctx, outputPath)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	switch format {
+	case ExportFormatJSON:
+		_, err = writeAtomicStreamContext(ctx, outputPath, func(output io.Writer) error { return DumpGraphContextTo(ctx, graph, output) })
+	case ExportFormatJSONL:
+		_, err = writeAtomicStreamContext(ctx, outputPath, func(output io.Writer) error { return exportJSONLContextTo(ctx, graph, output) })
+	case ExportFormatCSV:
+		_, err = exportCSV(ctx, graph, outputPath)
+	case ExportFormatDOT:
+		_, err = writeAtomicStreamContext(ctx, outputPath, func(output io.Writer) error { return exportDOTContextTo(ctx, graph, output) })
+	default:
+		err = fmt.Errorf("unsupported export format %q", format)
+	}
+	return err
+}
+
 func Dump(dbPath string) ([]byte, error) {
 	graph, _, _, _, err := store.LoadGraphState(dbPath)
 	if err != nil {
@@ -355,7 +382,6 @@ func exportDOTContext(ctx context.Context, graph *store.GraphState, outputPath s
 	if err := exportDOTContextTo(ctx, graph, &builder); err != nil {
 		return nil, err
 	}
-
 	data := []byte(builder.String())
 	if _, err := writeAtomicContext(ctx, outputPath, data); err != nil {
 		return nil, err
@@ -612,12 +638,18 @@ func writeEdgesCSVContext(ctx context.Context, graph *store.GraphState, path str
 }
 
 func writeAtomicContext(ctx context.Context, path string, data []byte) (bool, error) {
+	return writeAtomicStreamContext(ctx, path, func(output io.Writer) error {
+		return writeBytes(output, data)
+	})
+}
+
+func writeAtomicStreamContext(ctx context.Context, path string, write func(io.Writer) error) (bool, error) {
 	file, tempPath, err := createTempOutput(path)
 	if err != nil {
 		return false, err
 	}
 	defer os.Remove(tempPath)
-	if _, err := (contextOutputWriter{ctx: ctx, output: file}).Write(data); err != nil {
+	if err := write(contextOutputWriter{ctx: ctx, output: file}); err != nil {
 		_ = file.Close()
 		return false, err
 	}

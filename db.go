@@ -294,6 +294,13 @@ func (db *DB) ReadStream(stream string, afterSequence uint64, limit uint, timeou
 	return records, wrapError(err)
 }
 
+// ReadStreamContext reads stream records until a record is available, the byte
+// budget is reached, or ctx is canceled. A zero MaxBytes disables the byte limit.
+func (db *DB) ReadStreamContext(ctx context.Context, stream string, afterSequence uint64, opts StreamReadOptions) (StreamReadResult, error) {
+	result, err := db.inner.ReadStreamContext(ctx, stream, afterSequence, engine.StreamReadOptions{Limit: opts.Limit, MaxBytes: opts.MaxBytes})
+	return StreamReadResult{Records: result.Records, LastSequence: result.LastSequence, ByteLimited: result.ByteLimited}, wrapError(err)
+}
+
 func (db *DB) GetStreamOffset(stream, consumer string) (uint64, bool, error) {
 	offset, ok, err := db.inner.GetStreamOffset(stream, consumer)
 	return offset, ok, wrapError(err)
@@ -302,6 +309,12 @@ func (db *DB) GetStreamOffset(stream, consumer string) (uint64, bool, error) {
 func (db *DB) Changes(afterSequence uint64, limit uint, timeoutMS uint32) ([]StreamRecord, error) {
 	records, err := db.inner.Changes(afterSequence, limit, timeoutMS)
 	return records, wrapError(err)
+}
+
+// ChangesContext is ReadStreamContext for the automatic changefeed.
+func (db *DB) ChangesContext(ctx context.Context, afterSequence uint64, opts StreamReadOptions) (StreamReadResult, error) {
+	result, err := db.inner.ChangesContext(ctx, afterSequence, engine.StreamReadOptions{Limit: opts.Limit, MaxBytes: opts.MaxBytes})
+	return StreamReadResult{Records: result.Records, LastSequence: result.LastSequence, ByteLimited: result.ByteLimited}, wrapError(err)
 }
 
 func (db *DB) CacheClear() error {

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"slices"
 	"testing"
 	"unsafe"
 )
@@ -58,5 +59,30 @@ func TestEdgeListInlineChurnDoesNotCreateChunkGaps(t *testing.T) {
 	}
 	if chunks != 5 {
 		t.Fatalf("chunks = %d, want 5", chunks)
+	}
+}
+
+func TestEdgeListChunkedRemoveMissingID(t *testing.T) {
+	var list *EdgeList
+	for id := uint64(1); id <= adjacencyInlineLimit+1; id++ {
+		list = list.Append(id)
+	}
+	if got := list.Remove(adjacencyInlineLimit + 2); got != list {
+		t.Fatal("missing ID changed chunked adjacency")
+	}
+	if got := list.Len(); got != adjacencyInlineLimit+1 {
+		t.Fatalf("length = %d, want %d", got, adjacencyInlineLimit+1)
+	}
+}
+
+func TestEdgeListRemoveKnownPreservesFastChunkedPath(t *testing.T) {
+	var list *EdgeList
+	for id := uint64(1); id <= adjacencyInlineLimit+1; id++ {
+		list = list.Append(id)
+	}
+	list = list.RemoveKnown(adjacencyInlineLimit + 1)
+	values := slices.Collect(list.All())
+	if list.Len() != adjacencyInlineLimit || slices.Contains(values, adjacencyInlineLimit+1) {
+		t.Fatalf("RemoveKnown left invalid list: len=%d values=%v", list.Len(), values)
 	}
 }

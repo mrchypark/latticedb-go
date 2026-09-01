@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"slices"
@@ -16,35 +17,81 @@ const (
 
 type StreamRecord = store.StreamRecord
 
+type StreamReadOptions struct {
+	Limit    uint
+	MaxBytes uint64
+}
+
+type StreamReadResult struct {
+	Records      []StreamRecord
+	LastSequence uint64
+	ByteLimited  bool
+}
+
 func (db *DB) ReadStream(stream string, afterSequence uint64, limit uint, timeoutMS uint32) ([]StreamRecord, error) {
+	result, err := db.readStream(nil, stream, afterSequence, StreamReadOptions{Limit: limit}, time.Duration(timeoutMS)*time.Millisecond)
+	return result.Records, err
+}
+
+// ReadStreamContext reads stream records until a record is available, the byte
+// budget is reached, or ctx is canceled. A zero MaxBytes disables the byte limit.
+func (db *DB) ReadStreamContext(ctx context.Context, stream string, afterSequence uint64, opts StreamReadOptions) (StreamReadResult, error) {
+	if ctx == nil {
+		return StreamReadResult{}, fmt.Errorf("%w: stream read context is nil", ErrInvalidArgument)
+	}
+	return db.readStream(ctx, stream, afterSequence, opts, 0)
+}
+
+func (db *DB) readStream(ctx context.Context, stream string, afterSequence uint64, opts StreamReadOptions, timeout time.Duration) (StreamReadResult, error) {
 	if err := validateStreamName(stream, true); err != nil {
-		return nil, err
+		return StreamReadResult{}, err
 	}
-	if limit == 0 {
-		return nil, fmt.Errorf("%w: stream read limit must be positive", ErrInvalidArgument)
+	if opts.Limit == 0 {
+		return StreamReadResult{}, fmt.Errorf("%w: stream read limit must be positive", ErrInvalidArgument)
 	}
-	deadline := time.NewTimer(time.Duration(timeoutMS) * time.Millisecond)
-	defer deadline.Stop()
+	var deadline *time.Timer
+	defer func() {
+		if deadline != nil {
+			deadline.Stop()
+		}
+	}()
 	for {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return StreamReadResult{}, err
+			}
+		}
 		db.mu.RLock()
 		if db.closed {
 			db.mu.RUnlock()
-			return nil, ErrDatabaseClosed
+			return StreamReadResult{}, ErrDatabaseClosed
 		}
 		if db.recoveryRequired {
 			db.mu.RUnlock()
-			return nil, ErrRecoveryRequired
+			return StreamReadResult{}, ErrRecoveryRequired
 		}
-		records := db.graph.Streams.Read(stream, afterSequence, limit)
+		read := db.graph.Streams.ReadBounded(stream, afterSequence, opts.Limit, opts.MaxBytes)
 		notify := db.streamNotify
 		db.mu.RUnlock()
-		if len(records) != 0 || timeoutMS == 0 {
-			return records, nil
+		result := StreamReadResult{Records: read.Records, LastSequence: read.LastSequence, ByteLimited: read.ByteLimited}
+		if len(result.Records) != 0 || result.ByteLimited || ctx == nil && timeout == 0 {
+			return result, nil
+		}
+		if ctx != nil {
+			select {
+			case <-notify:
+			case <-ctx.Done():
+				return StreamReadResult{}, ctx.Err()
+			}
+			continue
+		}
+		if deadline == nil {
+			deadline = time.NewTimer(timeout)
 		}
 		select {
 		case <-notify:
 		case <-deadline.C:
-			return records, nil
+			return result, nil
 		}
 	}
 }
@@ -70,6 +117,10 @@ func (db *DB) GetStreamOffset(stream, consumer string) (uint64, bool, error) {
 
 func (db *DB) Changes(afterSequence uint64, limit uint, timeoutMS uint32) ([]StreamRecord, error) {
 	return db.ReadStream(changeStreamName, afterSequence, limit, timeoutMS)
+}
+
+func (db *DB) ChangesContext(ctx context.Context, afterSequence uint64, opts StreamReadOptions) (StreamReadResult, error) {
+	return db.ReadStreamContext(ctx, changeStreamName, afterSequence, opts)
 }
 
 func (tx *Tx) PublishStream(stream, kind string, payload any) error {
