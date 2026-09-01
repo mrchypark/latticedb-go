@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 90
     env:
       GOMAXPROCS: 2
+      ZIG_VERSION: '0.16.0'
+      ZIG_REF: d2c94ddd30c805a65493d8b997497d77254e10c3
     steps:
       - uses: actions/checkout@v7
         with:
@@ -28,6 +30,15 @@ jobs:
         with:
           go-version: '1.27.x'
           cache: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: actions/checkout@v7
+        with:
+          repository: mrchypark/latticedb
+          ref: ${{ env.ZIG_REF }}
+          path: zig-reference
+          persist-credentials: false
 
       - name: Download previous main result
         env:
@@ -54,9 +65,9 @@ jobs:
               go test -run '^$' -bench='^(BenchmarkReadRequests|BenchmarkOutgoingEdges|BenchmarkMatchedScale10K|BenchmarkPropertyEquality10K|BenchmarkPropertyIndexCommonValue10K)$' -benchmem -benchtime=100ms -count=3 .
               go test -run '^$' -bench='^BenchmarkSingleRecordCommitScaling$/^nodes_(1000|100000)$' -benchmem -benchtime=100ms -count=3 .
               go test -run '^$' -bench='.' -benchmem -benchtime=100ms -count=3 ./internal/store
-              go test -run '^$' -bench='^(BenchmarkQueryMultiHopSlots|BenchmarkVectorSearchMatched10K|BenchmarkVectorIndexBuildZigHarness)$' -benchmem -benchtime=100ms -count=3 ./internal/engine
+              go test -run '^$' -bench='^(BenchmarkQueryMultiHopSlots|BenchmarkVectorSearchMatched10K|BenchmarkVectorIndexBuild(Clustered128D|ZigHarness))$' -benchmem -benchtime=100ms -count=3 ./internal/engine
               go test -run '^$' -bench='^(BenchmarkVectorSearchScaling|BenchmarkFTSSearchScaling)$/^records_(1000|10000|100000)$' -benchmem -benchtime=100ms -count=3 ./internal/engine
-              go test -run '^$' -bench='^BenchmarkVectorSearchZigHarness$/^(1K|10K|100K)$' -benchmem -benchtime=1x -count=1 ./internal/engine
+              go test -run '^$' -bench='^BenchmarkVectorSearch(Clustered128D|ZigHarness)$/^(1K|10K|100K)$' -benchmem -benchtime=1x -count=1 ./internal/engine
             ) | tee "$output"
           }
 
@@ -74,6 +85,14 @@ jobs:
             printf '%s\n' "$BASE_SHA" > previous/revision.txt
           fi
 
+      - name: Run Zig reference benchmark (100K)
+        run: |
+          (
+            cd "$GITHUB_WORKSPACE/zig-reference"
+            zig build vector-benchmark -- --scale 100000 --scale-only
+          ) 2>&1 | tee results/zig.txt
+          git -C "$GITHUB_WORKSPACE/zig-reference" rev-parse HEAD > results/zig-revision.txt
+
       - name: Create comparison report
         run: |
           go run ./scripts/benchcmp.go \
@@ -81,6 +100,8 @@ jobs:
             -previous previous/current.txt \
             -current-label "$(cat results/revision.txt)" \
             -previous-label "$(cat previous/revision.txt)" \
+            -zig results/zig.txt \
+            -zig-label "mrchypark/latticedb@$(cat results/zig-revision.txt) (Zig $ZIG_VERSION, ReleaseFast)" \
             -output results/report.md
           cat results/report.md >> "$GITHUB_STEP_SUMMARY"
 
