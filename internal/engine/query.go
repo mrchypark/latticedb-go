@@ -19,6 +19,7 @@ import (
 )
 
 type queryPlan struct {
+	slots          map[string]int
 	unwindClause   *unwindClause
 	matchPatterns  []matchPattern
 	whereClauses   []*whereClause
@@ -258,8 +259,179 @@ const (
 )
 
 type queryRow struct {
-	Bindings map[string]boundValue
-	Order    float64
+	slots []boundValue
+	bound []bool
+	index map[string]int
+	Order float64
+}
+
+type queryIterator interface {
+	Next() (queryRow, bool, error)
+}
+
+type sliceQueryIterator struct {
+	rows  []queryRow
+	index int
+}
+
+func (it *sliceQueryIterator) Next() (queryRow, bool, error) {
+	if it.index == len(it.rows) {
+		return queryRow{}, false, nil
+	}
+	row := it.rows[it.index]
+	it.index++
+	return row, true, nil
+}
+
+type filterQueryIterator struct {
+	input queryIterator
+	eval  func(queryRow) (bool, error)
+}
+
+func (it *filterQueryIterator) Next() (queryRow, bool, error) {
+	for {
+		row, ok, err := it.input.Next()
+		if err != nil || !ok {
+			return queryRow{}, ok, err
+		}
+		keep, err := it.eval(row)
+		if err != nil || keep {
+			return row, keep, err
+		}
+	}
+}
+
+type limitQueryIterator struct {
+	input queryIterator
+	skip  int
+	limit int
+	seen  int
+}
+
+type patternQueryIterator struct {
+	plan    *queryPlan
+	tx      *Tx
+	input   queryIterator
+	pattern matchPattern
+	params  map[string]any
+	limit   uint
+	budget  *queryBudget
+	pending []queryRow
+	emitted int
+}
+
+type whereQueryIterator struct {
+	input   queryIterator
+	tx      *Tx
+	clause  *whereClause
+	params  map[string]any
+	budget  *queryBudget
+	pending []queryRow
+}
+
+func (it *whereQueryIterator) Next() (queryRow, bool, error) {
+	for {
+		if len(it.pending) != 0 {
+			row := it.pending[0]
+			it.pending = it.pending[1:]
+			return row, true, nil
+		}
+		row, ok, err := it.input.Next()
+		if err != nil || !ok {
+			return queryRow{}, ok, err
+		}
+		it.pending, err = it.clause.apply(it.tx, []queryRow{row}, it.params, it.budget)
+		if err != nil {
+			return queryRow{}, false, err
+		}
+	}
+}
+
+func (it *patternQueryIterator) Next() (queryRow, bool, error) {
+	for {
+		if len(it.pending) != 0 {
+			row := it.pending[0]
+			it.pending = it.pending[1:]
+			if err := it.budget.check(0, it.emitted+1); err != nil {
+				return queryRow{}, false, err
+			}
+			it.emitted++
+			return row, true, nil
+		}
+		row, ok, err := it.input.Next()
+		if err != nil || !ok {
+			return queryRow{}, ok, err
+		}
+		it.pending, err = it.apply(row)
+		if err != nil {
+			return queryRow{}, false, err
+		}
+	}
+}
+
+func (it *patternQueryIterator) apply(row queryRow) ([]queryRow, error) {
+	if node, ok := it.pattern.(nodePattern); ok {
+		if nodeID, found, err := it.plan.bindingNodeID(node.Var, it.params); err != nil {
+			return nil, err
+		} else if found {
+			return node.applyID(it.tx, []queryRow{row}, nodeID, nil, it.budget)
+		}
+		if nodeIDs, found, err := it.plan.indexedNodeIDs(it.tx, node, it.params, it.limit, it.budget); err != nil {
+			return nil, err
+		} else if found {
+			if err := it.budget.chargeTemporary(uint64(len(nodeIDs)) * 8); err != nil {
+				return nil, err
+			}
+			var rows []queryRow
+			for _, nodeID := range nodeIDs {
+				rows, err = node.applyID(it.tx, []queryRow{row}, nodeID, rows, it.budget)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return rows, nil
+		}
+	}
+	if edge, ok := it.pattern.(edgePattern); ok {
+		if edgeIDs, found, err := it.plan.indexedEdgeIDs(it.tx, edge, it.params); err != nil {
+			return nil, err
+		} else if found {
+			return edge.applyIDs(it.tx, []queryRow{row}, edgeIDs, it.budget)
+		}
+	}
+	return it.pattern.apply(it.tx, []queryRow{row}, it.budget)
+}
+
+func (it *limitQueryIterator) Next() (queryRow, bool, error) {
+	for it.skip > 0 {
+		_, ok, err := it.input.Next()
+		if err != nil || !ok {
+			return queryRow{}, ok, err
+		}
+		it.skip--
+	}
+	if it.limit >= 0 && it.seen == it.limit {
+		return queryRow{}, false, nil
+	}
+	row, ok, err := it.input.Next()
+	if ok {
+		it.seen++
+	}
+	return row, ok, err
+}
+
+func collectQueryRows(it queryIterator) ([]queryRow, error) {
+	var rows []queryRow
+	for {
+		row, ok, err := it.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return rows, nil
+		}
+		rows = append(rows, row)
+	}
 }
 
 type boundValue struct {
@@ -317,6 +489,24 @@ func parseQuery(query string) (*queryPlan, error) {
 	return plan, nil
 }
 
+func (plan *queryPlan) newRow() queryRow {
+	return queryRow{slots: make([]boundValue, len(plan.slots)), bound: make([]bool, len(plan.slots)), index: plan.slots}
+}
+
+func (row queryRow) get(name string) (boundValue, bool) {
+	slot, ok := row.index[name]
+	if !ok || !row.bound[slot] {
+		return boundValue{}, false
+	}
+	return row.slots[slot], true
+}
+
+func (row *queryRow) set(name string, value boundValue) {
+	if slot, ok := row.index[name]; ok {
+		row.slots[slot], row.bound[slot] = value, true
+	}
+}
+
 func normalizeQueryText(query string) string {
 	query = strings.TrimSpace(query)
 	if strings.HasSuffix(query, ";") {
@@ -362,6 +552,7 @@ const (
 
 func (plan *queryPlan) validateBindings() error {
 	bindings := map[string]bindingRole{}
+	plan.slots = make(map[string]int)
 	bind := func(name string, role bindingRole) error {
 		if name == "" {
 			return nil
@@ -373,6 +564,9 @@ func (plan *queryPlan) validateBindings() error {
 			return fmt.Errorf("binding %q has conflicting roles", name)
 		}
 		bindings[name] = role
+		if _, ok := plan.slots[name]; !ok {
+			plan.slots[name] = len(plan.slots)
+		}
 		return nil
 	}
 	if plan.unwindClause != nil {
@@ -727,7 +921,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	if err != nil {
 		return QueryResult{}, err
 	}
-	rows := []queryRow{{}}
+	rows := []queryRow{plan.newRow()}
 	if plan.unwindClause != nil {
 		var err error
 		rows, err = plan.unwindClause.apply(rows, params, budget)
@@ -735,77 +929,52 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 			return QueryResult{}, err
 		}
 	}
+	match := queryIterator(&sliceQueryIterator{rows: rows})
 	for _, pattern := range plan.matchPatterns {
-		var err error
+		lookupLimit := uint(0)
 		if node, ok := pattern.(nodePattern); ok {
-			if nodeID, found, lookupErr := plan.bindingNodeID(node.Var, params); lookupErr != nil {
-				return QueryResult{}, lookupErr
-			} else if found {
-				rows, err = node.applyID(tx, rows, nodeID, nil, budget)
-				if err != nil {
-					return QueryResult{}, err
-				}
-				continue
-			}
-			if nodeIDs, found, lookupErr := plan.indexedNodeIDs(tx, node, params, plan.indexedNodeLookupLimit(node, limit, skip), budget); lookupErr != nil {
-				return QueryResult{}, lookupErr
-			} else if found {
-				if err := budget.chargeTemporary(uint64(len(nodeIDs)) * 8); err != nil {
-					return QueryResult{}, err
-				}
-				nextRows := make([]queryRow, 0)
-				for _, nodeID := range nodeIDs {
-					nextRows, err = node.applyID(tx, rows, nodeID, nextRows, budget)
-					if err != nil {
-						return QueryResult{}, err
-					}
-				}
-				rows = nextRows
-				continue
-			}
+			lookupLimit = plan.indexedNodeLookupLimit(node, limit, skip)
 		}
-		if edge, ok := pattern.(edgePattern); ok {
-			if edgeIDs, found, lookupErr := plan.indexedEdgeIDs(tx, edge, params); lookupErr != nil {
-				return QueryResult{}, lookupErr
-			} else if found {
-				rows, err = edge.applyIDs(tx, rows, edgeIDs, budget)
-				if err != nil {
-					return QueryResult{}, err
-				}
-				continue
-			}
-		}
-		rows, err = pattern.apply(tx, rows, budget)
-		if err != nil {
-			return QueryResult{}, err
-		}
+		match = &patternQueryIterator{plan: plan, tx: tx, input: match, pattern: pattern, params: params, limit: lookupLimit, budget: budget}
 	}
-
+	var stream queryIterator = match
 	if len(plan.whereClauses) > 0 {
 		for _, clause := range plan.whereClauses {
-			var err error
-			rows, err = clause.apply(tx, rows, params, budget)
-			if err != nil {
-				return QueryResult{}, err
+			if clause.Kind == whereVector || clause.Kind == whereFTS {
+				rows, err = collectQueryRows(stream)
+				if err != nil {
+					return QueryResult{}, err
+				}
+				rows, err = clause.apply(tx, rows, params, budget)
+				if err != nil {
+					return QueryResult{}, err
+				}
+				stream = &sliceQueryIterator{rows: rows}
+				continue
 			}
+			stream = &whereQueryIterator{input: stream, tx: tx, clause: clause, params: params, budget: budget}
 		}
 	}
 	if plan.wherePredicate != nil {
-		filtered := rows[:0]
 		predicateWork := uint64(len(wherePredicateClauses(plan.wherePredicate)))
-		for _, row := range rows {
-			if err := budget.check(predicateWork, len(filtered)); err != nil {
-				return QueryResult{}, err
+		stream = &filterQueryIterator{input: stream, eval: func(row queryRow) (bool, error) {
+			if err := budget.check(predicateWork, 0); err != nil {
+				return false, err
 			}
 			match, err := plan.wherePredicate.eval(row, params)
-			if err != nil {
-				return QueryResult{}, err
-			}
-			if match == predicateTrue {
-				filtered = append(filtered, row)
-			}
+			return match == predicateTrue, err
+		}}
+	}
+	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) == 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" {
+		iteratorLimit := limit
+		if plan.limitExpr == nil {
+			iteratorLimit = -1
 		}
-		rows = filtered
+		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit}, budget)
+	}
+	rows, err = collectQueryRows(stream)
+	if err != nil {
+		return QueryResult{}, err
 	}
 
 	if plan.createNode != nil {
@@ -1160,10 +1329,10 @@ func (clause *unwindClause) apply(rows []queryRow, params map[string]any, budget
 				return nil, err
 			}
 			nextRow := row.clone()
-			nextRow.Bindings[clause.Var] = boundValue{
+			nextRow.set(clause.Var, boundValue{
 				Value:    store.CloneValue(item),
 				HasValue: true,
-			}
+			})
 			nextRows = append(nextRows, nextRow)
 		}
 	}
@@ -1948,7 +2117,7 @@ func parseOrderClauses(text string) ([]orderClause, error) {
 }
 
 func (clause orderClause) value(row queryRow) any {
-	binding, ok := row.Bindings[clause.Var]
+	binding, ok := row.get(clause.Var)
 	if !ok {
 		return nil
 	}
@@ -2063,7 +2232,7 @@ func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecor
 			continue
 		}
 		if pattern.Var != "" {
-			if existing, ok := row.Bindings[pattern.Var]; ok {
+			if existing, ok := row.get(pattern.Var); ok {
 				if existing.Node == nil || existing.Node.ID != node.ID {
 					continue
 				}
@@ -2079,7 +2248,7 @@ func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecor
 		}
 		nextRow := row.clone()
 		if pattern.Var != "" {
-			nextRow.Bindings[pattern.Var] = boundValue{Node: node}
+			nextRow.set(pattern.Var, boundValue{Node: node})
 		}
 		nextRows = append(nextRows, nextRow)
 	}
@@ -2145,7 +2314,7 @@ func boundNode(row queryRow, name string) (*store.NodeRecord, bool) {
 	if name == "" {
 		return nil, false
 	}
-	binding, ok := row.Bindings[name]
+	binding, ok := row.get(name)
 	if !ok {
 		return nil, false
 	}
@@ -2162,7 +2331,7 @@ func (pattern edgePattern) applyAdjacent(tx *Tx, row queryRow, edgeIDs *store.Ed
 			continue
 		}
 		if pattern.EdgeVar != "" {
-			if existing, ok := row.Bindings[pattern.EdgeVar]; ok && (existing.Edge == nil || existing.Edge.ID != edge.ID) {
+			if existing, ok := row.get(pattern.EdgeVar); ok && (existing.Edge == nil || existing.Edge.ID != edge.ID) {
 				continue
 			}
 		}
@@ -2205,7 +2374,7 @@ func (pattern edgePattern) applyIDs(tx *Tx, rows []queryRow, edgeIDs []uint64, b
 				continue
 			}
 			if pattern.EdgeVar != "" {
-				if existing, ok := row.Bindings[pattern.EdgeVar]; ok && (existing.Edge == nil || existing.Edge.ID != edge.ID) {
+				if existing, ok := row.get(pattern.EdgeVar); ok && (existing.Edge == nil || existing.Edge.ID != edge.ID) {
 					continue
 				}
 			}
@@ -2242,13 +2411,13 @@ func (pattern edgePattern) appendEdgeRow(row queryRow, edge *store.EdgeRecord, l
 	}
 	nextRow := row.clone()
 	if pattern.Left.Var != "" {
-		nextRow.Bindings[pattern.Left.Var] = boundValue{Node: left}
+		nextRow.set(pattern.Left.Var, boundValue{Node: left})
 	}
 	if pattern.Right.Var != "" {
-		nextRow.Bindings[pattern.Right.Var] = boundValue{Node: right}
+		nextRow.set(pattern.Right.Var, boundValue{Node: right})
 	}
 	if pattern.EdgeVar != "" {
-		nextRow.Bindings[pattern.EdgeVar] = boundValue{Edge: edge}
+		nextRow.set(pattern.EdgeVar, boundValue{Edge: edge})
 	}
 	return append(rows, nextRow), nil
 }
@@ -2259,7 +2428,7 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 		if err := budget.check(1, len(filtered)); err != nil {
 			return nil, err
 		}
-		binding, ok := row.Bindings[clause.Var]
+		binding, ok := row.get(clause.Var)
 		if !ok {
 			continue
 		}
@@ -2400,7 +2569,7 @@ func scoreQueryFTSTokens(tokens, terms []string, budget *queryBudget) (float32, 
 }
 
 func (clause *whereClause) eval(row queryRow, params map[string]any) (predicateTruth, error) {
-	binding, ok := row.Bindings[clause.Var]
+	binding, ok := row.get(clause.Var)
 	if !ok {
 		return predicateUnknown, nil
 	}
@@ -2647,7 +2816,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any) e
 	for index := range rows {
 		row := rows[index]
 		refreshRowBindings(tx, &row)
-		binding, ok := row.Bindings[clause.Var]
+		binding, ok := row.get(clause.Var)
 		if !ok {
 			continue
 		}
@@ -2746,14 +2915,17 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any) e
 		default:
 			return fmt.Errorf("unsupported SET kind %q", clause.Kind)
 		}
-		row.Bindings[clause.Var] = binding
+		row.set(clause.Var, binding)
 		rows[index] = row
 	}
 	return nil
 }
 
 func refreshRowBindings(tx *Tx, row *queryRow) {
-	for name, binding := range row.Bindings {
+	for slot, binding := range row.slots {
+		if !row.bound[slot] {
+			continue
+		}
 		switch {
 		case binding.Node != nil:
 			if current := tx.graph.Nodes.Get(binding.Node.ID); current != nil {
@@ -2764,7 +2936,7 @@ func refreshRowBindings(tx *Tx, row *queryRow) {
 				binding.Edge = current
 			}
 		}
-		row.Bindings[name] = binding
+		row.slots[slot] = binding
 	}
 }
 
@@ -2794,7 +2966,7 @@ func (clause *createNodeClause) apply(tx *Tx, rows []queryRow, params map[string
 
 		nextRow := row.clone()
 		if clause.Var != "" {
-			nextRow.Bindings[clause.Var] = boundValue{Node: tx.graph.Nodes.Get(node.ID)}
+			nextRow.set(clause.Var, boundValue{Node: tx.graph.Nodes.Get(node.ID)})
 		}
 		nextRows = append(nextRows, nextRow)
 	}
@@ -2804,7 +2976,7 @@ func (clause *createNodeClause) apply(tx *Tx, rows []queryRow, params map[string
 func (clause *removeClause) apply(tx *Tx, rows []queryRow) error {
 	for _, row := range rows {
 		for _, item := range clause.Items {
-			binding, ok := row.Bindings[item.Var]
+			binding, ok := row.get(item.Var)
 			if !ok {
 				return fmt.Errorf("unknown binding %q", item.Var)
 			}
@@ -2844,7 +3016,7 @@ func (clause *removeClause) apply(tx *Tx, rows []queryRow) error {
 			default:
 				return fmt.Errorf("invalid REMOVE item for binding %q", item.Var)
 			}
-			row.Bindings[item.Var] = binding
+			row.set(item.Var, binding)
 		}
 	}
 	return nil
@@ -2852,11 +3024,11 @@ func (clause *removeClause) apply(tx *Tx, rows []queryRow) error {
 
 func (clause *createClause) apply(tx *Tx, rows []queryRow, params map[string]any) error {
 	for _, row := range rows {
-		sourceBinding, ok := row.Bindings[clause.SourceVar]
+		sourceBinding, ok := row.get(clause.SourceVar)
 		if !ok || sourceBinding.Node == nil {
 			return fmt.Errorf("unknown source binding %q", clause.SourceVar)
 		}
-		targetBinding, ok := row.Bindings[clause.TargetVar]
+		targetBinding, ok := row.get(clause.TargetVar)
 		if !ok || targetBinding.Node == nil {
 			return fmt.Errorf("unknown target binding %q", clause.TargetVar)
 		}
@@ -2881,7 +3053,7 @@ func (clause *createClause) apply(tx *Tx, rows []queryRow, params map[string]any
 			return err
 		}
 		if clause.EdgeVar != "" {
-			row.Bindings[clause.EdgeVar] = boundValue{Edge: tx.graph.Edges.Get(edge.ID)}
+			row.set(clause.EdgeVar, boundValue{Edge: tx.graph.Edges.Get(edge.ID)})
 		}
 	}
 	return nil
@@ -2893,7 +3065,7 @@ func (clause *deleteClause) apply(tx *Tx, rows []queryRow) error {
 
 	for _, row := range rows {
 		for _, name := range clause.Vars {
-			binding, ok := row.Bindings[name]
+			binding, ok := row.get(name)
 			if !ok {
 				return fmt.Errorf("unknown binding %q", name)
 			}
@@ -2927,7 +3099,7 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 				count++
 				continue
 			}
-			binding, ok := row.Bindings[clause.CountVar]
+			binding, ok := row.get(clause.CountVar)
 			if !ok {
 				return QueryResult{}, fmt.Errorf("unknown binding %q", clause.CountVar)
 			}
@@ -2956,7 +3128,7 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 		for _, projection := range clause.Projections {
 			switch projection.Kind {
 			case projectionBindingID:
-				binding, ok := row.Bindings[projection.Var]
+				binding, ok := row.get(projection.Var)
 				if !ok {
 					resultRow[projection.Alias] = nil
 					continue
@@ -2968,7 +3140,7 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 				}
 				resultRow[projection.Alias] = value
 			case projectionProperty:
-				binding, ok := row.Bindings[projection.Var]
+				binding, ok := row.get(projection.Var)
 				if !ok {
 					resultRow[projection.Alias] = nil
 					continue
@@ -2983,7 +3155,7 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 				}
 				resultRow[projection.Alias] = store.CloneValue(value)
 			case projectionValue:
-				binding, ok := row.Bindings[projection.Var]
+				binding, ok := row.get(projection.Var)
 				if !ok {
 					resultRow[projection.Alias] = nil
 					continue
@@ -3014,6 +3186,72 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 		result.Rows = append(result.Rows, resultRow)
 	}
 	return result, nil
+}
+
+func (clause *returnClause) renderIterator(it queryIterator, budget *queryBudget) (QueryResult, error) {
+	result := QueryResult{Columns: make([]string, 0, len(clause.Projections))}
+	for _, projection := range clause.Projections {
+		result.Columns = append(result.Columns, projection.Alias)
+	}
+	for {
+		row, ok, err := it.Next()
+		if err != nil {
+			return QueryResult{}, err
+		}
+		if !ok {
+			return result, nil
+		}
+		if err := budget.chargeResult(64 + uint64(len(clause.Projections))*32); err != nil {
+			return QueryResult{}, err
+		}
+		resultRow := make(map[string]any, len(clause.Projections))
+		for _, projection := range clause.Projections {
+			binding, bound := row.get(projection.Var)
+			switch projection.Kind {
+			case projectionBindingID:
+				if value, ok := bindingID(binding); bound && ok {
+					resultRow[projection.Alias] = value
+				} else {
+					resultRow[projection.Alias] = nil
+				}
+			case projectionProperty:
+				value, exists := propertyFromBinding(binding, projection.Property)
+				if !bound || !exists {
+					resultRow[projection.Alias] = nil
+					continue
+				}
+				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+					return QueryResult{}, err
+				}
+				resultRow[projection.Alias] = store.CloneValue(value)
+			case projectionValue:
+				switch {
+				case !bound:
+					resultRow[projection.Alias] = nil
+				case binding.Node != nil:
+					if err := budget.chargeResult(queryPropertyBytes(binding.Node.Properties)); err != nil {
+						return QueryResult{}, err
+					}
+					resultRow[projection.Alias] = publicNode(binding.Node)
+				case binding.Edge != nil:
+					if err := budget.chargeResult(queryPropertyBytes(binding.Edge.Properties)); err != nil {
+						return QueryResult{}, err
+					}
+					resultRow[projection.Alias] = publicEdge(binding.Edge)
+				case binding.HasValue:
+					if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
+						return QueryResult{}, err
+					}
+					resultRow[projection.Alias] = store.CloneValue(binding.Value)
+				default:
+					resultRow[projection.Alias] = nil
+				}
+			default:
+				return QueryResult{}, fmt.Errorf("unsupported projection kind %q", projection.Kind)
+			}
+		}
+		result.Rows = append(result.Rows, resultRow)
+	}
 }
 
 func queryPropertyBytes(properties map[string]any) uint64 {
@@ -3188,7 +3426,7 @@ func (expr paramExpr) eval(_ queryRow, params map[string]any) (any, error) {
 }
 
 func (expr variableExpr) eval(row queryRow, _ map[string]any) (any, error) {
-	value, ok := row.Bindings[expr.Name]
+	value, ok := row.get(expr.Name)
 	if !ok {
 		return nil, fmt.Errorf("unknown binding %q", expr.Name)
 	}
@@ -3199,7 +3437,7 @@ func (expr variableExpr) eval(row queryRow, _ map[string]any) (any, error) {
 }
 
 func (expr propertyExpr) eval(row queryRow, _ map[string]any) (any, error) {
-	binding, ok := row.Bindings[expr.Var]
+	binding, ok := row.get(expr.Var)
 	if !ok {
 		return nil, fmt.Errorf("unknown binding %q", expr.Var)
 	}
@@ -3675,7 +3913,7 @@ func bindingMatchesNode(row queryRow, name string, node *store.NodeRecord) bool 
 	if name == "" {
 		return true
 	}
-	binding, ok := row.Bindings[name]
+	binding, ok := row.get(name)
 	if !ok {
 		return true
 	}
@@ -3703,16 +3941,12 @@ func propertyFromBinding(binding boundValue, property string) (any, bool) {
 }
 
 func (row queryRow) clone() queryRow {
-	bindings := make(map[string]boundValue, len(row.Bindings))
-	for key, value := range row.Bindings {
-		bindings[key] = value
-	}
-	return queryRow{Bindings: bindings, Order: row.Order}
+	return queryRow{slots: slices.Clone(row.slots), bound: slices.Clone(row.bound), index: row.index, Order: row.Order}
 }
 
 func compareRowBindings(left queryRow, right queryRow) int {
-	leftID := lowestBindingID(left.Bindings)
-	rightID := lowestBindingID(right.Bindings)
+	leftID := lowestBindingID(left)
+	rightID := lowestBindingID(right)
 	switch {
 	case leftID < rightID:
 		return -1
@@ -3723,9 +3957,12 @@ func compareRowBindings(left queryRow, right queryRow) int {
 	}
 }
 
-func lowestBindingID(bindings map[string]boundValue) uint64 {
+func lowestBindingID(row queryRow) uint64 {
 	var lowest uint64
-	for _, binding := range bindings {
+	for slot, binding := range row.slots {
+		if !row.bound[slot] {
+			continue
+		}
 		var candidate uint64
 		switch {
 		case binding.Node != nil:
