@@ -27,6 +27,41 @@ var ErrCommitOutcomeUnknown = errors.New("commit outcome is unknown")
 var ErrLoadResourceLimit = errors.New("database load resource limit exceeded")
 var ErrDerivedIndexResourceLimit = errors.New("derived index resource limit exceeded")
 
+// RecoveryLimits bounds the total work needed to load a checkpoint and WAL.
+// A zero value leaves that budget unbounded for internal callers.
+type RecoveryLimits struct {
+	MaxDecodedBytes uint64
+	MaxFrames       uint64
+	MaxWork         uint64
+}
+
+type recoveryBudget struct {
+	limits RecoveryLimits
+	bytes  uint64
+	frames uint64
+	work   uint64
+}
+
+func (budget *recoveryBudget) add(kind string, used *uint64, limit, amount uint64) error {
+	if limit != 0 && (*used > limit || amount > limit-*used) {
+		return fmt.Errorf("%w: recovery %s exceeds %d", ErrLoadResourceLimit, kind, limit)
+	}
+	*used += amount
+	return nil
+}
+
+func (budget *recoveryBudget) decodedBytes(amount uint64) error {
+	return budget.add("decoded bytes", &budget.bytes, budget.limits.MaxDecodedBytes, amount)
+}
+
+func (budget *recoveryBudget) frame() error {
+	return budget.add("WAL frame count", &budget.frames, budget.limits.MaxFrames, 1)
+}
+
+func (budget *recoveryBudget) replayWork(amount uint64) error {
+	return budget.add("replay work", &budget.work, budget.limits.MaxWork, amount)
+}
+
 const (
 	stateMagic             = "LATTICEDB"
 	idsMagic               = "LATTICEIDS"
@@ -254,6 +289,11 @@ func SerializeGraphState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 
 // DeserializeGraphState decodes bytes returned by SerializeGraphState.
 func DeserializeGraphState(data []byte, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes uint64) (*GraphState, uint64, uint64, uint64, error) {
+	return DeserializeGraphStateWithRecoveryLimits(data, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes, RecoveryLimits{})
+}
+
+// DeserializeGraphStateWithRecoveryLimits decodes a standalone checkpoint with cumulative recovery budgets.
+func DeserializeGraphStateWithRecoveryLimits(data []byte, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes uint64, limits RecoveryLimits) (*GraphState, uint64, uint64, uint64, error) {
 	if len(data) < stateHeaderSize {
 		return nil, 0, 0, 0, errors.New("invalid state header")
 	}
@@ -269,6 +309,10 @@ func DeserializeGraphState(data []byte, maxCanonicalBytes, maxDerivedWork, maxDe
 		return nil, 0, 0, 0, errors.New("state payload length mismatch")
 	}
 	payload := data[stateHeaderSize:]
+	budget := &recoveryBudget{limits: limits}
+	if err := budget.decodedBytes(payloadLength); err != nil {
+		return nil, 0, 0, 0, err
+	}
 	if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
 		return nil, 0, 0, 0, errors.New("state checksum mismatch")
 	}
@@ -279,6 +323,9 @@ func DeserializeGraphState(data []byte, maxCanonicalBytes, maxDerivedWork, maxDe
 	if snapshot.DatabaseID != string(header[32:64]) || snapshot.CommitID != binary.BigEndian.Uint64(header[12:20]) {
 		return nil, 0, 0, 0, errors.New("state header metadata mismatch")
 	}
+	if err := budget.replayWork(persistedStateWork(snapshot)); err != nil {
+		return nil, 0, 0, 0, err
+	}
 	return decodePersistedStateContext(context.Background(), snapshot, maxDerivedWork, maxDerivedBytes)
 }
 
@@ -287,15 +334,28 @@ func LoadGraphStateContext(ctx context.Context, dbPath string, maxCanonicalBytes
 }
 
 func LoadGraphStateFilesContext(ctx context.Context, files DatabaseFiles, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes uint64) (*GraphState, uint64, uint64, uint64, error) {
+	return LoadGraphStateFilesContextWithRecoveryLimits(ctx, files, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes, RecoveryLimits{})
+}
+
+// LoadGraphStateFilesContextWithRecoveryLimits loads state with cumulative recovery budgets.
+func LoadGraphStateFilesContextWithRecoveryLimits(ctx context.Context, files DatabaseFiles, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes uint64, limits RecoveryLimits) (*GraphState, uint64, uint64, uint64, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	snapshot, snapshotErr := loadCheckpointSnapshotFilesContext(ctx, files, maxCanonicalBytes)
+	budget := &recoveryBudget{limits: limits}
+	snapshot, snapshotErr := loadCheckpointSnapshotFilesContextWithRecoveryBudget(ctx, files, maxCanonicalBytes, budget)
+	if errors.Is(snapshotErr, ErrLoadResourceLimit) {
+		return nil, 0, 0, 0, snapshotErr
+	}
 	base := snapshot
 	if base == nil {
-		base, _ = loadWALBaseSnapshotFilesContext(ctx, files, maxCanonicalBytes)
+		var baseErr error
+		base, baseErr = loadWALBaseSnapshotFilesContextWithRecoveryBudget(ctx, files, maxCanonicalBytes, budget)
+		if errors.Is(baseErr, ErrLoadResourceLimit) {
+			return nil, 0, 0, 0, baseErr
+		}
 	}
-	walSnapshot, walErr := loadLatestWALSnapshotFilesContextWithBase(ctx, files, maxCanonicalBytes, base)
+	walSnapshot, walErr := loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudget(ctx, files, maxCanonicalBytes, base, budget)
 	if walSnapshot == nil && walErr != nil && !errors.Is(walErr, os.ErrNotExist) {
 		return nil, 0, 0, 0, walErr
 	}
@@ -320,7 +380,38 @@ func LoadGraphStateFilesContext(ctx context.Context, files DatabaseFiles, maxCan
 		return nil, 0, 0, 0, os.ErrNotExist
 	}
 
+	if err := budget.replayWork(persistedStateWork(*chosen)); err != nil {
+		return nil, 0, 0, 0, err
+	}
 	return decodePersistedStateContext(ctx, *chosen, maxDerivedWork, maxDerivedBytes)
+}
+
+func persistedStreamsWork(streams persistedStreams) uint64 {
+	work := uint64(len(streams.Offsets))
+	for _, stream := range streams.Streams {
+		work = addSaturated(work, uint64(len(stream.Records))+1)
+	}
+	return work
+}
+
+func persistedStateWork(state persistedState) uint64 {
+	work := uint64(len(state.AppMetadata))
+	work = addSaturated(work, uint64(len(state.Nodes)))
+	work = addSaturated(work, uint64(len(state.Edges)))
+	work = addSaturated(work, uint64(len(state.FTS)))
+	work = addSaturated(work, uint64(len(state.NodeIndexes)))
+	work = addSaturated(work, uint64(len(state.EdgeIndexes)))
+	return addSaturated(work, persistedStreamsWork(state.Streams))
+}
+
+func persistedDeltaWork(delta persistedDelta) uint64 {
+	work := uint64(len(delta.UpsertNodes) + len(delta.DeleteNodes) + len(delta.UpsertEdges) + len(delta.DeleteEdges))
+	work = addSaturated(work, uint64(len(delta.UpsertFTS)+len(delta.DeleteFTS)+len(delta.AppMetadata)))
+	work = addSaturated(work, uint64(len(delta.StreamOperations)+len(delta.CreateNodeIndexes)+len(delta.DropNodeIndexes)+len(delta.CreateEdgeIndexes)+len(delta.DropEdgeIndexes)))
+	if delta.Streams != nil {
+		work = addSaturated(work, persistedStreamsWork(*delta.Streams))
+	}
+	return work
 }
 
 func loadWALBaseSnapshotContext(ctx context.Context, dbPath string, maxCanonicalBytes uint64) (*persistedState, error) {
@@ -328,12 +419,16 @@ func loadWALBaseSnapshotContext(ctx context.Context, dbPath string, maxCanonical
 }
 
 func loadWALBaseSnapshotFilesContext(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64) (*persistedState, error) {
+	return loadWALBaseSnapshotFilesContextWithRecoveryBudget(ctx, files, maxCanonicalBytes, &recoveryBudget{})
+}
+
+func loadWALBaseSnapshotFilesContextWithRecoveryBudget(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64, budget *recoveryBudget) (*persistedState, error) {
 	file, err := os.Open(files.WALBase)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	return loadLatestWALV2Context(ctx, file, maxCanonicalBytes)
+	return loadLatestWALV2ContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, nil, budget)
 }
 
 var databaseTempKinds = []string{"state-payload", "snapshot-payload", "state", "wal-payload", "wal", "ids"}
@@ -1141,6 +1236,10 @@ func loadCheckpointSnapshotContext(ctx context.Context, dbPath string, maxCanoni
 }
 
 func loadCheckpointSnapshotFilesContext(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64) (*persistedState, error) {
+	return loadCheckpointSnapshotFilesContextWithRecoveryBudget(ctx, files, maxCanonicalBytes, &recoveryBudget{})
+}
+
+func loadCheckpointSnapshotFilesContextWithRecoveryBudget(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64, budget *recoveryBudget) (*persistedState, error) {
 	path := files.State
 	fileLimit := min(uint64(maxStateFileBytes), multiplySaturated(maxCanonicalBytes, 2))
 	if fileLimit <= maxStateFileBytes-stateHeaderSize {
@@ -1162,9 +1261,16 @@ func loadCheckpointSnapshotFilesContext(ctx context.Context, files DatabaseFiles
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
-		return loadBinaryCheckpointContext(ctx, file, maxCanonicalBytes)
+		return loadBinaryCheckpointContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, budget)
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if err := budget.decodedBytes(uint64(info.Size())); err != nil {
 		return nil, err
 	}
 	data, err := io.ReadAll(&contextReader{ctx: ctx, reader: io.LimitReader(file, int64(fileLimit)+1)})
@@ -1204,6 +1310,10 @@ func loadBinaryCheckpoint(file *os.File) (*persistedState, error) {
 }
 
 func loadBinaryCheckpointContext(ctx context.Context, file *os.File, maxCanonicalBytes uint64) (*persistedState, error) {
+	return loadBinaryCheckpointContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, &recoveryBudget{})
+}
+
+func loadBinaryCheckpointContextWithRecoveryBudget(ctx context.Context, file *os.File, maxCanonicalBytes uint64, budget *recoveryBudget) (*persistedState, error) {
 	var header [stateHeaderSize]byte
 	if _, err := io.ReadFull(file, header[:]); err != nil {
 		return nil, err
@@ -1221,6 +1331,9 @@ func loadBinaryCheckpointContext(ctx context.Context, file *os.File, maxCanonica
 	}
 	if payloadLength != uint64(info.Size()-stateHeaderSize) {
 		return nil, errors.New("state payload length mismatch")
+	}
+	if err := budget.decodedBytes(payloadLength); err != nil {
+		return nil, err
 	}
 	checksum := crc32.NewIEEE()
 	decoder := json.NewDecoder(io.TeeReader(&contextReader{ctx: ctx, reader: io.LimitReader(file, int64(payloadLength))}, checksum))
@@ -1286,6 +1399,10 @@ func loadLatestWALSnapshotFilesContext(ctx context.Context, files DatabaseFiles,
 }
 
 func loadLatestWALSnapshotFilesContextWithBase(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64, base *persistedState) (*persistedState, error) {
+	return loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudget(ctx, files, maxCanonicalBytes, base, &recoveryBudget{})
+}
+
+func loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudget(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64, base *persistedState, budget *recoveryBudget) (*persistedState, error) {
 	file, err := os.Open(files.WAL)
 	if err != nil {
 		return nil, err
@@ -1303,9 +1420,9 @@ func loadLatestWALSnapshotFilesContextWithBase(ctx context.Context, files Databa
 		return nil, fmt.Errorf("rewind wal: %w", err)
 	}
 	if magic == walMagic || magic == legacyWALMagic {
-		return loadLatestWALV2ContextWithBase(ctx, file, maxCanonicalBytes, base)
+		return loadLatestWALV2ContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, base, budget)
 	}
-	return loadLatestLegacyWALContext(ctx, file, maxCanonicalBytes)
+	return loadLatestLegacyWALContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, budget)
 }
 
 func WALReadyForAppend(dbPath string) bool {
@@ -1378,6 +1495,10 @@ func loadLatestLegacyWAL(file *os.File) (*persistedState, error) {
 }
 
 func loadLatestLegacyWALContext(ctx context.Context, file *os.File, maxCanonicalBytes uint64) (*persistedState, error) {
+	return loadLatestLegacyWALContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, &recoveryBudget{})
+}
+
+func loadLatestLegacyWALContextWithRecoveryBudget(ctx context.Context, file *os.File, maxCanonicalBytes uint64, budget *recoveryBudget) (*persistedState, error) {
 	reader := bufio.NewReader(&contextReader{ctx: ctx, reader: file})
 	var latest *persistedState
 	for {
@@ -1386,6 +1507,12 @@ func loadLatestLegacyWALContext(ctx context.Context, file *os.File, maxCanonical
 			return nil, ErrLoadResourceLimit
 		}
 		if len(line) > 0 && err == nil {
+			if err := budget.frame(); err != nil {
+				return nil, err
+			}
+			if err := budget.decodedBytes(uint64(len(line))); err != nil {
+				return nil, err
+			}
 			var entry persistedState
 			if decodeErr := json.Unmarshal(trimTrailingNewline(line), &entry); decodeErr != nil {
 				return nil, fmt.Errorf("decode wal: %w", decodeErr)
@@ -1394,6 +1521,9 @@ func loadLatestLegacyWALContext(ctx context.Context, file *os.File, maxCanonical
 				return nil, fmt.Errorf("wal commit id %d does not follow %d", entry.CommitID, latest.CommitID)
 			}
 			entryCopy := entry
+			if err := budget.replayWork(persistedStateWork(entry)); err != nil {
+				return nil, err
+			}
 			latest = &entryCopy
 		}
 		if errors.Is(err, io.EOF) {
@@ -1418,6 +1548,10 @@ func loadLatestWALV2Context(ctx context.Context, file *os.File, maxCanonicalByte
 }
 
 func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanonicalBytes uint64, base *persistedState) (*persistedState, error) {
+	return loadLatestWALV2ContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, base, &recoveryBudget{})
+}
+
+func loadLatestWALV2ContextWithRecoveryBudget(ctx context.Context, file *os.File, maxCanonicalBytes uint64, base *persistedState, budget *recoveryBudget) (*persistedState, error) {
 	info, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("stat WAL: %w", err)
@@ -1447,6 +1581,12 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 		}
 		if payloadLength > uint64(max(int64(0), info.Size()-offset)) {
 			break
+		}
+		if err := budget.frame(); err != nil {
+			return nil, err
+		}
+		if err := budget.decodedBytes(payloadLength); err != nil {
+			return nil, err
 		}
 		payload := make([]byte, int(payloadLength))
 		if _, err := io.ReadFull(&contextReader{ctx: ctx, reader: file}, payload); err != nil {
@@ -1480,6 +1620,9 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 				return nil, errors.New("WAL snapshot history regression")
 			}
 			var err error
+			if err := budget.replayWork(persistedStateWork(*wrapper.Snapshot)); err != nil {
+				return nil, err
+			}
 			accumulator, err = newWALAccumulator(ctx, *wrapper.Snapshot)
 			if err != nil {
 				return nil, fmt.Errorf("invalid WAL snapshot: %w", err)
@@ -1494,6 +1637,9 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 			if databaseID != accumulator.state.DatabaseID || accumulator.state.CommitID == ^uint64(0) || commitID != accumulator.state.CommitID+1 {
 				return nil, errors.New("WAL delta history regression")
 			}
+			if err := budget.replayWork(persistedDeltaWork(*wrapper.Delta)); err != nil {
+				return nil, err
+			}
 			if err := accumulator.apply(*wrapper.Delta); err != nil {
 				return nil, fmt.Errorf("invalid WAL delta: %w", err)
 			}
@@ -1502,6 +1648,9 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 				return nil, errors.New("WAL checkpoint base mismatch")
 			}
 			var err error
+			if err := budget.replayWork(persistedStateWork(*base)); err != nil {
+				return nil, err
+			}
 			accumulator, err = newWALAccumulator(ctx, *base)
 			if err != nil {
 				return nil, fmt.Errorf("invalid WAL checkpoint base: %w", err)

@@ -39,6 +39,12 @@ type OpenOptions struct {
 	ChangefeedMaxBytes uint64
 	// MaxDatabaseSnapshotBytes is a conservative upper bound for the canonical streamed snapshot payload.
 	MaxDatabaseSnapshotBytes uint64
+	// RecoveryMaxDecodedBytes bounds all checkpoint and WAL bytes decoded during Open. Zero uses 4 GiB.
+	RecoveryMaxDecodedBytes uint64
+	// RecoveryMaxFrames bounds all complete WAL frames read during Open. Zero uses 1,000,000.
+	RecoveryMaxFrames uint64
+	// RecoveryMaxWork bounds all replayed snapshot entries and WAL operations during Open. Zero uses 1,000,000,000.
+	RecoveryMaxWork uint64
 	// VectorIndexBuildMaxWork bounds synchronous HNSW distance work.
 	VectorIndexBuildMaxWork uint64
 	// VectorIndexBuildMaxLogicalBytes bounds conservative current+new index metadata, not process RSS.

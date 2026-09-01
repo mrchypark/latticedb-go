@@ -584,6 +584,58 @@ func TestOpenDerivedIndexBudgetFailureReleasesPathLock(t *testing.T) {
 	}
 }
 
+func TestOpenRecoveryBudgetFailureReleasesPathLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "recovery-budget.ltdb")
+	graph := store.NewGraphState()
+	if err := store.EnsureDatabaseID(graph); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CheckpointGraphState(path, graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	for id := uint64(1); id <= 2; id++ {
+		next := store.NewGraphState()
+		next.DatabaseID = graph.DatabaseID
+		next.Nodes.Set(id, &store.NodeRecord{ID: id})
+		if err := store.AppendWALCommit(path, next, id+1, 1, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := OpenContext(context.Background(), path, OpenOptions{RecoveryMaxFrames: 1}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("recovery budget error = %v, want ErrResourceLimit", err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("reopen after recovery budget error: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeserializeChecksRecoveryBytesBeforeDecode(t *testing.T) {
+	graph := store.NewGraphState()
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1})
+	graph.Nodes.Set(2, &store.NodeRecord{ID: 2})
+	data, err := store.SerializeGraphState(graph, 1, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Deserialize(data, OpenOptions{RecoveryMaxDecodedBytes: 1}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("deserialize recovery budget error = %v, want ErrResourceLimit", err)
+	}
+	if _, err := Deserialize(data, OpenOptions{RecoveryMaxWork: 1}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("deserialize recovery work error = %v, want ErrResourceLimit", err)
+	}
+	db, err := Deserialize(data, OpenOptions{RecoveryMaxDecodedBytes: uint64(len(data))})
+	if err != nil {
+		t.Fatalf("deserialize at recovery byte boundary: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFTSIndexContextHonorsCancellationAndBudget(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "fts-budget.ltdb"), OpenOptions{Create: true})
 	if err != nil {
