@@ -898,9 +898,6 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 	var results []VectorSearchResult
 
 	err = db.View(func(tx *Tx) error {
-		if err := validateGraphVectorsContext(budget.ctx, tx.graph); err != nil {
-			return err
-		}
 		capacity := limit
 		if nodeCount := uint64(tx.graph.Nodes.Len()); capacity > nodeCount {
 			capacity = nodeCount
@@ -2104,6 +2101,9 @@ func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 		return Node{}, err
 	}
 	if tx.db.enableVector {
+		if err := validateVectorProperties(props); err != nil {
+			return Node{}, err
+		}
 		for _, value := range props {
 			if vector, ok := value.([]float32); ok && tx.db.vectorDimensions > 0 && len(vector) != int(tx.db.vectorDimensions) {
 				return Node{}, fmt.Errorf("vector length %d does not match configured dimensions %d", len(vector), tx.db.vectorDimensions)
@@ -2216,6 +2216,9 @@ func (tx *Tx) SetProperty(nodeID uint64, key string, value any) error {
 	if vector, ok := normalized.([]float32); ok && tx.db.enableVector && tx.db.vectorDimensions > 0 && len(vector) != int(tx.db.vectorDimensions) {
 		return fmt.Errorf("vector length %d does not match configured dimensions %d", len(vector), tx.db.vectorDimensions)
 	}
+	if err := validateVectorPropertyUpdate(node, key, normalized); err != nil {
+		return err
+	}
 	node.Properties[key] = normalized
 	return nil
 }
@@ -2319,6 +2322,9 @@ func (tx *Tx) SetVector(nodeID uint64, key string, vector []float32) error {
 	}
 	normalized, err := store.NormalizeValue(vector)
 	if err != nil {
+		return err
+	}
+	if err := validateVectorPropertyUpdate(node, key, normalized); err != nil {
 		return err
 	}
 	node.Properties[key] = normalized

@@ -539,14 +539,18 @@ func validateGraphVectorsContext(ctx context.Context, graph *store.GraphState) e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	index := 0
-	for _, node := range graph.Nodes.All() {
+	ids := make([]uint64, 0, graph.Nodes.Len())
+	for id := range graph.Nodes.All() {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	for index, id := range ids {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		index++
+		node := graph.Nodes.Get(id)
 		if err := validateNodeVectors(graph.VectorDimensions, node); err != nil {
 			return err
 		}
@@ -558,15 +562,8 @@ func validateNodeVectors(dimensions uint16, node *store.NodeRecord) error {
 	if node == nil {
 		return nil
 	}
-	keys := make([]string, 0, 1)
-	for key, value := range node.Properties {
-		if _, ok := value.([]float32); ok {
-			keys = append(keys, key)
-		}
-	}
-	if len(keys) > 1 {
-		slices.Sort(keys)
-		return fmt.Errorf("node %d has multiple vector properties (%s); vector search requires at most one []float32 property", node.ID, strings.Join(keys, ", "))
+	if err := validateVectorProperties(node.Properties); err != nil {
+		return fmt.Errorf("node %d: %w", node.ID, err)
 	}
 	if dimensions == 0 {
 		return nil
@@ -577,6 +574,34 @@ func validateNodeVectors(dimensions uint16, node *store.NodeRecord) error {
 		}
 	}
 	return nil
+}
+
+func validateVectorProperties(props map[string]any) error {
+	keys := make([]string, 0, 1)
+	for key, value := range props {
+		if _, ok := value.([]float32); ok {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) > 1 {
+		slices.Sort(keys)
+		return fmt.Errorf("multiple vector properties (%s); vector search requires at most one []float32 property", strings.Join(keys, ", "))
+	}
+	return nil
+}
+
+func validateVectorPropertyUpdate(node *store.NodeRecord, key string, value any) error {
+	if node == nil {
+		return nil
+	}
+	props := make(map[string]any, len(node.Properties)+1)
+	for existingKey, existingValue := range node.Properties {
+		if existingKey != key {
+			props[existingKey] = existingValue
+		}
+	}
+	props[key] = value
+	return validateVectorProperties(props)
 }
 
 func (tx *Tx) applyVectorIndexChanges() error {
