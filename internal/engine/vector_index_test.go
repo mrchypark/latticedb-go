@@ -120,14 +120,14 @@ func TestVectorSelectionExactANNParityAndCOW(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldFingerprint := vectorIndexFingerprint(reader.graph)
-	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(id, "a", []float32{0, 0}) }); err != nil {
-		t.Fatal(err)
+	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(id, "a", []float32{0, 0}) }); err == nil {
+		t.Fatal("accepted an ambiguous second vector property")
 	}
 	if got := vectorIndexFingerprint(reader.graph); got != oldFingerprint {
 		t.Fatal("published vector index changed through a later generation")
 	}
 	_ = reader.Rollback()
-	assertVectorModesAgree(t, db, []float32{0, 0}, id)
+	assertVectorModesAgree(t, db, []float32{10, 10}, id)
 	if err := db.Update(func(tx *Tx) error { return tx.SetVector(id, "z", []float32{20, 20}) }); err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +161,68 @@ func TestVectorSelectionExactANNParityAndCOW(t *testing.T) {
 	results, err := db.VectorSearch([]float32{20, 20}, VectorSearchOptions{K: 1})
 	if err != nil || len(results) != 0 {
 		t.Fatalf("deleted node search = %#v, %v", results, err)
+	}
+}
+
+func TestVectorPropertyContract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ambiguous.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{
+			"a": []float32{1, 0}, "b": []float32{0, 1},
+		}})
+		if err != nil {
+			return err
+		}
+		return tx.SetProperty(node.ID, "c", []float32{1, 1})
+	}); err != nil {
+		t.Fatalf("vector properties should be ordinary values when disabled: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, OpenOptions{EnableVector: true, VectorDimensions: 2}); err == nil {
+		t.Fatal("opened database with ambiguous vector properties")
+	}
+
+	db, err = Open(filepath.Join(t.TempDir(), "enabled.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var id uint64
+	if err := db.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"a": []float32{1, 0}}})
+		id = node.ID
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetVector(id, "b", []float32{0, 1}) }); err == nil {
+		t.Fatal("SetVector accepted a second vector property")
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{
+			"a": []float32{1, 0}, "b": []float32{0, 1},
+		}})
+		return err
+	}); err == nil {
+		t.Fatal("CreateNode accepted multiple vector properties")
+	}
+
+	graph := store.NewGraphState()
+	graph.VectorDimensions = 2
+	graph.Nodes.Set(2, &store.NodeRecord{ID: 2, Properties: map[string]any{"z": []float32{1, 0}, "a": []float32{0, 1}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"z": []float32{1, 0}, "a": []float32{0, 1}}})
+	err = validateGraphVectors(graph)
+	if err == nil || !strings.Contains(err.Error(), "node 1") {
+		t.Fatalf("validation error = %v, want deterministic node 1 error", err)
+	}
+	if err := rebuildVectorIndexContext(context.Background(), graph); err == nil {
+		t.Fatal("rebuild accepted ambiguous vector properties")
 	}
 }
 
