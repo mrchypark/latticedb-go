@@ -2485,17 +2485,7 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 				continue
 			}
 			var score float32
-			hasIndex := false
-			if binding.Node != nil {
-				if record := tx.graph.FTS.Get(binding.Node.ID); record != nil {
-					hasIndex = true
-					score, err = scoreQueryFTSTokens(record.Tokens, terms, budget)
-					if err != nil {
-						return nil, err
-					}
-				}
-			}
-			if !hasIndex && exists {
+			if exists {
 				if text, ok := value.(string); ok {
 					tokens, tokenBytes, err := tokenizeQueryText(text, budget)
 					if err != nil {

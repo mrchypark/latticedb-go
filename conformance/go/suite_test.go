@@ -1381,7 +1381,7 @@ func TestConformanceSearchSemanticsAndQueryCache(t *testing.T) {
 
 		docNear, err := tx.CreateNode(CreateNodeOptions{
 			Labels:     []string{"Document"},
-			Properties: map[string]Value{"name": "Doc Candidate"},
+			Properties: map[string]Value{"name": "Doc Candidate", "text": "graph databases and traversal"},
 		})
 		if err != nil {
 			return err
@@ -1396,7 +1396,7 @@ func TestConformanceSearchSemanticsAndQueryCache(t *testing.T) {
 
 		docMiscGraph, err := tx.CreateNode(CreateNodeOptions{
 			Labels:     []string{"Document"},
-			Properties: map[string]Value{"name": "Doc Misc Graph"},
+			Properties: map[string]Value{"name": "Doc Misc Graph", "text": "graph notes and references"},
 		})
 		if err != nil {
 			return err
@@ -1411,7 +1411,7 @@ func TestConformanceSearchSemanticsAndQueryCache(t *testing.T) {
 
 		docFar, err := tx.CreateNode(CreateNodeOptions{
 			Labels:     []string{"Document"},
-			Properties: map[string]Value{"name": "Doc Far"},
+			Properties: map[string]Value{"name": "Doc Far", "text": "cooking recipes and ingredients"},
 		})
 		if err != nil {
 			return err

@@ -358,6 +358,8 @@ This matters more than exact internal planning strategy.
 - Exact score values are not part of the cross-engine contract.
 - Tie order is not currently specified.
 - Fuzzy search should be at least as permissive as a stricter exact configuration when given looser distance settings.
+- In a query predicate such as `n.title @@ "term"`, only the named string property is searched; a missing or misspelled property does not fall back to a node-level index.
+- Direct `FTSSearch` searches the explicitly indexed node text and is independent of query property predicates.
 
 ## Query Cache Semantics
 
