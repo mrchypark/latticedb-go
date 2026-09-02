@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"slices"
@@ -61,7 +62,13 @@ func parseZig(r io.Reader) (*zigResult, error) {
 			if err != nil {
 				return nil, fmt.Errorf("parse Zig 100K column %d: %w", i+2, err)
 			}
+			if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+				return nil, fmt.Errorf("parse Zig 100K column %d: invalid value", i+2)
+			}
 			values[i] = value
+		}
+		if values[3] > 100 {
+			return nil, fmt.Errorf("parse Zig 100K recall outside 0..100")
 		}
 		return &zigResult{insertMS: values[0], meanNS: values[1] * 1e3, p99NS: values[2] * 1e3, recall: values[3], memoryMB: values[4]}, nil
 	}
@@ -210,6 +217,22 @@ func read(path string) (result, error) {
 	return parse(file)
 }
 
+func validateGoResult(benchmarks result) error {
+	required := map[string][]string{
+		"BenchmarkReadRequests/query":             {"ns/op"},
+		"BenchmarkVectorSearchClustered128D/100K": {"ns/op", "index-build-ms", "recall@10"},
+	}
+	for name, units := range required {
+		metrics := benchmarks[name]
+		for _, unit := range units {
+			if _, ok := value(metrics, unit); !ok {
+				return fmt.Errorf("Go benchmark %s missing %s", name, unit)
+			}
+		}
+	}
+	return nil
+}
+
 func main() {
 	currentPath := flag.String("current", "", "current go test benchmark output")
 	previousPath := flag.String("previous", "", "previous go test benchmark output")
@@ -218,7 +241,35 @@ func main() {
 	previousLabel := flag.String("previous-label", "previous", "previous revision label")
 	zigPath := flag.String("zig", "", "Zig vector benchmark output")
 	zigLabel := flag.String("zig-label", "Zig reference", "Zig revision label")
+	validateGoPath := flag.String("validate-go", "", "validate Go benchmark output")
+	validateZigPath := flag.String("validate-zig", "", "validate Zig vector benchmark output")
 	flag.Parse()
+	if *validateGoPath != "" {
+		benchmarks, err := read(*validateGoPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := validateGoResult(benchmarks); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *validateZigPath != "" {
+		file, openErr := os.Open(*validateZigPath)
+		if openErr != nil {
+			fmt.Fprintln(os.Stderr, openErr)
+			os.Exit(1)
+		}
+		_, err := parseZig(file)
+		file.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	current, err := read(*currentPath)
 	if err != nil {
