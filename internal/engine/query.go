@@ -2425,6 +2425,28 @@ func (pattern edgePattern) appendEdgeRow(row queryRow, edge *store.EdgeRecord, l
 
 func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any, budget *queryBudget) ([]queryRow, error) {
 	filtered := rows[:0]
+	var queryTerms []string
+	var queryTermBytes uint64
+	queryTermsReady := false
+	if clause.Kind == whereFTS {
+		switch clause.Expr.(type) {
+		case literalExpr, paramExpr:
+			expected, err := clause.Expr.eval(queryRow{}, params)
+			if err != nil {
+				return nil, err
+			}
+			queryText, ok := expected.(string)
+			if !ok {
+				return nil, fmt.Errorf("fts comparison requires string, got %T", expected)
+			}
+			queryTerms, queryTermBytes, err = tokenizeQueryText(queryText, budget)
+			if err != nil {
+				return nil, err
+			}
+			queryTermsReady = true
+			defer budget.releaseTemporary(queryTermBytes)
+		}
+	}
 	for _, row := range rows {
 		if err := budget.check(1, len(filtered)); err != nil {
 			return nil, err
@@ -2468,20 +2490,26 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 			row.Order = float64(distance)
 			filtered = append(filtered, row)
 		case whereFTS:
-			expected, err := clause.Expr.eval(row, params)
-			if err != nil {
-				return nil, err
-			}
-			queryText, ok := expected.(string)
-			if !ok {
-				return nil, fmt.Errorf("fts comparison requires string, got %T", expected)
-			}
-			terms, termBytes, err := tokenizeQueryText(queryText, budget)
-			if err != nil {
-				return nil, err
+			var err error
+			terms, termBytes := queryTerms, queryTermBytes
+			if !queryTermsReady {
+				expected, err := clause.Expr.eval(row, params)
+				if err != nil {
+					return nil, err
+				}
+				queryText, ok := expected.(string)
+				if !ok {
+					return nil, fmt.Errorf("fts comparison requires string, got %T", expected)
+				}
+				terms, termBytes, err = tokenizeQueryText(queryText, budget)
+				if err != nil {
+					return nil, err
+				}
 			}
 			if len(terms) == 0 {
-				budget.releaseTemporary(termBytes)
+				if !queryTermsReady {
+					budget.releaseTemporary(termBytes)
+				}
 				continue
 			}
 			var score float32
@@ -2498,7 +2526,9 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 					}
 				}
 			}
-			budget.releaseTemporary(termBytes)
+			if !queryTermsReady {
+				budget.releaseTemporary(termBytes)
+			}
 			if score <= 0 {
 				continue
 			}
