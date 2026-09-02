@@ -2460,6 +2460,71 @@ func TestQueryFTSHonorsTokenizationBudgets(t *testing.T) {
 	}
 }
 
+func TestQueryFTSHoistsInvariantQueryTokenization(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-fts-hoist.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 1_000; i++ {
+			if _, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"text": "indexed text"}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A punctuation-only literal still incurs tokenization input work. With
+	// row-wise tokenization this exceeds the budget as rows scale.
+	query := `MATCH (n) WHERE n.text @@ "` + strings.Repeat("!", 128) + `" RETURN count(n) AS count`
+	result, err := db.QueryContext(context.Background(), query, nil, QueryOptions{MaxWork: 3_000})
+	if err != nil {
+		t.Fatalf("invariant FTS query: %v", err)
+	}
+	if got := result.Rows[0]["count"]; got != int64(0) {
+		t.Fatalf("punctuation-only FTS count = %v, want 0", got)
+	}
+	result, err = db.QueryContext(context.Background(), `MATCH (n) WHERE n.text @@ $query RETURN count(n) AS count`, map[string]any{"query": strings.Repeat("!", 128)}, QueryOptions{MaxWork: 3_000})
+	if err != nil || result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("parameter FTS query = %#v, %v", result.Rows, err)
+	}
+}
+
+func TestQueryFTSRowDependentRHSAndEmptyRows(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-fts-row-dependent.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for _, node := range []map[string]any{{"text": "alpha", "query": "alpha"}, {"text": "alpha", "query": "beta"}} {
+			if _, err := tx.CreateNode(CreateNodeOptions{Properties: node}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Query(`MATCH (n) WHERE n.text @@ n.query RETURN count(n) AS count`, nil)
+	if err != nil || result.Rows[0]["count"] != int64(1) {
+		t.Fatalf("row-dependent FTS query = %#v, %v", result.Rows, err)
+	}
+	empty, err := Open(filepath.Join(t.TempDir(), "query-fts-empty.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer empty.Close()
+	for _, params := range []map[string]any{nil, {"query": 42}} {
+		result, err := empty.Query(`MATCH (n) WHERE n.text @@ $query RETURN count(n) AS count`, params)
+		if err != nil || result.Rows[0]["count"] != int64(0) {
+			t.Fatalf("empty-row FTS query params %#v = %#v, %v", params, result.Rows, err)
+		}
+	}
+}
+
 func TestQuerySingleQuotedStructuralCharacters(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "single-quoted-query.ltdb"), OpenOptions{Create: true})
 	if err != nil {
