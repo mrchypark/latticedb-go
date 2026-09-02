@@ -164,6 +164,68 @@ func TestVectorSelectionExactANNParityAndCOW(t *testing.T) {
 	}
 }
 
+func TestVectorPropertyContract(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ambiguous.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{
+			"a": []float32{1, 0}, "b": []float32{0, 1},
+		}})
+		if err != nil {
+			return err
+		}
+		return tx.SetProperty(node.ID, "c", []float32{1, 1})
+	}); err != nil {
+		t.Fatalf("vector properties should be ordinary values when disabled: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, OpenOptions{EnableVector: true, VectorDimensions: 2}); err == nil {
+		t.Fatal("opened database with ambiguous vector properties")
+	}
+
+	db, err = Open(filepath.Join(t.TempDir(), "enabled.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var id uint64
+	if err := db.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"a": []float32{1, 0}}})
+		id = node.ID
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetVector(id, "b", []float32{0, 1}) }); err == nil {
+		t.Fatal("SetVector accepted a second vector property")
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{
+			"a": []float32{1, 0}, "b": []float32{0, 1},
+		}})
+		return err
+	}); err == nil {
+		t.Fatal("CreateNode accepted multiple vector properties")
+	}
+
+	graph := store.NewGraphState()
+	graph.VectorDimensions = 2
+	graph.Nodes.Set(2, &store.NodeRecord{ID: 2, Properties: map[string]any{"z": []float32{1, 0}, "a": []float32{0, 1}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"z": []float32{1, 0}, "a": []float32{0, 1}}})
+	err = validateGraphVectors(graph)
+	if err == nil || !strings.Contains(err.Error(), "node 1") {
+		t.Fatalf("validation error = %v, want deterministic node 1 error", err)
+	}
+	if err := rebuildVectorIndexContext(context.Background(), graph); err == nil {
+		t.Fatal("rebuild accepted ambiguous vector properties")
+	}
+}
+
 func assertVectorModesAgree(t *testing.T, db *DB, query []float32, want uint64) {
 	t.Helper()
 	for _, exact := range []bool{false, true} {

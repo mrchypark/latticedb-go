@@ -2216,8 +2216,10 @@ func (tx *Tx) SetProperty(nodeID uint64, key string, value any) error {
 	if vector, ok := normalized.([]float32); ok && tx.db.enableVector && tx.db.vectorDimensions > 0 && len(vector) != int(tx.db.vectorDimensions) {
 		return fmt.Errorf("vector length %d does not match configured dimensions %d", len(vector), tx.db.vectorDimensions)
 	}
-	if err := validateVectorPropertyUpdate(node, key, normalized); err != nil {
-		return err
+	if tx.db.enableVector {
+		if err := validateVectorPropertyUpdate(node, key, normalized); err != nil {
+			return err
+		}
 	}
 	node.Properties[key] = normalized
 	return nil
