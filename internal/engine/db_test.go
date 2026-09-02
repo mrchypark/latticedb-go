@@ -2253,6 +2253,69 @@ func TestQueryContextCancellationAndBudget(t *testing.T) {
 	}
 }
 
+func TestQueryVectorBudgetChargesDimension(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-vector-budget.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"embedding": []float32{1, 0, 0, 0}}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query := "MATCH (n) WHERE n.embedding <=> $vector RETURN n"
+	params := map[string]any{"vector": []float32{1, 0, 0, 0}}
+	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 5}); err != nil || len(result.Rows) != 1 {
+		t.Fatalf("dimension boundary query = %#v, %v", result, err)
+	}
+	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 4}); !errors.Is(err, ErrResourceLimit) || len(result.Rows) != 0 {
+		t.Fatalf("dimension budget query = %#v, %v", result, err)
+	}
+}
+
+func TestQueryVectorBudget4096Dimensions(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-vector-4096.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	vector := make([]float32, 4096)
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"embedding": vector}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query := "MATCH (n) WHERE n.embedding <=> $vector RETURN n"
+	params := map[string]any{"vector": vector}
+	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 4097}); err != nil || len(result.Rows) != 1 {
+		t.Fatalf("4096D query = %#v, %v", result, err)
+	}
+	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 4096}); !errors.Is(err, ErrResourceLimit) || len(result.Rows) != 0 {
+		t.Fatalf("4096D budget query = %#v, %v", result, err)
+	}
+}
+
+func TestQueryVectorBudgetZeroDimensionHasUnitCost(t *testing.T) {
+	graph := store.NewGraphState()
+	for id := uint64(1); id <= 2; id++ {
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"embedding": []float32{}}})
+	}
+	tx := &Tx{graph: graph}
+	clause := &whereClause{Kind: whereVector, Var: "n", Property: "embedding", Expr: paramExpr{Name: "vector"}}
+	rows := []queryRow{
+		{slots: []boundValue{{Node: graph.Nodes.Get(1)}}, bound: []bool{true}, index: map[string]int{"n": 0}},
+		{slots: []boundValue{{Node: graph.Nodes.Get(2)}}, bound: []bool{true}, index: map[string]int{"n": 0}},
+	}
+	budget := newQueryBudget(context.Background(), QueryOptions{MaxWork: 1})
+	filtered, err := clause.apply(tx, rows, map[string]any{"vector": []float32{}}, budget)
+	if !errors.Is(err, ErrResourceLimit) || filtered != nil {
+		t.Fatalf("zero-dimension budget = %#v, %v", filtered, err)
+	}
+}
+
 func TestVectorConfigurationPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vector-config.ltdb")
 	db, err := Open(path, OpenOptions{Create: true, EnableVector: true, VectorDimensions: 3})
