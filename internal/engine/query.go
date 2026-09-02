@@ -221,7 +221,8 @@ type removeItem struct {
 }
 
 type deleteClause struct {
-	Vars []string
+	Vars   []string
+	Detach bool
 }
 
 type unwindClause struct {
@@ -809,7 +810,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 			}
 		}
 	case " DETACH DELETE ", " DELETE ":
-		deleteClause, err := parseDeleteClause(tail)
+		deleteClause, err := parseDeleteClause(tail, nextKeyword == " DETACH DELETE ")
 		if err != nil {
 			return nil, err
 		}
@@ -1888,7 +1889,7 @@ func parseCreateNodeClause(text string) (*createNodeClause, error) {
 	return clause, nil
 }
 
-func parseDeleteClause(text string) (*deleteClause, error) {
+func parseDeleteClause(text string, detach bool) (*deleteClause, error) {
 	parts := splitTopLevel(text, ',')
 	vars := make([]string, 0, len(parts))
 	for _, part := range parts {
@@ -1901,7 +1902,7 @@ func parseDeleteClause(text string) (*deleteClause, error) {
 	if len(vars) == 0 {
 		return nil, fmt.Errorf("invalid DELETE clause %q", text)
 	}
-	return &deleteClause{Vars: vars}, nil
+	return &deleteClause{Vars: vars, Detach: detach}, nil
 }
 
 func parseRemoveClause(text string) (*removeClause, error) {
@@ -3076,6 +3077,22 @@ func (clause *deleteClause) apply(tx *Tx, rows []queryRow) error {
 				nodeIDs[binding.Node.ID] = struct{}{}
 			default:
 				return fmt.Errorf("binding %q is neither node nor edge", name)
+			}
+		}
+	}
+
+	if !clause.Detach {
+		for nodeID := range nodeIDs {
+			for _, adjacency := range []*store.EdgeList{tx.graph.Outgoing.Get(nodeID), tx.graph.Incoming.Get(nodeID)} {
+				for chunk := range adjacency.Chunks() {
+					for _, edgeID := range chunk {
+						if !adjacency.IsRemoved(edgeID) {
+							if _, explicitlyDeleted := edgeIDs[edgeID]; !explicitlyDeleted {
+								return fmt.Errorf("delete node %d with incident edges", nodeID)
+							}
+						}
+					}
+				}
 			}
 		}
 	}
