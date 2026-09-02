@@ -51,6 +51,9 @@ type queryBudget struct {
 var queryBudgetPool = sync.Pool{New: func() any { return new(queryBudget) }}
 
 func newQueryBudget(ctx context.Context, opts QueryOptions) *queryBudget {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if opts.MaxRows == 0 {
 		opts.MaxRows = 1_000_000
 	}
@@ -2440,8 +2443,10 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 		}()
 	}
 	for _, row := range rows {
-		if err := budget.check(1, len(filtered)); err != nil {
-			return nil, err
+		if clause.Kind != whereVector {
+			if err := budget.check(1, len(filtered)); err != nil {
+				return nil, err
+			}
 		}
 		binding, ok := row.get(clause.Var)
 		if !ok {
@@ -2461,10 +2466,16 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 		switch clause.Kind {
 		case whereVector:
 			if !exists {
+				if err := budget.check(1, len(filtered)); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			vector, ok := value.([]float32)
 			if !ok {
+				if err := budget.check(1, len(filtered)); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			expected, err := clause.Expr.eval(row, params)
@@ -2475,7 +2486,10 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 			if !ok {
 				return nil, fmt.Errorf("vector comparison requires []float32, got %T", expected)
 			}
-			distance, err := search.VectorDistance(vector, queryVector)
+			if err := budget.check(uint64(max(1, len(queryVector))), len(filtered)); err != nil {
+				return nil, err
+			}
+			distance, err := search.VectorDistanceContext(budget.ctx, vector, queryVector)
 			if err != nil {
 				return nil, err
 			}
