@@ -3,6 +3,8 @@ package latticedb
 import (
 	"errors"
 	"testing"
+
+	"github.com/mrchypark/latticedb-go/internal/engine"
 )
 
 func TestUpstreamStructuredErrorsAndDefaultStorageOptions(t *testing.T) {
@@ -51,11 +53,19 @@ func TestQueryErrorsExposeStage(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	var queryErr *QueryError
-	if _, err := db.Query("NOT CYPHER", nil); !errors.As(err, &queryErr) || queryErr.Stage != QueryErrorStageParse {
+	if _, err := db.Query("NOT CYPHER", nil); !errors.As(err, &queryErr) || queryErr.Stage != QueryErrorStageParse || queryErr.Code != ErrorGeneric || queryErr.Location != nil || queryErr.DiagnosticCode != "" {
 		t.Fatalf("parse error = %#v", err)
 	}
-	if _, err := db.Query("UNWIND $items AS x RETURN x", map[string]Value{"items": 1}); !errors.As(err, &queryErr) || queryErr.Stage != QueryErrorStageExecution {
+	if _, err := db.Query("UNWIND $items AS x RETURN x", map[string]Value{"items": 1}); !errors.As(err, &queryErr) || queryErr.Stage != QueryErrorStageExecution || queryErr.Code != ErrorGeneric || queryErr.Location != nil || queryErr.DiagnosticCode != "" {
 		t.Fatalf("execution error = %#v", err)
+	}
+}
+
+func TestQueryErrorUnknownEngineStageIsNotExecution(t *testing.T) {
+	err := wrapError(&engine.QueryError{Stage: engine.QueryErrorStage(99), Err: errors.New("future stage")})
+	var queryErr *QueryError
+	if !errors.As(err, &queryErr) || queryErr.Stage != QueryErrorStageNone {
+		t.Fatalf("unknown stage = %#v", err)
 	}
 }
 
