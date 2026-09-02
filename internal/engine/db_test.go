@@ -2756,6 +2756,74 @@ func TestCypherCompatibilitySyntaxBatch(t *testing.T) {
 	}
 }
 
+func TestDeleteRequiresDetachForIncidentEdges(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		match  string
+		plain  string
+		detach string
+	}{
+		{name: "outgoing", match: "MATCH (a), (b) CREATE (a)-[:LINK]->(b)", plain: "MATCH (a) DELETE a", detach: "MATCH (a) DETACH DELETE a"},
+		{name: "incoming", match: "MATCH (a), (b) CREATE (a)-[:LINK]->(b)", plain: "MATCH (b) DELETE b", detach: "MATCH (b) DETACH DELETE b"},
+		{name: "self-loop", match: "MATCH (a), (b) CREATE (a)-[:LINK]->(a)", plain: "MATCH (a) DELETE a", detach: "MATCH (a) DETACH DELETE a"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "delete.ltdb"), OpenOptions{Create: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if _, err := db.Query("CREATE (:Node)", nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Query("CREATE (:Node)", nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Query(test.match, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Query(test.plain, nil); err == nil {
+				t.Fatal("plain DELETE unexpectedly removed a node with an incident edge")
+			}
+			result, err := db.Query("MATCH (n) RETURN count(n) AS count", nil)
+			if err != nil || result.Rows[0]["count"] != int64(2) {
+				t.Fatalf("plain DELETE was not atomic: %#v, %v", result.Rows, err)
+			}
+			if _, err := db.Query(test.detach, nil); err != nil {
+				t.Fatal(err)
+			}
+			result, err = db.Query("MATCH (n) RETURN count(n) AS count", nil)
+			if err != nil || result.Rows[0]["count"] != int64(0) {
+				t.Fatalf("DETACH DELETE node count = %#v, %v", result.Rows, err)
+			}
+		})
+	}
+
+	t.Run("edge-and-node-same-query", func(t *testing.T) {
+		db, err := Open(filepath.Join(t.TempDir(), "delete-edge-node.ltdb"), OpenOptions{Create: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := db.Query("CREATE (:Node)", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Query("CREATE (:Node)", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Query("MATCH (a), (b) CREATE (a)-[r:LINK]->(b)", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Query("MATCH (a)-[r:LINK]->(b) DELETE r, a, b", nil); err != nil {
+			t.Fatalf("explicit edge deletion should permit plain node deletion: %v", err)
+		}
+		result, err := db.Query("MATCH (n) RETURN count(n) AS count", nil)
+		if err != nil || result.Rows[0]["count"] != int64(0) {
+			t.Fatalf("edge+node DELETE count = %#v, %v", result.Rows, err)
+		}
+	})
+}
+
 func TestAdditionalCypherSyntaxBatch(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "additional-cypher.ltdb"), OpenOptions{Create: true})
 	if err != nil {

@@ -325,7 +325,7 @@ The following behaviors are part of the contract:
 - `REMOVE target.prop` removes a property
 - `REMOVE target:Label` removes a label
 - `SET`, `REMOVE`, and relationship `CREATE` may be followed by `RETURN`; a created relationship binding is available to that projection.
-- `DELETE` and its explicit `DETACH DELETE` spelling remove incident relationships when deleting a node.
+- Plain `DELETE` rejects nodes with incident relationships; `DETACH DELETE` removes incident relationships when deleting a node.
 - On mutation queries with `RETURN`, `SKIP` and `LIMIT` truncate the returned rows but do not suppress earlier statement side effects.
 - mutation against a bound edge variable targets the matched stable edge instance, not all parallel edges with the same endpoints
 
