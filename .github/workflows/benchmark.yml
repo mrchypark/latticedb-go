@@ -31,22 +31,6 @@ jobs:
         with:
           go-version: '1.27.x'
           cache: false
-      - name: Install Zig
-        run: |
-          archive="$RUNNER_TEMP/zig.tar.xz"
-          curl --fail --location --silent --show-error \
-            "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
-            --output "$archive"
-          printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum --check
-          tar -xJf "$archive" -C "$RUNNER_TEMP"
-          printf '%s\n' "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v7
-        with:
-          repository: mrchypark/latticedb
-          ref: ${{ env.ZIG_REF }}
-          path: zig-reference
-          persist-credentials: false
-
       - name: Download previous main result
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,15 +40,77 @@ jobs:
           if [[ -n "$run_id" ]]; then
             download_dir=$(mktemp -d)
             if gh run download "$run_id" --name performance-results --dir "$download_dir"; then
-              cp "$download_dir/current.txt" previous/current.txt
-              cp "$download_dir/revision.txt" previous/revision.txt
+              if [[ -s "$download_dir/current.txt" && -n "$(tr -d '[:space:]' < "$download_dir/revision.txt")" ]] \
+                && go run ./scripts/benchcmp.go -validate-go "$download_dir/current.txt"; then
+                cp "$download_dir/current.txt" previous/current.txt
+                cp "$download_dir/revision.txt" previous/revision.txt
+              fi
             fi
           fi
+
+      - name: Download compatible Zig reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while IFS= read -r run_id; do
+            [[ -n "$run_id" ]] || continue
+            download_dir=$(mktemp -d)
+            if ! gh run download "$run_id" --name performance-results --dir "$download_dir"; then
+              continue
+            fi
+            if [[ -f "$download_dir/zig.txt" && -f "$download_dir/zig-revision.txt" && -f "$download_dir/zig-version.txt" && -f "$download_dir/zig-ref.txt" && -f "$download_dir/zig-sha256.txt" ]] \
+              && [[ "$(<"$download_dir/zig-version.txt")" == "$ZIG_VERSION" ]] \
+              && [[ "$(<"$download_dir/zig-ref.txt")" == "$ZIG_REF" ]] \
+              && [[ "$(<"$download_dir/zig-revision.txt")" == "$ZIG_REF" ]] \
+              && (cd "$download_dir" && sha256sum --check --status zig-sha256.txt) \
+              && go run ./scripts/benchcmp.go -validate-zig "$download_dir/zig.txt" >/dev/null 2>&1; then
+              cp "$download_dir"/zig{.txt,-revision.txt,-version.txt,-ref.txt,-sha256.txt} previous/
+              break
+            fi
+          done < <(gh run list --workflow benchmark.yml --status success --limit 20 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
+
+      - name: Reuse or prepare Zig reference
+        run: |
+          mkdir -p results
+          if [[ -f previous/zig.txt && -f previous/zig-revision.txt && -f previous/zig-version.txt && -f previous/zig-ref.txt && -f previous/zig-sha256.txt ]] \
+            && [[ "$(<previous/zig-version.txt)" == "$ZIG_VERSION" ]] \
+            && [[ "$(<previous/zig-ref.txt)" == "$ZIG_REF" ]] \
+            && [[ "$(<previous/zig-revision.txt)" == "$ZIG_REF" ]] \
+            && (cd previous && sha256sum --check --status zig-sha256.txt) \
+            && go run ./scripts/benchcmp.go -validate-zig previous/zig.txt; then
+            cp previous/zig.txt results/zig.txt
+            cp previous/zig-revision.txt results/zig-revision.txt
+            cp previous/zig-version.txt results/zig-version.txt
+            cp previous/zig-ref.txt results/zig-ref.txt
+            cp previous/zig-sha256.txt results/zig-sha256.txt
+            echo 'ZIG_REUSED=true' >> "$GITHUB_ENV"
+          else
+            echo 'ZIG_REUSED=false' >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Zig
+        if: env.ZIG_REUSED != 'true'
+        run: |
+          archive="$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --silent --show-error \
+            "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" \
+            --output "$archive"
+          printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum --check
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          printf '%s\n' "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v7
+        if: env.ZIG_REUSED != 'true'
+        with:
+          repository: mrchypark/latticedb
+          ref: ${{ env.ZIG_REF }}
+          path: zig-reference
+          persist-credentials: false
 
       - name: Run benchmarks (maximum scale 100K)
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
+          set -o pipefail
           run_suite() {
             local repo=$1 output=$2
             (
@@ -93,23 +139,35 @@ jobs:
           fi
 
       - name: Run Zig reference benchmark (100K)
+        if: env.ZIG_REUSED != 'true'
         run: |
+          set -o pipefail
           (
             cd "$GITHUB_WORKSPACE/zig-reference"
             zig build vector-benchmark -- --scale 100000 --scale-only
           ) 2>&1 | tee results/zig.txt
-          git -C "$GITHUB_WORKSPACE/zig-reference" rev-parse HEAD > results/zig-revision.txt
+          zig_revision=$(git -C "$GITHUB_WORKSPACE/zig-reference" rev-parse HEAD)
+          [[ "$zig_revision" == "$ZIG_REF" ]]
+          printf '%s\n' "$zig_revision" > results/zig-revision.txt
+          printf '%s\n' "$ZIG_VERSION" > results/zig-version.txt
+          printf '%s\n' "$ZIG_REF" > results/zig-ref.txt
+          (cd results && sha256sum zig.txt > zig-sha256.txt)
 
       - name: Create comparison report
         run: |
+          zig_status='freshly measured in this run'
+          if [[ "$ZIG_REUSED" == true ]]; then
+            zig_status='reused from a compatible successful benchmark artifact; not measured in this run'
+          fi
           go run ./scripts/benchcmp.go \
             -current results/current.txt \
             -previous previous/current.txt \
             -current-label "$(cat results/revision.txt)" \
             -previous-label "$(cat previous/revision.txt)" \
             -zig results/zig.txt \
-            -zig-label "mrchypark/latticedb@$(cat results/zig-revision.txt) (Zig $ZIG_VERSION, ReleaseFast)" \
+            -zig-label "mrchypark/latticedb@$(cat results/zig-revision.txt) (Zig $(cat results/zig-version.txt), ReleaseFast; $zig_status)" \
             -output results/report.md
+          printf 'Zig reference: %s (Zig %s, ref %s).\n\n' "$zig_status" "$(cat results/zig-version.txt)" "$(cat results/zig-ref.txt)" >> "$GITHUB_STEP_SUMMARY"
           cat results/report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload performance report

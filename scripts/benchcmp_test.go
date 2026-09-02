@@ -47,3 +47,39 @@ func TestReportComparesPureGoWithZig100K(t *testing.T) {
 		}
 	}
 }
+
+func TestParseZigRejectsInvalidValues(t *testing.T) {
+	for _, output := range []string{
+		"│  100000 │          NaN │      500.00 │      700.00 │    98.0%  │        42.0 │\n",
+		"│  100000 │         +Inf │      500.00 │      700.00 │    98.0%  │        42.0 │\n",
+		"│  100000 │     1000.00 │     -500.00 │      700.00 │    98.0%  │        42.0 │\n",
+		"│  100000 │     1000.00 │      500.00 │      700.00 │   100.1%  │        42.0 │\n",
+	} {
+		if _, err := parseZig(strings.NewReader(output)); err == nil {
+			t.Fatalf("parseZig accepted invalid output: %q", output)
+		}
+	}
+}
+
+func TestValidateGoResultRequiresBenchmarkSuiteSentinels(t *testing.T) {
+	for name, input := range map[string]string{
+		"garbage": "Benchmark garbage 1 foo\n",
+		"partial": "BenchmarkReadRequests/query-8 1 100 ns/op\n",
+	} {
+		benchmarks, err := parse(strings.NewReader(input))
+		if err != nil {
+			t.Fatalf("%s parse: %v", name, err)
+		}
+		if err := validateGoResult(benchmarks); err == nil {
+			t.Fatalf("%s result passed validation", name)
+		}
+	}
+
+	benchmarks, err := parse(strings.NewReader("BenchmarkReadRequests/query-8 1 100 ns/op\nBenchmarkVectorSearchClustered128D/100K-8 1 200 ns/op 300 index-build-ms 99 recall@10\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGoResult(benchmarks); err != nil {
+		t.Fatalf("full result failed validation: %v", err)
+	}
+}
