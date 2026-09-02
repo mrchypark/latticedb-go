@@ -1828,8 +1828,10 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		}
 	}
 	if tx.db.enableVector {
-		if err := validateGraphVectorsContext(ctx, tx.graph); err != nil {
-			return err
+		for id := range tx.changes.upsertNodes {
+			if err := validateNodeVectors(tx.graph.VectorDimensions, tx.graph.Nodes.Get(id)); err != nil {
+				return err
+			}
 		}
 	}
 	if size, err := tx.db.wal.TailSize(); err != nil {
