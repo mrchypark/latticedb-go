@@ -539,23 +539,21 @@ func validateGraphVectorsContext(ctx context.Context, graph *store.GraphState) e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ids := make([]uint64, 0, graph.Nodes.Len())
-	for id := range graph.Nodes.All() {
-		ids = append(ids, id)
-	}
-	slices.Sort(ids)
-	for index, id := range ids {
+	var invalidErr error
+	var invalidID uint64
+	index := 0
+	for _, node := range graph.Nodes.All() {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		node := graph.Nodes.Get(id)
-		if err := validateNodeVectors(graph.VectorDimensions, node); err != nil {
-			return err
+		index++
+		if err := validateNodeVectors(graph.VectorDimensions, node); err != nil && (invalidErr == nil || node.ID < invalidID) {
+			invalidID, invalidErr = node.ID, err
 		}
 	}
-	return nil
+	return invalidErr
 }
 
 func validateNodeVectors(dimensions uint16, node *store.NodeRecord) error {

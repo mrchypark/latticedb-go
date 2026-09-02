@@ -39,3 +39,8 @@ Compatibility boundary:
 - This value model is part of the required engine/query contract.
 - No JSON import format is currently part of the required value-model contract.
 - A future import/export interchange format should be specified explicitly rather than inferred from any single engine implementation.
+
+Vector search contract:
+
+- When vector search is enabled, each node may have at most one direct `[]float32` property. Adding a second vector property is rejected, because the unqualified vector-search API cannot safely choose between fields.
+- When vector search is disabled, `[]float32` values are ordinary properties and multiple vector-valued properties remain allowed. Reopening that database with vector search enabled requires removing the ambiguity first.
