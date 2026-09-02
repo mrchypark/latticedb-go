@@ -120,14 +120,14 @@ func TestVectorSelectionExactANNParityAndCOW(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldFingerprint := vectorIndexFingerprint(reader.graph)
-	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(id, "a", []float32{0, 0}) }); err != nil {
-		t.Fatal(err)
+	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(id, "a", []float32{0, 0}) }); err == nil {
+		t.Fatal("accepted an ambiguous second vector property")
 	}
 	if got := vectorIndexFingerprint(reader.graph); got != oldFingerprint {
 		t.Fatal("published vector index changed through a later generation")
 	}
 	_ = reader.Rollback()
-	assertVectorModesAgree(t, db, []float32{0, 0}, id)
+	assertVectorModesAgree(t, db, []float32{10, 10}, id)
 	if err := db.Update(func(tx *Tx) error { return tx.SetVector(id, "z", []float32{20, 20}) }); err != nil {
 		t.Fatal(err)
 	}

@@ -898,6 +898,9 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 	var results []VectorSearchResult
 
 	err = db.View(func(tx *Tx) error {
+		if err := validateGraphVectorsContext(budget.ctx, tx.graph); err != nil {
+			return err
+		}
 		capacity := limit
 		if nodeCount := uint64(tx.graph.Nodes.Len()); capacity > nodeCount {
 			capacity = nodeCount
@@ -1824,6 +1827,11 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	}
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if tx.db.enableVector {
+		if err := validateGraphVectorsContext(ctx, tx.graph); err != nil {
 			return err
 		}
 	}

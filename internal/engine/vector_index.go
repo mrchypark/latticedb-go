@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/bits"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/mrchypark/latticedb-go/internal/search"
@@ -118,6 +119,9 @@ func rebuildVectorIndexContext(ctx context.Context, graph *store.GraphState) err
 }
 
 func rebuildVectorIndexBudget(ctx context.Context, graph *store.GraphState, maxWork, maxBytes uint64) error {
+	if err := validateGraphVectorsContext(ctx, graph); err != nil {
+		return err
+	}
 	var live uint64
 	for _, node := range graph.Nodes.All() {
 		if _, ok := selectedVector(graph, node); ok {
@@ -532,6 +536,9 @@ func validateGraphVectors(graph *store.GraphState) error {
 }
 
 func validateGraphVectorsContext(ctx context.Context, graph *store.GraphState) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	index := 0
 	for _, node := range graph.Nodes.All() {
 		if index&255 == 0 {
@@ -548,7 +555,20 @@ func validateGraphVectorsContext(ctx context.Context, graph *store.GraphState) e
 }
 
 func validateNodeVectors(dimensions uint16, node *store.NodeRecord) error {
-	if dimensions == 0 || node == nil {
+	if node == nil {
+		return nil
+	}
+	keys := make([]string, 0, 1)
+	for key, value := range node.Properties {
+		if _, ok := value.([]float32); ok {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) > 1 {
+		slices.Sort(keys)
+		return fmt.Errorf("node %d has multiple vector properties (%s); vector search requires at most one []float32 property", node.ID, strings.Join(keys, ", "))
+	}
+	if dimensions == 0 {
 		return nil
 	}
 	for _, value := range node.Properties {
