@@ -2031,6 +2031,60 @@ func TestFTSIndexDoesNotOverwriteTextProperty(t *testing.T) {
 	}
 }
 
+func TestQueryFTSSearchesNamedPropertyOnly(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-fts-properties.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var first, second Node
+	if err := db.Update(func(tx *Tx) error {
+		var err error
+		first, err = tx.CreateNode(CreateNodeOptions{Properties: map[string]any{
+			"title": "alpha", "body": "beta",
+		}})
+		if err != nil {
+			return err
+		}
+		second, err = tx.CreateNode(CreateNodeOptions{Properties: map[string]any{
+			"title": "beta", "body": "alpha",
+		}})
+		if err != nil {
+			return err
+		}
+		// A node-level index must not make an unrelated or missing property match.
+		return tx.FTSIndex(first.ID, "alpha")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, query string
+		want        uint64
+	}{
+		{"title", `MATCH (n) WHERE n.title @@ "alpha" RETURN n`, first.ID},
+		{"body", `MATCH (n) WHERE n.body @@ "alpha" RETURN n`, second.ID},
+	} {
+		result, err := db.Query(test.query, nil)
+		if err != nil {
+			t.Fatalf("%s query: %v", test.name, err)
+		}
+		if len(result.Rows) != 1 || result.Rows[0]["n"].(Node).ID != test.want {
+			t.Fatalf("%s rows = %#v, want node %d", test.name, result.Rows, test.want)
+		}
+	}
+	result, err := db.Query(`MATCH (n) WHERE n.typo @@ "alpha" RETURN n`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("missing property unexpectedly matched: %#v", result.Rows)
+	}
+	direct, err := db.FTSSearch("alpha", FTSSearchOptions{})
+	if err != nil || len(direct) != 1 || direct[0].NodeID != first.ID {
+		t.Fatalf("direct FTS = %#v, %v", direct, err)
+	}
+}
+
 func TestCanonicalTextValidationAndRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "canonical-text.ltdb")
 	db, err := Open(path, OpenOptions{Create: true})
