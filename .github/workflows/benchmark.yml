@@ -45,13 +45,29 @@ jobs:
                 cp "$download_dir/current.txt" previous/current.txt
                 cp "$download_dir/revision.txt" previous/revision.txt
               fi
-              for file in zig.txt zig-revision.txt zig-version.txt zig-ref.txt zig-sha256.txt; do
-                if [[ -f "$download_dir/$file" ]]; then
-                  cp "$download_dir/$file" "previous/$file"
-                fi
-              done
             fi
           fi
+
+      - name: Download compatible Zig reference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while IFS= read -r run_id; do
+            [[ -n "$run_id" ]] || continue
+            download_dir=$(mktemp -d)
+            if ! gh run download "$run_id" --name performance-results --dir "$download_dir"; then
+              continue
+            fi
+            if [[ -f "$download_dir/zig.txt" && -f "$download_dir/zig-revision.txt" && -f "$download_dir/zig-version.txt" && -f "$download_dir/zig-ref.txt" && -f "$download_dir/zig-sha256.txt" ]] \
+              && [[ "$(<"$download_dir/zig-version.txt")" == "$ZIG_VERSION" ]] \
+              && [[ "$(<"$download_dir/zig-ref.txt")" == "$ZIG_REF" ]] \
+              && [[ "$(<"$download_dir/zig-revision.txt")" == "$ZIG_REF" ]] \
+              && (cd "$download_dir" && sha256sum --check --status zig-sha256.txt) \
+              && go run ./scripts/benchcmp.go -validate-zig "$download_dir/zig.txt" >/dev/null 2>&1; then
+              cp "$download_dir"/zig{.txt,-revision.txt,-version.txt,-ref.txt,-sha256.txt} previous/
+              break
+            fi
+          done < <(gh run list --workflow benchmark.yml --status success --limit 20 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
 
       - name: Reuse or prepare Zig reference
         run: |
@@ -141,7 +157,7 @@ jobs:
         run: |
           zig_status='freshly measured in this run'
           if [[ "$ZIG_REUSED" == true ]]; then
-            zig_status='reused from the latest successful main artifact; not measured in this run'
+            zig_status='reused from a compatible successful benchmark artifact; not measured in this run'
           fi
           go run ./scripts/benchcmp.go \
             -current results/current.txt \
