@@ -2428,24 +2428,16 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 	var queryTerms []string
 	var queryTermBytes uint64
 	queryTermsReady := false
+	_, queryInvariant := clause.Expr.(literalExpr)
+	if !queryInvariant {
+		_, queryInvariant = clause.Expr.(paramExpr)
+	}
 	if clause.Kind == whereFTS {
-		switch clause.Expr.(type) {
-		case literalExpr, paramExpr:
-			expected, err := clause.Expr.eval(queryRow{}, params)
-			if err != nil {
-				return nil, err
+		defer func() {
+			if queryTermsReady {
+				budget.releaseTemporary(queryTermBytes)
 			}
-			queryText, ok := expected.(string)
-			if !ok {
-				return nil, fmt.Errorf("fts comparison requires string, got %T", expected)
-			}
-			queryTerms, queryTermBytes, err = tokenizeQueryText(queryText, budget)
-			if err != nil {
-				return nil, err
-			}
-			queryTermsReady = true
-			defer budget.releaseTemporary(queryTermBytes)
-		}
+		}()
 	}
 	for _, row := range rows {
 		if err := budget.check(1, len(filtered)); err != nil {
@@ -2493,9 +2485,9 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 			var err error
 			terms, termBytes := queryTerms, queryTermBytes
 			if !queryTermsReady {
-				expected, err := clause.Expr.eval(row, params)
-				if err != nil {
-					return nil, err
+				expected, evalErr := clause.Expr.eval(row, params)
+				if evalErr != nil {
+					return nil, evalErr
 				}
 				queryText, ok := expected.(string)
 				if !ok {
@@ -2504,6 +2496,10 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 				terms, termBytes, err = tokenizeQueryText(queryText, budget)
 				if err != nil {
 					return nil, err
+				}
+				if queryInvariant {
+					queryTerms, queryTermBytes = terms, termBytes
+					queryTermsReady = true
 				}
 			}
 			if len(terms) == 0 {
