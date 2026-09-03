@@ -106,9 +106,14 @@ func wrapErrorSlow(err error) error {
 	}
 	var queryErr *engine.QueryError
 	if errors.As(err, &queryErr) {
-		stage := QueryErrorStageExecution
-		if queryErr.Stage == engine.QueryErrorStageParse {
+		// The engine currently emits only parse and execution errors. Keep an
+		// unknown engine stage explicit instead of silently reporting execution.
+		stage := QueryErrorStageNone
+		switch queryErr.Stage {
+		case engine.QueryErrorStageParse:
 			stage = QueryErrorStageParse
+		case engine.QueryErrorStageExecution:
+			stage = QueryErrorStageExecution
 		}
 		code, _ := classifyError(queryErr.Err)
 		return &QueryError{Code: code, Stage: stage, Message: queryErr.Error(), cause: err}
