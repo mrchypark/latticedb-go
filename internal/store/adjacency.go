@@ -6,8 +6,10 @@ import (
 )
 
 const (
-	adjacencyChunkSize   = 64
-	adjacencyInlineLimit = 256
+	adjacencyChunkSize        = 64
+	adjacencySyncCompactLimit = adjacencyChunkSize * 4
+	// Keep at most 63 IDs inline so the 64th append fills the first chunk.
+	adjacencyInlineLimit = adjacencyChunkSize - 1
 )
 
 // EdgeList is an immutable adjacency list. Small lists stay inline; larger
@@ -142,9 +144,10 @@ func (list *EdgeList) RemoveKnown(id uint64) *EdgeList {
 	result.removed.CloneShardOnce(id)
 	result.removed.Set(id, struct{}{})
 	result.count--
-	if result.removed.Len() > adjacencyChunkSize && result.removed.Len() > result.count {
+	if result.total <= adjacencySyncCompactLimit && result.removed.Len() > adjacencyChunkSize && result.removed.Len() > result.count {
 		return result.compact()
 	}
+	// ponytail: lists over 256 retain tombstones until reopen rebuilds adjacency; add incremental/background compaction if read amplification is measurable.
 	return &result
 }
 

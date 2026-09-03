@@ -182,7 +182,7 @@ func BenchmarkShardMapAllScaling(b *testing.B) {
 }
 
 func BenchmarkAdjacencyAppendScaling(b *testing.B) {
-	for _, size := range []int{1_000, 10_000} {
+	for _, size := range []int{1_000, 10_000, 100_000} {
 		var chunked *EdgeList
 		flat := make([]uint64, size)
 		for index := range size {
@@ -203,6 +203,44 @@ func BenchmarkAdjacencyAppendScaling(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkAdjacencyDeleteScaling(b *testing.B) {
+	const size = 100_000
+	var base *EdgeList
+	for index := range size {
+		base = base.Append(uint64(index + 1))
+	}
+	full := base
+	for index := range size / 2 {
+		base = base.RemoveKnown(uint64(index + 1))
+	}
+	if base.count != size/2 || base.removed.Len() != size/2 {
+		b.Fatalf("unexpected deletion setup: count=%d removed=%d", base.count, base.removed.Len())
+	}
+	crossed := base.RemoveKnown(uint64(size/2 + 1))
+	if crossed.Len() != size/2-1 || crossed.removed.Len() != size/2+1 {
+		b.Fatalf("deletion setup did not cross majority-removal boundary: count=%d removed=%d", crossed.Len(), crossed.removed.Len())
+	}
+
+	b.Run("majority_removed_100000", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			_ = base.RemoveKnown(uint64(size/2 + 1))
+		}
+	})
+	b.Run("bulk_100000", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			list := full
+			for id := uint64(1); id <= uint64(size/2+1); id++ {
+				list = list.RemoveKnown(id)
+			}
+			if list.Len() != size/2-1 {
+				b.Fatalf("bulk deletion left unexpected count: %d", list.Len())
+			}
+		}
+	})
 }
 
 func BenchmarkGraphAdjacencyForkAppend(b *testing.B) {
