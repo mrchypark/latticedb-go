@@ -139,12 +139,33 @@ func TestCheckGatesRejectsAllocationRegressions(t *testing.T) {
 	previous := gateFixture(nil)
 	current := gateFixture(map[string]float64{
 		"BenchmarkReadRequests/query B/op":             102,
-		"BenchmarkReadRequests/write_commit allocs/op": 101,
+		"BenchmarkReadRequests/write_commit allocs/op": 103,
 	})
 	var diagnostics bytes.Buffer
 	err := checkGates(current, previous, &diagnostics)
 	if err == nil || !strings.Contains(err.Error(), "BenchmarkReadRequests/query B/op") || !strings.Contains(err.Error(), "write_commit allocs/op") {
 		t.Fatalf("checkGates error = %v, want allocation failures", err)
+	}
+}
+
+func TestCheckGatesAllowsOneAllocationDriftForWrites(t *testing.T) {
+	previous := gateFixture(nil)
+	previous["BenchmarkReadRequests/write_commit"]["allocs/op"] = []float64{65}
+	previous["BenchmarkSingleRecordCommitScaling/nodes_100000/direct"]["allocs/op"] = []float64{65}
+	current := gateFixture(map[string]float64{
+		"BenchmarkReadRequests/write_commit allocs/op":                     66,
+		"BenchmarkSingleRecordCommitScaling/nodes_100000/direct allocs/op": 66,
+	})
+	if err := checkGates(current, previous, new(bytes.Buffer)); err != nil {
+		t.Fatalf("one allocation drift failed gate: %v", err)
+	}
+
+	current["BenchmarkReadRequests/write_commit"]["allocs/op"] = []float64{67}
+	current["BenchmarkSingleRecordCommitScaling/nodes_100000/direct"]["allocs/op"] = []float64{67}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err == nil ||
+		!strings.Contains(err.Error(), "write_commit allocs/op") ||
+		!strings.Contains(err.Error(), "nodes_100000/direct allocs/op") {
+		t.Fatalf("two allocation drift error = %v, want write allocation failures", err)
 	}
 }
 

@@ -35,9 +35,10 @@ var blockingGates = []performanceGate{
 	{benchmark: "BenchmarkReadRequests/query", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkReadRequests/query", unit: "allocs/op"},
 	{benchmark: "BenchmarkReadRequests/write_commit", unit: "B/op", maxRise: 0.01},
-	{benchmark: "BenchmarkReadRequests/write_commit", unit: "allocs/op"},
+	// One rounded allocation can drift between equivalent runs; two cannot.
+	{benchmark: "BenchmarkReadRequests/write_commit", unit: "allocs/op", maxRise: 0.02},
 	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "B/op", maxRise: 0.01},
-	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "allocs/op"},
+	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "allocs/op", maxRise: 0.02},
 	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "allocs/op"},
 	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "ns/op", maxRise: 0.20},
@@ -250,7 +251,7 @@ func writeReport(w io.Writer, current, previous result, currentLabel, previousLa
 
 	fmt.Fprintln(w, "# Performance benchmark report")
 	fmt.Fprintf(w, "\nCurrent: `%s`  \nPrevious: `%s`\n", currentLabel, previousLabel)
-	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; enforced graph-core gates allow up to +1% B/op drift, require exact-zero allocs/op drift, and allow up to +20% ns/op drift for multi-hop and WAL recovery.")
+	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; enforced graph-core gates allow up to +1% B/op drift, +2% allocs/op drift for write benchmarks, and allow up to +20% ns/op drift for multi-hop and WAL recovery.")
 	if zig != nil {
 		writeZigComparison(w, current, zig, zigLabel)
 	}

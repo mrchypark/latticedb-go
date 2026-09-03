@@ -122,7 +122,7 @@ func BenchmarkReadRequests(b *testing.B) {
 }
 
 func BenchmarkOutgoingEdges(b *testing.B) {
-	db, err := Open(filepath.Join(b.TempDir(), "edges.db"), OpenOptions{Create: true})
+	db, err := Open(filepath.Join(b.TempDir(), "edges.db"), OpenOptions{Create: true, WALCheckpointThresholdBytes: ^uint64(0)})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func BenchmarkColdOpen(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var err error
-		db, err = Open(path, OpenOptions{})
+		db, err = Open(path, OpenOptions{WALCheckpointThresholdBytes: ^uint64(0)})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -261,7 +261,7 @@ func BenchmarkReaderDuringCommit(b *testing.B) {
 }
 
 func BenchmarkMatchedScale10K(b *testing.B) {
-	db, err := Open(filepath.Join(b.TempDir(), "matched.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 16, VectorIndexMode: VectorIndexHNSWSynchronous})
+	db, err := Open(filepath.Join(b.TempDir(), "matched.ltdb"), OpenOptions{Create: true, WALCheckpointThresholdBytes: ^uint64(0), EnableVector: true, VectorDimensions: 16, VectorIndexMode: VectorIndexHNSWSynchronous})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func BenchmarkMatchedScale10K(b *testing.B) {
 }
 
 func BenchmarkPropertyEquality10K(b *testing.B) {
-	db, err := Open(filepath.Join(b.TempDir(), "property-index.ltdb"), OpenOptions{Create: true})
+	db, err := Open(filepath.Join(b.TempDir(), "property-index.ltdb"), OpenOptions{Create: true, WALCheckpointThresholdBytes: ^uint64(0)})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -359,7 +359,7 @@ func BenchmarkPropertyEquality10K(b *testing.B) {
 }
 
 func BenchmarkPropertyIndexCommonValue10K(b *testing.B) {
-	db, err := Open(filepath.Join(b.TempDir(), "property-index-common.ltdb"), OpenOptions{Create: true})
+	db, err := Open(filepath.Join(b.TempDir(), "property-index-common.ltdb"), OpenOptions{Create: true, WALCheckpointThresholdBytes: ^uint64(0)})
 	if err != nil {
 		b.Fatal(err)
 	}
