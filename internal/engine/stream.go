@@ -204,8 +204,42 @@ func (tx *Tx) appendChangefeed() error {
 	if tx.changes == nil || (!hasIDs(tx.changes.upsertNodes) && !hasIDs(tx.changes.deleteNodes) && !hasIDs(tx.changes.upsertEdges) && !hasIDs(tx.changes.deleteEdges)) {
 		return nil
 	}
+	for id := range tx.changes.upsertNodes {
+		if err := store.ValidateEntityID(id); err != nil {
+			return err
+		}
+	}
+	for id := range tx.changes.deleteNodes {
+		if err := store.ValidateEntityID(id); err != nil {
+			return err
+		}
+	}
+	for id := range tx.changes.upsertEdges {
+		if err := store.ValidateEntityID(id); err != nil {
+			return err
+		}
+		if edge := tx.graph.Edges.Get(id); edge != nil {
+			if err := store.ValidateEntityID(edge.SourceID); err != nil {
+				return err
+			}
+			if err := store.ValidateEntityID(edge.TargetID); err != nil {
+				return err
+			}
+		}
+	}
+	for id := range tx.changes.deleteEdges {
+		if err := store.ValidateEntityID(id); err != nil {
+			return err
+		}
+	}
 	for _, id := range mapKeys(tx.changes.deleteEdges) {
 		if edge := tx.base.Edges.Get(id); edge != nil {
+			if err := store.ValidateEntityID(edge.SourceID); err != nil {
+				return err
+			}
+			if err := store.ValidateEntityID(edge.TargetID); err != nil {
+				return err
+			}
 			tx.appendChange("edge.delete", map[string]any{"edge_id": int64(id), "source_id": int64(edge.SourceID), "target_id": int64(edge.TargetID), "type": edge.Type})
 		}
 	}

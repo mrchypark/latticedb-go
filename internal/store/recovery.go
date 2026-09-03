@@ -807,6 +807,58 @@ func syncCheckpointDirectory(dbPath, prefix string, fault CheckpointFault) error
 }
 
 func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
+	if nextNodeID == 0 {
+		nextNodeID = 1
+	}
+	if nextEdgeID == 0 {
+		nextEdgeID = 1
+	}
+	if err := ValidateIDHighWater(nextNodeID); err != nil {
+		return err
+	}
+	if err := ValidateIDHighWater(nextEdgeID); err != nil {
+		return err
+	}
+	for _, nodeID := range SortedNodeIDs(graph) {
+		node := graph.Nodes.Get(nodeID)
+		if node == nil || node.ID != nodeID {
+			return fmt.Errorf("node key %d does not match record", nodeID)
+		}
+		if node == nil {
+			return fmt.Errorf("node %d does not exist", nodeID)
+		}
+		if node.ID != nodeID {
+			return fmt.Errorf("node key %d does not match record ID %d", nodeID, node.ID)
+		}
+		if err := ValidateEntityID(node.ID); err != nil {
+			return err
+		}
+	}
+	for _, edgeID := range SortedEdgeIDs(graph) {
+		edge := graph.Edges.Get(edgeID)
+		if edge == nil || edge.ID != edgeID {
+			return fmt.Errorf("edge key %d does not match record", edgeID)
+		}
+		if edge == nil {
+			return fmt.Errorf("edge %d does not exist", edgeID)
+		}
+		if edge.ID != edgeID {
+			return fmt.Errorf("edge key %d does not match record ID %d", edgeID, edge.ID)
+		}
+		for _, id := range []uint64{edge.ID, edge.SourceID, edge.TargetID} {
+			if err := ValidateEntityID(id); err != nil {
+				return err
+			}
+		}
+	}
+	for nodeID, record := range graph.FTS.All() {
+		if err := ValidateEntityID(nodeID); err != nil {
+			return err
+		}
+		if record == nil {
+			return fmt.Errorf("FTS record %d is nil", nodeID)
+		}
+	}
 	metadata, err := buildPersistedAppMetadata(graph.AppMetadata)
 	if err != nil {
 		return err
@@ -1137,6 +1189,9 @@ func LoadIDReservationFiles(files DatabaseFiles, databaseID string) (uint64, uin
 			return 0, 0, errors.New("ID reservation checksum mismatch")
 		}
 	}
+	if ids.NextNodeID > EntityIDExhausted || ids.NextEdgeID > EntityIDExhausted {
+		return 0, 0, errors.New("ID reservation high-water mark exceeds entity domain")
+	}
 	return ids.NextNodeID, ids.NextEdgeID, nil
 }
 
@@ -1145,6 +1200,9 @@ func ReserveIDs(dbPath string, databaseID string, nextNodeID uint64, nextEdgeID 
 }
 
 func ReserveIDsFiles(files DatabaseFiles, databaseID string, nextNodeID uint64, nextEdgeID uint64) error {
+	if nextNodeID > EntityIDExhausted || nextEdgeID > EntityIDExhausted {
+		return errors.New("ID reservation high-water mark exceeds entity domain")
+	}
 	ids := persistedIDs{Magic: idsMagic, Version: storageVersion, DatabaseID: databaseID, NextNodeID: nextNodeID, NextEdgeID: nextEdgeID}
 	ids.Checksum = checksumIDs(databaseID, nextNodeID, nextEdgeID)
 	data, err := json.Marshal(ids)
@@ -1697,6 +1755,18 @@ func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulat
 	if state.CommitID == ^uint64(0) {
 		return nil, errors.New("commit ID space exhausted")
 	}
+	if state.NextNodeID == 0 {
+		state.NextNodeID = 1
+	}
+	if state.NextEdgeID == 0 {
+		state.NextEdgeID = 1
+	}
+	if err := ValidateIDHighWater(state.NextNodeID); err != nil {
+		return nil, err
+	}
+	if err := ValidateIDHighWater(state.NextEdgeID); err != nil {
+		return nil, err
+	}
 	accumulator := &walAccumulator{
 		state:    state,
 		metadata: make(map[string]persistedAppMetadata, len(state.AppMetadata)),
@@ -1725,8 +1795,8 @@ func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulat
 				return nil, err
 			}
 		}
-		if node.ID == 0 {
-			return nil, errors.New("stored node id must be non-zero")
+		if err := ValidateEntityID(node.ID); err != nil {
+			return nil, fmt.Errorf("stored node %d: %w", node.ID, err)
 		}
 		if err := ValidateCreateLabels(node.Labels); err != nil {
 			return nil, fmt.Errorf("stored node %d labels: %w", node.ID, err)
@@ -1747,8 +1817,14 @@ func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulat
 				return nil, err
 			}
 		}
-		if edge.ID == 0 {
-			return nil, errors.New("stored edge id must be non-zero")
+		if err := ValidateEntityID(edge.ID); err != nil {
+			return nil, fmt.Errorf("stored edge %d: %w", edge.ID, err)
+		}
+		if err := ValidateEntityID(edge.SourceID); err != nil {
+			return nil, fmt.Errorf("stored edge source %d: %w", edge.SourceID, err)
+		}
+		if err := ValidateEntityID(edge.TargetID); err != nil {
+			return nil, fmt.Errorf("stored edge target %d: %w", edge.TargetID, err)
 		}
 		if err := ValidateEdgeType(edge.Type); err != nil {
 			return nil, fmt.Errorf("stored edge %d type: %w", edge.ID, err)
@@ -1781,6 +1857,9 @@ func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulat
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
+		}
+		if err := ValidateEntityID(record.NodeID); err != nil {
+			return nil, fmt.Errorf("stored FTS node %d: %w", record.NodeID, err)
 		}
 		if _, ok := accumulator.nodes[record.NodeID]; !ok {
 			return nil, fmt.Errorf("stored FTS record references missing node %d", record.NodeID)
@@ -1834,6 +1913,12 @@ func validatePersistedPropertyIndexes(ctx context.Context, indexes []persistedPr
 }
 
 func (accumulator *walAccumulator) apply(delta persistedDelta) error {
+	if err := ValidateIDHighWater(delta.NextNodeID); err != nil {
+		return err
+	}
+	if err := ValidateIDHighWater(delta.NextEdgeID); err != nil {
+		return err
+	}
 	if delta.NextNodeID < accumulator.state.NextNodeID || delta.NextEdgeID < accumulator.state.NextEdgeID {
 		return errors.New("WAL ID high-water mark regressed")
 	}
@@ -1842,6 +1927,14 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 	}
 	if err := validateUniqueDeltaIDs(delta.DeleteEdges, delta.UpsertEdges, func(edge persistedEdge) uint64 { return edge.ID }); err != nil {
 		return fmt.Errorf("edge operations: %w", err)
+	}
+	for _, edge := range delta.UpsertEdges {
+		if err := ValidateEntityID(edge.SourceID); err != nil {
+			return fmt.Errorf("edge operations: %w", err)
+		}
+		if err := ValidateEntityID(edge.TargetID); err != nil {
+			return fmt.Errorf("edge operations: %w", err)
+		}
 	}
 	if err := validateUniqueDeltaIDs(delta.DeleteFTS, delta.UpsertFTS, func(record persistedFTS) uint64 { return record.NodeID }); err != nil {
 		return fmt.Errorf("FTS operations: %w", err)
@@ -2018,8 +2111,8 @@ func applyPropertyIndexDelta(definitions *[]persistedPropertyIndexDefinition, cr
 func validateUniqueDeltaIDs[T any](deletes []uint64, upserts []T, id func(T) uint64) error {
 	seen := make(map[uint64]struct{}, len(deletes)+len(upserts))
 	for _, value := range deletes {
-		if value == 0 {
-			return errors.New("zero ID")
+		if err := ValidateEntityID(value); err != nil {
+			return err
 		}
 		if _, exists := seen[value]; exists {
 			return fmt.Errorf("duplicate ID %d", value)
@@ -2028,8 +2121,8 @@ func validateUniqueDeltaIDs[T any](deletes []uint64, upserts []T, id func(T) uin
 	}
 	for _, value := range upserts {
 		valueID := id(value)
-		if valueID == 0 {
-			return errors.New("zero ID")
+		if err := ValidateEntityID(valueID); err != nil {
+			return err
 		}
 		if _, exists := seen[valueID]; exists {
 			return fmt.Errorf("duplicate ID %d", valueID)
@@ -2077,6 +2170,18 @@ func sortedMapKeys[T any](values map[uint64]T) []uint64 {
 }
 
 func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) (persistedState, error) {
+	if nextNodeID == 0 {
+		nextNodeID = 1
+	}
+	if nextEdgeID == 0 {
+		nextEdgeID = 1
+	}
+	if err := ValidateIDHighWater(nextNodeID); err != nil {
+		return persistedState{}, err
+	}
+	if err := ValidateIDHighWater(nextEdgeID); err != nil {
+		return persistedState{}, err
+	}
 	if err := ensureDatabaseID(graph); err != nil {
 		return persistedState{}, err
 	}
@@ -2106,6 +2211,12 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 
 	for _, nodeID := range SortedNodeIDs(graph) {
 		node := graph.Nodes.Get(nodeID)
+		if node == nil || node.ID != nodeID {
+			return persistedState{}, fmt.Errorf("node key %d does not match record", nodeID)
+		}
+		if err := ValidateEntityID(node.ID); err != nil {
+			return persistedState{}, err
+		}
 		if err := ValidateCreateLabels(node.Labels); err != nil {
 			return persistedState{}, fmt.Errorf("encode node %d labels: %w", nodeID, err)
 		}
@@ -2121,6 +2232,18 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 	}
 	for _, edgeID := range SortedEdgeIDs(graph) {
 		edge := graph.Edges.Get(edgeID)
+		if edge == nil || edge.ID != edgeID {
+			return persistedState{}, fmt.Errorf("edge key %d does not match record", edgeID)
+		}
+		if err := ValidateEntityID(edge.ID); err != nil {
+			return persistedState{}, err
+		}
+		if err := ValidateEntityID(edge.SourceID); err != nil {
+			return persistedState{}, err
+		}
+		if err := ValidateEntityID(edge.TargetID); err != nil {
+			return persistedState{}, err
+		}
 		if err := ValidateEdgeType(edge.Type); err != nil {
 			return persistedState{}, fmt.Errorf("encode edge %d type: %w", edgeID, err)
 		}
@@ -2135,6 +2258,20 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 			Type:       edge.Type,
 			Properties: props,
 		})
+	}
+	for nodeID, record := range graph.FTS.All() {
+		if err := ValidateEntityID(nodeID); err != nil {
+			return persistedState{}, err
+		}
+		if record == nil {
+			return persistedState{}, fmt.Errorf("FTS record %d is nil", nodeID)
+		}
+		if graph.Nodes.Get(nodeID) == nil {
+			return persistedState{}, fmt.Errorf("FTS record %d references missing node", nodeID)
+		}
+		if err := ValidateFTSText(record.Text); err != nil {
+			return persistedState{}, fmt.Errorf("encode FTS record for node %d: %w", nodeID, err)
+		}
 	}
 	for _, nodeID := range SortedNodeIDs(graph) {
 		record := graph.FTS.Get(nodeID)
@@ -2180,6 +2317,25 @@ func persistedPropertyIndexes(indexes PropertyIndexes) []persistedPropertyIndexD
 }
 
 func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, changes GraphDelta) (persistedDelta, error) {
+	if nextNodeID == 0 {
+		nextNodeID = 1
+	}
+	if nextEdgeID == 0 {
+		nextEdgeID = 1
+	}
+	if err := ValidateIDHighWater(nextNodeID); err != nil {
+		return persistedDelta{}, err
+	}
+	if err := ValidateIDHighWater(nextEdgeID); err != nil {
+		return persistedDelta{}, err
+	}
+	for _, ids := range [][]uint64{changes.UpsertNodes, changes.DeleteNodes, changes.UpsertEdges, changes.DeleteEdges, changes.UpsertFTS, changes.DeleteFTS} {
+		for _, id := range ids {
+			if err := ValidateEntityID(id); err != nil {
+				return persistedDelta{}, err
+			}
+		}
+	}
 	if err := ensureDatabaseID(graph); err != nil {
 		return persistedDelta{}, err
 	}
@@ -2232,6 +2388,12 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		if node == nil {
 			return persistedDelta{}, fmt.Errorf("WAL delta node %d does not exist", nodeID)
 		}
+		if node.ID != nodeID {
+			return persistedDelta{}, fmt.Errorf("WAL delta node key %d does not match record ID %d", nodeID, node.ID)
+		}
+		if err := ValidateEntityID(node.ID); err != nil {
+			return persistedDelta{}, err
+		}
 		if err := ValidateCreateLabels(node.Labels); err != nil {
 			return persistedDelta{}, fmt.Errorf("encode node %d labels: %w", nodeID, err)
 		}
@@ -2246,6 +2408,18 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		if edge == nil {
 			return persistedDelta{}, fmt.Errorf("WAL delta edge %d does not exist", edgeID)
 		}
+		if edge.ID != edgeID {
+			return persistedDelta{}, fmt.Errorf("WAL delta edge key %d does not match record ID %d", edgeID, edge.ID)
+		}
+		if err := ValidateEntityID(edge.ID); err != nil {
+			return persistedDelta{}, err
+		}
+		if err := ValidateEntityID(edge.SourceID); err != nil {
+			return persistedDelta{}, err
+		}
+		if err := ValidateEntityID(edge.TargetID); err != nil {
+			return persistedDelta{}, err
+		}
 		if err := ValidateEdgeType(edge.Type); err != nil {
 			return persistedDelta{}, fmt.Errorf("encode edge %d type: %w", edgeID, err)
 		}
@@ -2259,6 +2433,9 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		record := graph.FTS.Get(nodeID)
 		if record == nil {
 			return persistedDelta{}, fmt.Errorf("WAL delta FTS node %d does not exist", nodeID)
+		}
+		if err := ValidateEntityID(nodeID); err != nil {
+			return persistedDelta{}, err
 		}
 		if err := ValidateFTSText(record.Text); err != nil {
 			return persistedDelta{}, fmt.Errorf("encode FTS record for node %d: %w", nodeID, err)
@@ -2493,6 +2670,19 @@ func decodePersistedState(snapshot persistedState) (*GraphState, uint64, uint64,
 }
 
 func decodePersistedStateContext(ctx context.Context, snapshot persistedState, maxDerivedWork, maxDerivedBytes uint64) (*GraphState, uint64, uint64, uint64, error) {
+	// Zero was omitted by early JSON snapshots; retain that compatibility.
+	if snapshot.NextNodeID == 0 {
+		snapshot.NextNodeID = 1
+	}
+	if snapshot.NextEdgeID == 0 {
+		snapshot.NextEdgeID = 1
+	}
+	if err := ValidateIDHighWater(snapshot.NextNodeID); err != nil {
+		return nil, 0, 0, 0, err
+	}
+	if err := ValidateIDHighWater(snapshot.NextEdgeID); err != nil {
+		return nil, 0, 0, 0, err
+	}
 	budget := derivedIndexBudget{ctx: ctx, maxWork: maxDerivedWork, maxBytes: maxDerivedBytes}
 	graph := NewGraphState()
 	if snapshot.DatabaseID == "" {
@@ -2523,8 +2713,8 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 				return nil, 0, 0, 0, err
 			}
 		}
-		if storedNode.ID == 0 {
-			return nil, 0, 0, 0, errors.New("stored node id must be non-zero")
+		if err := ValidateEntityID(storedNode.ID); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("stored node %d: %w", storedNode.ID, err)
 		}
 		if err := ValidateCreateLabels(storedNode.Labels); err != nil {
 			return nil, 0, 0, 0, fmt.Errorf("stored node %d labels: %w", storedNode.ID, err)
@@ -2556,8 +2746,14 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 				return nil, 0, 0, 0, err
 			}
 		}
-		if storedEdge.ID == 0 {
-			return nil, 0, 0, 0, errors.New("stored edge id must be non-zero")
+		if err := ValidateEntityID(storedEdge.ID); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("stored edge %d: %w", storedEdge.ID, err)
+		}
+		if err := ValidateEntityID(storedEdge.SourceID); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("stored edge source %d: %w", storedEdge.SourceID, err)
+		}
+		if err := ValidateEntityID(storedEdge.TargetID); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("stored edge target %d: %w", storedEdge.TargetID, err)
 		}
 		if err := ValidateEdgeType(storedEdge.Type); err != nil {
 			return nil, 0, 0, 0, fmt.Errorf("stored edge %d type: %w", storedEdge.ID, err)
@@ -2650,6 +2846,9 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 			if err := budget.check(); err != nil {
 				return nil, 0, 0, 0, err
 			}
+		}
+		if err := ValidateEntityID(storedFTS.NodeID); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("stored FTS node %d: %w", storedFTS.NodeID, err)
 		}
 		if graph.Nodes.Get(storedFTS.NodeID) == nil {
 			return nil, 0, 0, 0, fmt.Errorf("stored FTS record references missing node %d", storedFTS.NodeID)

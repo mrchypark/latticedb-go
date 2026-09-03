@@ -14,6 +14,9 @@
 
 Required semantics:
 
+- Node, edge, and endpoint IDs are uint64 values in `1..MaxInt64`; `MaxInt64+1`
+  is reserved only as the persisted allocation-exhaustion sentinel.
+
 - lists are ordered and heterogeneous
 - maps are string-keyed nested values
 - nested values may contain other nested values recursively

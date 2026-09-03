@@ -2135,6 +2135,9 @@ func (tx *Tx) DeleteNode(nodeID uint64) error {
 	if err := tx.ensureWritable(); err != nil {
 		return err
 	}
+	if err := validateEntityID(nodeID); err != nil {
+		return err
+	}
 	if node := tx.graph.Nodes.Get(nodeID); node != nil {
 		for _, label := range node.Labels {
 			tx.graph.Labels.Remove(label, nodeID)
@@ -2178,6 +2181,9 @@ func (tx *Tx) NodeExists(nodeID uint64) (bool, error) {
 	if tx.closed {
 		return false, ErrInactiveTx
 	}
+	if err := validateEntityID(nodeID); err != nil {
+		return false, err
+	}
 	return tx.graph.Nodes.Get(nodeID) != nil, nil
 }
 
@@ -2192,6 +2198,9 @@ func (tx *Tx) GetNode(nodeID uint64) (*Node, error) {
 func (tx *Tx) GetNodeValue(nodeID uint64) (Node, bool, error) {
 	if tx.closed {
 		return Node{}, false, ErrInactiveTx
+	}
+	if err := validateEntityID(nodeID); err != nil {
+		return Node{}, false, err
 	}
 	node := tx.graph.Nodes.Get(nodeID)
 	if node == nil {
@@ -2728,6 +2737,9 @@ func (tx *Tx) requireNode(nodeID uint64) (*store.NodeRecord, error) {
 	if tx.closed {
 		return nil, ErrInactiveTx
 	}
+	if err := validateEntityID(nodeID); err != nil {
+		return nil, err
+	}
 	node := tx.graph.Nodes.Get(nodeID)
 	if node == nil {
 		return nil, fmt.Errorf("node %d not found", nodeID)
@@ -2739,11 +2751,21 @@ func (tx *Tx) requireEdge(edgeID uint64) (*store.EdgeRecord, error) {
 	if tx.closed {
 		return nil, ErrInactiveTx
 	}
+	if err := validateEntityID(edgeID); err != nil {
+		return nil, err
+	}
 	edge := tx.graph.Edges.Get(edgeID)
 	if edge == nil {
 		return nil, fmt.Errorf("edge %d not found", edgeID)
 	}
 	return edge, nil
+}
+
+func validateEntityID(id uint64) error {
+	if err := store.ValidateEntityID(id); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	return nil
 }
 
 func (tx *Tx) writableNode(nodeID uint64) (*store.NodeRecord, error) {
@@ -2865,7 +2887,7 @@ func propertyIndexKeys(values map[store.PropertyIndexDefinition]struct{}) []stor
 func (db *DB) allocateNodeID() (uint64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.nextNodeID == ^uint64(0) {
+	if db.nextNodeID >= store.EntityIDExhausted {
 		return 0, errors.New("node id space exhausted")
 	}
 	if db.nextNodeID >= db.reservedNodeID {
@@ -2884,7 +2906,7 @@ func (db *DB) allocateNodeID() (uint64, error) {
 func (db *DB) allocateEdgeID() (uint64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.nextEdgeID == ^uint64(0) {
+	if db.nextEdgeID >= store.EntityIDExhausted {
 		return 0, errors.New("edge id space exhausted")
 	}
 	if db.nextEdgeID >= db.reservedEdgeID {
@@ -2901,8 +2923,8 @@ func (db *DB) allocateEdgeID() (uint64, error) {
 }
 
 func reserveIDBlock(next uint64) uint64 {
-	if next > ^uint64(0)-idReservationBlock {
-		return ^uint64(0)
+	if next >= store.MaxEntityID-idReservationBlock {
+		return store.EntityIDExhausted
 	}
 	return next + idReservationBlock
 }
