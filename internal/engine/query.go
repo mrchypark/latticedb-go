@@ -1380,6 +1380,9 @@ func (plan *queryPlan) boundedFilteredNodeIDs(tx *Tx, pattern nodePattern, defin
 	}
 	expected := make([]any, len(plan.whereClauses))
 	for i, clause := range plan.whereClauses {
+		if clause.Var != pattern.Var {
+			continue
+		}
 		if clause.Kind == whereEquals || clause.Kind == whereBindingID {
 			expected[i], err = clause.Expr.eval(queryRow{}, params)
 			if err != nil {
@@ -1438,6 +1441,9 @@ func (plan *queryPlan) nodeMatchesBoundedFilter(node *store.NodeRecord, pattern 
 	}
 	binding := boundValue{Node: node}
 	for i, clause := range plan.whereClauses {
+		if clause.Var != pattern.Var {
+			continue
+		}
 		value, exists := propertyFromBinding(binding, clause.Property)
 		switch clause.Kind {
 		case whereEquals:
