@@ -2160,20 +2160,8 @@ func compareOrderValues(left, right any) int {
 	if right == nil {
 		return -1
 	}
-	if leftInt, ok := normalizeInt64(left); ok {
-		if rightInt, ok := normalizeInt64(right); ok {
-			return cmp.Compare(leftInt, rightInt)
-		}
-	}
-	if leftFloat, ok := left.(float64); ok {
-		if rightFloat, ok := right.(float64); ok {
-			return cmp.Compare(leftFloat, rightFloat)
-		}
-	}
-	if leftString, ok := left.(string); ok {
-		if rightString, ok := right.(string); ok {
-			return strings.Compare(leftString, rightString)
-		}
+	if comparison, comparable := compareQueryValues(left, right); comparable {
+		return comparison
 	}
 	if leftBool, ok := left.(bool); ok {
 		if rightBool, ok := right.(bool); ok {

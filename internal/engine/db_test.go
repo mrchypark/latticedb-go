@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2853,6 +2854,66 @@ func TestMixedNumericComparisonPreservesIntegerPrecision(t *testing.T) {
 		if !ok || got != test.want {
 			t.Fatalf("compareQueryValues(%v, %v) = %d, %v; want %d, true", test.left, test.right, got, ok, test.want)
 		}
+	}
+}
+
+func TestMixedNumericOrderUsesPrecisionSafeComparison(t *testing.T) {
+	negativeZero := math.Copysign(0, -1)
+	tests := []struct {
+		name  string
+		left  any
+		right any
+		want  int
+		equal bool
+	}{
+		{name: "negative nonintegral", left: int64(-1), right: -1.5, want: 1},
+		{name: "negative reverse", left: -1.5, right: int64(-1), want: -1},
+		{name: "integral float", left: int64(2), right: 2.0, equal: true},
+		{name: "signed zero", left: int64(0), right: negativeZero, equal: true},
+		{name: "precision boundary", left: int64(9_007_199_254_740_993), right: float64(9_007_199_254_740_992), want: 1},
+	}
+	for _, test := range tests {
+		if got := compareOrderValues(test.left, test.right); got != test.want {
+			t.Errorf("compareOrderValues(%v, %v) = %d, want %d", test.left, test.right, got, test.want)
+		}
+		if test.equal && !queryValuesEqual(test.left, test.right) {
+			t.Errorf("queryValuesEqual(%v, %v) = false, want true", test.left, test.right)
+		}
+	}
+
+	db, err := Open(filepath.Join(t.TempDir(), "mixed-numeric-order.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	result, err := db.Query("UNWIND $values AS value RETURN value ORDER BY value", map[string]any{
+		"values": []any{
+			float64(1.5),
+			int64(-1),
+			float64(-1.5),
+			int64(0),
+			int64(9_007_199_254_740_993),
+			float64(9_007_199_254_740_992),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]any, len(result.Rows))
+	for index, row := range result.Rows {
+		got[index] = row["value"]
+	}
+	want := []any{
+		float64(-1.5),
+		int64(-1),
+		int64(0),
+		float64(1.5),
+		float64(9_007_199_254_740_992),
+		int64(9_007_199_254_740_993),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mixed numeric ORDER BY = %#v, want %#v", got, want)
 	}
 }
 
