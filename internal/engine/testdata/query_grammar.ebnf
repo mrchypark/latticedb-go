@@ -53,3 +53,18 @@ pagination     = non-negative-integer | parameter
 value          = null | true | false | integer | float | string | parameter | map
 map            = "{" [property ":" expression {"," property ":" expression}] "}"
 expression     = value | binding | property-access
+
+identifier     = unquoted-identifier | quoted-identifier
+unquoted-identifier
+               = ("A"..."Z" | "a"..."z" | "_")
+                 {"A"..."Z" | "a"..."z" | "0"..."9" | "_"}
+quoted-identifier
+               = "`" {quoted-character} "`"
+quoted-character
+               = UTF-8-non-NUL-character-except-backtick | "``"
+binding        = identifier
+label          = identifier
+type           = identifier
+property       = identifier
+alias          = identifier
+parameter      = "$" identifier

@@ -219,7 +219,7 @@ LatticeDB implements a deliberately small, case-sensitive Cypher subset. It does
 
 ### Supported Cypher Subset
 
-Structural keywords are uppercase. Bindings, property names, labels, relationship types, aliases, and parameters use unquoted ASCII identifiers matching `[A-Za-z_][A-Za-z0-9_]*`; keywords are not reserved when they occur in an identifier position. Integers are signed base-10 values, and floats use decimal or scientific notation. Strings may use single or double quotes with Go-style escapes.
+Structural keywords are uppercase. Bindings, property names, labels, relationship types, aliases, and parameters use either unquoted ASCII identifiers matching `[A-Za-z_][A-Za-z0-9_]*` or backtick-quoted identifiers. Quoted identifiers preserve valid UTF-8 exactly, including spaces and structural delimiters; a backtick is written as doubled backticks, and backslashes are literal. Empty, NUL-containing, invalid UTF-8, and unterminated identifiers are rejected. Keywords are not reserved when they occur in an identifier position. Integers are signed base-10 values, and floats use decimal or scientific notation. Strings may use single or double quotes with Go-style escapes.
 
 <!-- BEGIN supported-cypher-grammar -->
 ```text
@@ -278,10 +278,25 @@ pagination     = non-negative-integer | parameter
 value          = null | true | false | integer | float | string | parameter | map
 map            = "{" [property ":" expression {"," property ":" expression}] "}"
 expression     = value | binding | property-access
+
+identifier     = unquoted-identifier | quoted-identifier
+unquoted-identifier
+               = ("A"..."Z" | "a"..."z" | "_")
+                 {"A"..."Z" | "a"..."z" | "0"..."9" | "_"}
+quoted-identifier
+               = "`" {quoted-character} "`"
+quoted-character
+               = UTF-8-non-NUL-character-except-backtick | "``"
+binding        = identifier
+label          = identifier
+type           = identifier
+property       = identifier
+alias          = identifier
+parameter      = "$" identifier
 ```
 <!-- END supported-cypher-grammar -->
 
-Fixed-length `MATCH` paths may be incoming, outgoing, or undirected; relationship creation remains directed. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, list literals, and backtick identifiers remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
+Fixed-length `MATCH` paths may be incoming, outgoing, or undirected; relationship creation remains directed. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, and list literals remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
 
 An undirected relationship produces one row per matching orientation. A non-self edge can therefore produce two rows when both endpoints are unbound; a self-loop produces one.
 
