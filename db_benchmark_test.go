@@ -9,10 +9,11 @@ import (
 func benchmarkDB(b *testing.B) *DB {
 	b.Helper()
 	db, err := Open(filepath.Join(b.TempDir(), "bench.db"), OpenOptions{
-		Create:           true,
-		EnableVector:     true,
-		VectorDimensions: 16,
-		Durability:       DurabilityStandard,
+		Create:                      true,
+		WALCheckpointThresholdBytes: ^uint64(0),
+		EnableVector:                true,
+		VectorDimensions:            16,
+		Durability:                  DurabilityStandard,
 	})
 	if err != nil {
 		b.Fatal(err)

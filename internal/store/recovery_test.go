@@ -135,6 +135,70 @@ func TestCreateCheckpointGraphStateFilesPublishesOnce(t *testing.T) {
 	}
 }
 
+func TestPreparedCheckpointPublishFaultMatrix(t *testing.T) {
+	stages := []string{
+		"wal-snapshot-rename", "wal-snapshot-dir-sync",
+		"state-rename", "state-dir-sync",
+		"wal-marker-rename", "wal-marker-dir-sync",
+		"wal-base-remove", "wal-base-dir-sync",
+	}
+	for _, flat := range []bool{false, true} {
+		for _, stage := range stages {
+			for _, after := range []bool{false, true} {
+				name := fmt.Sprintf("flat=%v/%s/after=%v", flat, stage, after)
+				t.Run(name, func(t *testing.T) {
+					dir := t.TempDir()
+					var files DatabaseFiles
+					if flat {
+						files = FlatDatabaseFiles(filepath.Join(dir, "database.ltdb"))
+					} else {
+						files = DirectoryDatabaseFiles(filepath.Join(dir, "database.ltdb"))
+					}
+					first := NewGraphState()
+					first.DatabaseID = "00000000000000000000000000000001"
+					first.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"revision": int64(1)}})
+					second := CloneGraphState(first)
+					second.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"revision": int64(2)}})
+					if err := CheckpointGraphStateAndCompactWALFiles(files, first, 2, 1, 1, 1); err != nil {
+						t.Fatal(err)
+					}
+					prepared, err := PrepareCheckpointFiles(files, second, 2, 1, 2)
+					if err != nil {
+						t.Fatal(err)
+					}
+					injected := errors.New("injected prepared publish fault")
+					fault := func(gotStage string, gotAfter bool) error {
+						if gotStage == stage && gotAfter == after {
+							return injected
+						}
+						return nil
+					}
+					if err := prepared.PublishCheckpointFilesWithFault(files, fault); !errors.Is(err, injected) {
+						t.Fatalf("publish fault = %v, want %v", err, injected)
+					}
+					if err := prepared.Cleanup(); err != nil {
+						t.Fatal(err)
+					}
+					graph, _, _, commitID, err := LoadGraphStateFilesContext(context.Background(), files, maxStateFileBytes, ^uint64(0), ^uint64(0))
+					if err != nil {
+						t.Fatalf("reopen after %s after=%v: %v", stage, after, err)
+					}
+					expectedCommit := uint64(2)
+					if stage == "wal-snapshot-rename" && !after {
+						expectedCommit = 1
+					}
+					if commitID != expectedCommit {
+						t.Fatalf("recovered commit ID = %d, want %d", commitID, expectedCommit)
+					}
+					if got := graph.Nodes.Get(1).Properties["revision"]; got != int64(expectedCommit) {
+						t.Fatalf("recovered revision = %v, want %d", got, expectedCommit)
+					}
+				})
+			}
+		}
+	}
+}
+
 type cancelLoadAfterChecks struct {
 	checks atomic.Int32
 	limit  int32
