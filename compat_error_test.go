@@ -2,6 +2,7 @@ package latticedb
 
 import (
 	"errors"
+	"syscall"
 	"testing"
 
 	"github.com/mrchypark/latticedb-go/internal/engine"
@@ -82,6 +83,15 @@ func TestCriticalSentinelWrappingPreservesRetrySemantics(t *testing.T) {
 	err = wrapError(ErrRecoveryRequired)
 	if !errors.As(err, &latticeErr) || latticeErr.Code != ErrorIO || !errors.Is(err, ErrRecoveryRequired) {
 		t.Fatalf("recovery-required error = %v", err)
+	}
+}
+
+func TestCompatibilityClassifiesSyscallErrnoAsIO(t *testing.T) {
+	errNoSpace := syscall.Errno(28)
+	var latticeErr *Error
+	err := wrapError(errNoSpace)
+	if !errors.As(err, &latticeErr) || latticeErr.Code != ErrorIO || !errors.Is(err, errNoSpace) {
+		t.Fatalf("ENOSPC error = %v, want ErrorIO preserving errno", err)
 	}
 }
 

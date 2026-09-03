@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"syscall"
 
 	"github.com/mrchypark/latticedb-go/internal/engine"
 )
@@ -167,5 +168,6 @@ func isOSError(err error) bool {
 	var pathErr *os.PathError
 	var linkErr *os.LinkError
 	var syscallErr *os.SyscallError
-	return errors.As(err, &pathErr) || errors.As(err, &linkErr) || errors.As(err, &syscallErr)
+	var errno syscall.Errno
+	return errors.As(err, &pathErr) || errors.As(err, &linkErr) || errors.As(err, &syscallErr) || errors.As(err, &errno)
 }
