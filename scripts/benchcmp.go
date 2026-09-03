@@ -23,6 +23,33 @@ type zigResult struct {
 	memoryMB float64
 }
 
+type performanceGate struct {
+	benchmark string
+	unit      string
+	maxRise   float64
+}
+
+// Keep blocking gates to stable graph-core metrics. Most latency remains
+// informational because shared-runner noise makes it unsuitable as a blocker.
+var blockingGates = []performanceGate{
+	{benchmark: "BenchmarkReadRequests/query", unit: "B/op", maxRise: 0.01},
+	{benchmark: "BenchmarkReadRequests/query", unit: "allocs/op"},
+	{benchmark: "BenchmarkReadRequests/write_commit", unit: "B/op", maxRise: 0.01},
+	{benchmark: "BenchmarkReadRequests/write_commit", unit: "allocs/op"},
+	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "B/op", maxRise: 0.01},
+	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "allocs/op"},
+	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "B/op", maxRise: 0.01},
+	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "allocs/op"},
+	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "ns/op", maxRise: 0.20},
+	{benchmark: "BenchmarkAdjacencyReadScaling/chunked_10000", unit: "B/op", maxRise: 0.01},
+	{benchmark: "BenchmarkAdjacencyReadScaling/chunked_10000", unit: "allocs/op"},
+	{benchmark: "BenchmarkAdjacencyAppendScaling/chunked_10000", unit: "B/op", maxRise: 0.01},
+	{benchmark: "BenchmarkAdjacencyAppendScaling/chunked_10000", unit: "allocs/op"},
+	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "B/op", maxRise: 0.01},
+	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "allocs/op"},
+	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "ns/op", maxRise: 0.20},
+}
+
 var cpuSuffix = regexp.MustCompile(`-\d+$`)
 
 func parse(r io.Reader) (result, error) {
@@ -42,6 +69,9 @@ func parse(r io.Reader) (result, error) {
 		for i := 2; i+1 < len(fields); i += 2 {
 			value, err := strconv.ParseFloat(fields[i], 64)
 			if err == nil {
+				if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+					return nil, fmt.Errorf("benchmark %s %s: invalid metric %q", name, fields[i+1], fields[i])
+				}
 				results[name][fields[i+1]] = append(results[name][fields[i+1]], value)
 			}
 		}
@@ -100,7 +130,11 @@ func value(metrics map[string][]float64, unit string) (float64, bool) {
 	if !ok || len(values) == 0 {
 		return 0, false
 	}
-	return median(values), true
+	v := median(values)
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0, false
+	}
+	return v, true
 }
 
 func display(metrics map[string][]float64, unit string) string {
@@ -121,6 +155,33 @@ func delta(current, previous map[string][]float64, unit string) string {
 		return "—"
 	}
 	return change(c, p)
+}
+
+func checkGates(current, previous result, stderr io.Writer) error {
+	var failures []string
+	for _, gate := range blockingGates {
+		currentValue, currentOK := value(current[gate.benchmark], gate.unit)
+		if !currentOK {
+			failures = append(failures, fmt.Sprintf("%s %s missing from current result", gate.benchmark, gate.unit))
+			continue
+		}
+		previousValue, previousOK := value(previous[gate.benchmark], gate.unit)
+		if !previousOK {
+			fmt.Fprintf(stderr, "performance gate skipped: %s %s has no compatible baseline\n", gate.benchmark, gate.unit)
+			continue
+		}
+		if math.IsNaN(currentValue) || math.IsInf(currentValue, 0) || currentValue < 0 || math.IsNaN(previousValue) || math.IsInf(previousValue, 0) || previousValue < 0 {
+			failures = append(failures, fmt.Sprintf("%s %s has invalid metric values", gate.benchmark, gate.unit))
+			continue
+		}
+		if currentValue > previousValue*(1+gate.maxRise) {
+			failures = append(failures, fmt.Sprintf("%s %s regressed %.1f%% (limit +%.1f%%)", gate.benchmark, gate.unit, (currentValue/previousValue-1)*100, gate.maxRise*100))
+		}
+	}
+	if len(failures) == 0 {
+		return nil
+	}
+	return fmt.Errorf("performance gates failed:\n- %s", strings.Join(failures, "\n- "))
 }
 
 func otherMetrics(current, previous map[string][]float64) string {
@@ -189,7 +250,7 @@ func writeReport(w io.Writer, current, previous result, currentLabel, previousLa
 
 	fmt.Fprintln(w, "# Performance benchmark report")
 	fmt.Fprintf(w, "\nCurrent: `%s`  \nPrevious: `%s`\n", currentLabel, previousLabel)
-	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; this report does not fail CI on variance.")
+	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; enforced graph-core gates allow up to +1% B/op drift, require exact-zero allocs/op drift, and allow up to +20% ns/op drift for multi-hop and WAL recovery.")
 	if zig != nil {
 		writeZigComparison(w, current, zig, zigLabel)
 	}
@@ -219,8 +280,14 @@ func read(path string) (result, error) {
 
 func validateGoResult(benchmarks result) error {
 	required := map[string][]string{
-		"BenchmarkReadRequests/query":             {"ns/op"},
-		"BenchmarkVectorSearchClustered128D/100K": {"ns/op", "index-build-ms", "recall@10"},
+		"BenchmarkReadRequests/query":                         {"ns/op"},
+		"BenchmarkCheckpoint":                                 {"ns/op"},
+		"BenchmarkColdOpen":                                   {"ns/op"},
+		"BenchmarkReaderDuringCommit":                         {"ns/op"},
+		"BenchmarkFTSSearchScaling/records_100000/fuzzy_rare": {"ns/op"},
+		"BenchmarkVectorSearchScaling/records_100000":         {"ns/op"},
+		"BenchmarkVectorSearchANNFallback10K":                 {"ns/op"},
+		"BenchmarkVectorSearchClustered128D/100K":             {"ns/op", "index-build-ms", "recall@10"},
 	}
 	for name, units := range required {
 		metrics := benchmarks[name]
@@ -243,6 +310,7 @@ func main() {
 	zigLabel := flag.String("zig-label", "Zig reference", "Zig revision label")
 	validateGoPath := flag.String("validate-go", "", "validate Go benchmark output")
 	validateZigPath := flag.String("validate-zig", "", "validate Zig vector benchmark output")
+	checkPath := flag.Bool("check", false, "enforce stable performance gates")
 	flag.Parse()
 	if *validateGoPath != "" {
 		benchmarks, err := read(*validateGoPath)
@@ -265,6 +333,23 @@ func main() {
 		_, err := parseZig(file)
 		file.Close()
 		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *checkPath {
+		current, err := read(*currentPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		previous, err := read(*previousPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := checkGates(current, previous, os.Stderr); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

@@ -75,6 +75,34 @@ func BenchmarkVectorSearchMatched10K(b *testing.B) {
 	}
 }
 
+func BenchmarkVectorSearchANNFallback10K(b *testing.B) {
+	db := benchmarkSearchDB(10_000, true)
+	entry := db.graph.VectorIndex.EntryID
+	db.graph.VectorIndex = store.NewVectorIndex()
+	db.graph.VectorIndex.EntryID = entry
+	db.graph.VectorIndex.Nodes.Set(entry, &store.VectorIndexNode{Level: 0, Neighbors: [][]uint64{nil}})
+	query := make([]float32, 16)
+	before, err := db.VectorIndexStats()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := db.VectorSearch(query, VectorSearchOptions{K: 10}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	after, err := db.VectorIndexStats()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if got := after.ExactFallbacks - before.ExactFallbacks; got != uint64(b.N) {
+		b.Fatalf("exact fallback count delta = %d, want %d", got, b.N)
+	}
+}
+
 func benchmarkSearchDB(size int, indexed bool) *DB {
 	return benchmarkSearchDBWithDimensions(size, 16, indexed)
 }

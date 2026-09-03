@@ -189,6 +189,76 @@ func BenchmarkSingleRecordCommitScaling(b *testing.B) {
 	}
 }
 
+func BenchmarkCheckpoint(b *testing.B) {
+	db, target := benchmarkWriteScaleDB(b, 10_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := db.Update(func(tx *Tx) error {
+			return tx.SetProperty(target, "checkpoint_revision", int64(i))
+		}); err != nil {
+			b.Fatal(err)
+		}
+		if err := db.Checkpoint(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkColdOpen(b *testing.B) {
+	db, _ := benchmarkWriteScaleDB(b, 10_000)
+	path := db.Path()
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var err error
+		db, err = Open(path, OpenOptions{})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReaderDuringCommit(b *testing.B) {
+	db, target := benchmarkWriteScaleDB(b, 10_000)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		readerReady := make(chan struct{})
+		releaseReader := make(chan struct{})
+		readerDone := make(chan error, 1)
+		go func() {
+			readerDone <- db.View(func(tx *Tx) error {
+				if _, err := tx.GetNode(target); err != nil {
+					return err
+				}
+				close(readerReady)
+				<-releaseReader
+				return nil
+			})
+		}()
+		<-readerReady
+
+		commitErr := db.Update(func(tx *Tx) error {
+			return tx.SetProperty(target, "reader_overlap", int64(i))
+		})
+		close(releaseReader)
+
+		if err := <-readerDone; err != nil {
+			b.Fatal(err)
+		}
+		if commitErr != nil {
+			b.Fatal(commitErr)
+		}
+	}
+}
+
 func BenchmarkMatchedScale10K(b *testing.B) {
 	db, err := Open(filepath.Join(b.TempDir(), "matched.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 16, VectorIndexMode: VectorIndexHNSWSynchronous})
 	if err != nil {
