@@ -1115,7 +1115,7 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 }
 
 func (plan *queryPlan) indexedNodeLookupLimit(pattern nodePattern, limit, skip int) uint {
-	if plan.limitExpr == nil || limit == 0 || skip != 0 || plan.wherePredicate != nil || plan.returnClause == nil || plan.returnClause.CountAlias != "" || plan.returnClause.Distinct || len(plan.matchPatterns) != 1 || plan.mutates() {
+	if plan.limitExpr == nil || limit == 0 || skip != 0 || len(plan.orderClauses) != 0 || len(pattern.Labels) != 1 || len(pattern.Properties) != 0 || len(pattern.PropertyExprs) != 0 || plan.wherePredicate != nil || plan.returnClause == nil || plan.returnClause.CountAlias != "" || plan.returnClause.Distinct || len(plan.matchPatterns) != 1 || plan.mutates() {
 		return ^uint(0)
 	}
 	for _, clause := range plan.whereClauses {
