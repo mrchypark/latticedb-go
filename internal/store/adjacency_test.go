@@ -187,3 +187,103 @@ func TestEdgeListNilAndMissingRemoval(t *testing.T) {
 		t.Fatalf("missing removal changed adjacency: %v", got.IDs())
 	}
 }
+
+func TestCompactGraphAdjacencyBoundsWorkAndPreservesOrder(t *testing.T) {
+	var list *EdgeList
+	for id := uint64(1); id <= 10_000; id++ {
+		list = list.Append(id)
+	}
+	for id := uint64(1); id <= 250; id++ {
+		list = list.RemoveKnown(id)
+	}
+	for id := uint64(9_001); id <= 9_250; id++ {
+		list = list.RemoveKnown(id)
+	}
+	graph := NewGraphState()
+	graph.Outgoing.Set(1, list)
+
+	compactor := NewAdjacencyCompactor(graph, 0, 1)
+	done, changed := compactor.Step(64)
+	if done {
+		t.Fatalf("first pass done=%v changed=%v", done, changed)
+	}
+	for !done {
+		done, _ = compactor.Step(64)
+	}
+	compacted := compactor.Result().Outgoing.Get(1)
+	if compacted.Len() != 9_500 || compacted.HasRemovals() {
+		t.Fatalf("compaction len/tombstones = %d/%v", compacted.Len(), compacted.HasRemovals())
+	}
+	var want []uint64
+	for id := uint64(251); id <= 9_000; id++ {
+		want = append(want, id)
+	}
+	for id := uint64(9_251); id <= 10_000; id++ {
+		want = append(want, id)
+	}
+	if got := slices.Collect(compacted.All()); !slices.Equal(got, want) {
+		t.Fatalf("live IDs changed by compaction")
+	}
+	if !list.HasRemovals() || !slices.Equal(list.IDs(), slices.Collect(list.All())) {
+		t.Fatal("active source adjacency was modified")
+	}
+	appended := compacted.Append(10_001)
+	if got := appended.IDs(); len(got) != 9_501 || got[len(got)-1] != 10_001 {
+		t.Fatalf("append order after compaction changed: last=%d len=%d", got[len(got)-1], len(got))
+	}
+}
+
+func TestAdjacencyCompactionDeletesAllRemovedList(t *testing.T) {
+	var list *EdgeList
+	for id := uint64(1); id <= 512; id++ {
+		list = list.Append(id)
+	}
+	for id := uint64(1); id <= 512; id++ {
+		list = list.RemoveKnown(id)
+	}
+	graph := NewGraphState()
+	graph.Outgoing.Set(1, list)
+	compactor := NewAdjacencyCompactor(graph, 0, 1)
+	done, _ := compactor.Step(adjacencyChunkSize)
+	if !done || compactor.Result().Outgoing.Has(1) || compactor.Result().Outgoing.Get(1) != nil {
+		t.Fatal("all-removed adjacency was retained")
+	}
+}
+
+func TestAdjacencyCompactionDirectionsPreserveOrder(t *testing.T) {
+	for _, direction := range []uint8{0, 1} {
+		t.Run(map[uint8]string{0: "outgoing", 1: "incoming"}[direction], func(t *testing.T) {
+			var list *EdgeList
+			for id := uint64(1); id <= 512; id++ {
+				list = list.Append(id)
+			}
+			for id := uint64(1); id <= 100; id++ {
+				list = list.RemoveKnown(id)
+			}
+			graph := NewGraphState()
+			if direction == 0 {
+				graph.Outgoing.Set(1, list)
+			} else {
+				graph.Incoming.Set(1, list)
+			}
+			compactor := NewAdjacencyCompactor(graph, direction, 1)
+			done, _ := compactor.Step(adjacencyChunkSize)
+			if !done {
+				t.Fatal("compaction did not finish")
+			}
+			var compacted *EdgeList
+			if direction == 0 {
+				compacted = compactor.Result().Outgoing.Get(1)
+			} else {
+				compacted = compactor.Result().Incoming.Get(1)
+			}
+			want := make([]uint64, 0, 412)
+			for id := uint64(101); id <= 512; id++ {
+				want = append(want, id)
+			}
+			if got := slices.Collect(compacted.All()); !slices.Equal(got, want) {
+				t.Fatal("compaction changed edge order")
+			}
+		})
+	}
+}

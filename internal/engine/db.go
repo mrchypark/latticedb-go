@@ -245,6 +245,14 @@ type DB struct {
 	checkpointWorkerMu               sync.Mutex
 	checkpointQueued                 bool
 	checkpointNeeded                 atomic.Bool
+	adjacencyMaintenanceNeeded       atomic.Bool
+	adjacencyCompactor               *store.AdjacencyCompactor
+	adjacencyCompactorGraph          *store.GraphState
+	adjacencyCompactorCommit         uint64
+	adjacencyMaintenanceQueue        []adjacencyCandidate
+	adjacencyMaintenanceQueued       map[adjacencyCandidate]struct{}
+	adjacencyCompactorCandidate      adjacencyCandidate
+	adjacencyCompactorActive         bool
 	checkpointAttemptCond            sync.Cond
 	checkpointAttemptActive          bool
 	checkpointAttemptEpoch           uint64
@@ -280,6 +288,11 @@ type Tx struct {
 	changefeedApplied      bool
 	appMetadataWritable    bool
 	queryIndexesDisabled   bool
+}
+
+type adjacencyCandidate struct {
+	direction uint8
+	nodeID    uint64
 }
 
 type txChanges struct {
@@ -566,14 +579,14 @@ func (db *DB) requestBackgroundCheckpoint() {
 		return
 	}
 	db.mu.RLock()
-	if db.closed || db.readOnly || db.recoveryRequired || db.wal == nil || !db.dirty {
+	if db.closed || db.readOnly || db.recoveryRequired || db.wal == nil || (!db.dirty && !db.adjacencyMaintenanceNeeded.Load()) {
 		db.mu.RUnlock()
 		return
 	}
 	size, err := db.wal.TailSize()
 	threshold := db.walCheckpointThresholdBytes
 	db.mu.RUnlock()
-	if err != nil || size < 0 || uint64(size) < threshold {
+	if !db.adjacencyMaintenanceNeeded.Load() && (err != nil || size < 0 || uint64(size) < threshold) {
 		return
 	}
 	db.checkpointWorkerMu.Lock()
@@ -610,8 +623,10 @@ func (db *DB) checkpointWorker() {
 				return
 			default:
 			}
+			db.runBackgroundAdjacencyMaintenance()
+			checkpointRequested := db.checkpointNeeded.Load()
 			db.runBackgroundCheckpoint()
-			if db.checkpointComplete != nil {
+			if checkpointRequested && db.checkpointComplete != nil {
 				select {
 				case db.checkpointComplete <- struct{}{}:
 				default:
@@ -619,6 +634,160 @@ func (db *DB) checkpointWorker() {
 			}
 		}
 	}
+}
+
+func (db *DB) runBackgroundAdjacencyMaintenance() {
+	db.mu.RLock()
+	if db.closed || db.readOnly || db.recoveryRequired || !db.adjacencyMaintenanceNeeded.Load() {
+		db.mu.RUnlock()
+		return
+	}
+	graph, commitID := db.graph, db.commitID
+	db.mu.RUnlock()
+
+	if db.adjacencyCompactorGraph != graph || db.adjacencyCompactorCommit != commitID {
+		if db.adjacencyCompactorActive {
+			db.mu.Lock()
+			db.enqueueAdjacencyCandidateLocked(db.adjacencyCompactorCandidate)
+			db.mu.Unlock()
+		}
+		db.clearAdjacencyCompactor()
+	}
+	if db.adjacencyCompactor == nil {
+		candidate, ok := db.nextAdjacencyCandidate(graph)
+		if !ok {
+			db.clearAdjacencyCompactor()
+			db.mu.Lock()
+			if db.graph == graph && db.commitID == commitID {
+				db.adjacencyMaintenanceNeeded.Store(false)
+			}
+			db.mu.Unlock()
+			return
+		}
+		db.adjacencyCompactorGraph = graph
+		db.adjacencyCompactorCommit = commitID
+		db.adjacencyCompactor = store.NewAdjacencyCompactor(graph, candidate.direction, candidate.nodeID)
+		db.adjacencyCompactorCandidate = candidate
+		db.adjacencyCompactorActive = true
+		if db.adjacencyCompactor == nil {
+			db.clearAdjacencyCompactor()
+			db.mu.Lock()
+			more := len(db.adjacencyMaintenanceQueue) != 0
+			if !more && db.graph == graph && db.commitID == commitID {
+				db.adjacencyMaintenanceNeeded.Store(false)
+			}
+			db.mu.Unlock()
+			if more {
+				db.requestBackgroundCheckpoint()
+			}
+			return
+		}
+	}
+	done, changed := db.adjacencyCompactor.Step(store.AdjacencyCompactionChunkBudget)
+	if !done {
+		db.requestBackgroundCheckpoint()
+		return
+	}
+	if !changed {
+		db.clearAdjacencyCompactor()
+		db.mu.Lock()
+		if db.graph == graph && db.commitID == commitID {
+			db.adjacencyMaintenanceNeeded.Store(false)
+		}
+		db.mu.Unlock()
+		return
+	}
+	if db.publishBackgroundAdjacency(db.adjacencyCompactor.Result(), graph, commitID) {
+		db.clearAdjacencyCompactor()
+		if db.adjacencyMaintenanceNeeded.Load() {
+			db.requestBackgroundCheckpoint()
+		}
+	}
+}
+
+func (db *DB) clearAdjacencyCompactor() {
+	db.adjacencyCompactor = nil
+	db.adjacencyCompactorGraph = nil
+	db.adjacencyCompactorCommit = 0
+	db.adjacencyCompactorCandidate = adjacencyCandidate{}
+	db.adjacencyCompactorActive = false
+}
+
+func (db *DB) nextAdjacencyCandidate(graph *store.GraphState) (adjacencyCandidate, bool) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for len(db.adjacencyMaintenanceQueue) != 0 {
+		candidate := db.adjacencyMaintenanceQueue[0]
+		db.adjacencyMaintenanceQueue = db.adjacencyMaintenanceQueue[1:]
+		delete(db.adjacencyMaintenanceQueued, candidate)
+		if len(db.adjacencyMaintenanceQueue) == 0 {
+			db.adjacencyMaintenanceQueue = nil
+			db.adjacencyMaintenanceQueued = nil
+		}
+		if graph != db.graph {
+			db.enqueueAdjacencyCandidateLocked(candidate)
+			return adjacencyCandidate{}, false
+		}
+		return candidate, true
+	}
+	return adjacencyCandidate{}, false
+}
+
+func (db *DB) enqueueAdjacencyCandidatesLocked(graph, base *store.GraphState, delta store.GraphDelta) bool {
+	if db.adjacencyMaintenanceQueued == nil {
+		db.adjacencyMaintenanceQueued = make(map[adjacencyCandidate]struct{})
+	}
+	added := false
+	add := func(direction uint8, nodeID uint64) {
+		if nodeID == 0 {
+			return
+		}
+		if !store.AdjacencyNeedsCompaction(graph, direction, nodeID) {
+			return
+		}
+		db.enqueueAdjacencyCandidateLocked(adjacencyCandidate{direction: direction, nodeID: nodeID})
+		added = true
+	}
+	for _, edgeID := range delta.DeleteEdges {
+		if base == nil {
+			continue
+		}
+		edge := base.Edges.Get(edgeID)
+		if edge != nil {
+			add(0, edge.SourceID)
+			add(1, edge.TargetID)
+		}
+	}
+	return added
+}
+
+func (db *DB) enqueueAdjacencyCandidateLocked(candidate adjacencyCandidate) {
+	if candidate.nodeID == 0 {
+		return
+	}
+	if db.adjacencyMaintenanceQueued == nil {
+		db.adjacencyMaintenanceQueued = make(map[adjacencyCandidate]struct{})
+	}
+	if _, ok := db.adjacencyMaintenanceQueued[candidate]; ok {
+		return
+	}
+	db.adjacencyMaintenanceQueued[candidate] = struct{}{}
+	db.adjacencyMaintenanceQueue = append(db.adjacencyMaintenanceQueue, candidate)
+}
+
+func (db *DB) publishBackgroundAdjacency(compacted, graph *store.GraphState, commitID uint64) bool {
+	if !db.writeMu.TryLock() {
+		return false
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	defer db.writeMu.Unlock()
+	if db.closed || db.readOnly || db.recoveryRequired || db.graph != graph || db.commitID != commitID {
+		return false
+	}
+	db.graph = compacted
+	db.adjacencyMaintenanceNeeded.Store(len(db.adjacencyMaintenanceQueue) != 0)
+	return true
 }
 
 func (db *DB) announceCheckpointAttempt() {
@@ -781,6 +950,7 @@ func (db *DB) Close() error {
 	db.mu.Unlock()
 
 	db.stopCheckpointWorker()
+	db.clearAdjacencyCompactor()
 	db.mu.Lock()
 
 	var closeErr error
@@ -831,7 +1001,10 @@ func (db *DB) Serialize() ([]byte, error) {
 	if !db.writeMu.TryLock() {
 		return nil, ErrWriteTxActive
 	}
-	defer db.writeMu.Unlock()
+	defer func() {
+		db.writeMu.Unlock()
+		db.requestBackgroundCheckpoint()
+	}()
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
@@ -918,7 +1091,10 @@ func (db *DB) Checkpoint() error {
 	if !db.writeMu.TryLock() {
 		return ErrWriteTxActive
 	}
-	defer db.writeMu.Unlock()
+	defer func() {
+		db.writeMu.Unlock()
+		db.requestBackgroundCheckpoint()
+	}()
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
@@ -2038,7 +2214,10 @@ func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
-	defer db.writeMu.Unlock()
+	defer func() {
+		db.writeMu.Unlock()
+		db.requestBackgroundCheckpoint()
+	}()
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
@@ -2230,6 +2409,11 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	tx.db.graph = tx.graph
 	tx.db.commitID = nextCommitID
 	tx.db.dirty = true
+	if len(delta.DeleteEdges) != 0 {
+		if tx.db.enqueueAdjacencyCandidatesLocked(tx.graph, tx.base, delta) {
+			tx.db.adjacencyMaintenanceNeeded.Store(true)
+		}
+	}
 	if size, sizeErr := wal.TailSize(); sizeErr == nil && size >= 0 && uint64(size) >= tx.db.walCheckpointThresholdBytes {
 		tx.db.checkpointNeeded.Store(true)
 	}
@@ -2379,7 +2563,7 @@ func (tx *Tx) finish() *DB {
 	}
 	tx.closed = true
 	tx.db.activeTx.Add(-1)
-	requestCheckpoint := tx.writeLocked && tx.db.checkpointNeeded.Load()
+	requestCheckpoint := tx.writeLocked && (tx.db.checkpointNeeded.Load() || tx.db.adjacencyMaintenanceNeeded.Load())
 	if tx.writeLocked {
 		tx.writeLocked = false
 		tx.db.writeMu.Unlock()
