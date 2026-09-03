@@ -938,7 +938,11 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		}
 	}
 	match := queryIterator(&sliceQueryIterator{rows: rows})
-	for _, pattern := range plan.matchPatterns {
+	patterns, err := plan.orderedMatchPatterns(tx, params)
+	if err != nil {
+		return QueryResult{}, err
+	}
+	for _, pattern := range patterns {
 		lookupLimit := uint(0)
 		if node, ok := pattern.(nodePattern); ok {
 			lookupLimit = plan.indexedNodeLookupLimit(node, limit, skip)
@@ -1053,6 +1057,209 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		result.Rows = result.Rows[:limit]
 	}
 	return result, nil
+}
+
+// orderedMatchPatterns keeps each connected path in source order and only
+// changes the order of independent read-only components with explicit sorting.
+func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any) ([]matchPattern, error) {
+	if plan.mutates() || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) < 2 {
+		return plan.matchPatterns, nil
+	}
+	if plan.hasMissingPatternParam(tx, params) {
+		return plan.matchPatterns, nil
+	}
+	type component struct {
+		patterns []matchPattern
+		estimate int
+		first    int
+	}
+	components := make([]component, 0, len(plan.matchPatterns))
+	for index, pattern := range plan.matchPatterns {
+		components = append(components, component{patterns: []matchPattern{pattern}, first: index})
+	}
+	for i := 0; i < len(components); i++ {
+		for j := i + 1; j < len(components); {
+			overlap := false
+			for _, left := range components[i].patterns {
+				for _, right := range components[j].patterns {
+					overlap = overlap || bindingsOverlap(patternBindings(left), patternBindings(right))
+				}
+			}
+			if !overlap {
+				j++
+				continue
+			}
+			components[i].patterns = append(components[i].patterns, components[j].patterns...)
+			components = append(components[:j], components[j+1:]...)
+		}
+	}
+	if len(components) < 2 {
+		return plan.matchPatterns, nil
+	}
+	for i := range components {
+		components[i].estimate = tx.graph.Nodes.Len() + tx.graph.Edges.Len()
+		for _, pattern := range components[i].patterns {
+			estimate, err := plan.patternCardinality(tx, pattern, params)
+			if err != nil {
+				return nil, err
+			}
+			if estimate < components[i].estimate {
+				components[i].estimate = estimate
+			}
+		}
+	}
+	slices.SortStableFunc(components, func(left, right component) int {
+		return cmp.Or(cmp.Compare(left.estimate, right.estimate), cmp.Compare(left.first, right.first))
+	})
+	ordered := make([]matchPattern, 0, len(plan.matchPatterns))
+	for _, component := range components {
+		ordered = append(ordered, component.patterns...)
+	}
+	return ordered, nil
+}
+
+func (plan *queryPlan) hasMissingPatternParam(tx *Tx, params map[string]any) bool {
+	for _, clause := range plan.whereClauses {
+		param, ok := clause.Expr.(paramExpr)
+		if !ok {
+			continue
+		}
+		if _, exists := params[param.Name]; exists {
+			continue
+		}
+		if clause.Kind == whereBindingID {
+			for _, item := range plan.matchPatterns {
+				if pattern, ok := item.(nodePattern); ok && pattern.Var == clause.Var {
+					return true
+				}
+			}
+			continue
+		}
+		if clause.Kind != whereEquals {
+			continue
+		}
+		for _, item := range plan.matchPatterns {
+			switch pattern := item.(type) {
+			case nodePattern:
+				if pattern.Var == clause.Var {
+					for _, label := range pattern.Labels {
+						if tx.graph.NodeProperties.Has(store.PropertyIndexDefinition{Scope: label, Property: clause.Property}) {
+							return true
+						}
+					}
+				}
+			case edgePattern:
+				if pattern.EdgeVar == clause.Var && tx.graph.EdgeProperties.Has(store.PropertyIndexDefinition{Scope: pattern.EdgeType, Property: clause.Property}) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func patternBindings(pattern matchPattern) []string {
+	switch pattern := pattern.(type) {
+	case nodePattern:
+		if pattern.Var == "" {
+			return nil
+		}
+		return []string{pattern.Var}
+	case edgePattern:
+		bindings := make([]string, 0, 3)
+		for _, name := range []string{pattern.Left.Var, pattern.EdgeVar, pattern.Right.Var} {
+			if name != "" {
+				bindings = append(bindings, name)
+			}
+		}
+		return bindings
+	default:
+		return nil
+	}
+}
+
+func bindingsOverlap(left, right []string) bool {
+	for _, l := range left {
+		if slices.Contains(right, l) {
+			return true
+		}
+	}
+	return false
+}
+
+func (plan *queryPlan) patternCardinality(tx *Tx, pattern matchPattern, params map[string]any) (int, error) {
+	cardinality := tx.graph.Nodes.Len() + tx.graph.Edges.Len()
+	consider := func(value int) {
+		if value < cardinality {
+			cardinality = value
+		}
+	}
+	propertyCardinality := func(indexes store.PropertyIndexes, definition store.PropertyIndexDefinition, expr valueExpr) error {
+		if !indexes.Has(definition) {
+			return nil
+		}
+		switch expr.(type) {
+		case literalExpr, paramExpr:
+		default:
+			return nil
+		}
+		if param, ok := expr.(paramExpr); ok {
+			if _, exists := params[param.Name]; !exists {
+				return nil
+			}
+		}
+		value, err := expr.eval(queryRow{}, params)
+		if err != nil {
+			return err
+		}
+		count, found, err := indexes.Cardinality(definition, value)
+		if err != nil {
+			return err
+		}
+		if found {
+			if alternate, ok := alternateNumericIndexValue(value); ok {
+				more, found, err := indexes.Cardinality(definition, alternate)
+				if err != nil {
+					return err
+				}
+				if found {
+					count += more
+				}
+			}
+			consider(count)
+		}
+		return nil
+	}
+	whereCardinality := func(indexes store.PropertyIndexes, scope, variable string) error {
+		for _, clause := range plan.whereClauses {
+			if clause.Kind != whereEquals || clause.Var != variable {
+				continue
+			}
+			if err := propertyCardinality(indexes, store.PropertyIndexDefinition{Scope: scope, Property: clause.Property}, clause.Expr); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	switch pattern := pattern.(type) {
+	case nodePattern:
+		for _, label := range pattern.Labels {
+			consider(tx.graph.Labels.Len(label))
+		}
+		for _, label := range pattern.Labels {
+			if err := whereCardinality(tx.graph.NodeProperties, label, pattern.Var); err != nil {
+				return 0, err
+			}
+		}
+	case edgePattern:
+		if pattern.EdgeType != "" {
+			consider(tx.graph.EdgeTypes.Len(pattern.EdgeType))
+		}
+		if err := whereCardinality(tx.graph.EdgeProperties, pattern.EdgeType, pattern.EdgeVar); err != nil {
+			return 0, err
+		}
+	}
+	return cardinality, nil
 }
 
 func normalizeQueryParams(params map[string]any) (map[string]any, error) {
