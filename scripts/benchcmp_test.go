@@ -211,6 +211,22 @@ func TestCheckGatesAllowsTwentyPercentLatencyButRejectsMore(t *testing.T) {
 	}
 }
 
+func TestCheckGatesReportsButDoesNotBlockWALLatency(t *testing.T) {
+	previous := gateFixture(nil)
+	current := gateFixture(map[string]float64{
+		"BenchmarkLoadLatestWALV2/delta_history/256 allocs/op": 101,
+	})
+	current["BenchmarkLoadLatestWALV2/delta_history/256"]["ns/op"] = []float64{200}
+
+	err := checkGates(current, previous, new(bytes.Buffer))
+	if err == nil || !strings.Contains(err.Error(), "BenchmarkLoadLatestWALV2/delta_history/256 allocs/op") {
+		t.Fatalf("WAL allocation regression was not gated: %v", err)
+	}
+	if strings.Contains(err.Error(), "ns/op") {
+		t.Fatalf("WAL latency regression was incorrectly gated: %v", err)
+	}
+}
+
 func TestCheckGatesSkipsNewRowsUntilBaselineExists(t *testing.T) {
 	var diagnostics bytes.Buffer
 	if err := checkGates(gateFixture(nil), result{}, &diagnostics); err != nil {

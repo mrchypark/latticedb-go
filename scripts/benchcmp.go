@@ -30,7 +30,8 @@ type performanceGate struct {
 }
 
 // Keep blocking gates to stable graph-core metrics. Most latency remains
-// informational because shared-runner noise makes it unsuitable as a blocker.
+// informational because shared-runner noise makes it unsuitable as a blocker;
+// WAL loading is especially sensitive to filesystem/cache variance.
 var blockingGates = []performanceGate{
 	{benchmark: "BenchmarkReadRequests/query", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkReadRequests/query", unit: "allocs/op"},
@@ -48,7 +49,6 @@ var blockingGates = []performanceGate{
 	{benchmark: "BenchmarkAdjacencyAppendScaling/chunked_10000", unit: "allocs/op"},
 	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "allocs/op"},
-	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "ns/op", maxRise: 0.20},
 }
 
 var cpuSuffix = regexp.MustCompile(`-\d+$`)
@@ -251,7 +251,7 @@ func writeReport(w io.Writer, current, previous result, currentLabel, previousLa
 
 	fmt.Fprintln(w, "# Performance benchmark report")
 	fmt.Fprintf(w, "\nCurrent: `%s`  \nPrevious: `%s`\n", currentLabel, previousLabel)
-	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; enforced graph-core gates allow up to +1% B/op drift, +2% allocs/op drift for write benchmarks, and allow up to +20% ns/op drift for multi-hop and WAL recovery.")
+	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; enforced graph-core gates allow up to +1% B/op drift, +2% allocs/op drift for write benchmarks, and allow up to +20% ns/op drift for multi-hop latency. WAL recovery latency is informational; its allocation and byte metrics remain gated.")
 	if zig != nil {
 		writeZigComparison(w, current, zig, zigLabel)
 	}

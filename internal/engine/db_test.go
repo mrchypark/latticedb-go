@@ -2302,6 +2302,111 @@ func TestReadTransactionKeepsWholeGraphSnapshot(t *testing.T) {
 	}
 }
 
+func TestChunkedAdjacencySnapshotAndRecoveryAfterMassDelete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chunked-adjacency.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const totalEdges = 512
+	const deletedEdges = 384
+	var hub Node
+	allEdgeIDs := make([]uint64, 0, totalEdges)
+	edgeIDs := func(edges []Edge) []uint64 {
+		ids := make([]uint64, len(edges))
+		for i, edge := range edges {
+			ids[i] = edge.ID
+		}
+		return ids
+	}
+	if err := db.Update(func(tx *Tx) error {
+		var err error
+		hub, err = tx.CreateNode(CreateNodeOptions{})
+		if err != nil {
+			return err
+		}
+		for i := 0; i < totalEdges; i++ {
+			target, err := tx.CreateNode(CreateNodeOptions{})
+			if err != nil {
+				return err
+			}
+			edge, err := tx.CreateEdge(hub.ID, target.ID, "LINK", CreateEdgeOptions{})
+			if err != nil {
+				return err
+			}
+			allEdgeIDs = append(allEdgeIDs, edge.ID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	read, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldEdges, err := read.GetOutgoingEdges(hub.ID)
+	if err != nil {
+		read.Rollback()
+		t.Fatal(err)
+	}
+	if got := edgeIDs(oldEdges); !slices.Equal(got, allEdgeIDs) {
+		read.Rollback()
+		t.Fatalf("initial snapshot adjacency = %v, want %v", got, allEdgeIDs)
+	}
+
+	if err := db.Update(func(tx *Tx) error {
+		for _, edgeID := range allEdgeIDs[:deletedEdges] {
+			tx.deleteEdge(edgeID)
+		}
+		return nil
+	}); err != nil {
+		read.Rollback()
+		t.Fatal(err)
+	}
+	oldEdges, err = read.GetOutgoingEdges(hub.ID)
+	if err != nil {
+		read.Rollback()
+		t.Fatal(err)
+	}
+	if got := edgeIDs(oldEdges); !slices.Equal(got, allEdgeIDs) {
+		read.Rollback()
+		t.Fatalf("old snapshot adjacency = %v, want %v", got, allEdgeIDs)
+	}
+
+	wantLive := allEdgeIDs[deletedEdges:]
+	check := func(tx *Tx) error {
+		edges, err := tx.GetOutgoingEdges(hub.ID)
+		if err != nil {
+			return err
+		}
+		if got := edgeIDs(edges); !slices.Equal(got, wantLive) {
+			t.Fatalf("current adjacency = %v, want %v", got, wantLive)
+		}
+		return nil
+	}
+	if err := db.View(check); err != nil {
+		read.Rollback()
+		t.Fatal(err)
+	}
+	if err := read.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.View(check); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestReadTransactionKeepsPropertyIndexSnapshotAcrossPostingPromotion(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "property-index-snapshot.ltdb"), OpenOptions{Create: true})
 	if err != nil {
