@@ -57,6 +57,28 @@ func TestPropertyIndexesTypedValuesAndForkIsolation(t *testing.T) {
 	}
 }
 
+func TestPropertyIndexesCardinality(t *testing.T) {
+	indexes := NewPropertyIndexes()
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+	if !indexes.Create(definition) {
+		t.Fatal("Create returned false")
+	}
+	for id, value := range []any{"rare", "common", "common"} {
+		if err := indexes.Add(definition, value, uint64(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, found, err := indexes.Cardinality(definition, "common"); err != nil || !found || got != 2 {
+		t.Fatalf("common cardinality = %d, %t, %v", got, found, err)
+	}
+	if got, found, err := indexes.Cardinality(definition, "missing"); err != nil || !found || got != 0 {
+		t.Fatalf("missing cardinality = %d, %t, %v", got, found, err)
+	}
+	if got, found, err := indexes.Cardinality(PropertyIndexDefinition{Scope: "missing"}, "common"); err != nil || found || got != 0 {
+		t.Fatalf("missing definition cardinality = %d, %t, %v", got, found, err)
+	}
+}
+
 func TestPropertyIndexReclaimsHistoricalValues(t *testing.T) {
 	indexes := NewPropertyIndexes()
 	definition := PropertyIndexDefinition{Scope: "Item", Property: "version"}

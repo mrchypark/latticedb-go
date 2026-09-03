@@ -177,6 +177,19 @@ func (indexes PropertyIndexes) Visit(definition PropertyIndexDefinition, value a
 	return true, nil
 }
 
+// Cardinality returns the number of IDs in a value posting without allocating.
+func (indexes PropertyIndexes) Cardinality(definition PropertyIndexDefinition, value any) (int, bool, error) {
+	data, ok := indexes.definitions[definition]
+	if !ok {
+		return 0, false, nil
+	}
+	key, err := makePropertyValueKey(value)
+	if err != nil {
+		return 0, true, err
+	}
+	return data.values.Get(hashPropertyValueKey(key))[key].len(), true, nil
+}
+
 func (indexes PropertyIndexes) LookupLimit(definition PropertyIndexDefinition, value any, limit uint) ([]uint64, bool, error) {
 	if limit == ^uint(0) {
 		return indexes.Lookup(definition, value)
