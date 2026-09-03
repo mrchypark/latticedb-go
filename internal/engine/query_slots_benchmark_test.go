@@ -6,7 +6,7 @@ import (
 )
 
 func BenchmarkQueryMultiHopSlots(b *testing.B) {
-	db, err := Open(filepath.Join(b.TempDir(), "query-slots-bench.ltdb"), OpenOptions{Create: true})
+	db, err := Open(filepath.Join(b.TempDir(), "query-slots-bench.ltdb"), OpenOptions{Create: true, WALCheckpointThresholdBytes: ^uint64(0)})
 	if err != nil {
 		b.Fatal(err)
 	}
