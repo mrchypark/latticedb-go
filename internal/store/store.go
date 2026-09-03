@@ -1153,6 +1153,17 @@ func encodePropertyMap(in map[string]any) (map[string]persistedValue, error) {
 	if len(in) == 0 {
 		return map[string]persistedValue{}, nil
 	}
+	normalized, err := NormalizeProperties(in)
+	if err != nil {
+		return nil, err
+	}
+	return encodeNormalizedPropertyMap(normalized)
+}
+
+func encodeNormalizedPropertyMap(in map[string]any) (map[string]persistedValue, error) {
+	if len(in) == 0 {
+		return map[string]persistedValue{}, nil
+	}
 	out := make(map[string]persistedValue, len(in))
 	for key, value := range in {
 		encoded, err := encodeValue(value)
@@ -1165,6 +1176,17 @@ func encodePropertyMap(in map[string]any) (map[string]persistedValue, error) {
 }
 
 func decodePropertyMap(in map[string]persistedValue) (map[string]any, error) {
+	if len(in) == 0 {
+		return map[string]any{}, nil
+	}
+	out, err := decodePropertyMapRaw(in)
+	if err != nil {
+		return nil, err
+	}
+	return NormalizeProperties(out)
+}
+
+func decodePropertyMapRaw(in map[string]persistedValue) (map[string]any, error) {
 	if len(in) == 0 {
 		return map[string]any{}, nil
 	}
@@ -1206,7 +1228,7 @@ func encodeValue(value any) (persistedValue, error) {
 		}
 		return persistedValue{Kind: "list", List: list}, nil
 	case map[string]any:
-		mapped, err := encodePropertyMap(v)
+		mapped, err := encodeNormalizedPropertyMap(v)
 		if err != nil {
 			return persistedValue{}, err
 		}
@@ -1250,7 +1272,7 @@ func decodeValue(value persistedValue) (any, error) {
 		}
 		return list, nil
 	case "map":
-		return decodePropertyMap(value.Map)
+		return decodePropertyMapRaw(value.Map)
 	default:
 		return nil, fmt.Errorf("unknown stored value kind %q", value.Kind)
 	}

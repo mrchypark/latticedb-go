@@ -2,12 +2,88 @@ package latticedb
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"hash/crc32"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+func mutateSerializedState(t *testing.T, data []byte, mutate func(map[string]any)) []byte {
+	t.Helper()
+	state := map[string]any{}
+	if err := json.Unmarshal(data[64:], &state); err != nil {
+		t.Fatal(err)
+	}
+	mutate(state)
+	payload, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := append([]byte(nil), data[:64]...)
+	binary.BigEndian.PutUint64(mutated[20:28], uint64(len(payload)))
+	binary.BigEndian.PutUint32(mutated[28:32], crc32.ChecksumIEEE(payload))
+	return append(mutated, payload...)
+}
+
+func TestDeserializeRejectsInvalidPersistedSemantics(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "source"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		first, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Person"}})
+		if err != nil {
+			return err
+		}
+		second, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Person"}})
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateEdge(first.ID, second.ID, "KNOWS", CreateEdgeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := db.Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"empty label": func(state map[string]any) {
+			node := state["nodes"].([]any)[0].(map[string]any)
+			node["labels"] = []any{""}
+		},
+		"duplicate label": func(state map[string]any) {
+			node := state["nodes"].([]any)[0].(map[string]any)
+			node["labels"] = []any{"tag", "tag"}
+		},
+		"empty edge type": func(state map[string]any) {
+			edge := state["edges"].([]any)[0].(map[string]any)
+			edge["type"] = ""
+		},
+		"deep property": func(state map[string]any) {
+			node := state["nodes"].([]any)[0].(map[string]any)
+			value := map[string]any{"kind": "string", "string": "ok"}
+			for range 65 {
+				value = map[string]any{"kind": "map", "map": map[string]any{"next": value}}
+			}
+			node["properties"].(map[string]any)["deep"] = value
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Deserialize(mutateSerializedState(t, data, mutate), OpenOptions{}); err == nil {
+				t.Fatal("invalid persisted state was accepted")
+			}
+		})
+	}
+}
 
 func TestSerializeDeserializePublicAPI(t *testing.T) {
 	if Version() == "" {
