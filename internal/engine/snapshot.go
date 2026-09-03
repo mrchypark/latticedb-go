@@ -29,7 +29,10 @@ func (db *DB) BeginSnapshot() (*Snapshot, error) {
 	if !db.writeMu.TryLock() {
 		return nil, ErrWriteTxActive
 	}
-	defer db.writeMu.Unlock()
+	defer func() {
+		db.writeMu.Unlock()
+		db.requestBackgroundCheckpoint()
+	}()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
