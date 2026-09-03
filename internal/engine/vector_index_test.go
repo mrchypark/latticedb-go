@@ -834,6 +834,64 @@ func TestVectorSearchRejectsNonFiniteQueryWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestZeroVectorDimensionsRejectActiveVectors(t *testing.T) {
+	scalar := &store.NodeRecord{ID: 1, Properties: map[string]any{"name": "ok"}}
+	if err := validateNodeVectors(0, scalar); err != nil {
+		t.Fatalf("scalar node rejected: %v", err)
+	}
+	vector := &store.NodeRecord{ID: 2, Properties: map[string]any{"embedding": []float32{1, 2}}}
+	if err := validateNodeVectors(0, vector); err == nil {
+		t.Fatal("zero-dimension validator accepted vector node")
+	}
+
+	graph := store.NewGraphState()
+	graph.VectorDimensions = 2
+	graph.Nodes.Set(vector.ID, vector)
+	insertVectorIndex(graph, vector.ID)
+	graph.VectorDimensions = 0
+	fingerprint := vectorIndexFingerprint(graph)
+	if err := rebuildVectorIndexContext(context.Background(), graph); err == nil {
+		t.Fatal("zero-dimension rebuild accepted vector node")
+	}
+	if got := vectorIndexFingerprint(graph); got != fingerprint {
+		t.Fatal("failed rebuild mutated vector index")
+	}
+
+	db := &DB{graph: graph, enableVector: true, vectorDimensions: 0, queryCache: map[string]*queryPlan{}}
+	if _, err := db.VectorSearch([]float32{1, 2}, VectorSearchOptions{Exact: true}); err == nil {
+		t.Fatal("zero-dimension exact search succeeded")
+	}
+	if _, err := db.Query("MATCH (n) WHERE n.embedding <=> $vector RETURN n", map[string]any{"vector": []float32{1, 2}}); err == nil {
+		t.Fatal("zero-dimension vector query succeeded")
+	}
+}
+
+func TestZeroVectorDimensionsCommitDoesNotPublish(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "commit-zero-dim.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"embedding": []float32{1, 2}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.SetVector(node.ID, "embedding", []float32{3, 4}); err != nil {
+		t.Fatal(err)
+	}
+	tx.graph.VectorDimensions = 0
+	if err := tx.Commit(); err == nil {
+		t.Fatal("commit accepted active zero dimensions")
+	}
+	if db.graph.Nodes.Get(node.ID) != nil {
+		t.Fatal("failed commit published node")
+	}
+}
+
 func TestVectorSearchScratchRejectsOversizedPooledCapacity(t *testing.T) {
 	scratch := &vectorSearchScratch{visited: make(map[uint64]struct{}), visitedCapacity: 100, frontier: make([]vectorCandidate, 0, 100), best: make([]vectorCandidate, 0, 100)}
 	if vectorSearchScratchFits(scratch, 16, 16, 16) {

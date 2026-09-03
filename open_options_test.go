@@ -41,3 +41,32 @@ func TestOpenOptionsDefaultsRemainCompatible(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestVectorZeroDimensionAndDisabledCompatibility(t *testing.T) {
+	db, err := Open(t.TempDir(), OpenOptions{Create: true, EnableVector: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	vector := make([]float32, 128)
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]Value{"embedding": vector}})
+		return err
+	}); err != nil {
+		t.Fatalf("zero dimensions did not use public default: %v", err)
+	}
+
+	disabled, err := Open(t.TempDir(), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disabled.Close()
+	if err := disabled.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]Value{
+			"a": []float32{1}, "b": []float32{2, 3},
+		}})
+		return err
+	}); err != nil {
+		t.Fatalf("disabled database rejected arbitrary vectors: %v", err)
+	}
+}
