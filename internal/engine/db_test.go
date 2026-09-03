@@ -172,6 +172,106 @@ func TestReaderStartsDuringWALSync(t *testing.T) {
 	}
 }
 
+func TestIDReservationDoesNotBlockReadersOrWriters(t *testing.T) {
+	tests := map[string]struct {
+		reserve func(*testing.T, *OpenOptions, <-chan struct{}, chan<- struct{})
+		mutate  func(*Tx) error
+	}{
+		"node": {
+			reserve: func(t *testing.T, options *OpenOptions, release <-chan struct{}, started chan<- struct{}) {
+				var startedOnce sync.Once
+				options.reserveIDs = func(store.DatabaseFiles, string, uint64, uint64) error {
+					startedOnce.Do(func() { close(started) })
+					<-release
+					return nil
+				}
+			},
+			mutate: func(tx *Tx) error {
+				_, err := tx.CreateNode(CreateNodeOptions{})
+				return err
+			},
+		},
+		"edge": {
+			reserve: func(t *testing.T, options *OpenOptions, release <-chan struct{}, started chan<- struct{}) {
+				var startedOnce sync.Once
+				options.reserveIDs = func(files store.DatabaseFiles, databaseID string, nextNodeID, nextEdgeID uint64) error {
+					if nextEdgeID > 1 {
+						startedOnce.Do(func() { close(started) })
+						<-release
+					}
+					return store.ReserveIDsFiles(files, databaseID, nextNodeID, nextEdgeID)
+				}
+			},
+			mutate: func(tx *Tx) error {
+				node, err := tx.CreateNode(CreateNodeOptions{})
+				if err != nil {
+					return err
+				}
+				_, err = tx.CreateEdge(node.ID, node.ID, "loop", CreateEdgeOptions{})
+				return err
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseReservation := func() { releaseOnce.Do(func() { close(release) }) }
+			started := make(chan struct{})
+			options := OpenOptions{Create: true}
+			test.reserve(t, &options, release, started)
+			db, err := Open(filepath.Join(t.TempDir(), "reservation.ltdb"), options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			mutationDone := make(chan error, 1)
+			go func() { mutationDone <- db.Update(test.mutate) }()
+			<-started
+
+			readDone := make(chan error, 1)
+			go func() {
+				readDone <- db.View(func(tx *Tx) error {
+					exists, err := tx.NodeExists(1)
+					if err == nil && exists {
+						return errors.New("uncommitted mutation is visible")
+					}
+					return err
+				})
+			}()
+			select {
+			case err := <-readDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				releaseReservation()
+				t.Fatal("reader blocked on ID reservation")
+			}
+
+			writerDone := make(chan error, 1)
+			go func() {
+				_, err := db.Begin(false)
+				writerDone <- err
+			}()
+			select {
+			case err := <-writerDone:
+				if !errors.Is(err, ErrWriteTxActive) {
+					t.Fatalf("concurrent writer error = %v, want ErrWriteTxActive", err)
+				}
+			case <-time.After(time.Second):
+				releaseReservation()
+				t.Fatal("concurrent writer was not serialized")
+			}
+			releaseReservation()
+			if err := <-mutationDone; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestCommitSyncUnknownFencesDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unknown-sync.ltdb")
 	db, err := Open(path, OpenOptions{

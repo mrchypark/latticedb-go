@@ -782,9 +782,11 @@ func (db *DB) Close() error {
 
 	db.stopCheckpointWorker()
 	db.mu.Lock()
-	defer db.mu.Unlock()
 
 	var closeErr error
+	var reserveDatabaseID string
+	var reserveNodeID, reserveEdgeID uint64
+	reserve := false
 	if !db.readOnly {
 		if err := db.wal.Close(); err != nil {
 			closeErr = err
@@ -792,7 +794,15 @@ func (db *DB) Close() error {
 			// The WAL may or may not contain the last frame. Recovery must decide; compaction could destroy that evidence.
 		} else if err := db.writeCheckpoint(db.graph, db.nextNodeID, db.nextEdgeID, db.commitID); err != nil {
 			closeErr = err
-		} else if err := db.reserveIDsToDisk(db.graph.DatabaseID, db.nextNodeID, db.nextEdgeID); err != nil {
+		} else {
+			reserveDatabaseID = db.graph.DatabaseID
+			reserveNodeID, reserveEdgeID = db.nextNodeID, db.nextEdgeID
+			reserve = true
+		}
+	}
+	db.mu.Unlock()
+	if reserve {
+		if err := db.reserveIDsToDisk(reserveDatabaseID, reserveNodeID, reserveEdgeID); err != nil {
 			closeErr = err
 		}
 	}
@@ -3176,39 +3186,61 @@ func propertyIndexKeys(values map[store.PropertyIndexDefinition]struct{}) []stor
 
 func (db *DB) allocateNodeID() (uint64, error) {
 	db.mu.Lock()
-	defer db.mu.Unlock()
 	if db.nextNodeID >= store.EntityIDExhausted {
+		db.mu.Unlock()
 		return 0, errors.New("node id space exhausted")
 	}
-	if db.nextNodeID >= db.reservedNodeID {
-		reserved := reserveIDBlock(db.nextNodeID)
-		if err := db.reserveIDsToDisk(db.graph.DatabaseID, reserved, db.reservedEdgeID); err != nil {
-			db.recoveryRequired = true
-			return 0, err
-		}
-		db.reservedNodeID = reserved
+	if db.nextNodeID < db.reservedNodeID {
+		id := db.nextNodeID
+		db.nextNodeID++
+		db.mu.Unlock()
+		return id, nil
 	}
+	databaseID := db.graph.DatabaseID
+	reservedNodeID := reserveIDBlock(db.nextNodeID)
+	reservedEdgeID := db.reservedEdgeID
+	db.mu.Unlock()
+	if err := db.reserveIDsToDisk(databaseID, reservedNodeID, reservedEdgeID); err != nil {
+		db.mu.Lock()
+		db.recoveryRequired = true
+		db.mu.Unlock()
+		return 0, err
+	}
+	db.mu.Lock()
+	db.reservedNodeID = reservedNodeID
 	id := db.nextNodeID
 	db.nextNodeID++
+	db.mu.Unlock()
 	return id, nil
 }
 
 func (db *DB) allocateEdgeID() (uint64, error) {
 	db.mu.Lock()
-	defer db.mu.Unlock()
 	if db.nextEdgeID >= store.EntityIDExhausted {
+		db.mu.Unlock()
 		return 0, errors.New("edge id space exhausted")
 	}
-	if db.nextEdgeID >= db.reservedEdgeID {
-		reserved := reserveIDBlock(db.nextEdgeID)
-		if err := db.reserveIDsToDisk(db.graph.DatabaseID, db.reservedNodeID, reserved); err != nil {
-			db.recoveryRequired = true
-			return 0, err
-		}
-		db.reservedEdgeID = reserved
+	if db.nextEdgeID < db.reservedEdgeID {
+		id := db.nextEdgeID
+		db.nextEdgeID++
+		db.mu.Unlock()
+		return id, nil
 	}
+	databaseID := db.graph.DatabaseID
+	reservedNodeID := db.reservedNodeID
+	reservedEdgeID := reserveIDBlock(db.nextEdgeID)
+	db.mu.Unlock()
+	if err := db.reserveIDsToDisk(databaseID, reservedNodeID, reservedEdgeID); err != nil {
+		db.mu.Lock()
+		db.recoveryRequired = true
+		db.mu.Unlock()
+		return 0, err
+	}
+	db.mu.Lock()
+	db.reservedEdgeID = reservedEdgeID
 	id := db.nextEdgeID
 	db.nextEdgeID++
+	db.mu.Unlock()
 	return id, nil
 }
 
