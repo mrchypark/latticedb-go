@@ -1077,6 +1077,13 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 	if pattern.Var == "" || len(pattern.Labels) == 0 {
 		return nil, false, nil
 	}
+	var indexed [][]uint64
+	var indexedClause *whereClause
+	var indexedDefinition store.PropertyIndexDefinition
+	lookupLimit := ^uint(0)
+	if len(plan.whereClauses) == 1 {
+		lookupLimit = limit
+	}
 	for _, clause := range plan.whereClauses {
 		if clause.Kind != whereEquals || clause.Var != pattern.Var {
 			continue
@@ -1095,27 +1102,45 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 			if !tx.graph.NodeProperties.Has(definition) {
 				continue
 			}
-			if limit != ^uint(0) && len(plan.whereClauses) > 1 {
-				ids, err := plan.boundedFilteredNodeIDs(tx, pattern, definition, value, params, limit, budget)
-				return ids, true, err
-			}
-			ids, err := tx.FindNodesByLabelProperty(label, clause.Property, value, limit)
+			ids, err := tx.FindNodesByLabelProperty(label, clause.Property, value, lookupLimit)
 			if err != nil {
 				return nil, false, err
 			}
 			if alternate, ok := alternateNumericIndexValue(value); ok {
-				more, err := tx.FindNodesByLabelProperty(label, clause.Property, alternate, limit)
+				more, err := tx.FindNodesByLabelProperty(label, clause.Property, alternate, lookupLimit)
 				if err != nil {
 					return nil, false, err
 				}
 				ids = append(ids, more...)
-				slices.Sort(ids)
-				ids = slices.Compact(ids)
 			}
-			return ids, true, nil
+			slices.Sort(ids)
+			ids = slices.Compact(ids)
+			indexed = append(indexed, ids)
+			if indexedClause == nil {
+				indexedClause, indexedDefinition = clause, definition
+			}
+			break
 		}
 	}
-	return nil, false, nil
+	if len(indexed) == 0 {
+		return nil, false, nil
+	}
+	if len(indexed) == 1 && limit != ^uint(0) && len(plan.whereClauses) > 1 {
+		value, err := indexedClause.Expr.eval(queryRow{}, params)
+		if err != nil {
+			return nil, false, err
+		}
+		ids, err := plan.boundedFilteredNodeIDs(tx, pattern, indexedDefinition, value, params, limit, budget)
+		return ids, true, err
+	}
+	ids := indexed[0]
+	for _, posting := range indexed[1:] {
+		ids = intersectSortedIDs(ids, posting)
+	}
+	if limit != ^uint(0) && uint(len(ids)) > limit && len(indexed) == len(plan.whereClauses) {
+		ids = ids[:limit]
+	}
+	return ids, true, nil
 }
 
 func (plan *queryPlan) indexedNodeLookupLimit(pattern nodePattern, limit, skip int) uint {
@@ -1247,6 +1272,7 @@ func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[st
 	if pattern.EdgeVar == "" || pattern.EdgeType == "" {
 		return nil, false, nil
 	}
+	var indexed [][]uint64
 	for _, clause := range plan.whereClauses {
 		if clause.Kind != whereEquals || clause.Var != pattern.EdgeVar {
 			continue
@@ -1274,12 +1300,35 @@ func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[st
 				return nil, false, err
 			}
 			ids = append(ids, more...)
-			slices.Sort(ids)
-			ids = slices.Compact(ids)
 		}
-		return ids, true, nil
+		slices.Sort(ids)
+		indexed = append(indexed, slices.Compact(ids))
 	}
-	return nil, false, nil
+	if len(indexed) == 0 {
+		return nil, false, nil
+	}
+	ids := indexed[0]
+	for _, posting := range indexed[1:] {
+		ids = intersectSortedIDs(ids, posting)
+	}
+	return ids, true, nil
+}
+
+func intersectSortedIDs(left, right []uint64) []uint64 {
+	result := make([]uint64, 0, min(len(left), len(right)))
+	for i, j := 0, 0; i < len(left) && j < len(right); {
+		switch {
+		case left[i] < right[j]:
+			i++
+		case left[i] > right[j]:
+			j++
+		default:
+			result = append(result, left[i])
+			i++
+			j++
+		}
+	}
+	return result
 }
 
 func alternateNumericIndexValue(value any) (any, bool) {
