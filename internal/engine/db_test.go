@@ -11,11 +11,14 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/latticedb-go/internal/store"
 )
+
+var testENOSPC = syscall.Errno(28)
 
 func TestCommitFailureDoesNotExposeWrites(t *testing.T) {
 	root := t.TempDir()
@@ -291,6 +294,248 @@ func TestWALFullWriteWithErrorIsOutcomeUnknown(t *testing.T) {
 			return count, errors.New("injected acknowledgement loss")
 		}
 	})
+}
+
+func TestWALShortWriteENOSPCIsReopenable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "write-enospc.ltdb")
+	db, err := Open(path, OpenOptions{
+		Create: true,
+		walWrite: func(file *os.File, data []byte) (int, error) {
+			count, writeErr := file.Write(data[:len(data)/2])
+			if writeErr != nil {
+				return count, writeErr
+			}
+			return count, testENOSPC
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var issued Node
+	err = db.Update(func(tx *Tx) error {
+		issued, err = tx.CreateNode(CreateNodeOptions{})
+		return err
+	})
+	if !errors.Is(err, testENOSPC) || errors.Is(err, ErrCommitOutcomeUnknown) {
+		t.Fatalf("short write error = %v, want deterministic ENOSPC", err)
+	}
+	read, err := db.Begin(true)
+	if err != nil {
+		t.Fatalf("short write fenced database: %v", err)
+	}
+	if err := read.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.View(func(tx *Tx) error {
+		exists, err := tx.NodeExists(issued.ID)
+		if err == nil && exists {
+			t.Fatalf("short-written node %d was recovered", issued.ID)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWALSyncENOSPCFencesAndRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync-enospc.ltdb")
+	db, err := Open(path, OpenOptions{
+		Create: true,
+		walSync: func(file *os.File) error {
+			if err := file.Sync(); err != nil {
+				return err
+			}
+			return testENOSPC
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var issued Node
+	err = db.Update(func(tx *Tx) error {
+		issued, err = tx.CreateNode(CreateNodeOptions{})
+		return err
+	})
+	if !errors.Is(err, testENOSPC) || !errors.Is(err, ErrCommitOutcomeUnknown) {
+		t.Fatalf("sync error = %v, want ENOSPC and unknown outcome", err)
+	}
+	if _, err := db.Begin(true); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("sync failure Begin error = %v, want ErrRecoveryRequired", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.View(func(tx *Tx) error {
+		exists, err := tx.NodeExists(issued.ID)
+		if err == nil && !exists {
+			t.Fatalf("durable sync frame was discarded")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIDReservationENOSPCIsAtomicAndReopenable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ids-enospc.ltdb")
+	db, err := Open(path, OpenOptions{
+		Create: true,
+		reserveIDs: func(store.DatabaseFiles, string, uint64, uint64) error {
+			return testENOSPC
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); !errors.Is(err, testENOSPC) {
+		t.Fatalf("reservation error = %v, want ENOSPC", err)
+	}
+	if _, err := db.Begin(true); !errors.Is(err, ErrRecoveryRequired) {
+		t.Fatalf("reservation failure Begin error = %v, want ErrRecoveryRequired", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{})
+		if err == nil && node.ID != 1 {
+			t.Fatalf("reservation failure consumed ID %d", node.ID)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIDReservationPostWriteENOSPCPreservesHighWaterMark(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ids-delayed-enospc.ltdb")
+	db, err := Open(path, OpenOptions{
+		Create: true,
+		reserveIDs: func(files store.DatabaseFiles, databaseID string, nextNodeID, nextEdgeID uint64) error {
+			if err := store.ReserveIDsFiles(files, databaseID, nextNodeID, nextEdgeID); err != nil {
+				return err
+			}
+			return testENOSPC
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); !errors.Is(err, testENOSPC) {
+		t.Fatalf("post-write reservation error = %v, want ENOSPC", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{})
+		if err == nil && node.ID <= 1 {
+			t.Fatalf("post-write reservation reused ID %d", node.ID)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIDReservationFaultMatrixPreservesPublicationBoundary(t *testing.T) {
+	stages := []string{"ids-create", "ids-write", "ids-sync", "ids-close", "ids-rename", "ids-dir-sync"}
+	for _, stage := range stages {
+		for _, after := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s-after-%v", stage, after), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "ids-fault-matrix.ltdb")
+				db, err := Open(path, OpenOptions{
+					Create: true,
+					reserveIDs: func(files store.DatabaseFiles, databaseID string, nextNodeID, nextEdgeID uint64) error {
+						return store.ReserveIDsFilesWithFault(files, databaseID, nextNodeID, nextEdgeID, func(gotStage string, gotAfter bool) error {
+							if gotStage == stage && gotAfter == after {
+								return testENOSPC
+							}
+							return nil
+						})
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Update(func(tx *Tx) error {
+					_, err := tx.CreateNode(CreateNodeOptions{})
+					return err
+				}); !errors.Is(err, testENOSPC) {
+					t.Fatalf("reservation fault = %v, want ENOSPC", err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				reopened, err := Open(path, OpenOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer reopened.Close()
+				if err := reopened.View(func(tx *Tx) error {
+					exists, err := tx.NodeExists(1)
+					if err == nil && exists {
+						t.Fatal("failed graph mutation was published")
+					}
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := reopened.Update(func(tx *Tx) error {
+					node, err := tx.CreateNode(CreateNodeOptions{})
+					published := stage == "ids-dir-sync" || (stage == "ids-rename" && after)
+					want := uint64(1)
+					if published {
+						want = 1 + idReservationBlock
+					}
+					if err == nil && node.ID != want {
+						t.Fatalf("next ID = %d, want %d", node.ID, want)
+					}
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				entries, err := os.ReadDir(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, entry := range entries {
+					if strings.HasSuffix(entry.Name(), ".tmp") {
+						t.Fatalf("temporary reservation file remains: %s", entry.Name())
+					}
+				}
+			})
+		}
+	}
 }
 
 func TestWALGrowthIsBoundedWithoutClose(t *testing.T) {

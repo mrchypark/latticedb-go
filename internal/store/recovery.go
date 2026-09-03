@@ -159,18 +159,18 @@ func (writer *WALWriter) append(databaseID string, commitID uint64, payload []by
 	}
 	if full, err := writer.write(header[:]); err != nil {
 		if full {
-			return fmt.Errorf("%w: write WAL header: %v", ErrCommitOutcomeUnknown, err)
+			return fmt.Errorf("%w: write WAL header: %w", ErrCommitOutcomeUnknown, err)
 		}
 		return writer.writeFailure("header", err, offset)
 	}
 	if full, err := writer.write(payload); err != nil {
 		if full {
-			return fmt.Errorf("%w: write WAL payload: %v", ErrCommitOutcomeUnknown, err)
+			return fmt.Errorf("%w: write WAL payload: %w", ErrCommitOutcomeUnknown, err)
 		}
 		return writer.writeFailure("payload", err, offset)
 	}
 	if err := writer.sync(); err != nil {
-		return fmt.Errorf("%w: sync WAL: %v", ErrCommitOutcomeUnknown, err)
+		return fmt.Errorf("%w: sync WAL: %w", ErrCommitOutcomeUnknown, err)
 	}
 	writer.tailSize += int64(len(header) + len(payload))
 	return nil
@@ -192,7 +192,7 @@ func (writer *WALWriter) write(data []byte) (bool, error) {
 
 func (writer *WALWriter) writeFailure(part string, writeErr error, offset int64) error {
 	if cleanupErr := writer.truncateAndSync(offset); cleanupErr != nil {
-		return fmt.Errorf("%w: write WAL %s: %v; cleanup: %v", ErrCommitOutcomeUnknown, part, writeErr, cleanupErr)
+		return fmt.Errorf("%w: write WAL %s: %w; cleanup: %w", ErrCommitOutcomeUnknown, part, writeErr, cleanupErr)
 	}
 	return fmt.Errorf("write WAL %s: %w", part, writeErr)
 }
@@ -1127,14 +1127,14 @@ func appendWALRecord(files DatabaseFiles, databaseID string, commitID uint64, pa
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return fmt.Errorf("%w: sync wal: %v", ErrCommitOutcomeUnknown, err)
+		return fmt.Errorf("%w: sync wal: %w", ErrCommitOutcomeUnknown, err)
 	}
 	if err := file.Close(); err != nil {
-		return fmt.Errorf("%w: close wal: %v", ErrCommitOutcomeUnknown, err)
+		return fmt.Errorf("%w: close wal: %w", ErrCommitOutcomeUnknown, err)
 	}
 	if created {
 		if err := syncDirectory(files.Directory); err != nil {
-			return fmt.Errorf("%w: %v", ErrCommitOutcomeUnknown, err)
+			return fmt.Errorf("%w: %w", ErrCommitOutcomeUnknown, err)
 		}
 	}
 	return nil
@@ -1200,6 +1200,12 @@ func ReserveIDs(dbPath string, databaseID string, nextNodeID uint64, nextEdgeID 
 }
 
 func ReserveIDsFiles(files DatabaseFiles, databaseID string, nextNodeID uint64, nextEdgeID uint64) error {
+	return ReserveIDsFilesWithFault(files, databaseID, nextNodeID, nextEdgeID, nil)
+}
+
+// ReserveIDsFilesWithFault persists the allocator high-water marks with the
+// same deterministic before/after fault seam used by checkpoint files.
+func ReserveIDsFilesWithFault(files DatabaseFiles, databaseID string, nextNodeID uint64, nextEdgeID uint64, fault CheckpointFault) error {
 	if nextNodeID > EntityIDExhausted || nextEdgeID > EntityIDExhausted {
 		return errors.New("ID reservation high-water mark exceeds entity domain")
 	}
@@ -1209,19 +1215,79 @@ func ReserveIDsFiles(files DatabaseFiles, databaseID string, nextNodeID uint64, 
 	if err != nil {
 		return fmt.Errorf("encode id reservation: %w", err)
 	}
+	if err := runCheckpointFault(fault, "ids-create", false); err != nil {
+		return err
+	}
 	temp, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "ids"))
 	if err != nil {
 		return fmt.Errorf("create temp id reservation: %w", err)
 	}
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
-	if err := writeFileDurably(temp, data); err != nil {
-		return fmt.Errorf("write id reservation: %w", err)
+	if fault != nil {
+		defer temp.Close()
+	}
+	if fault == nil {
+		if err := writeFileDurably(temp, data); err != nil {
+			return fmt.Errorf("write id reservation: %w", err)
+		}
+	} else {
+		if err := runCheckpointFault(fault, "ids-create", true); err != nil {
+			return err
+		}
+		if err := runCheckpointFault(fault, "ids-write", false); err != nil {
+			return err
+		}
+		count, err := temp.Write(data)
+		if err == nil && count != len(data) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			return fmt.Errorf("write id reservation: %w", err)
+		}
+		if err := runCheckpointFault(fault, "ids-write", true); err != nil {
+			return err
+		}
+		if err := runCheckpointFault(fault, "ids-sync", false); err != nil {
+			return err
+		}
+		if err := temp.Sync(); err != nil {
+			return fmt.Errorf("sync id reservation: %w", err)
+		}
+		if err := runCheckpointFault(fault, "ids-sync", true); err != nil {
+			return err
+		}
+		if err := runCheckpointFault(fault, "ids-close", false); err != nil {
+			return err
+		}
+		if err := temp.Close(); err != nil {
+			return fmt.Errorf("close id reservation: %w", err)
+		}
+		if err := runCheckpointFault(fault, "ids-close", true); err != nil {
+			return err
+		}
+	}
+	if fault != nil {
+		if err := runCheckpointFault(fault, "ids-rename", false); err != nil {
+			return err
+		}
 	}
 	if err := os.Rename(tempPath, files.IDs); err != nil {
 		return fmt.Errorf("rename id reservation: %w", err)
 	}
-	return syncDirectory(files.Directory)
+	if fault == nil {
+		return syncDirectory(files.Directory)
+	}
+	if err := runCheckpointFault(fault, "ids-rename", true); err != nil {
+		return err
+	}
+	if err := runCheckpointFault(fault, "ids-dir-sync", false); err != nil {
+		return err
+	}
+	if err := syncDirectory(files.Directory); err != nil {
+		return err
+	}
+	return runCheckpointFault(fault, "ids-dir-sync", true)
 }
 
 func checksumIDs(databaseID string, nextNodeID uint64, nextEdgeID uint64) uint32 {
@@ -1233,7 +1299,11 @@ func checksumIDs(databaseID string, nextNodeID uint64, nextEdgeID uint64) uint32
 }
 
 func writeFileDurably(file *os.File, data []byte) error {
-	if _, err := file.Write(data); err != nil {
+	count, err := file.Write(data)
+	if err == nil && count != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		_ = file.Close()
 		return err
 	}

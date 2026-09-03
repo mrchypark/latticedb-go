@@ -91,6 +91,7 @@ type OpenOptions struct {
 	walWrite                         func(*os.File, []byte) (int, error)
 	walTruncate                      func(*os.File, int64) error
 	walCleanupSync                   func(*os.File) error
+	reserveIDs                       func(store.DatabaseFiles, string, uint64, uint64) error
 	checkpoint                       func(string, *store.GraphState, uint64, uint64, uint64) error
 }
 
@@ -229,6 +230,7 @@ type DB struct {
 	walWrite                         func(*os.File, []byte) (int, error)
 	walTruncate                      func(*os.File, int64) error
 	walCleanupSync                   func(*os.File) error
+	reserveIDs                       func(store.DatabaseFiles, string, uint64, uint64) error
 	checkpoint                       func(string, *store.GraphState, uint64, uint64, uint64) error
 	pathLock                         *pathLock
 	wal                              *store.WALWriter
@@ -494,6 +496,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		walWrite:                         opts.walWrite,
 		walTruncate:                      opts.walTruncate,
 		walCleanupSync:                   opts.walCleanupSync,
+		reserveIDs:                       opts.reserveIDs,
 		checkpoint:                       opts.checkpoint,
 		pathLock:                         lock,
 		wal:                              wal,
@@ -526,7 +529,7 @@ func (db *DB) Close() error {
 			// The WAL may or may not contain the last frame. Recovery must decide; compaction could destroy that evidence.
 		} else if err := db.writeCheckpoint(db.graph, db.nextNodeID, db.nextEdgeID, db.commitID); err != nil {
 			closeErr = err
-		} else if err := store.ReserveIDsFiles(db.files, db.graph.DatabaseID, db.nextNodeID, db.nextEdgeID); err != nil {
+		} else if err := db.reserveIDsToDisk(db.graph.DatabaseID, db.nextNodeID, db.nextEdgeID); err != nil {
 			closeErr = err
 		}
 	}
@@ -2895,7 +2898,7 @@ func (db *DB) allocateNodeID() (uint64, error) {
 	}
 	if db.nextNodeID >= db.reservedNodeID {
 		reserved := reserveIDBlock(db.nextNodeID)
-		if err := store.ReserveIDsFiles(db.files, db.graph.DatabaseID, reserved, db.reservedEdgeID); err != nil {
+		if err := db.reserveIDsToDisk(db.graph.DatabaseID, reserved, db.reservedEdgeID); err != nil {
 			db.recoveryRequired = true
 			return 0, err
 		}
@@ -2914,7 +2917,7 @@ func (db *DB) allocateEdgeID() (uint64, error) {
 	}
 	if db.nextEdgeID >= db.reservedEdgeID {
 		reserved := reserveIDBlock(db.nextEdgeID)
-		if err := store.ReserveIDsFiles(db.files, db.graph.DatabaseID, db.reservedNodeID, reserved); err != nil {
+		if err := db.reserveIDsToDisk(db.graph.DatabaseID, db.reservedNodeID, reserved); err != nil {
 			db.recoveryRequired = true
 			return 0, err
 		}
@@ -2923,6 +2926,13 @@ func (db *DB) allocateEdgeID() (uint64, error) {
 	id := db.nextEdgeID
 	db.nextEdgeID++
 	return id, nil
+}
+
+func (db *DB) reserveIDsToDisk(databaseID string, nextNodeID, nextEdgeID uint64) error {
+	if db.reserveIDs != nil {
+		return db.reserveIDs(db.files, databaseID, nextNodeID, nextEdgeID)
+	}
+	return store.ReserveIDsFiles(db.files, databaseID, nextNodeID, nextEdgeID)
 }
 
 func reserveIDBlock(next uint64) uint64 {
