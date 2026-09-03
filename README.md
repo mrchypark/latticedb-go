@@ -60,6 +60,9 @@ func main() {
 
 ## Storage and transaction contract
 
+- Entity IDs (nodes, edges, and edge endpoints) are uint64 values in `1..MaxInt64`.
+  `MaxInt64+1` is reserved as the high-water exhaustion sentinel and is never
+  allocated.
 - WAL is always enabled: `OpenOptions.EnableWAL`, `DisableWAL`, and `EnableAdjacencyCache` must remain false (their default); true requests return `ErrUnsupportedOption`.
 - v0.1 uses the new state v4 and WAL v3 formats. Older metadata-free state v3 and WAL v2 files are readable, but new files intentionally fail closed in older binaries.
 - A `Tx` is single-owner and must not be used concurrently.

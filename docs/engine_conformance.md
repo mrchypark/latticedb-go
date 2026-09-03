@@ -69,7 +69,7 @@ The project has four different compatibility surfaces. They should be treated se
 
 ### Nodes
 
-- A node is identified by an opaque node ID.
+- A node is identified by a uint64 node ID in the inclusive range `1..MaxInt64`.
 - Node IDs are stable within a database and remain valid across close/reopen for surviving nodes.
 - Nodes may have zero or more labels.
 - Unlabeled nodes are valid.
@@ -85,11 +85,16 @@ The project has four different compatibility surfaces. They should be treated se
 - Multiple parallel edges with the same `(source, target, type)` are valid.
 - Every edge has a stable edge ID distinct from its `(source, target, type)` triple.
 - Edge IDs are:
+  - in the inclusive range `1..MaxInt64` (source and target IDs use the same range)
   - unique
   - stable across close/reopen
   - monotonic
   - never reused after delete or rollback
 - Mutations addressed by edge ID apply to exactly one edge instance, even when parallel edges exist.
+
+Entity IDs remain uint64 in the public and storage APIs for compatibility. The
+high-water counters use `MaxInt64+1` only as an exhaustion sentinel; IDs are
+never allocated from that value.
 
 ### Properties And Values
 
