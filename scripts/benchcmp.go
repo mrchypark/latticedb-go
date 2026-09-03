@@ -42,7 +42,6 @@ var blockingGates = []performanceGate{
 	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "allocs/op", maxRise: 0.02},
 	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "allocs/op"},
-	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "ns/op", maxRise: 0.20},
 	{benchmark: "BenchmarkAdjacencyReadScaling/chunked_10000", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkAdjacencyReadScaling/chunked_10000", unit: "allocs/op"},
 	{benchmark: "BenchmarkAdjacencyAppendScaling/chunked_10000", unit: "B/op", maxRise: 0.01},
@@ -251,7 +250,7 @@ func writeReport(w io.Writer, current, previous result, currentLabel, previousLa
 
 	fmt.Fprintln(w, "# Performance benchmark report")
 	fmt.Fprintf(w, "\nCurrent: `%s`  \nPrevious: `%s`\n", currentLabel, previousLabel)
-	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; enforced graph-core gates allow up to +1% B/op drift, +2% allocs/op drift for write benchmarks, and allow up to +20% ns/op drift for multi-hop latency. WAL recovery latency is informational; its allocation and byte metrics remain gated.")
+	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; ns/op is informational because shared-runner latency is noisy, while graph-core B/op and allocs/op remain enforced (including multi-hop). WAL recovery latency is informational; its allocation and byte metrics remain gated.")
 	if zig != nil {
 		writeZigComparison(w, current, zig, zigLabel)
 	}
