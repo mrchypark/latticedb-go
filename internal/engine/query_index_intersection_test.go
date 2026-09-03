@@ -164,3 +164,54 @@ func TestEqualityIndexIntersectionKeepsResidualLimitCandidates(t *testing.T) {
 		t.Fatalf("indexed residual limit = %#v, %v; want %#v", result.Rows, err, want)
 	}
 }
+
+func TestBoundedFilterScopesClausesToPatternVariable(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-index-partial-pattern.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var target Node
+	if err := db.Update(func(tx *Tx) error {
+		var err error
+		target, err = tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"x": "hit"}})
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateNode(CreateNodeOptions{Labels: []string{"Other"}, Properties: map[string]any{"y": "hit"}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNodePropertyIndex("Item", "x"); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := parseMatchQuery(`MATCH (a:Item), (b:Other) WHERE a.x = "hit" AND b.y = a.x RETURN id(a) AS id LIMIT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pattern, ok := plan.matchPatterns[0].(nodePattern)
+	if !ok || pattern.Var != "a" {
+		t.Fatalf("first pattern = %#v, want a node pattern", plan.matchPatterns[0])
+	}
+	if err := db.View(func(tx *Tx) error {
+		budget := newQueryBudget(t.Context(), QueryOptions{MaxWork: 64})
+		defer releaseQueryBudget(budget)
+		ids, indexed, err := plan.indexedNodeIDs(tx, pattern, nil, 1, budget)
+		if err != nil {
+			return err
+		}
+		if !indexed {
+			return errors.New("expected indexed node lookup")
+		}
+		want := []uint64{target.ID}
+		if !reflect.DeepEqual(ids, want) {
+			t.Errorf("bounded indexed IDs = %v, want %v", ids, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
