@@ -20,12 +20,15 @@ const (
 )
 
 type OpenOptions struct {
-	Create                      bool
-	ReadOnly                    bool
-	CacheSizeMB                 uint32
-	PageSize                    uint32
-	EnableWAL                   bool
-	DisableWAL                  bool
+	Create      bool
+	ReadOnly    bool
+	CacheSizeMB uint32
+	PageSize    uint32
+	// EnableWAL is reserved for compatibility; true is unsupported because WAL is always enabled. Leave false (the default).
+	EnableWAL bool
+	// DisableWAL requests an unsupported mode because WAL is always enabled. Leave false (the default).
+	DisableWAL bool
+	// EnableAdjacencyCache is reserved for compatibility; true is unsupported. Leave false (the default).
 	EnableAdjacencyCache        bool
 	EnableVectors               bool
 	EnableVector                bool

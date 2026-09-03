@@ -60,6 +60,7 @@ func main() {
 
 ## Storage and transaction contract
 
+- WAL is always enabled: `OpenOptions.EnableWAL`, `DisableWAL`, and `EnableAdjacencyCache` must remain false (their default); true requests return `ErrUnsupportedOption`.
 - v0.1 uses the new state v4 and WAL v3 formats. Older metadata-free state v3 and WAL v2 files are readable, but new files intentionally fail closed in older binaries.
 - A `Tx` is single-owner and must not be used concurrently.
 - `Commit` and `CommitContext` are one-shot: the transaction becomes inactive whether the commit succeeds or fails.
