@@ -1413,7 +1413,6 @@ func parseNodePattern(text string) (nodePattern, error) {
 		return nodePattern{}, err
 	}
 
-	props := map[string]any{}
 	propertyExprs := map[string]valueExpr{}
 	propStart := findTopLevelRune(body, '{')
 	prefix := strings.TrimSpace(body)
@@ -1427,11 +1426,7 @@ func parseNodePattern(text string) (nodePattern, error) {
 			return nodePattern{}, err
 		}
 		for key, expr := range parsedProps {
-			if literal, ok := expr.(literalExpr); ok {
-				props[key] = literal.Value
-			} else {
-				propertyExprs[key] = expr
-			}
+			propertyExprs[key] = expr
 		}
 		if strings.TrimSpace(body[propEnd+1:]) != "" {
 			return nodePattern{}, fmt.Errorf("unexpected text after node properties in %q", text)
@@ -1440,7 +1435,7 @@ func parseNodePattern(text string) (nodePattern, error) {
 	}
 
 	segments := splitTopLevel(prefix, ':')
-	pattern := nodePattern{Properties: props, PropertyExprs: propertyExprs}
+	pattern := nodePattern{PropertyExprs: propertyExprs}
 	if len(segments) > 0 {
 		first := strings.TrimSpace(segments[0])
 		if first != "" {
@@ -1545,7 +1540,6 @@ func parsePathNode(text string) (nodePattern, string, error) {
 
 func parseEdgeBody(text string) (edgePattern, error) {
 	edgeBody := strings.TrimSpace(text)
-	props := map[string]any{}
 	propertyExprs := map[string]valueExpr{}
 	prefix := edgeBody
 	if propStart := findTopLevelRune(edgeBody, '{'); propStart >= 0 {
@@ -1558,11 +1552,7 @@ func parseEdgeBody(text string) (edgePattern, error) {
 			return edgePattern{}, err
 		}
 		for key, expr := range parsed {
-			if literal, ok := expr.(literalExpr); ok {
-				props[key] = literal.Value
-			} else {
-				propertyExprs[key] = expr
-			}
+			propertyExprs[key] = expr
 		}
 		if strings.TrimSpace(edgeBody[propEnd+1:]) != "" {
 			return edgePattern{}, fmt.Errorf("unexpected text after edge properties in %q", text)
@@ -1570,7 +1560,7 @@ func parseEdgeBody(text string) (edgePattern, error) {
 		prefix = strings.TrimSpace(edgeBody[:propStart])
 	}
 
-	pattern := edgePattern{Properties: props, PropertyExprs: propertyExprs}
+	pattern := edgePattern{PropertyExprs: propertyExprs}
 	if left, right, ok := splitOperator(prefix, ":"); ok {
 		varText, typeText := strings.TrimSpace(left), strings.TrimSpace(right)
 		var err error
