@@ -2441,6 +2441,9 @@ func (pattern edgePattern) appendEdgeRow(row queryRow, edge *store.EdgeRecord, l
 }
 
 func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any, budget *queryBudget) ([]queryRow, error) {
+	if clause.Kind == whereVector && tx.db != nil && tx.db.enableVector && tx.graph.VectorDimensions == 0 {
+		return nil, errors.New("vector comparison requires configured dimensions")
+	}
 	filtered := rows[:0]
 	var queryTerms []string
 	var queryTermBytes uint64

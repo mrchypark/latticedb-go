@@ -875,6 +875,9 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 	if !db.enableVector {
 		return nil, fmt.Errorf("%w: vector search is disabled", ErrUnsupportedOption)
 	}
+	if db.vectorDimensions == 0 {
+		return nil, errors.New("vector search requires configured dimensions")
+	}
 	limit := uint64(opts.K)
 	if limit == 0 {
 		limit = 10

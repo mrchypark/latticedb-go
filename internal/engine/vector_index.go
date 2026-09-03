@@ -564,6 +564,11 @@ func validateNodeVectors(dimensions uint16, node *store.NodeRecord) error {
 		return fmt.Errorf("node %d: %w", node.ID, err)
 	}
 	if dimensions == 0 {
+		for key, value := range node.Properties {
+			if _, ok := value.([]float32); ok {
+				return fmt.Errorf("vector property %q requires configured dimensions", key)
+			}
+		}
 		return nil
 	}
 	for _, value := range node.Properties {
