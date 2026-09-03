@@ -50,7 +50,7 @@ func TestReportUsesMediansAndComparesMetrics(t *testing.T) {
 	}
 	var report bytes.Buffer
 	writeReport(&report, current, previous, "head", "base", nil, "")
-	for _, want := range []string{"`BenchmarkLookup`", "| 110 | 100 | +10.0% | 8 | 16 | -50.0% | 1 | 2 | -50.0% |"} {
+	for _, want := range []string{"`BenchmarkLookup`", "| 110 | 100 | +10.0% | 8 | 16 | -50.0% | 1 | 2 | -50.0% |", "ns/op is informational because shared-runner latency is noisy"} {
 		if !strings.Contains(report.String(), want) {
 			t.Fatalf("report does not contain %q:\n%s", want, report.String())
 		}
@@ -197,17 +197,22 @@ func TestCheckGatesAllowsOnePercentBytesButRejectsMore(t *testing.T) {
 	}
 }
 
-func TestCheckGatesAllowsTwentyPercentLatencyButRejectsMore(t *testing.T) {
+func TestCheckGatesTreatsMultiHopLatencyAsInformational(t *testing.T) {
 	previous := gateFixture(nil)
-	for name, latency := range map[string]float64{"twenty percent": 120, "over twenty percent": 121} {
-		current := gateFixture(map[string]float64{"BenchmarkQueryMultiHopSlots ns/op": latency})
-		err := checkGates(current, previous, new(bytes.Buffer))
-		if name == "twenty percent" && err != nil {
-			t.Fatalf("20%% ns/op drift failed gate: %v", err)
-		}
-		if name == "over twenty percent" && (err == nil || !strings.Contains(err.Error(), "BenchmarkQueryMultiHopSlots ns/op")) {
-			t.Fatalf("greater than 20%% ns/op drift error = %v", err)
-		}
+	current := gateFixture(nil)
+	current["BenchmarkQueryMultiHopSlots"]["ns/op"] = []float64{1000}
+	previous["BenchmarkQueryMultiHopSlots"]["ns/op"] = []float64{100}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err != nil {
+		t.Fatalf("multi-hop latency regression was incorrectly gated: %v", err)
+	}
+}
+
+func TestCheckGatesKeepsMultiHopAllocationsBlocking(t *testing.T) {
+	previous := gateFixture(nil)
+	current := gateFixture(map[string]float64{"BenchmarkQueryMultiHopSlots allocs/op": 101})
+	current["BenchmarkQueryMultiHopSlots"]["ns/op"] = []float64{1000}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err == nil || !strings.Contains(err.Error(), "BenchmarkQueryMultiHopSlots allocs/op") {
+		t.Fatalf("multi-hop allocation regression was not gated: %v", err)
 	}
 }
 
