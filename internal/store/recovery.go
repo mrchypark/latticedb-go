@@ -831,6 +831,9 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 			}
 		}
 		node := graph.Nodes.Get(nodeID)
+		if err := ValidateCreateLabels(node.Labels); err != nil {
+			return fmt.Errorf("node %d labels: %w", nodeID, err)
+		}
 		properties, err := encodePropertyMap(node.Properties)
 		if err != nil {
 			return err
@@ -853,6 +856,9 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 			}
 		}
 		edge := graph.Edges.Get(edgeID)
+		if err := ValidateEdgeType(edge.Type); err != nil {
+			return fmt.Errorf("edge %d type: %w", edgeID, err)
+		}
 		properties, err := encodePropertyMap(edge.Properties)
 		if err != nil {
 			return err
@@ -873,6 +879,9 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 		record := graph.FTS.Get(nodeID)
 		if record == nil {
 			continue
+		}
+		if err := ValidateFTSText(record.Text); err != nil {
+			return fmt.Errorf("FTS record for node %d: %w", nodeID, err)
 		}
 		if !first {
 			if _, err := io.WriteString(output, ","); err != nil {
@@ -1719,6 +1728,9 @@ func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulat
 		if node.ID == 0 {
 			return nil, errors.New("stored node id must be non-zero")
 		}
+		if err := ValidateCreateLabels(node.Labels); err != nil {
+			return nil, fmt.Errorf("stored node %d labels: %w", node.ID, err)
+		}
 		if _, exists := accumulator.nodes[node.ID]; exists {
 			return nil, fmt.Errorf("duplicate stored node id %d", node.ID)
 		}
@@ -1737,6 +1749,9 @@ func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulat
 		}
 		if edge.ID == 0 {
 			return nil, errors.New("stored edge id must be non-zero")
+		}
+		if err := ValidateEdgeType(edge.Type); err != nil {
+			return nil, fmt.Errorf("stored edge %d type: %w", edge.ID, err)
 		}
 		if _, exists := accumulator.edges[edge.ID]; exists {
 			return nil, fmt.Errorf("duplicate stored edge id %d", edge.ID)
@@ -1769,6 +1784,9 @@ func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulat
 		}
 		if _, ok := accumulator.nodes[record.NodeID]; !ok {
 			return nil, fmt.Errorf("stored FTS record references missing node %d", record.NodeID)
+		}
+		if err := ValidateFTSText(record.Text); err != nil {
+			return nil, fmt.Errorf("stored FTS record for node %d: %w", record.NodeID, err)
 		}
 		if _, exists := accumulator.fts[record.NodeID]; exists {
 			return nil, fmt.Errorf("duplicate stored FTS node id %d", record.NodeID)
@@ -1869,11 +1887,17 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 		return fmt.Errorf("edge property index operations: %w", err)
 	}
 	for _, node := range delta.UpsertNodes {
+		if err := ValidateCreateLabels(node.Labels); err != nil {
+			return fmt.Errorf("node %d labels: %w", node.ID, err)
+		}
 		if _, err := decodePropertyMap(node.Properties); err != nil {
 			return fmt.Errorf("decode node %d properties: %w", node.ID, err)
 		}
 	}
 	for _, edge := range delta.UpsertEdges {
+		if err := ValidateEdgeType(edge.Type); err != nil {
+			return fmt.Errorf("edge %d type: %w", edge.ID, err)
+		}
 		if _, err := decodePropertyMap(edge.Properties); err != nil {
 			return fmt.Errorf("decode edge %d properties: %w", edge.ID, err)
 		}
@@ -1920,6 +1944,9 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 	for _, record := range delta.UpsertFTS {
 		if _, ok := accumulator.nodes[record.NodeID]; !ok {
 			return fmt.Errorf("FTS record references missing node %d", record.NodeID)
+		}
+		if err := ValidateFTSText(record.Text); err != nil {
+			return fmt.Errorf("FTS record for node %d: %w", record.NodeID, err)
 		}
 		accumulator.fts[record.NodeID] = record
 	}
@@ -2079,6 +2106,9 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 
 	for _, nodeID := range SortedNodeIDs(graph) {
 		node := graph.Nodes.Get(nodeID)
+		if err := ValidateCreateLabels(node.Labels); err != nil {
+			return persistedState{}, fmt.Errorf("encode node %d labels: %w", nodeID, err)
+		}
 		props, err := encodePropertyMap(node.Properties)
 		if err != nil {
 			return persistedState{}, fmt.Errorf("encode node %d properties: %w", nodeID, err)
@@ -2091,6 +2121,9 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 	}
 	for _, edgeID := range SortedEdgeIDs(graph) {
 		edge := graph.Edges.Get(edgeID)
+		if err := ValidateEdgeType(edge.Type); err != nil {
+			return persistedState{}, fmt.Errorf("encode edge %d type: %w", edgeID, err)
+		}
 		props, err := encodePropertyMap(edge.Properties)
 		if err != nil {
 			return persistedState{}, fmt.Errorf("encode edge %d properties: %w", edgeID, err)
@@ -2107,6 +2140,9 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		record := graph.FTS.Get(nodeID)
 		if record == nil {
 			continue
+		}
+		if err := ValidateFTSText(record.Text); err != nil {
+			return persistedState{}, fmt.Errorf("encode FTS record for node %d: %w", nodeID, err)
 		}
 		snapshot.FTS = append(snapshot.FTS, persistedFTS{NodeID: nodeID, Text: record.Text})
 	}
@@ -2196,6 +2232,9 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		if node == nil {
 			return persistedDelta{}, fmt.Errorf("WAL delta node %d does not exist", nodeID)
 		}
+		if err := ValidateCreateLabels(node.Labels); err != nil {
+			return persistedDelta{}, fmt.Errorf("encode node %d labels: %w", nodeID, err)
+		}
 		props, err := encodePropertyMap(node.Properties)
 		if err != nil {
 			return persistedDelta{}, fmt.Errorf("encode node %d properties: %w", nodeID, err)
@@ -2207,6 +2246,9 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		if edge == nil {
 			return persistedDelta{}, fmt.Errorf("WAL delta edge %d does not exist", edgeID)
 		}
+		if err := ValidateEdgeType(edge.Type); err != nil {
+			return persistedDelta{}, fmt.Errorf("encode edge %d type: %w", edgeID, err)
+		}
 		props, err := encodePropertyMap(edge.Properties)
 		if err != nil {
 			return persistedDelta{}, fmt.Errorf("encode edge %d properties: %w", edgeID, err)
@@ -2217,6 +2259,9 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		record := graph.FTS.Get(nodeID)
 		if record == nil {
 			return persistedDelta{}, fmt.Errorf("WAL delta FTS node %d does not exist", nodeID)
+		}
+		if err := ValidateFTSText(record.Text); err != nil {
+			return persistedDelta{}, fmt.Errorf("encode FTS record for node %d: %w", nodeID, err)
 		}
 		delta.UpsertFTS = append(delta.UpsertFTS, persistedFTS{NodeID: nodeID, Text: record.Text})
 	}
@@ -2481,6 +2526,9 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 		if storedNode.ID == 0 {
 			return nil, 0, 0, 0, errors.New("stored node id must be non-zero")
 		}
+		if err := ValidateCreateLabels(storedNode.Labels); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("stored node %d labels: %w", storedNode.ID, err)
+		}
 		if graph.Nodes.Get(storedNode.ID) != nil {
 			return nil, 0, 0, 0, fmt.Errorf("duplicate stored node id %d", storedNode.ID)
 		}
@@ -2510,6 +2558,9 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 		}
 		if storedEdge.ID == 0 {
 			return nil, 0, 0, 0, errors.New("stored edge id must be non-zero")
+		}
+		if err := ValidateEdgeType(storedEdge.Type); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("stored edge %d type: %w", storedEdge.ID, err)
 		}
 		if graph.Edges.Get(storedEdge.ID) != nil {
 			return nil, 0, 0, 0, fmt.Errorf("duplicate stored edge id %d", storedEdge.ID)
@@ -2605,6 +2656,9 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 		}
 		if graph.FTS.Get(storedFTS.NodeID) != nil {
 			return nil, 0, 0, 0, fmt.Errorf("duplicate stored FTS node id %d", storedFTS.NodeID)
+		}
+		if err := ValidateFTSText(storedFTS.Text); err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("stored FTS record for node %d: %w", storedFTS.NodeID, err)
 		}
 		estimatedWork := multiplySaturated(uint64(len(storedFTS.Text)), 2)
 		if budget.work > budget.maxWork || estimatedWork > budget.maxWork-budget.work {

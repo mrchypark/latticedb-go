@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -688,7 +689,7 @@ func TestWALV2RejectsSemanticallyInvalidDelta(t *testing.T) {
 	base := NewGraphState()
 	base.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{}})
 	base.Nodes.Set(2, &NodeRecord{ID: 2, Properties: map[string]any{}})
-	base.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 2, Properties: map[string]any{}})
+	base.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 2, Type: "edge", Properties: map[string]any{}})
 	base.FTS.Set(1, &FTSRecord{Text: "one"})
 	snapshot, err := buildPersistedState(base, 3, 2, 1)
 	if err != nil {
@@ -732,6 +733,183 @@ func TestWALV2RejectsSemanticallyInvalidDelta(t *testing.T) {
 			}
 			if _, _, _, _, err := LoadGraphState(dbPath); err == nil {
 				t.Fatal("expected invalid delta to fail")
+			}
+		})
+	}
+}
+
+func deeplyNestedPersistedValue(depth int) persistedValue {
+	value := persistedValue{Kind: "string", String: "ok"}
+	for range depth {
+		value = persistedValue{Kind: "map", Map: map[string]persistedValue{"next": value}}
+	}
+	return value
+}
+
+func serializedPersistedState(t *testing.T, snapshot persistedState) []byte {
+	t.Helper()
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := encodeStateHeader(snapshot.DatabaseID, snapshot.CommitID, uint64(len(payload)), crc32.ChecksumIEEE(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(header[:], payload...)
+}
+
+func TestDeserializeRejectsInvalidPersistedSemantics(t *testing.T) {
+	const databaseID = "0123456789abcdef0123456789abcdef"
+	base := persistedState{DatabaseID: databaseID, CommitID: 1, NextNodeID: 2, NextEdgeID: 2,
+		Nodes: []persistedNode{{ID: 1, Properties: map[string]persistedValue{}}},
+		Edges: []persistedEdge{{ID: 1, SourceID: 1, TargetID: 1, Type: "edge", Properties: map[string]persistedValue{}}}}
+	for name, mutate := range map[string]func(*persistedState){
+		"empty label":     func(state *persistedState) { state.Nodes[0].Labels = []string{""} },
+		"duplicate label": func(state *persistedState) { state.Nodes[0].Labels = []string{"tag", "tag"} },
+		"empty edge type": func(state *persistedState) { state.Edges[0].Type = "" },
+		"deep property": func(state *persistedState) {
+			state.Nodes[0].Properties = map[string]persistedValue{"deep": deeplyNestedPersistedValue(maxValueDepth + 1)}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			snapshot := base
+			snapshot.Nodes = slices.Clone(base.Nodes)
+			snapshot.Edges = slices.Clone(base.Edges)
+			mutate(&snapshot)
+			if _, _, _, _, err := DeserializeGraphState(serializedPersistedState(t, snapshot), maxStateFileBytes, ^uint64(0), ^uint64(0)); err == nil {
+				t.Fatal("invalid persisted state was accepted")
+			}
+		})
+	}
+}
+
+func TestPersistenceWritersRejectInvalidSemantics(t *testing.T) {
+	const databaseID = "0123456789abcdef0123456789abcdef"
+	for name, graph := range map[string]*GraphState{
+		"empty label": func() *GraphState {
+			graph := NewGraphState()
+			graph.DatabaseID = databaseID
+			graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{""}, Properties: map[string]any{}})
+			return graph
+		}(),
+		"duplicate label": func() *GraphState {
+			graph := NewGraphState()
+			graph.DatabaseID = databaseID
+			graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{"tag", "tag"}, Properties: map[string]any{}})
+			return graph
+		}(),
+		"empty edge type": func() *GraphState {
+			graph := NewGraphState()
+			graph.DatabaseID = databaseID
+			graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{}})
+			graph.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 1, Properties: map[string]any{}})
+			return graph
+		}(),
+		"deep property": func() *GraphState {
+			graph := NewGraphState()
+			graph.DatabaseID = databaseID
+			value := any("ok")
+			for range maxValueDepth + 1 {
+				value = map[string]any{"next": value}
+			}
+			graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"deep": value}})
+			return graph
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := SerializeGraphState(graph, 2, 2, 1); err == nil {
+				t.Fatal("invalid graph was serialized")
+			}
+		})
+	}
+	graph := NewGraphState()
+	graph.DatabaseID = databaseID
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{""}, Properties: map[string]any{}})
+	if _, err := buildPersistedDelta(graph, 2, 1, 1, GraphDelta{UpsertNodes: []uint64{1}}); err == nil {
+		t.Fatal("invalid graph was encoded in a WAL delta")
+	}
+}
+
+func TestPersistedFTSRejectsInvalidUTF8(t *testing.T) {
+	const databaseID = "0123456789abcdef0123456789abcdef"
+	invalid := string([]byte{0xff})
+	graph := NewGraphState()
+	graph.DatabaseID = databaseID
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{}})
+	graph.FTS.Set(1, &FTSRecord{Text: invalid})
+	if _, err := SerializeGraphState(graph, 2, 1, 1); err == nil {
+		t.Fatal("invalid FTS text was serialized")
+	}
+	if _, err := buildPersistedDelta(graph, 2, 1, 1, GraphDelta{UpsertFTS: []uint64{1}}); err == nil {
+		t.Fatal("invalid FTS text was encoded in a WAL delta")
+	}
+
+	snapshot := persistedState{DatabaseID: databaseID, CommitID: 1, NextNodeID: 2, NextEdgeID: 1,
+		Nodes: []persistedNode{{ID: 1, Properties: map[string]persistedValue{}}},
+		FTS:   []persistedFTS{{NodeID: 1, Text: invalid}}}
+	if _, _, _, _, err := decodePersistedState(snapshot); err == nil {
+		t.Fatal("invalid FTS text was decoded")
+	}
+	if _, err := newWALAccumulator(context.Background(), snapshot); err == nil {
+		t.Fatal("invalid FTS text was accepted by WAL replay")
+	}
+	snapshot.FTS[0].Text = "valid"
+	accumulator, err := newWALAccumulator(context.Background(), snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accumulator.apply(persistedDelta{CommitID: 2, DatabaseID: databaseID, NextNodeID: 2, NextEdgeID: 1,
+		UpsertFTS: []persistedFTS{{NodeID: 1, Text: invalid}}}); err == nil {
+		t.Fatal("invalid FTS text was accepted in a WAL delta")
+	}
+}
+
+func persistedWALTestRecord(t *testing.T, databaseID string, commitID uint64, payload walPayload) []byte {
+	t.Helper()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := encodeWALHeader(databaseID, commitID, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(header[:], data...)
+}
+
+func TestWALDeltaRejectsInvalidPersistedSemantics(t *testing.T) {
+	const databaseID = "0123456789abcdef0123456789abcdef"
+	base := persistedState{DatabaseID: databaseID, CommitID: 1, NextNodeID: 2, NextEdgeID: 2,
+		Nodes: []persistedNode{{ID: 1, Properties: map[string]persistedValue{}}},
+		Edges: []persistedEdge{{ID: 1, SourceID: 1, TargetID: 1, Type: "edge", Properties: map[string]persistedValue{}}}}
+	for name, delta := range map[string]persistedDelta{
+		"empty label": {
+			DatabaseID: databaseID, CommitID: 2, NextNodeID: 3, NextEdgeID: 2,
+			UpsertNodes: []persistedNode{{ID: 2, Labels: []string{""}, Properties: map[string]persistedValue{}}},
+		},
+		"duplicate label": {
+			DatabaseID: databaseID, CommitID: 2, NextNodeID: 3, NextEdgeID: 2,
+			UpsertNodes: []persistedNode{{ID: 2, Labels: []string{"tag", "tag"}, Properties: map[string]persistedValue{}}},
+		},
+		"empty edge type": {
+			DatabaseID: databaseID, CommitID: 2, NextNodeID: 2, NextEdgeID: 3,
+			UpsertEdges: []persistedEdge{{ID: 2, SourceID: 1, TargetID: 1, Properties: map[string]persistedValue{}}},
+		},
+		"deep property": {
+			DatabaseID: databaseID, CommitID: 2, NextNodeID: 3, NextEdgeID: 2,
+			UpsertNodes: []persistedNode{{ID: 2, Properties: map[string]persistedValue{"deep": deeplyNestedPersistedValue(maxValueDepth + 1)}}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := t.TempDir()
+			wal := persistedWALTestRecord(t, databaseID, 1, walPayload{Kind: "snapshot", Snapshot: &base})
+			wal = append(wal, persistedWALTestRecord(t, databaseID, 2, walPayload{Kind: "delta", Delta: &delta})...)
+			if err := os.WriteFile(walFilePath(path), wal, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, _, _, err := LoadGraphState(path); err == nil {
+				t.Fatal("invalid WAL delta was accepted")
 			}
 		})
 	}
