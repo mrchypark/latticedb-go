@@ -6,6 +6,7 @@ import (
 )
 
 func BenchmarkQueryMultiHopSlots(b *testing.B) {
+	const query = `MATCH (a)-[:NEXT]->(b)-[:NEXT]->(c) RETURN id(c) AS id`
 	db, err := Open(filepath.Join(b.TempDir(), "query-slots-bench.ltdb"), OpenOptions{Create: true, WALCheckpointThresholdBytes: ^uint64(0)})
 	if err != nil {
 		b.Fatal(err)
@@ -30,9 +31,12 @@ func BenchmarkQueryMultiHopSlots(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
+	if _, err := db.Query(query, nil); err != nil {
+		b.Fatal(err)
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := db.Query(`MATCH (a)-[:NEXT]->(b)-[:NEXT]->(c) RETURN id(c) AS id`, nil); err != nil {
+		if _, err := db.Query(query, nil); err != nil {
 			b.Fatal(err)
 		}
 	}
