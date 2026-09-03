@@ -118,7 +118,8 @@ jobs:
               go test -run '^$' -bench='^(BenchmarkReadRequests|BenchmarkOutgoingEdges|BenchmarkCheckpoint|BenchmarkColdOpen|BenchmarkReaderDuringCommit|BenchmarkMatchedScale10K|BenchmarkPropertyEquality10K|BenchmarkPropertyIndexCommonValue10K)$' -benchmem -benchtime=100ms -count=3 .
               go test -run '^$' -bench='^BenchmarkSingleRecordCommitScaling$/^nodes_(1000|100000)$' -benchmem -benchtime=100ms -count=3 .
               go test -run '^$' -bench='.' -benchmem -benchtime=100ms -count=3 ./internal/store
-              go test -run '^$' -bench='^(BenchmarkQueryMultiHopSlots|BenchmarkVectorSearchMatched10K|BenchmarkVectorSearchANNFallback10K|BenchmarkVectorIndexBuild(Clustered128D|ZigHarness))$' -benchmem -benchtime=100ms -count=3 ./internal/engine
+              go test -run '^$' -bench='^(BenchmarkVectorSearchMatched10K|BenchmarkVectorSearchANNFallback10K|BenchmarkVectorIndexBuild(Clustered128D|ZigHarness))$' -benchmem -benchtime=100ms -count=3 ./internal/engine
+              go test -run '^$' -bench='^BenchmarkQueryMultiHopSlots$' -benchmem -benchtime=1s -count=3 ./internal/engine
               go test -run '^$' -bench='^(BenchmarkVectorSearchScaling|BenchmarkFTSSearchScaling)$/^records_(1000|10000|100000)$' -benchmem -benchtime=100ms -count=3 ./internal/engine
               go test -run '^$' -bench='^BenchmarkVectorSearch(Clustered128D|ZigHarness)$/^(1K|10K|100K)$' -benchmem -benchtime=1x -count=1 ./internal/engine
             ) | tee "$output"
