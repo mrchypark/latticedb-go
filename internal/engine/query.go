@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/mrchypark/latticedb-go/internal/search"
 	"github.com/mrchypark/latticedb-go/internal/store"
@@ -471,6 +472,9 @@ type propertyExpr struct {
 }
 
 func parseQuery(query string) (*queryPlan, error) {
+	if err := validateQueryQuotes(query); err != nil {
+		return nil, err
+	}
 	query = normalizeQueryText(query)
 	var plan *queryPlan
 	var err error
@@ -837,9 +841,9 @@ func parseUnwindQuery(query string) (*queryPlan, error) {
 		return nil, err
 	}
 
-	varName, nextKeyword, afterVar := splitOnNextClause(tail, " MATCH ", " CREATE ", " RETURN ")
-	varName = strings.TrimSpace(varName)
-	if varName == "" {
+	varText, nextKeyword, afterVar := splitOnNextClause(tail, " MATCH ", " CREATE ", " RETURN ")
+	varName, err := parseQueryIdentifier(varText)
+	if err != nil {
 		return nil, fmt.Errorf("invalid UNWIND binding %q", query)
 	}
 	var plan *queryPlan
@@ -1435,18 +1439,22 @@ func parseNodePattern(text string) (nodePattern, error) {
 		prefix = strings.TrimSpace(body[:propStart])
 	}
 
-	segments := strings.Split(prefix, ":")
+	segments := splitTopLevel(prefix, ':')
 	pattern := nodePattern{Properties: props, PropertyExprs: propertyExprs}
 	if len(segments) > 0 {
 		first := strings.TrimSpace(segments[0])
 		if first != "" {
-			pattern.Var = first
+			pattern.Var, err = parseQueryIdentifier(first)
+			if err != nil {
+				return nodePattern{}, fmt.Errorf("invalid binding %q", first)
+			}
 		}
 	}
 	for _, segment := range segments[1:] {
-		label := strings.TrimSpace(segment)
-		if !isQueryIdentifier(label) {
-			return nodePattern{}, fmt.Errorf("invalid label %q", label)
+		labelText := strings.TrimSpace(segment)
+		label, err := parseQueryIdentifier(labelText)
+		if err != nil {
+			return nodePattern{}, fmt.Errorf("invalid label %q", labelText)
 		}
 		pattern.Labels = append(pattern.Labels, label)
 	}
@@ -1562,22 +1570,29 @@ func parseEdgeBody(text string) (edgePattern, error) {
 		prefix = strings.TrimSpace(edgeBody[:propStart])
 	}
 
-	edgeSegments := strings.SplitN(prefix, ":", 2)
 	pattern := edgePattern{Properties: props, PropertyExprs: propertyExprs}
-	if len(edgeSegments) == 2 {
-		pattern.EdgeVar = strings.TrimSpace(edgeSegments[0])
-		pattern.EdgeType = strings.TrimSpace(edgeSegments[1])
-		if pattern.EdgeType == "" {
+	if left, right, ok := splitOperator(prefix, ":"); ok {
+		varText, typeText := strings.TrimSpace(left), strings.TrimSpace(right)
+		var err error
+		if varText != "" {
+			pattern.EdgeVar, err = parseQueryIdentifier(varText)
+			if err != nil {
+				return edgePattern{}, fmt.Errorf("invalid edge binding %q", varText)
+			}
+		}
+		pattern.EdgeType, err = parseQueryIdentifier(typeText)
+		if err != nil {
 			return edgePattern{}, errors.New("edge type must be non-empty after colon")
 		}
 	} else {
-		pattern.EdgeVar = strings.TrimSpace(edgeSegments[0])
-	}
-	if pattern.EdgeVar != "" && !isQueryIdentifier(pattern.EdgeVar) {
-		return edgePattern{}, fmt.Errorf("invalid edge binding %q", pattern.EdgeVar)
-	}
-	if pattern.EdgeType != "" && !isQueryIdentifier(pattern.EdgeType) {
-		return edgePattern{}, fmt.Errorf("invalid edge type %q", pattern.EdgeType)
+		varText := strings.TrimSpace(prefix)
+		if varText != "" {
+			var err error
+			pattern.EdgeVar, err = parseQueryIdentifier(varText)
+			if err != nil {
+				return edgePattern{}, fmt.Errorf("invalid edge binding %q", varText)
+			}
+		}
 	}
 	return pattern, nil
 }
@@ -1665,15 +1680,15 @@ func wherePredicateClauses(predicate wherePredicate) []*whereClause {
 
 func parseWhereClause(text string) (*whereClause, error) {
 	text = strings.TrimSpace(text)
-	if strings.HasSuffix(text, " IS NOT NULL") {
-		varName, property, err := parsePropertyAccess(strings.TrimSuffix(text, " IS NOT NULL"))
+	if prefix, ok := trimTopLevelSuffix(text, " IS NOT NULL"); ok {
+		varName, property, err := parsePropertyAccess(prefix)
 		if err != nil {
 			return nil, err
 		}
 		return &whereClause{Kind: whereIsNotNull, Var: varName, Property: property}, nil
 	}
-	if strings.HasSuffix(text, " IS NULL") {
-		varName, property, err := parsePropertyAccess(strings.TrimSuffix(text, " IS NULL"))
+	if prefix, ok := trimTopLevelSuffix(text, " IS NULL"); ok {
+		varName, property, err := parsePropertyAccess(prefix)
 		if err != nil {
 			return nil, err
 		}
@@ -1766,16 +1781,20 @@ func parseWhereClause(text string) (*whereClause, error) {
 }
 
 func parseSetClause(text string) (*setClause, error) {
-	if !strings.Contains(text, " = ") && !strings.Contains(text, " += ") {
-		left, right, ok := splitOperator(text, ":")
-		if !ok || !isQueryIdentifier(left) || !isQueryIdentifier(right) {
-			return nil, fmt.Errorf("unsupported SET clause %q", text)
+	if _, _, hasEquals := splitOperator(text, " = "); !hasEquals {
+		if _, _, hasMerge := splitOperator(text, " += "); !hasMerge {
+			left, right, ok := splitOperator(text, ":")
+			varName, varErr := parseQueryIdentifier(left)
+			label, labelErr := parseQueryIdentifier(right)
+			if !ok || varErr != nil || labelErr != nil {
+				return nil, fmt.Errorf("unsupported SET clause %q", text)
+			}
+			return &setClause{Kind: setLabel, Var: varName, Label: label}, nil
 		}
-		return &setClause{Kind: setLabel, Var: left, Label: right}, nil
 	}
 	if left, right, ok := splitOperator(text, " += "); ok {
-		name := strings.TrimSpace(left)
-		if name == "" || strings.Contains(name, ".") {
+		name, err := parseQueryIdentifier(left)
+		if err != nil {
 			return nil, fmt.Errorf("invalid SET merge target %q", left)
 		}
 		expr, err := parseValueExpr(right)
@@ -1796,8 +1815,8 @@ func parseSetClause(text string) (*setClause, error) {
 	if varName, property, err := parsePropertyAccess(left); err == nil {
 		return &setClause{Kind: setProperty, Var: varName, Property: property, Expr: expr}, nil
 	}
-	name := strings.TrimSpace(left)
-	if name == "" {
+	name, err := parseQueryIdentifier(left)
+	if err != nil {
 		return nil, fmt.Errorf("invalid SET target %q", left)
 	}
 	return &setClause{Kind: setReplace, Var: name, Expr: expr}, nil
@@ -1874,18 +1893,22 @@ func parseCreateNodeClause(text string) (*createNodeClause, error) {
 		prefix = strings.TrimSpace(body[:propStart])
 	}
 
-	segments := strings.Split(prefix, ":")
+	segments := splitTopLevel(prefix, ':')
 	clause := &createNodeClause{Props: props}
 	if len(segments) > 0 {
 		first := strings.TrimSpace(segments[0])
 		if first != "" {
-			clause.Var = first
+			clause.Var, err = parseQueryIdentifier(first)
+			if err != nil {
+				return nil, fmt.Errorf("invalid binding %q", first)
+			}
 		}
 	}
 	for _, segment := range segments[1:] {
-		label := strings.TrimSpace(segment)
-		if !isQueryIdentifier(label) {
-			return nil, fmt.Errorf("invalid label %q", label)
+		labelText := strings.TrimSpace(segment)
+		label, err := parseQueryIdentifier(labelText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid label %q", labelText)
 		}
 		clause.Labels = append(clause.Labels, label)
 	}
@@ -1896,8 +1919,8 @@ func parseDeleteClause(text string, detach bool) (*deleteClause, error) {
 	parts := splitTopLevel(text, ',')
 	vars := make([]string, 0, len(parts))
 	for _, part := range parts {
-		name := strings.TrimSpace(part)
-		if name == "" {
+		name, err := parseQueryIdentifier(part)
+		if err != nil {
 			return nil, fmt.Errorf("invalid DELETE clause %q", text)
 		}
 		vars = append(vars, name)
@@ -1924,9 +1947,9 @@ func parseRemoveClause(text string) (*removeClause, error) {
 		if !ok {
 			return nil, fmt.Errorf("invalid REMOVE clause item %q", part)
 		}
-		varName := strings.TrimSpace(left)
-		label := strings.TrimSpace(right)
-		if varName == "" || !isQueryIdentifier(label) {
+		varName, varErr := parseQueryIdentifier(left)
+		label, labelErr := parseQueryIdentifier(right)
+		if varErr != nil || labelErr != nil {
 			return nil, fmt.Errorf("invalid REMOVE clause item %q", part)
 		}
 		items = append(items, removeItem{Var: varName, Label: label})
@@ -1941,12 +1964,20 @@ func parseReturnClause(text string) (*returnClause, error) {
 		text = strings.TrimSpace(strings.TrimPrefix(text, "DISTINCT "))
 	}
 	if strings.HasPrefix(text, "count(") {
-		closeIdx := strings.Index(text, ")")
+		closeIdx := findMatchingBrace(text, len("count")-1, '(', ')')
 		if closeIdx < 0 {
 			return nil, fmt.Errorf("invalid count return %q", text)
 		}
 		derivedAlias := strings.TrimSpace(text[:closeIdx+1])
-		countVar := strings.TrimSpace(text[len("count("):closeIdx])
+		countVarText := strings.TrimSpace(text[len("count("):closeIdx])
+		countVar := countVarText
+		if countVarText != "*" {
+			var err error
+			countVar, err = parseQueryIdentifier(countVarText)
+			if err != nil {
+				return nil, fmt.Errorf("invalid count expression %q", text)
+			}
+		}
 		rest := strings.TrimSpace(text[closeIdx+1:])
 		switch {
 		case rest == "":
@@ -1958,9 +1989,9 @@ func parseReturnClause(text string) (*returnClause, error) {
 		case !strings.HasPrefix(rest, "AS "):
 			return nil, fmt.Errorf("invalid count return %q", text)
 		}
-		alias := strings.TrimSpace(strings.TrimPrefix(rest, "AS "))
-		if !isQueryIdentifier(alias) {
-			return nil, fmt.Errorf("invalid count alias %q", alias)
+		alias, err := parseQueryIdentifier(strings.TrimSpace(strings.TrimPrefix(rest, "AS ")))
+		if err != nil {
+			return nil, fmt.Errorf("invalid count alias %q", rest)
 		}
 		return &returnClause{
 			CountVar:   countVar,
@@ -1978,11 +2009,11 @@ func parseReturnClause(text string) (*returnClause, error) {
 			return nil, errors.New("RETURN projection must be non-empty")
 		}
 		alias := exprText
-		pieces := strings.SplitN(exprText, " AS ", 2)
-		if len(pieces) == 2 {
-			exprText = strings.TrimSpace(pieces[0])
-			alias = strings.TrimSpace(pieces[1])
-			if !isQueryIdentifier(alias) {
+		if expression, name, ok := splitOperator(exprText, " AS "); ok {
+			exprText = strings.TrimSpace(expression)
+			var err error
+			alias, err = parseQueryIdentifier(name)
+			if err != nil {
 				return nil, fmt.Errorf("invalid RETURN alias %q", alias)
 			}
 		}
@@ -2001,24 +2032,24 @@ func parseReturnClause(text string) (*returnClause, error) {
 			})
 			continue
 		}
-		if !strings.Contains(exprText, ".") {
+		if name, property, err := parsePropertyAccess(exprText); err == nil {
 			projections = append(projections, projection{
-				Kind:  projectionValue,
-				Var:   exprText,
-				Alias: alias,
+				Kind:     projectionProperty,
+				Var:      name,
+				Property: property,
+				Alias:    alias,
 			})
 			continue
 		}
-		varName, property, err := parsePropertyAccess(exprText)
-		if err != nil {
-			return nil, err
+		if name, err := parseQueryIdentifier(exprText); err != nil {
+			return nil, fmt.Errorf("invalid RETURN projection %q", exprText)
+		} else {
+			projections = append(projections, projection{
+				Kind:  projectionValue,
+				Var:   name,
+				Alias: alias,
+			})
 		}
-		projections = append(projections, projection{
-			Kind:     projectionProperty,
-			Var:      varName,
-			Property: property,
-			Alias:    alias,
-		})
 	}
 	return &returnClause{Projections: projections, Distinct: distinct}, nil
 }
@@ -2088,27 +2119,22 @@ func parseOrderClauses(text string) ([]orderClause, error) {
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		clause := orderClause{}
-		switch {
-		case strings.HasSuffix(part, " DESC"):
+		if trimmed, ok := trimTopLevelSuffix(part, " DESC"); ok {
+			part = trimmed
 			clause.Desc = true
-			part = strings.TrimSpace(strings.TrimSuffix(part, " DESC"))
-		case strings.HasSuffix(part, " ASC"):
-			part = strings.TrimSpace(strings.TrimSuffix(part, " ASC"))
+		} else if trimmed, ok := trimTopLevelSuffix(part, " ASC"); ok {
+			part = trimmed
 		}
 		if name, ok := parseBindingIDAccess(part); ok {
 			clause.Kind = projectionBindingID
 			clause.Var = name
-		} else if strings.Contains(part, ".") {
-			name, property, err := parsePropertyAccess(part)
-			if err != nil {
-				return nil, err
-			}
+		} else if name, property, err := parsePropertyAccess(part); err == nil {
 			clause.Kind = projectionProperty
 			clause.Var = name
 			clause.Property = property
-		} else if isQueryIdentifier(part) {
+		} else if name, err := parseQueryIdentifier(part); err == nil {
 			clause.Kind = projectionValue
-			clause.Var = part
+			clause.Var = name
 		} else {
 			return nil, fmt.Errorf("invalid ORDER BY expression %q", part)
 		}
@@ -3493,7 +3519,11 @@ func parseValueExpr(text string) (valueExpr, error) {
 		return literalExpr{Value: false}, nil
 	case strings.HasPrefix(text, "$"):
 		name := strings.TrimPrefix(text, "$")
-		if !isQueryIdentifier(name) {
+		if name == "" || name != strings.TrimSpace(name) {
+			return nil, fmt.Errorf("invalid parameter %q", text)
+		}
+		name, err := parseQueryIdentifier(name)
+		if err != nil {
 			return nil, fmt.Errorf("invalid parameter %q", text)
 		}
 		return paramExpr{Name: name}, nil
@@ -3513,14 +3543,14 @@ func parseValueExpr(text string) (valueExpr, error) {
 		if number, ok := parseQueryNumber(text); ok {
 			return literalExpr{Value: number}, nil
 		}
-		if strings.Contains(text, ".") {
-			name, property, err := parsePropertyAccess(text)
-			if err != nil {
-				return nil, err
-			}
+		if name, property, err := parsePropertyAccess(text); err == nil {
 			return propertyExpr{Var: name, Property: property}, nil
 		}
-		return variableExpr{Name: text}, nil
+		name, err := parseQueryIdentifier(text)
+		if err != nil {
+			return nil, fmt.Errorf("invalid value expression %q", text)
+		}
+		return variableExpr{Name: name}, nil
 	}
 }
 
@@ -3614,21 +3644,26 @@ func splitPropertyAssignment(text string) (string, string, error) {
 	if !ok {
 		return "", "", fmt.Errorf("invalid property assignment %q", text)
 	}
-	key = strings.TrimSpace(key)
-	if !isQueryIdentifier(key) {
-		return "", "", fmt.Errorf("invalid property key %q", key)
+	keyText := strings.TrimSpace(key)
+	key, err := parseQueryIdentifier(keyText)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid property key %q", keyText)
 	}
 	return key, strings.TrimSpace(value), nil
 }
 
 func parsePropertyAccess(text string) (string, string, error) {
-	parts := strings.SplitN(strings.TrimSpace(text), ".", 2)
-	if len(parts) != 2 {
+	text = strings.TrimSpace(text)
+	index := findTopLevelToken(text, ".")
+	if index < 0 || findTopLevelToken(text[index+1:], ".") >= 0 {
 		return "", "", fmt.Errorf("invalid property access %q", text)
 	}
-	variable := strings.TrimSpace(parts[0])
-	property := strings.TrimSpace(parts[1])
-	if !isQueryIdentifier(variable) || !isQueryIdentifier(property) {
+	variable, err := parseQueryIdentifier(text[:index])
+	if err != nil {
+		return "", "", fmt.Errorf("invalid property access %q", text)
+	}
+	property, err := parseQueryIdentifier(text[index+1:])
+	if err != nil {
 		return "", "", fmt.Errorf("invalid property access %q", text)
 	}
 	return variable, property, nil
@@ -3636,17 +3671,52 @@ func parsePropertyAccess(text string) (string, string, error) {
 
 func parseBindingIDAccess(text string) (string, bool) {
 	text = strings.TrimSpace(text)
-	if !strings.HasPrefix(text, "id(") || !strings.HasSuffix(text, ")") {
+	if !strings.HasPrefix(text, "id(") || findMatchingBrace(text, 2, '(', ')') != len(text)-1 {
 		return "", false
 	}
-	name := strings.TrimSpace(text[len("id(") : len(text)-1])
-	if !isQueryIdentifier(name) {
+	name, err := parseQueryIdentifier(text[len("id(") : len(text)-1])
+	if err != nil {
 		return "", false
 	}
 	return name, true
 }
 
-func isQueryIdentifier(value string) bool {
+func parseQueryIdentifier(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("identifier must be non-empty")
+	}
+	if value[0] != '`' {
+		if !isASCIIQueryIdentifier(value) {
+			return "", fmt.Errorf("invalid identifier %q", value)
+		}
+		return value, nil
+	}
+	if len(value) < 2 || value[len(value)-1] != '`' {
+		return "", fmt.Errorf("unterminated identifier %q", value)
+	}
+	var decoded strings.Builder
+	for index := 1; index < len(value)-1; index++ {
+		if value[index] == 0 {
+			return "", errors.New("identifier contains NUL")
+		}
+		if value[index] != '`' {
+			decoded.WriteByte(value[index])
+			continue
+		}
+		if index+1 >= len(value)-1 || value[index+1] != '`' {
+			return "", fmt.Errorf("invalid identifier %q", value)
+		}
+		decoded.WriteByte('`')
+		index++
+	}
+	if decoded.Len() == 0 || !utf8.ValidString(decoded.String()) {
+		return "", fmt.Errorf("invalid identifier %q", value)
+	}
+	return decoded.String(), nil
+}
+
+func isASCIIQueryIdentifier(value string) bool {
 	for index, char := range []byte(value) {
 		if char == '_' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || index > 0 && char >= '0' && char <= '9' {
 			continue
@@ -3654,6 +3724,11 @@ func isQueryIdentifier(value string) bool {
 		return false
 	}
 	return value != ""
+}
+
+// isQueryIdentifier validates a decoded identifier stored in a query plan.
+func isQueryIdentifier(value string) bool {
+	return value != "" && utf8.ValidString(value) && !strings.ContainsRune(value, '\x00')
 }
 
 func splitOperator(text string, operator string) (string, string, bool) {
@@ -3698,6 +3773,45 @@ func findTopLevelToken(text, token string) int {
 		}
 	}
 	return -1
+}
+
+func trimTopLevelSuffix(text, suffix string) (string, bool) {
+	text = strings.TrimSpace(text)
+	index := -1
+	var quote byte
+	braceDepth, bracketDepth, parenDepth := 0, 0, 0
+	for i := 0; i < len(text); i++ {
+		if scanQueryString(text, i, &quote) {
+			continue
+		}
+		switch text[i] {
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		}
+		if braceDepth == 0 && bracketDepth == 0 && parenDepth == 0 && strings.HasPrefix(text[i:], suffix) {
+			index = i
+		}
+	}
+	if index < 0 || index+len(suffix) != len(text) {
+		return text, false
+	}
+	return strings.TrimSpace(text[:index]), true
 }
 
 func splitOnNextClause(input string, keywords ...string) (string, string, string) {
@@ -3929,14 +4043,51 @@ func findMatchingBrace(text string, start int, open byte, close byte) int {
 	return -1
 }
 
+const escapedQueryBacktick = 0xff
+
+func validateQueryQuotes(text string) error {
+	if !utf8.ValidString(text) {
+		return errors.New("query contains invalid UTF-8")
+	}
+	var quote byte
+	for index := 0; index < len(text); index++ {
+		scanQueryString(text, index, &quote)
+		if quote == escapedQueryBacktick {
+			continue
+		}
+	}
+	if quote == '`' || quote == escapedQueryBacktick {
+		return fmt.Errorf("unterminated identifier in query")
+	}
+	return nil
+}
+
 func scanQueryString(text string, index int, quote *byte) bool {
 	char := text[index]
+	if *quote == escapedQueryBacktick {
+		*quote = '`'
+		return true
+	}
 	if *quote == 0 {
+		if char == '`' {
+			*quote = char
+			return true
+		}
 		if (char == '\'' || char == '"') && !isEscaped(text, index) {
 			*quote = char
 			return true
 		}
 		return false
+	}
+	if *quote == '`' {
+		if char == '`' {
+			if index+1 < len(text) && text[index+1] == '`' {
+				*quote = escapedQueryBacktick
+				return true
+			}
+			*quote = 0
+		}
+		return true
 	}
 	if char == *quote && !isEscaped(text, index) {
 		*quote = 0
