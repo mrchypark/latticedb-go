@@ -2,9 +2,42 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
+
+func gateFixture(overrides map[string]float64) result {
+	var output strings.Builder
+	seen := map[string]bool{}
+	for _, gate := range blockingGates {
+		if seen[gate.benchmark] {
+			continue
+		}
+		seen[gate.benchmark] = true
+		fmt.Fprintf(&output, "%s-2 1", gate.benchmark)
+		units := map[string]bool{}
+		for _, candidate := range blockingGates {
+			if candidate.benchmark == gate.benchmark {
+				units[candidate.unit] = true
+			}
+		}
+		for unit := range units {
+			value := 100.0
+			if override, ok := overrides[gate.benchmark+" "+unit]; ok {
+				value = override
+			}
+			fmt.Fprintf(&output, " %.0f %s", value, unit)
+		}
+		output.WriteByte('\n')
+	}
+	parsed, err := parse(strings.NewReader(output.String()))
+	if err != nil {
+		panic(err)
+	}
+	return parsed
+}
 
 func TestReportUsesMediansAndComparesMetrics(t *testing.T) {
 	current, err := parse(strings.NewReader("BenchmarkLookup-8 1 120 ns/op 8 B/op 1 allocs/op\nBenchmarkLookup-8 1 100 ns/op 8 B/op 1 allocs/op\nBenchmarkLookup-8 1 110 ns/op 8 B/op 1 allocs/op\n"))
@@ -75,11 +108,94 @@ func TestValidateGoResultRequiresBenchmarkSuiteSentinels(t *testing.T) {
 		}
 	}
 
-	benchmarks, err := parse(strings.NewReader("BenchmarkReadRequests/query-8 1 100 ns/op\nBenchmarkVectorSearchClustered128D/100K-8 1 200 ns/op 300 index-build-ms 99 recall@10\n"))
+	benchmarks, err := parse(strings.NewReader("BenchmarkReadRequests/query-8 1 100 ns/op\nBenchmarkCheckpoint-8 1 100 ns/op\nBenchmarkColdOpen-8 1 100 ns/op\nBenchmarkReaderDuringCommit-8 1 100 ns/op\nBenchmarkFTSSearchScaling/records_100000/fuzzy_rare-8 1 100 ns/op\nBenchmarkVectorSearchScaling/records_100000-8 1 100 ns/op\nBenchmarkVectorSearchANNFallback10K-8 1 100 ns/op\nBenchmarkVectorSearchClustered128D/100K-8 1 200 ns/op 300 index-build-ms 99 recall@10\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := validateGoResult(benchmarks); err != nil {
 		t.Fatalf("full result failed validation: %v", err)
+	}
+}
+
+func TestParseRejectsInvalidGoMetrics(t *testing.T) {
+	for _, metric := range []string{"NaN", "+Inf", "-1"} {
+		if _, err := parse(strings.NewReader("BenchmarkReadRequests/query-8 1 " + metric + " B/op\n")); err == nil {
+			t.Fatalf("parse accepted invalid metric %q", metric)
+		}
+	}
+}
+
+func TestCheckGatesRejectsInvalidMetrics(t *testing.T) {
+	for _, metric := range []float64{math.NaN(), math.Inf(1), -1} {
+		current := gateFixture(nil)
+		current["BenchmarkReadRequests/query"]["B/op"] = []float64{metric}
+		if err := checkGates(current, gateFixture(nil), new(bytes.Buffer)); err == nil {
+			t.Fatalf("checkGates accepted invalid metric %v", metric)
+		}
+	}
+}
+
+func TestCheckGatesRejectsAllocationRegressions(t *testing.T) {
+	previous := gateFixture(nil)
+	current := gateFixture(map[string]float64{
+		"BenchmarkReadRequests/query B/op":             102,
+		"BenchmarkReadRequests/write_commit allocs/op": 101,
+	})
+	var diagnostics bytes.Buffer
+	err := checkGates(current, previous, &diagnostics)
+	if err == nil || !strings.Contains(err.Error(), "BenchmarkReadRequests/query B/op") || !strings.Contains(err.Error(), "write_commit allocs/op") {
+		t.Fatalf("checkGates error = %v, want allocation failures", err)
+	}
+}
+
+func TestCheckGatesAllowsStableOrLowerAllocations(t *testing.T) {
+	previous := gateFixture(nil)
+	current := gateFixture(map[string]float64{
+		"BenchmarkReadRequests/query B/op":      100,
+		"BenchmarkReadRequests/query allocs/op": 99,
+	})
+	if err := checkGates(current, previous, new(bytes.Buffer)); err != nil {
+		t.Fatalf("stable or lower allocation metrics failed gate: %v", err)
+	}
+}
+
+func TestCheckGatesAllowsOnePercentBytesButRejectsMore(t *testing.T) {
+	previous := gateFixture(nil)
+	for name, bytesPerOp := range map[string]float64{
+		"one percent":      101,
+		"over one percent": 102,
+	} {
+		current := gateFixture(map[string]float64{"BenchmarkReadRequests/query B/op": bytesPerOp})
+		err := checkGates(current, previous, new(bytes.Buffer))
+		if name == "one percent" && err != nil {
+			t.Fatalf("1%% B/op drift failed gate: %v", err)
+		}
+		if name == "over one percent" && (err == nil || !strings.Contains(err.Error(), "BenchmarkReadRequests/query B/op")) {
+			t.Fatalf("greater than 1%% B/op drift error = %v", err)
+		}
+	}
+}
+
+func TestCheckGatesAllowsTwentyPercentLatencyButRejectsMore(t *testing.T) {
+	previous := gateFixture(nil)
+	for name, latency := range map[string]float64{"twenty percent": 120, "over twenty percent": 121} {
+		current := gateFixture(map[string]float64{"BenchmarkQueryMultiHopSlots ns/op": latency})
+		err := checkGates(current, previous, new(bytes.Buffer))
+		if name == "twenty percent" && err != nil {
+			t.Fatalf("20%% ns/op drift failed gate: %v", err)
+		}
+		if name == "over twenty percent" && (err == nil || !strings.Contains(err.Error(), "BenchmarkQueryMultiHopSlots ns/op")) {
+			t.Fatalf("greater than 20%% ns/op drift error = %v", err)
+		}
+	}
+}
+
+func TestCheckGatesSkipsNewRowsUntilBaselineExists(t *testing.T) {
+	var diagnostics bytes.Buffer
+	if err := checkGates(gateFixture(nil), result{}, &diagnostics); err != nil {
+		t.Fatalf("new benchmark without baseline failed gate: %v", err)
+	}
+	if !strings.Contains(diagnostics.String(), "no compatible baseline") {
+		t.Fatalf("diagnostics = %q, want baseline skip", diagnostics.String())
 	}
 }

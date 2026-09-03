@@ -115,10 +115,10 @@ jobs:
             local repo=$1 output=$2
             (
               cd "$repo"
-              go test -run '^$' -bench='^(BenchmarkReadRequests|BenchmarkOutgoingEdges|BenchmarkMatchedScale10K|BenchmarkPropertyEquality10K|BenchmarkPropertyIndexCommonValue10K)$' -benchmem -benchtime=100ms -count=3 .
+              go test -run '^$' -bench='^(BenchmarkReadRequests|BenchmarkOutgoingEdges|BenchmarkCheckpoint|BenchmarkColdOpen|BenchmarkReaderDuringCommit|BenchmarkMatchedScale10K|BenchmarkPropertyEquality10K|BenchmarkPropertyIndexCommonValue10K)$' -benchmem -benchtime=100ms -count=3 .
               go test -run '^$' -bench='^BenchmarkSingleRecordCommitScaling$/^nodes_(1000|100000)$' -benchmem -benchtime=100ms -count=3 .
               go test -run '^$' -bench='.' -benchmem -benchtime=100ms -count=3 ./internal/store
-              go test -run '^$' -bench='^(BenchmarkQueryMultiHopSlots|BenchmarkVectorSearchMatched10K|BenchmarkVectorIndexBuild(Clustered128D|ZigHarness))$' -benchmem -benchtime=100ms -count=3 ./internal/engine
+              go test -run '^$' -bench='^(BenchmarkQueryMultiHopSlots|BenchmarkVectorSearchMatched10K|BenchmarkVectorSearchANNFallback10K|BenchmarkVectorIndexBuild(Clustered128D|ZigHarness))$' -benchmem -benchtime=100ms -count=3 ./internal/engine
               go test -run '^$' -bench='^(BenchmarkVectorSearchScaling|BenchmarkFTSSearchScaling)$/^records_(1000|10000|100000)$' -benchmem -benchtime=100ms -count=3 ./internal/engine
               go test -run '^$' -bench='^BenchmarkVectorSearch(Clustered128D|ZigHarness)$/^(1K|10K|100K)$' -benchmem -benchtime=1x -count=1 ./internal/engine
             ) | tee "$output"
@@ -126,6 +126,7 @@ jobs:
 
           mkdir -p results
           run_suite "$GITHUB_WORKSPACE" results/current.txt
+          go run ./scripts/benchcmp.go -validate-go results/current.txt
           git rev-parse HEAD > results/revision.txt
 
           if [[ ! -f previous/current.txt ]]; then
@@ -169,6 +170,13 @@ jobs:
             -output results/report.md
           printf 'Zig reference: %s (Zig %s, ref %s).\n\n' "$zig_status" "$(cat results/zig-version.txt)" "$(cat results/zig-ref.txt)" >> "$GITHUB_STEP_SUMMARY"
           cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce stable performance gates
+        run: |
+          go run ./scripts/benchcmp.go \
+            -current results/current.txt \
+            -previous previous/current.txt \
+            -check
 
       - name: Upload performance report
         uses: actions/upload-artifact@v7
