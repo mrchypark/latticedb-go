@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -540,7 +541,8 @@ func TestIDReservationFaultMatrixPreservesPublicationBoundary(t *testing.T) {
 
 func TestWALGrowthIsBoundedWithoutClose(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bounded-wal.ltdb")
-	db, err := Open(path, OpenOptions{Create: true, WALCheckpointThresholdBytes: 8 << 10})
+	checkpointDone := make(chan struct{}, 32)
+	db, err := Open(path, OpenOptions{Create: true, WALCheckpointThresholdBytes: 8 << 10, ChangefeedMaxBytes: 1 << 10, checkpointComplete: checkpointDone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,6 +558,7 @@ func TestWALGrowthIsBoundedWithoutClose(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
 	info, err := os.Stat(filepath.Join(path, "wal.log"))
 	if err != nil {
 		t.Fatal(err)
@@ -606,7 +609,8 @@ func TestWALThresholdCountsOnlyDeltaTail(t *testing.T) {
 	if err := seed.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(path, OpenOptions{WALCheckpointThresholdBytes: 2 << 10})
+	checkpointDone := make(chan struct{}, 32)
+	db, err := Open(path, OpenOptions{WALCheckpointThresholdBytes: 2 << 10, checkpointComplete: checkpointDone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,8 +620,653 @@ func TestWALThresholdCountsOnlyDeltaTail(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
 	if db.checkpointCount == 0 || db.checkpointCount >= 100 {
 		t.Fatalf("checkpoint count = %d; base snapshot was included in trigger", db.checkpointCount)
+	}
+}
+
+func TestBackgroundCheckpointDoesNotBlockNextCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-checkpoint.ltdb")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	checkpointDone := make(chan struct{}, 32)
+	var once sync.Once
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointComplete:          checkpointDone,
+		checkpointPrepare: func(string, *store.GraphState, uint64, uint64, uint64) error {
+			once.Do(func() {
+				close(started)
+				<-release
+			})
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	committed := make(chan error, 1)
+	go func() {
+		committed <- db.Update(func(tx *Tx) error {
+			_, err := tx.CreateNode(CreateNodeOptions{})
+			return err
+		})
+	}()
+	select {
+	case err := <-committed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("next commit blocked by background checkpoint preparation")
+	}
+	close(release)
+	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
+	if err := db.View(func(tx *Tx) error {
+		result, err := tx.Query("MATCH (n) RETURN count(n) AS count", nil)
+		if err != nil {
+			return err
+		}
+		if got := result.Rows[0]["count"]; got != int64(2) {
+			t.Fatalf("committed node count = %v, want 2", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBackgroundCheckpointStaleCandidateRecoversLatestCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-stale.ltdb")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	checkpointDone := make(chan struct{}, 32)
+	var once sync.Once
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointComplete:          checkpointDone,
+		checkpointPrepare: func(string, *store.GraphState, uint64, uint64, uint64) error {
+			once.Do(func() {
+				close(started)
+				<-release
+			})
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var node Node
+	if err := db.Update(func(tx *Tx) error {
+		node, err = tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"revision": int64(1)}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := db.Update(func(tx *Tx) error {
+		return tx.SetProperty(node.ID, "revision", int64(2))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.View(func(tx *Tx) error {
+		value, ok, err := tx.GetProperty(node.ID, "revision")
+		if err != nil {
+			return err
+		}
+		if !ok || value != int64(2) {
+			t.Fatalf("recovered stale-candidate value = %#v, ok=%v", value, ok)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseWaitsForBackgroundCheckpointPreparation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-close.ltdb")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointPrepare: func(string, *store.GraphState, uint64, uint64, uint64) error {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-release
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	closed := make(chan error, 1)
+	go func() { closed <- db.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned before preparation completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not drain background checkpoint worker")
+	}
+	if _, err := db.Begin(true); !errors.Is(err, ErrDatabaseClosed) {
+		t.Fatalf("closed DB Begin error = %v", err)
+	}
+}
+
+func TestBackgroundCheckpointPreparationFailureRetriesOnNextCommit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-prepare-failure.ltdb")
+	checkpointDone := make(chan struct{}, 8)
+	attempts := 0
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointComplete:          checkpointDone,
+		checkpointPrepare: func(string, *store.GraphState, uint64, uint64, uint64) error {
+			attempts++
+			if attempts == 1 {
+				return errors.New("injected checkpoint preparation failure")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-checkpointDone:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint preparation did not finish")
+	}
+	db.mu.RLock()
+	if !db.dirty || db.checkpointCount != 0 {
+		db.mu.RUnlock()
+		t.Fatalf("failed preparation state: dirty=%v count=%d", db.dirty, db.checkpointCount)
+	}
+	db.mu.RUnlock()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	result, err := reopened.Query("MATCH (n) RETURN count(n) AS count", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Rows[0]["count"]; got != int64(2) {
+		t.Fatalf("recovered node count = %v, want 2", got)
+	}
+}
+
+func TestExplicitCheckpointWhileBackgroundPreparationRuns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-explicit-checkpoint.ltdb")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	checkpointDone := make(chan struct{}, 8)
+	var once sync.Once
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointComplete:          checkpointDone,
+		checkpointPrepare: func(string, *store.GraphState, uint64, uint64, uint64) error {
+			once.Do(func() { close(started) })
+			<-release
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint did not start")
+	}
+	explicitDone := make(chan error, 1)
+	go func() { explicitDone <- db.Checkpoint() }()
+	select {
+	case err := <-explicitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("explicit checkpoint blocked on background preparation")
+	}
+	close(release)
+	select {
+	case <-checkpointDone:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint attempt did not finish")
+	}
+}
+
+func TestForegroundUpdateWaitsForCheckpointPublication(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-foreground-priority.ltdb")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointPublish: func() {
+			close(started)
+			<-release
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint did not reach publication")
+	}
+	committed := make(chan error, 1)
+	go func() {
+		committed <- db.Update(func(tx *Tx) error {
+			_, err := tx.CreateNode(CreateNodeOptions{})
+			return err
+		})
+	}()
+	select {
+	case err := <-committed:
+		t.Fatalf("foreground update returned while publication was blocked: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-committed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground update did not complete after publication")
+	}
+}
+
+func TestForegroundWriterStillConflictsWithForegroundWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "foreground-writer-conflict.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Begin(false); !errors.Is(err, ErrWriteTxActive) {
+		t.Fatalf("concurrent foreground Begin error = %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForegroundBeginRetriesAfterCheckpointAttemptFinishes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "foreground-begin-after-checkpoint.ltdb")
+	published := make(chan struct{})
+	release := make(chan struct{})
+	failed := make(chan struct{})
+	allowState := make(chan struct{})
+	checkpointDone := make(chan struct{}, 8)
+	var publishOnce sync.Once
+	var failedOnce sync.Once
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointComplete:          checkpointDone,
+		checkpointPublish: func() {
+			publishOnce.Do(func() { close(published) })
+			<-release
+		},
+		checkpointTryLockFailed: func() {
+			failedOnce.Do(func() {
+				close(failed)
+				<-allowState
+			})
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-published:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint did not reach publication")
+	}
+	type beginResult struct {
+		tx  *Tx
+		err error
+	}
+	resultCh := make(chan beginResult, 1)
+	go func() {
+		tx, err := db.Begin(false)
+		resultCh <- beginResult{tx: tx, err: err}
+	}()
+	select {
+	case <-failed:
+	case <-time.After(time.Second):
+		t.Fatal("foreground Begin did not observe checkpoint contention")
+	}
+	close(release)
+	select {
+	case <-checkpointDone:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint did not finish")
+	}
+	close(allowState)
+	result := <-resultCh
+	if result.err != nil {
+		t.Fatalf("foreground Begin after completed checkpoint = %v", result.err)
+	}
+	if err := result.tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForegroundBeginRetriesWorkerHandoffAfterInactiveObservation(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "foreground-worker-handoff.ltdb"), OpenOptions{
+		Create: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	db.writeMu.Lock()
+	firstFailed := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	beforeFinal := make(chan struct{})
+	releaseFinal := make(chan struct{})
+	workerReady := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var firstOnce, finalOnce sync.Once
+	db.checkpointTryLockFailed = func() {
+		firstOnce.Do(func() {
+			close(firstFailed)
+			<-releaseFirst
+		})
+	}
+	db.checkpointBeforeFinalTryLock = func() {
+		finalOnce.Do(func() {
+			close(beforeFinal)
+			<-releaseFinal
+		})
+	}
+	resultCh := make(chan error, 1)
+	go func() {
+		tx, err := db.Begin(false)
+		if err == nil {
+			err = tx.Rollback()
+		}
+		resultCh <- err
+	}()
+	select {
+	case <-firstFailed:
+	case <-time.After(time.Second):
+		t.Fatal("foreground Begin did not observe writer contention")
+	}
+	close(releaseFirst)
+	select {
+	case <-beforeFinal:
+	case <-time.After(time.Second):
+		t.Fatal("foreground Begin did not reach final TryLock")
+	}
+	db.writeMu.Unlock()
+	db.announceCheckpointAttempt()
+	go func() {
+		db.writeMu.Lock()
+		close(workerReady)
+		<-releaseWorker
+		db.writeMu.Unlock()
+		db.finishCheckpointAttempt()
+	}()
+	select {
+	case <-workerReady:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not acquire writeMu")
+	}
+	close(releaseFinal)
+	select {
+	case err := <-resultCh:
+		t.Fatalf("foreground Begin returned while worker owned writeMu: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseWorker)
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("foreground Begin did not complete after worker handoff")
+	}
+}
+
+func TestRollbackAfterCheckpointPublicationContentionReschedules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-rollback-reschedule.ltdb")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	checkpointDone := make(chan struct{}, 8)
+	var once sync.Once
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointComplete:          checkpointDone,
+		checkpointPrepare: func(string, *store.GraphState, uint64, uint64, uint64) error {
+			once.Do(func() { close(started) })
+			<-release
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint did not start")
+	}
+	foreground, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case <-checkpointDone:
+	case <-time.After(time.Second):
+		t.Fatal("contended background checkpoint did not finish")
+	}
+	if err := foreground.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
+	info, err := os.Stat(filepath.Join(path, "wal.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > 16<<10 {
+		t.Fatalf("WAL after rollback reschedule = %d bytes", info.Size())
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	result, err := reopened.Query("MATCH (n) RETURN count(n) AS count", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Rows[0]["count"]; got != int64(1) {
+		t.Fatalf("recovered node count = %v, want 1", got)
+	}
+}
+
+func TestCloseWithActiveReadTransactionLeavesCheckpointWorkerRunning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-read-close.ltdb")
+	checkpointDone := make(chan struct{}, 8)
+	db, err := Open(path, OpenOptions{Create: true, WALCheckpointThresholdBytes: 1, checkpointComplete: checkpointDone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); !errors.Is(err, ErrTransactionsActive) {
+		t.Fatalf("Close with active read transaction = %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseWithActiveSnapshotLeavesCheckpointWorkerRunning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "background-snapshot-close.ltdb")
+	checkpointDone := make(chan struct{}, 8)
+	db, err := Open(path, OpenOptions{Create: true, WALCheckpointThresholdBytes: 1, checkpointComplete: checkpointDone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	snapshot, err := db.BeginSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); !errors.Is(err, ErrSnapshotActive) {
+		t.Fatalf("Close with active snapshot = %v", err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func waitForBackgroundCheckpoint(t *testing.T, db *DB, minimum uint64, complete <-chan struct{}) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-complete:
+		case <-timer.C:
+			db.mu.RLock()
+			count, dirty := db.checkpointCount, db.dirty
+			db.mu.RUnlock()
+			t.Fatalf("background checkpoint did not finish: count=%d dirty=%v", count, dirty)
+		}
+		db.mu.RLock()
+		count := db.checkpointCount
+		dirty := db.dirty
+		db.mu.RUnlock()
+		if count >= minimum && !dirty {
+			return
+		}
 	}
 }
 

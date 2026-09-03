@@ -92,6 +92,11 @@ type OpenOptions struct {
 	walTruncate                      func(*os.File, int64) error
 	walCleanupSync                   func(*os.File) error
 	reserveIDs                       func(store.DatabaseFiles, string, uint64, uint64) error
+	checkpointPrepare                func(string, *store.GraphState, uint64, uint64, uint64) error
+	checkpointPublish                func()
+	checkpointTryLockFailed          func()
+	checkpointBeforeFinalTryLock     func()
+	checkpointComplete               chan struct{}
 	checkpoint                       func(string, *store.GraphState, uint64, uint64, uint64) error
 }
 
@@ -231,12 +236,34 @@ type DB struct {
 	walTruncate                      func(*os.File, int64) error
 	walCleanupSync                   func(*os.File) error
 	reserveIDs                       func(store.DatabaseFiles, string, uint64, uint64) error
+	checkpointPrepare                func(string, *store.GraphState, uint64, uint64, uint64) error
+	checkpointPublish                func()
+	checkpointTryLockFailed          func()
+	checkpointBeforeFinalTryLock     func()
+	checkpointComplete               chan struct{}
 	checkpoint                       func(string, *store.GraphState, uint64, uint64, uint64) error
+	checkpointWorkerMu               sync.Mutex
+	checkpointQueued                 bool
+	checkpointNeeded                 atomic.Bool
+	checkpointAttemptCond            sync.Cond
+	checkpointAttemptActive          bool
+	checkpointAttemptEpoch           uint64
+	checkpointWake                   chan struct{}
+	checkpointStop                   chan struct{}
+	checkpointStopOnce               sync.Once
+	checkpointDone                   chan struct{}
 	pathLock                         *pathLock
 	wal                              *store.WALWriter
 	temporary                        bool
 	streamNotify                     chan struct{}
 	activeSnapshot                   bool
+}
+
+type checkpointGeneration struct {
+	graph      *store.GraphState
+	nextNodeID uint64
+	nextEdgeID uint64
+	commitID   uint64
 }
 
 type Tx struct {
@@ -470,7 +497,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		}
 	}
 
-	return &DB{
+	db := &DB{
 		path:                             path,
 		files:                            files,
 		graph:                            graph,
@@ -497,30 +524,266 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		walTruncate:                      opts.walTruncate,
 		walCleanupSync:                   opts.walCleanupSync,
 		reserveIDs:                       opts.reserveIDs,
+		checkpointPrepare:                opts.checkpointPrepare,
+		checkpointPublish:                opts.checkpointPublish,
+		checkpointTryLockFailed:          opts.checkpointTryLockFailed,
+		checkpointBeforeFinalTryLock:     opts.checkpointBeforeFinalTryLock,
+		checkpointComplete:               opts.checkpointComplete,
 		checkpoint:                       opts.checkpoint,
 		pathLock:                         lock,
 		wal:                              wal,
 		streamNotify:                     make(chan struct{}),
-	}, nil
+	}
+	db.checkpointAttemptCond.L = &db.checkpointWorkerMu
+	if !db.readOnly {
+		db.startCheckpointWorker()
+	}
+	return db, nil
+}
+
+func (db *DB) startCheckpointWorker() {
+	db.checkpointWake = make(chan struct{}, 1)
+	db.checkpointStop = make(chan struct{})
+	db.checkpointDone = make(chan struct{})
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		db.checkpointWorker()
+	}()
+	<-started
+}
+
+func (db *DB) stopCheckpointWorker() {
+	if db.checkpointDone == nil {
+		return
+	}
+	db.checkpointStopOnce.Do(func() { close(db.checkpointStop) })
+	<-db.checkpointDone
+}
+
+func (db *DB) requestBackgroundCheckpoint() {
+	if db.checkpointWake == nil {
+		return
+	}
+	db.mu.RLock()
+	if db.closed || db.readOnly || db.recoveryRequired || db.wal == nil || !db.dirty {
+		db.mu.RUnlock()
+		return
+	}
+	size, err := db.wal.TailSize()
+	threshold := db.walCheckpointThresholdBytes
+	db.mu.RUnlock()
+	if err != nil || size < 0 || uint64(size) < threshold {
+		return
+	}
+	db.checkpointWorkerMu.Lock()
+	select {
+	case <-db.checkpointStop:
+		db.checkpointWorkerMu.Unlock()
+		return
+	default:
+	}
+	if db.checkpointQueued {
+		db.checkpointWorkerMu.Unlock()
+		return
+	}
+	db.checkpointQueued = true
+	select {
+	case db.checkpointWake <- struct{}{}:
+	default:
+	}
+	db.checkpointWorkerMu.Unlock()
+}
+
+func (db *DB) checkpointWorker() {
+	defer close(db.checkpointDone)
+	for {
+		select {
+		case <-db.checkpointStop:
+			return
+		case <-db.checkpointWake:
+			db.checkpointWorkerMu.Lock()
+			db.checkpointQueued = false
+			db.checkpointWorkerMu.Unlock()
+			select {
+			case <-db.checkpointStop:
+				return
+			default:
+			}
+			db.runBackgroundCheckpoint()
+			if db.checkpointComplete != nil {
+				select {
+				case db.checkpointComplete <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}
+}
+
+func (db *DB) announceCheckpointAttempt() {
+	db.checkpointWorkerMu.Lock()
+	db.checkpointAttemptEpoch++
+	db.checkpointAttemptActive = true
+	db.checkpointWorkerMu.Unlock()
+}
+
+func (db *DB) finishCheckpointAttempt() {
+	db.checkpointWorkerMu.Lock()
+	db.checkpointAttemptActive = false
+	db.checkpointAttemptCond.Broadcast()
+	db.checkpointWorkerMu.Unlock()
+}
+
+func (db *DB) waitForCheckpointAttempt() {
+	db.checkpointWorkerMu.Lock()
+	for db.checkpointAttemptActive {
+		db.checkpointAttemptCond.Wait()
+	}
+	db.checkpointWorkerMu.Unlock()
+}
+
+func (db *DB) checkpointAttemptEpochState() uint64 {
+	db.checkpointWorkerMu.Lock()
+	epoch := db.checkpointAttemptEpoch
+	db.checkpointWorkerMu.Unlock()
+	return epoch
+}
+
+func (db *DB) checkpointAttemptEpochChanged(epoch uint64) bool {
+	db.checkpointWorkerMu.Lock()
+	changed := db.checkpointAttemptEpoch != epoch
+	db.checkpointWorkerMu.Unlock()
+	return changed
+}
+
+func (db *DB) captureCheckpointGeneration() (checkpointGeneration, bool) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed || db.readOnly || db.recoveryRequired || db.wal == nil || !db.dirty {
+		return checkpointGeneration{}, false
+	}
+	size, err := db.wal.TailSize()
+	if err != nil || size < 0 || uint64(size) < db.walCheckpointThresholdBytes {
+		return checkpointGeneration{}, false
+	}
+	return checkpointGeneration{graph: db.graph, nextNodeID: db.nextNodeID, nextEdgeID: db.nextEdgeID, commitID: db.commitID}, true
+}
+
+func (db *DB) runBackgroundCheckpoint() {
+	generation, ok := db.captureCheckpointGeneration()
+	if !ok {
+		return
+	}
+	if db.checkpointPrepare != nil {
+		if err := db.checkpointPrepare(db.path, generation.graph, generation.nextNodeID, generation.nextEdgeID, generation.commitID); err != nil {
+			return
+		}
+	}
+	prepared, err := store.PrepareCheckpointFiles(db.files, generation.graph, generation.nextNodeID, generation.nextEdgeID, generation.commitID)
+	if err != nil {
+		return
+	}
+	defer func() { _ = prepared.Cleanup() }()
+
+	db.announceCheckpointAttempt()
+	if !db.writeMu.TryLock() {
+		db.finishCheckpointAttempt()
+		return
+	}
+	defer func() {
+		db.writeMu.Unlock()
+		db.finishCheckpointAttempt()
+	}()
+	if db.checkpointPublish != nil {
+		db.checkpointPublish()
+	}
+
+	db.mu.RLock()
+	stale := db.closed || db.readOnly || db.recoveryRequired || !db.dirty || db.graph != generation.graph || db.commitID != generation.commitID
+	db.mu.RUnlock()
+	if stale {
+		db.requestBackgroundCheckpoint()
+		return
+	}
+	if err := db.publishBackgroundCheckpoint(prepared, generation); err != nil {
+		return
+	}
+	// A newer commit may have queued another generation while this one was
+	// being prepared. Its request remains in checkpointWake for the next pass.
+}
+
+func (db *DB) publishBackgroundCheckpoint(prepared *store.PreparedCheckpoint, generation checkpointGeneration) error {
+	db.mu.RLock()
+	wal := db.wal
+	db.mu.RUnlock()
+	if err := wal.Close(); err != nil {
+		db.mu.Lock()
+		db.recoveryRequired = true
+		db.mu.Unlock()
+		return err
+	}
+	if err := prepared.PublishCheckpointFiles(db.files); err != nil {
+		return db.reopenWALAfterCheckpointError(err)
+	}
+	wal, err := store.OpenWALWriterFiles(db.files, db.fullSync, db.walSync, db.walWrite, db.walTruncate, db.walCleanupSync)
+	if err != nil {
+		db.mu.Lock()
+		db.recoveryRequired = true
+		db.mu.Unlock()
+		return err
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed || db.graph != generation.graph || db.commitID != generation.commitID {
+		_ = wal.Close()
+		db.recoveryRequired = true
+		return ErrWriteConflict
+	}
+	db.wal = wal
+	db.dirty = false
+	db.checkpointNeeded.Store(false)
+	db.checkpointCount++
+	return nil
 }
 
 func (db *DB) Close() error {
 	if !db.writeMu.TryLock() {
-		return ErrWriteTxActive
+		if db.activeTx.Load() != 0 {
+			return ErrWriteTxActive
+		}
+		// A checkpoint worker may own writeMu only for its short publication
+		// phase. Wait for that phase to finish, but preserve the existing
+		// non-blocking behavior when a writer transaction arrives.
+		for !db.writeMu.TryLock() {
+			if db.activeTx.Load() != 0 {
+				return ErrWriteTxActive
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 	defer db.writeMu.Unlock()
 	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	if db.closed {
+		db.mu.Unlock()
 		return nil
 	}
 	if db.activeTx.Load() != 0 {
+		db.mu.Unlock()
 		return ErrTransactionsActive
 	}
 	if db.activeSnapshot {
+		db.mu.Unlock()
 		return ErrSnapshotActive
 	}
+	db.closed = true
+	db.notifyStreamsLocked()
+	db.mu.Unlock()
+
+	db.stopCheckpointWorker()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	var closeErr error
 	if !db.readOnly {
 		if err := db.wal.Close(); err != nil {
@@ -533,8 +796,6 @@ func (db *DB) Close() error {
 			closeErr = err
 		}
 	}
-	db.closed = true
-	db.notifyStreamsLocked()
 	closeErr = errors.Join(closeErr, db.pathLock.close())
 	if db.temporary {
 		closeErr = errors.Join(closeErr, os.RemoveAll(db.path))
@@ -714,6 +975,7 @@ func (db *DB) checkpointWithWriterHeld(ctx context.Context) error {
 	}
 	db.wal = wal
 	db.dirty = false
+	db.checkpointNeeded.Store(false)
 	db.checkpointCount++
 	return nil
 }
@@ -744,7 +1006,24 @@ func (db *DB) SnapshotGraph() (*store.GraphState, error) {
 
 func (db *DB) Begin(readOnly bool) (*Tx, error) {
 	if !readOnly && !db.writeMu.TryLock() {
-		return nil, ErrWriteTxActive
+		attemptEpoch := db.checkpointAttemptEpochState()
+		if db.checkpointTryLockFailed != nil {
+			db.checkpointTryLockFailed()
+		}
+		db.waitForCheckpointAttempt()
+		if db.checkpointBeforeFinalTryLock != nil {
+			db.checkpointBeforeFinalTryLock()
+		}
+		if !db.writeMu.TryLock() {
+			if db.checkpointAttemptEpochChanged(attemptEpoch) {
+				db.waitForCheckpointAttempt()
+				if !db.writeMu.TryLock() {
+					return nil, ErrWriteTxActive
+				}
+			} else {
+				return nil, ErrWriteTxActive
+			}
+		}
 	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -1817,7 +2096,9 @@ func (tx *Tx) CommitContext(ctx context.Context) error {
 		return ErrManagedTransaction
 	}
 	err := tx.commitInternalContext(ctx)
-	tx.finish()
+	if db := tx.finish(); db != nil {
+		db.requestBackgroundCheckpoint()
+	}
 	return err
 }
 
@@ -1838,13 +2119,6 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 			if err := validateNodeVectors(tx.graph.VectorDimensions, tx.graph.Nodes.Get(id)); err != nil {
 				return err
 			}
-		}
-	}
-	if size, err := tx.db.wal.TailSize(); err != nil {
-		return err
-	} else if uint64(size) >= tx.db.walCheckpointThresholdBytes {
-		if err := tx.db.checkpointWithWriterHeld(ctx); err != nil {
-			return err
 		}
 	}
 	if !tx.propertyIndexesApplied {
@@ -1946,6 +2220,9 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	tx.db.graph = tx.graph
 	tx.db.commitID = nextCommitID
 	tx.db.dirty = true
+	if size, sizeErr := wal.TailSize(); sizeErr == nil && size >= 0 && uint64(size) >= tx.db.walCheckpointThresholdBytes {
+		tx.db.checkpointNeeded.Store(true)
+	}
 	tx.db.notifyStreamsLocked()
 	tx.db.mu.Unlock()
 	return nil
@@ -2080,20 +2357,27 @@ func (tx *Tx) rollbackInternal() error {
 	if tx.closed {
 		return ErrInactiveTx
 	}
-	tx.finish()
+	if db := tx.finish(); db != nil {
+		db.requestBackgroundCheckpoint()
+	}
 	return nil
 }
 
-func (tx *Tx) finish() {
+func (tx *Tx) finish() *DB {
 	if tx.closed {
-		return
+		return nil
 	}
 	tx.closed = true
 	tx.db.activeTx.Add(-1)
+	requestCheckpoint := tx.writeLocked && tx.db.checkpointNeeded.Load()
 	if tx.writeLocked {
 		tx.writeLocked = false
 		tx.db.writeMu.Unlock()
 	}
+	if requestCheckpoint {
+		return tx.db
+	}
+	return nil
 }
 
 func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {

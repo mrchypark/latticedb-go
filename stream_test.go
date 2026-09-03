@@ -186,6 +186,7 @@ func TestStreamChangefeedWALStaysBoundedAcrossCheckpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Close()
 	var nodeID uint64
 	if err := db.Update(func(tx *Tx) error {
 		if _, err := tx.PublishStreamGetSequence("events", "first", int64(1)); err != nil {
@@ -210,6 +211,9 @@ func TestStreamChangefeedWALStaysBoundedAcrossCheckpoints(t *testing.T) {
 		if err := db.Update(func(tx *Tx) error { return tx.SetProperty(nodeID, "value", value) }); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
 	}
 	info, err := os.Stat(filepath.Join(path, "wal.log"))
 	if err != nil {

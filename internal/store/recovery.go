@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/mrchypark/latticedb-go/internal/search"
 )
@@ -86,7 +87,7 @@ var legacyStateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '3'}
 
 type WALWriter struct {
 	file          *os.File
-	tailSize      int64
+	tailSize      atomic.Int64
 	fullSync      bool
 	syncFn        func(*os.File) error
 	writeFn       func(*os.File, []byte) (int, error)
@@ -118,7 +119,9 @@ func OpenWALWriterFiles(files DatabaseFiles, fullSync bool, syncFn func(*os.File
 		_ = file.Close()
 		return nil, errors.New("WAL base snapshot is incomplete")
 	}
-	return &WALWriter{file: file, tailSize: offset - baseSize, fullSync: fullSync, syncFn: syncFn, writeFn: writeFn, truncateFn: truncateFn, cleanupSyncFn: cleanupSyncFn}, nil
+	writer := &WALWriter{file: file, fullSync: fullSync, syncFn: syncFn, writeFn: writeFn, truncateFn: truncateFn, cleanupSyncFn: cleanupSyncFn}
+	writer.tailSize.Store(offset - baseSize)
+	return writer, nil
 }
 
 func (writer *WALWriter) AppendSnapshot(graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
@@ -172,7 +175,7 @@ func (writer *WALWriter) append(databaseID string, commitID uint64, payload []by
 	if err := writer.sync(); err != nil {
 		return fmt.Errorf("%w: sync WAL: %w", ErrCommitOutcomeUnknown, err)
 	}
-	writer.tailSize += int64(len(header) + len(payload))
+	writer.tailSize.Add(int64(len(header) + len(payload)))
 	return nil
 }
 
@@ -241,10 +244,10 @@ func (writer *WALWriter) Close() error {
 }
 
 func (writer *WALWriter) TailSize() (int64, error) {
-	if writer == nil || writer.file == nil {
+	if writer == nil {
 		return 0, errors.New("WAL writer is closed")
 	}
-	return writer.tailSize, nil
+	return writer.tailSize.Load(), nil
 }
 
 func (writer *WALWriter) MatchesPath(path string) (bool, error) {
@@ -431,7 +434,7 @@ func loadWALBaseSnapshotFilesContextWithRecoveryBudget(ctx context.Context, file
 	return loadLatestWALV2ContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, nil, budget)
 }
 
-var databaseTempKinds = []string{"state-payload", "snapshot-payload", "state", "wal-payload", "wal", "ids"}
+var databaseTempKinds = []string{"state-payload", "snapshot-payload", "state", "wal-payload", "wal", "ids", "checkpoint"}
 
 func databaseTempPattern(files DatabaseFiles, kind string) string {
 	token := sha256.Sum256([]byte(filepath.Base(files.State)))
@@ -456,9 +459,22 @@ func CleanupDatabaseTempFiles(files DatabaseFiles, includeLegacy bool) error {
 		}
 	}
 	removed := false
+	checkpointPrefix := strings.TrimSuffix(databaseTempPattern(files, "checkpoint"), "*.tmp")
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") ||
-			!slices.ContainsFunc(prefixes, func(prefix string) bool { return strings.HasPrefix(entry.Name(), prefix) }) {
+		if !slices.ContainsFunc(prefixes, func(prefix string) bool { return strings.HasPrefix(entry.Name(), prefix) }) {
+			continue
+		}
+		if entry.IsDir() {
+			if !strings.HasPrefix(entry.Name(), checkpointPrefix) {
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(files.Directory, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			removed = true
+			continue
+		}
+		if !strings.HasSuffix(entry.Name(), ".tmp") {
 			continue
 		}
 		if err := os.Remove(filepath.Join(files.Directory, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -584,6 +600,114 @@ func CheckpointGraphStateAndCompactWALFiles(files DatabaseFiles, graph *GraphSta
 }
 
 type CheckpointFault func(stage string, afterSideEffect bool) error
+
+// PreparedCheckpoint contains durable checkpoint files written into a private
+// staging directory. Its contents are safe to build while the live WAL is in
+// use; PublishCheckpointFiles only swaps the completed files into place.
+type PreparedCheckpoint struct {
+	staging string
+	files   DatabaseFiles
+}
+
+// PrepareCheckpointFiles performs the serialization and fsync work for a
+// checkpoint without touching any live database file.
+func PrepareCheckpointFiles(files DatabaseFiles, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) (*PreparedCheckpoint, error) {
+	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
+		return nil, err
+	}
+	prefix := strings.TrimSuffix(databaseTempPattern(files, "checkpoint"), "*.tmp")
+	staging, err := os.MkdirTemp(files.Directory, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("create checkpoint staging directory: %w", err)
+	}
+	stagedFiles := DirectoryDatabaseFiles(staging)
+	// Keep the candidate self-contained. Publishing a separately generated
+	// WAL base introduces a crash window where state and WAL can refer to
+	// different bases; the live WAL remains untouched until publication.
+	if err := CheckpointGraphStateAndWALFiles(stagedFiles, graph, nextNodeID, nextEdgeID, commitID); err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, err
+	}
+	if err := rewriteWALStatePayload(stagedFiles, nil, graph.DatabaseID, commitID, nil, stagedFiles.WALBase); err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, err
+	}
+	return &PreparedCheckpoint{staging: staging, files: stagedFiles}, nil
+}
+
+// PublishCheckpointFiles atomically installs a prepared checkpoint. Callers
+// must serialize this operation with WAL writers and hold their writer lock.
+func (prepared *PreparedCheckpoint) PublishCheckpointFiles(files DatabaseFiles) error {
+	return prepared.PublishCheckpointFilesWithFault(files, nil)
+}
+
+// PublishCheckpointFilesWithFault atomically installs a prepared checkpoint
+// using the same deterministic fault stages as synchronous checkpoints.
+func (prepared *PreparedCheckpoint) PublishCheckpointFilesWithFault(files DatabaseFiles, fault CheckpointFault) error {
+	if prepared == nil || prepared.staging == "" {
+		return errors.New("checkpoint preparation is empty")
+	}
+	if err := runCheckpointFault(fault, "wal-snapshot-rename", false); err != nil {
+		return err
+	}
+	if err := os.Rename(prepared.files.WAL, files.WAL); err != nil {
+		return fmt.Errorf("publish checkpoint snapshot WAL: %w", err)
+	}
+	if err := runCheckpointFault(fault, "wal-snapshot-rename", true); err != nil {
+		return err
+	}
+	if err := syncCheckpointDirectory(files.Directory, "wal-snapshot", fault); err != nil {
+		return err
+	}
+	if err := runCheckpointFault(fault, "state-rename", false); err != nil {
+		return err
+	}
+	if err := os.Rename(prepared.files.State, files.State); err != nil {
+		return fmt.Errorf("publish checkpoint state: %w", err)
+	}
+	if err := runCheckpointFault(fault, "state-rename", true); err != nil {
+		return err
+	}
+	if err := syncCheckpointDirectory(files.Directory, "state", fault); err != nil {
+		return err
+	}
+	if err := runCheckpointFault(fault, "wal-marker-rename", false); err != nil {
+		return err
+	}
+	if err := os.Rename(prepared.files.WALBase, files.WAL); err != nil {
+		return fmt.Errorf("publish checkpoint marker WAL: %w", err)
+	}
+	if err := runCheckpointFault(fault, "wal-marker-rename", true); err != nil {
+		return err
+	}
+	if err := syncCheckpointDirectory(files.Directory, "wal-marker", fault); err != nil {
+		return err
+	}
+	if err := runCheckpointFault(fault, "wal-base-remove", false); err != nil {
+		return err
+	}
+	if err := os.Remove(files.WALBase); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove checkpoint WAL base: %w", err)
+	}
+	if err := runCheckpointFault(fault, "wal-base-remove", true); err != nil {
+		return err
+	}
+	if err := syncCheckpointDirectory(files.Directory, "wal-base", fault); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Cleanup removes the private staging directory and is safe after a partial
+// publish; live files are never within this directory.
+func (prepared *PreparedCheckpoint) Cleanup() error {
+	if prepared == nil || prepared.staging == "" {
+		return nil
+	}
+	err := os.RemoveAll(prepared.staging)
+	prepared.staging = ""
+	return err
+}
 
 func CheckpointGraphStateAndWALWithFault(dbPath string, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, fault CheckpointFault) error {
 	return checkpointGraphStateAndWALFiles(DirectoryDatabaseFiles(dbPath), graph, nextNodeID, nextEdgeID, commitID, 0, fault)
