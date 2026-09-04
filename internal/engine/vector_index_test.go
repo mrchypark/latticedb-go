@@ -30,6 +30,7 @@ func TestVectorIndexRecallAndDeletion(t *testing.T) {
 		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": vector}})
 		insertVectorIndex(graph, id)
 	}
+	refreshVectorLiveCount(graph)
 	db := &DB{graph: graph, enableVector: true, vectorDimensions: 16, queryCache: map[string]*queryPlan{}}
 	if err := validateVectorIndex(graph); err != nil {
 		t.Fatal(err)
@@ -428,9 +429,34 @@ func TestVectorExactOnlyOpenSkipsIndex(t *testing.T) {
 	if db.graph.VectorIndex.Nodes.Len() != 0 {
 		t.Fatal("exact-only Open built a vector index")
 	}
+	stats, err := db.VectorIndexStats()
+	if err != nil || stats.LiveEntries != 1 {
+		t.Fatalf("exact-only live vectors after reopen = %d, %v; want 1", stats.LiveEntries, err)
+	}
 	results, err := db.VectorSearch([]float32{1, 2}, VectorSearchOptions{K: 1})
 	if err != nil || len(results) != 1 {
 		t.Fatalf("exact-only search = %#v, %v", results, err)
+	}
+	if _, err := db.Query("MATCH (n) WHERE id(n) = 1 REMOVE n.vector", nil); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = db.VectorIndexStats()
+	if err != nil || stats.LiveEntries != 0 {
+		t.Fatalf("exact-only live vectors after removal = %d, %v; want 0", stats.LiveEntries, err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetVector(1, "vector", []float32{2, 3}) }); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = db.VectorIndexStats()
+	if err != nil || stats.LiveEntries != 1 {
+		t.Fatalf("exact-only live vectors after re-add = %d, %v; want 1", stats.LiveEntries, err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.DeleteNode(1) }); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = db.VectorIndexStats()
+	if err != nil || stats.LiveEntries != 0 {
+		t.Fatalf("exact-only live vectors after delete = %d, %v; want 0", stats.LiveEntries, err)
 	}
 }
 
@@ -472,6 +498,7 @@ func TestVectorIndexChurnInvariantsAndDeterministicRebuild(t *testing.T) {
 	if err := validateVectorIndex(graph); err != nil {
 		t.Fatal(err)
 	}
+	refreshVectorLiveCount(graph)
 	db := &DB{graph: graph, enableVector: true, vectorDimensions: 16, queryCache: map[string]*queryPlan{}}
 	matches := 0
 	total := 0
@@ -682,6 +709,71 @@ func TestVectorIndexStats(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestVectorSearchDoesNotFallbackWhenAllLiveVectorsAreFound(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "sparse.ltdb"), OpenOptions{
+		Create: true, EnableVector: true, VectorDimensions: 2, VectorIndexMode: VectorIndexHNSWSynchronous,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		if _, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"vector": []float32{1, 0}}}); err != nil {
+			return err
+		}
+		for range 9 {
+			if _, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"name": "non-vector"}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.VectorIndexStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.LiveEntries != 1 {
+		t.Fatalf("live vectors after create = %d, want 1", before.LiveEntries)
+	}
+	results, err := db.VectorSearch([]float32{1, 0}, VectorSearchOptions{K: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].NodeID != 1 {
+		t.Fatalf("sparse vector results = %#v, want node 1 only", results)
+	}
+	after, err := db.VectorIndexStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ExactFallbacks != before.ExactFallbacks {
+		t.Fatalf("exact fallbacks changed from %d to %d", before.ExactFallbacks, after.ExactFallbacks)
+	}
+	if _, err := db.Query("MATCH (n) WHERE id(n) = 1 REMOVE n.vector", nil); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := db.VectorIndexStats()
+	if err != nil || stats.LiveEntries != 0 {
+		t.Fatalf("live vectors after removal = %d, %v; want 0", stats.LiveEntries, err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetVector(1, "vector", []float32{2, 3}) }); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = db.VectorIndexStats()
+	if err != nil || stats.LiveEntries != 1 {
+		t.Fatalf("live vectors after re-add = %d, %v; want 1", stats.LiveEntries, err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.DeleteNode(1) }); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = db.VectorIndexStats()
+	if err != nil || stats.LiveEntries != 0 {
+		t.Fatalf("live vectors after delete = %d, %v; want 0", stats.LiveEntries, err)
 	}
 }
 

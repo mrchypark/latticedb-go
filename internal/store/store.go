@@ -424,7 +424,9 @@ type GraphState struct {
 	EdgeProperties   PropertyIndexes
 	VectorIndex      VectorIndex
 	VectorTombstones PagedMap[[]float32]
-	VectorMutations  uint64
+	// VectorLiveCount is derived from node properties and rebuilt on load/rebuild.
+	VectorLiveCount uint64
+	VectorMutations uint64
 	// DerivedIndexWork/LogicalBytes are rebuilt on recovery and maintained by mutations.
 	DerivedIndexWork         uint64
 	DerivedIndexLogicalBytes uint64
@@ -679,6 +681,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 	cloned.VectorIndex.EntryID = graph.VectorIndex.EntryID
 	cloned.VectorIndex.MaxLevel = graph.VectorIndex.MaxLevel
 	cloned.VectorMutations = graph.VectorMutations
+	cloned.VectorLiveCount = graph.VectorLiveCount
 	cloned.Streams = graph.Streams.Fork()
 	for definition := range graph.NodeProperties.Definitions() {
 		cloned.NodeProperties.Create(definition)
@@ -731,6 +734,7 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 		EdgeProperties:           graph.EdgeProperties.Fork(),
 		VectorIndex:              graph.VectorIndex.Fork(),
 		VectorTombstones:         graph.VectorTombstones.Fork(),
+		VectorLiveCount:          graph.VectorLiveCount,
 		VectorMutations:          graph.VectorMutations,
 		DerivedIndexWork:         graph.DerivedIndexWork,
 		DerivedIndexLogicalBytes: graph.DerivedIndexLogicalBytes,

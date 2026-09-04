@@ -129,6 +129,7 @@ func zigHarnessIndexedDB(tb testing.TB, graph *store.GraphState, count int) *DB 
 			tb.Fatal(err)
 		}
 	}
+	graph.VectorLiveCount = uint64(count)
 	return &DB{graph: graph, enableVector: true, vectorDimensions: 128, queryCache: map[string]*queryPlan{}}
 }
 

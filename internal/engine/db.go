@@ -284,6 +284,7 @@ type Tx struct {
 	closed                 bool
 	changes                *txChanges
 	vectorIndexApplied     bool
+	vectorLiveCountApplied bool
 	propertyIndexesApplied bool
 	changefeedApplied      bool
 	appMetadataWritable    bool
@@ -479,6 +480,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 			_ = lock.close()
 			return nil, err
 		}
+		refreshVectorLiveCount(graph)
 		if opts.VectorIndexMode == VectorIndexHNSWSynchronous {
 			if err := rebuildVectorIndexBudget(ctx, graph, opts.VectorIndexBuildMaxWork, opts.VectorIndexBuildMaxLogicalBytes); err != nil {
 				_ = lock.close()
@@ -1370,7 +1372,9 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 
 	err = db.View(func(tx *Tx) error {
 		capacity := limit
-		if nodeCount := uint64(tx.graph.Nodes.Len()); capacity > nodeCount {
+		if !opts.Exact && !db.disableVectorIndex && tx.graph.VectorIndex.Nodes.Len() > 0 {
+			capacity = min(limit, tx.graph.VectorLiveCount)
+		} else if nodeCount := uint64(tx.graph.Nodes.Len()); capacity > nodeCount {
 			capacity = nodeCount
 		}
 		results = make([]VectorSearchResult, 0, int(capacity))
@@ -2167,12 +2171,7 @@ func (db *DB) VectorIndexStats() (VectorIndexStats, error) {
 	if db.closed {
 		return VectorIndexStats{}, ErrDatabaseClosed
 	}
-	var live uint64
-	for _, node := range db.graph.Nodes.All() {
-		if _, ok := selectedVector(db.graph, node); ok {
-			live++
-		}
-	}
+	live := db.graph.VectorLiveCount
 	threshold := uint64(vectorRebuildThreshold(db.graph))
 	debt := uint64(db.graph.VectorTombstones.Len()) + db.graph.VectorMutations
 	remaining := uint64(0)
@@ -2308,6 +2307,10 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 			if err := validateNodeVectors(tx.graph.VectorDimensions, tx.graph.Nodes.Get(id)); err != nil {
 				return err
 			}
+		}
+		if !tx.vectorLiveCountApplied {
+			tx.applyVectorLiveCountChanges()
+			tx.vectorLiveCountApplied = true
 		}
 	}
 	if !tx.propertyIndexesApplied {
