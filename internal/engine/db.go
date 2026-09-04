@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"math"
 	"os"
 	"slices"
@@ -2012,7 +2013,11 @@ func (db *DB) CacheStats() (QueryCacheStats, error) {
 }
 
 func (db *DB) CreateNodePropertyIndex(label, property string) error {
-	return db.updatePropertyIndex(true, true, label, property)
+	return db.CreateNodePropertyIndexContext(context.Background(), label, property)
+}
+
+func (db *DB) CreateNodePropertyIndexContext(ctx context.Context, label, property string) error {
+	return db.createPropertyIndexContext(ctx, true, label, property)
 }
 
 func (db *DB) DropNodePropertyIndex(label, property string) error {
@@ -2020,11 +2025,142 @@ func (db *DB) DropNodePropertyIndex(label, property string) error {
 }
 
 func (db *DB) CreateEdgePropertyIndex(edgeType, property string) error {
-	return db.updatePropertyIndex(false, true, edgeType, property)
+	return db.CreateEdgePropertyIndexContext(context.Background(), edgeType, property)
+}
+
+func (db *DB) CreateEdgePropertyIndexContext(ctx context.Context, edgeType, property string) error {
+	return db.createPropertyIndexContext(ctx, false, edgeType, property)
 }
 
 func (db *DB) DropEdgePropertyIndex(edgeType, property string) error {
 	return db.updatePropertyIndex(false, false, edgeType, property)
+}
+
+var errPropertyIndexGenerationChanged = errors.New("property index build generation changed")
+
+func (db *DB) createPropertyIndexContext(ctx context.Context, node bool, scope, property string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if scope == "" || property == "" {
+		return fmt.Errorf("%w: property index scope and property must be non-empty", ErrInvalidArgument)
+	}
+	if node {
+		if err := store.ValidateCreateLabels([]string{scope}); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+		}
+	} else if err := store.ValidateEdgeType(scope); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if err := store.ValidatePropertyKey(property); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	definition := store.PropertyIndexDefinition{Scope: scope, Property: property}
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		db.mu.RLock()
+		if db.closed {
+			db.mu.RUnlock()
+			return ErrDatabaseClosed
+		}
+		if db.readOnly {
+			db.mu.RUnlock()
+			return ErrReadOnly
+		}
+		source, baseCommit := db.graph, db.commitID
+		db.mu.RUnlock()
+		indexes, work, logicalBytes, err := buildPropertyIndex(ctx, source, node, definition, db)
+		if err != nil {
+			return err
+		}
+		err = db.UpdateContext(ctx, func(tx *Tx) error {
+			if tx.base != source || tx.changes.baseCommitID != baseCommit {
+				return errPropertyIndexGenerationChanged
+			}
+			target := &tx.graph.EdgeProperties
+			if node {
+				target = &tx.graph.NodeProperties
+			}
+			if target.Has(definition) {
+				return fmt.Errorf("%w: property index already exists", ErrAlreadyExists)
+			}
+			*target = indexes
+			tx.graph.DerivedIndexWork = saturatingAdd(tx.graph.DerivedIndexWork, work)
+			tx.graph.DerivedIndexLogicalBytes = saturatingAdd(tx.graph.DerivedIndexLogicalBytes, logicalBytes)
+			if exceedsDerivedBudget(tx.graph, db, 0, 0) {
+				return fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
+			}
+			if node {
+				tx.changes.createNodeIndexes[definition] = struct{}{}
+			} else {
+				tx.changes.createEdgeIndexes[definition] = struct{}{}
+			}
+			return nil
+		})
+		if !errors.Is(err, errPropertyIndexGenerationChanged) && !errors.Is(err, ErrWriteTxActive) {
+			return err
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return ErrWriteConflict
+}
+
+func buildPropertyIndex(ctx context.Context, source *store.GraphState, node bool, definition store.PropertyIndexDefinition, db *DB) (store.PropertyIndexes, uint64, uint64, error) {
+	indexes := source.NodeProperties.Fork()
+	if !node {
+		indexes = source.EdgeProperties.Fork()
+	}
+	if !indexes.Create(definition) {
+		return indexes, 0, 0, fmt.Errorf("%w: property index already exists", ErrAlreadyExists)
+	}
+	work := uint64(1)
+	logicalBytes := saturatingAdd(uint64(len(definition.Scope)+len(definition.Property)), 192)
+	if exceedsDerivedBudget(source, db, work, logicalBytes) {
+		return indexes, 0, 0, fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
+	}
+	var ids iter.Seq[uint64]
+	if node {
+		ids = source.Labels.All(definition.Scope)
+	} else {
+		ids = source.EdgeTypes.All(definition.Scope)
+	}
+	for id := range ids {
+		if err := ctx.Err(); err != nil {
+			return indexes, 0, 0, err
+		}
+		work = saturatingAdd(work, 1)
+		if exceedsDerivedBudget(source, db, work, logicalBytes) {
+			return indexes, 0, 0, fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
+		}
+		var properties map[string]any
+		if node {
+			properties = source.Nodes.Get(id).Properties
+		} else {
+			properties = source.Edges.Get(id).Properties
+		}
+		value, ok := properties[definition.Property]
+		if !ok {
+			continue
+		}
+		valueBytes := store.EstimatePropertyIndexValueBytes(value)
+		work = saturatingAdd(work, max(uint64(1), valueBytes))
+		logicalBytes = saturatingAdd(logicalBytes, saturatingAdd(valueBytes, 192))
+		if exceedsDerivedBudget(source, db, work, logicalBytes) {
+			return indexes, 0, 0, fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
+		}
+		if err := indexes.Add(definition, value, id); err != nil {
+			return indexes, 0, 0, err
+		}
+	}
+	return indexes, work, logicalBytes, nil
 }
 
 func (db *DB) updatePropertyIndex(node, create bool, scope, property string) error {

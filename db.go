@@ -356,12 +356,26 @@ func (db *DB) CreateNodePropertyIndex(label, property string) error {
 	return wrapError(db.inner.CreateNodePropertyIndex(label, property))
 }
 
+func (db *DB) CreateNodePropertyIndexContext(ctx context.Context, label, property string) error {
+	if db == nil || db.inner == nil {
+		return ErrDatabaseClosed
+	}
+	return wrapError(db.inner.CreateNodePropertyIndexContext(ctx, label, property))
+}
+
 func (db *DB) DropNodePropertyIndex(label, property string) error {
 	return wrapError(db.inner.DropNodePropertyIndex(label, property))
 }
 
 func (db *DB) CreateEdgePropertyIndex(edgeType, property string) error {
 	return wrapError(db.inner.CreateEdgePropertyIndex(edgeType, property))
+}
+
+func (db *DB) CreateEdgePropertyIndexContext(ctx context.Context, edgeType, property string) error {
+	if db == nil || db.inner == nil {
+		return ErrDatabaseClosed
+	}
+	return wrapError(db.inner.CreateEdgePropertyIndexContext(ctx, edgeType, property))
 }
 
 func (db *DB) DropEdgePropertyIndex(edgeType, property string) error {
