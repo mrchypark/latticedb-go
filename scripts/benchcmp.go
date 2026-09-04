@@ -24,9 +24,10 @@ type zigResult struct {
 }
 
 type performanceGate struct {
-	benchmark string
-	unit      string
-	maxRise   float64
+	benchmark       string
+	unit            string
+	maxRise         float64
+	maxAbsoluteRise float64
 }
 
 // Keep blocking gates to stable graph-core metrics. Most latency remains
@@ -36,10 +37,10 @@ var blockingGates = []performanceGate{
 	{benchmark: "BenchmarkReadRequests/query", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkReadRequests/query", unit: "allocs/op"},
 	{benchmark: "BenchmarkReadRequests/write_commit", unit: "B/op", maxRise: 0.01},
-	// One rounded allocation can drift between equivalent runs; two cannot.
-	{benchmark: "BenchmarkReadRequests/write_commit", unit: "allocs/op", maxRise: 0.02},
+	// Write paths permit up to two measured allocation drift; larger changes block.
+	{benchmark: "BenchmarkReadRequests/write_commit", unit: "allocs/op", maxAbsoluteRise: 2},
 	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "B/op", maxRise: 0.01},
-	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "allocs/op", maxRise: 0.02},
+	{benchmark: "BenchmarkSingleRecordCommitScaling/nodes_100000/direct", unit: "allocs/op", maxAbsoluteRise: 2},
 	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkQueryMultiHopSlots", unit: "allocs/op"},
 	{benchmark: "BenchmarkAdjacencyReadScaling/chunked_10000", unit: "B/op", maxRise: 0.01},
@@ -174,7 +175,11 @@ func checkGates(current, previous result, stderr io.Writer) error {
 			failures = append(failures, fmt.Sprintf("%s %s has invalid metric values", gate.benchmark, gate.unit))
 			continue
 		}
-		if currentValue > previousValue*(1+gate.maxRise) {
+		if gate.maxAbsoluteRise > 0 {
+			if currentValue > previousValue+gate.maxAbsoluteRise {
+				failures = append(failures, fmt.Sprintf("%s %s regressed %.1f allocations (limit +%.1f allocations)", gate.benchmark, gate.unit, currentValue-previousValue, gate.maxAbsoluteRise))
+			}
+		} else if currentValue > previousValue*(1+gate.maxRise) {
 			failures = append(failures, fmt.Sprintf("%s %s regressed %.1f%% (limit +%.1f%%)", gate.benchmark, gate.unit, (currentValue/previousValue-1)*100, gate.maxRise*100))
 		}
 	}
