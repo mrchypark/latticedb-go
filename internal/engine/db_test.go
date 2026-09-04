@@ -1547,21 +1547,42 @@ func TestRollbackAfterCheckpointPublicationContentionReschedules(t *testing.T) {
 
 func TestCloseWithActiveReadTransactionLeavesCheckpointWorkerRunning(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "background-read-close.ltdb")
+	checkpointStarted := make(chan struct{})
+	checkpointRelease := make(chan struct{})
 	checkpointDone := make(chan struct{}, 8)
-	db, err := Open(path, OpenOptions{Create: true, WALCheckpointThresholdBytes: 1, checkpointComplete: checkpointDone})
+	var once sync.Once
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(checkpointRelease) }) }
+	db, err := Open(path, OpenOptions{
+		Create:                      true,
+		WALCheckpointThresholdBytes: 1,
+		checkpointComplete:          checkpointDone,
+		checkpointPrepare: func(string, *store.GraphState, uint64, uint64, uint64) error {
+			once.Do(func() { close(checkpointStarted) })
+			<-checkpointRelease
+			return nil
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
+	defer release()
 	tx, err := db.Begin(true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = tx.Rollback() }()
 	if err := db.Update(func(tx *Tx) error {
 		_, err := tx.CreateNode(CreateNodeOptions{})
 		return err
 	}); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-checkpointStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint did not start")
 	}
 	if err := db.Close(); !errors.Is(err, ErrTransactionsActive) {
 		t.Fatalf("Close with active read transaction = %v", err)
@@ -1569,6 +1590,7 @@ func TestCloseWithActiveReadTransactionLeavesCheckpointWorkerRunning(t *testing.
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
+	release()
 	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
