@@ -103,6 +103,37 @@ func BenchmarkVectorSearchANNFallback10K(b *testing.B) {
 	}
 }
 
+func BenchmarkVectorSearchSparseComplete10K(b *testing.B) {
+	graph := store.NewGraphState()
+	graph.VectorDimensions = 16
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"embedding": make([]float32, 16)}})
+	for id := uint64(2); id <= 10_000; id++ {
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"name": "non-vector"}})
+	}
+	rebuildVectorIndex(graph)
+	db := &DB{graph: graph, enableVector: true, vectorDimensions: 16, queryCache: map[string]*queryPlan{}}
+	query := make([]float32, 16)
+	before, err := db.VectorIndexStats()
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := db.VectorSearch(query, VectorSearchOptions{K: 10}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	after, err := db.VectorIndexStats()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if after.ExactFallbacks != before.ExactFallbacks {
+		b.Fatalf("complete sparse ANN unexpectedly fell back %d times", after.ExactFallbacks-before.ExactFallbacks)
+	}
+}
+
 func benchmarkSearchDB(size int, indexed bool) *DB {
 	return benchmarkSearchDBWithDimensions(size, 16, indexed)
 }

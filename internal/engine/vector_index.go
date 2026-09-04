@@ -114,6 +114,16 @@ func rebuildVectorIndex(graph *store.GraphState) {
 	_ = rebuildVectorIndexContext(context.Background(), graph)
 }
 
+func refreshVectorLiveCount(graph *store.GraphState) {
+	var live uint64
+	for _, node := range graph.Nodes.All() {
+		if _, ok := selectedVector(graph, node); ok {
+			live++
+		}
+	}
+	graph.VectorLiveCount = live
+}
+
 func rebuildVectorIndexContext(ctx context.Context, graph *store.GraphState) error {
 	return rebuildVectorIndexBudget(ctx, graph, ^uint64(0), ^uint64(0))
 }
@@ -158,6 +168,7 @@ func rebuildVectorIndexBudget(ctx context.Context, graph *store.GraphState, maxW
 	}
 	graph.VectorIndex = target.VectorIndex
 	graph.VectorTombstones = target.VectorTombstones
+	graph.VectorLiveCount = live
 	graph.VectorMutations = 0
 	return nil
 }
@@ -644,6 +655,28 @@ func (tx *Tx) applyVectorIndexChanges() error {
 		return ErrVectorIndexMaintenanceRequired
 	}
 	return nil
+}
+
+func (tx *Tx) applyVectorLiveCountChanges() {
+	for _, id := range mapKeys(tx.changes.upsertNodes) {
+		beforeOK := false
+		if tx.base != nil {
+			_, beforeOK = selectedVector(tx.base, tx.base.Nodes.Get(id))
+		}
+		_, afterOK := selectedVector(tx.graph, tx.graph.Nodes.Get(id))
+		if !beforeOK && afterOK {
+			tx.graph.VectorLiveCount++
+		} else if beforeOK && !afterOK && tx.graph.VectorLiveCount > 0 {
+			tx.graph.VectorLiveCount--
+		}
+	}
+	for _, id := range mapKeys(tx.changes.deleteNodes) {
+		if tx.base != nil {
+			if _, ok := selectedVector(tx.base, tx.base.Nodes.Get(id)); ok && tx.graph.VectorLiveCount > 0 {
+				tx.graph.VectorLiveCount--
+			}
+		}
+	}
 }
 
 func estimateVectorIndexBytes(live uint64, dimensions uint16) uint64 {
