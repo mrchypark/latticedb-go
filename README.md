@@ -68,6 +68,7 @@ func main() {
 - A `Tx` is single-owner and must not be used concurrently.
 - `Commit` and `CommitContext` are one-shot: the transaction becomes inactive whether the commit succeeds or fails.
 - Only one online snapshot may be active per database. Writers can continue after the snapshot generation is captured.
+- During a background checkpoint, the active WAL append tail is bounded by `WALCheckpointThresholdBytes` plus one permitted WAL frame; once the bound is reached, commits return `ErrResourceLimit` before WAL mutation and must be retried as a new transaction after checkpoint progress. The marker frame's fixed file overhead is separate from that tail measurement.
 
 The detailed behavioral contract is documented in [docs/engine_conformance.md](docs/engine_conformance.md), with the value model in [docs/value_model.md](docs/value_model.md).
 
