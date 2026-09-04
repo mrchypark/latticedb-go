@@ -2712,22 +2712,17 @@ func (tx *Tx) DeleteNode(nodeID uint64) error {
 		tx.graph.FTS.Delete(nodeID)
 		tx.markDelete(&tx.changes.upsertFTS, &tx.changes.deleteFTS, tx.base != nil && tx.base.FTS.Get(nodeID) != nil, nodeID)
 	}
-	outgoing := tx.graph.Outgoing.Get(nodeID)
-	for chunk := range outgoing.Chunks() {
-		for _, edgeID := range chunk {
-			if !outgoing.IsRemoved(edgeID) {
-				tx.deleteEdge(edgeID)
+	edges := make(map[uint64]struct{})
+	for _, adjacency := range []*store.EdgeList{tx.graph.Outgoing.Get(nodeID), tx.graph.Incoming.Get(nodeID)} {
+		for chunk := range adjacency.Chunks() {
+			for _, edgeID := range chunk {
+				if !adjacency.IsRemoved(edgeID) {
+					edges[edgeID] = struct{}{}
+				}
 			}
 		}
 	}
-	incoming := tx.graph.Incoming.Get(nodeID)
-	for chunk := range incoming.Chunks() {
-		for _, edgeID := range chunk {
-			if !incoming.IsRemoved(edgeID) {
-				tx.deleteEdge(edgeID)
-			}
-		}
-	}
+	tx.deleteEdgesBatch(edges)
 	tx.ensureOutgoingWritable(nodeID)
 	tx.ensureIncomingWritable(nodeID)
 	tx.graph.Outgoing.Delete(nodeID)
@@ -3275,6 +3270,41 @@ func (tx *Tx) deleteEdge(edgeID uint64) {
 		tx.graph.Incoming.Delete(edge.TargetID)
 	} else {
 		tx.graph.Incoming.Set(edge.TargetID, incoming)
+	}
+}
+
+func (tx *Tx) deleteEdgesBatch(edgeIDs map[uint64]struct{}) {
+	outgoing := map[uint64][]uint64{}
+	incoming := map[uint64][]uint64{}
+	for edgeID := range edgeIDs {
+		edge := tx.graph.Edges.Get(edgeID)
+		if edge == nil {
+			continue
+		}
+		tx.ensureEdgesWritable(edgeID)
+		tx.graph.Edges.Delete(edgeID)
+		tx.graph.EdgeTypes.Remove(edge.Type, edgeID)
+		tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, tx.base != nil && tx.base.Edges.Get(edgeID) != nil, edgeID)
+		outgoing[edge.SourceID] = append(outgoing[edge.SourceID], edgeID)
+		incoming[edge.TargetID] = append(incoming[edge.TargetID], edgeID)
+	}
+	for nodeID, ids := range outgoing {
+		tx.ensureOutgoingWritable(nodeID)
+		list := tx.graph.Outgoing.Get(nodeID).RemoveKnownBatch(ids)
+		if list.Len() == 0 {
+			tx.graph.Outgoing.Delete(nodeID)
+		} else {
+			tx.graph.Outgoing.Set(nodeID, list)
+		}
+	}
+	for nodeID, ids := range incoming {
+		tx.ensureIncomingWritable(nodeID)
+		list := tx.graph.Incoming.Get(nodeID).RemoveKnownBatch(ids)
+		if list.Len() == 0 {
+			tx.graph.Incoming.Delete(nodeID)
+		} else {
+			tx.graph.Incoming.Set(nodeID, list)
+		}
 	}
 }
 
