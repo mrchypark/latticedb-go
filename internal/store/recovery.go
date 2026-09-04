@@ -41,6 +41,9 @@ type recoveryBudget struct {
 	bytes  uint64
 	frames uint64
 	work   uint64
+	// ponytail: four-pointer dedup covers the state, two chain bases, and final state; overflow safely overcharges.
+	states     [4]*persistedState
+	stateCount uint8
 }
 
 func (budget *recoveryBudget) add(kind string, used *uint64, limit, amount uint64) error {
@@ -61,6 +64,25 @@ func (budget *recoveryBudget) frame() error {
 
 func (budget *recoveryBudget) replayWork(amount uint64) error {
 	return budget.add("replay work", &budget.work, budget.limits.MaxWork, amount)
+}
+
+func (budget *recoveryBudget) replayState(state *persistedState) error {
+	if state == nil {
+		return nil
+	}
+	for index := uint8(0); index < budget.stateCount; index++ {
+		if budget.states[index] == state {
+			return nil
+		}
+	}
+	if err := budget.replayWork(persistedStateWork(*state)); err != nil {
+		return err
+	}
+	if budget.stateCount < uint8(len(budget.states)) {
+		budget.states[budget.stateCount] = state
+		budget.stateCount++
+	}
+	return nil
 }
 
 const (
@@ -351,12 +373,21 @@ func LoadGraphStateFilesContextWithRecoveryLimits(ctx context.Context, files Dat
 		return nil, 0, 0, 0, snapshotErr
 	}
 	base := snapshot
-	if base == nil {
-		var baseErr error
-		base, baseErr = loadWALBaseSnapshotFilesContextWithRecoveryBudget(ctx, files, maxCanonicalBytes, budget)
-		if errors.Is(baseErr, ErrLoadResourceLimit) {
-			return nil, 0, 0, 0, baseErr
+	if snapshot != nil {
+		if err := budget.replayState(snapshot); err != nil {
+			return nil, 0, 0, 0, err
 		}
+	}
+	walBase, baseErr := loadWALBaseSnapshotFilesContextWithBaseAndRecoveryBudget(ctx, files, maxCanonicalBytes, base, budget)
+	if errors.Is(baseErr, ErrLoadResourceLimit) {
+		return nil, 0, 0, 0, baseErr
+	}
+	if baseErr == nil {
+		if base == nil || walBase.CommitID >= base.CommitID {
+			base = walBase
+		}
+	} else if !errors.Is(baseErr, os.ErrNotExist) {
+		return nil, 0, 0, 0, baseErr
 	}
 	walSnapshot, walErr := loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudget(ctx, files, maxCanonicalBytes, base, budget)
 	if walSnapshot == nil && walErr != nil && !errors.Is(walErr, os.ErrNotExist) {
@@ -364,26 +395,22 @@ func LoadGraphStateFilesContextWithRecoveryLimits(ctx context.Context, files Dat
 	}
 
 	var chosen *persistedState
-	if snapshot != nil && walSnapshot != nil && snapshot.DatabaseID != "" && walSnapshot.DatabaseID != "" && snapshot.DatabaseID != walSnapshot.DatabaseID {
-		return nil, 0, 0, 0, errors.New("checkpoint and WAL database IDs differ")
+	if err := validateRecoveryDatabaseIDs(snapshot, walBase, walSnapshot); err != nil {
+		return nil, 0, 0, 0, err
 	}
-	switch {
-	case walSnapshot != nil && (snapshot == nil || walSnapshot.CommitID > snapshot.CommitID):
-		chosen = walSnapshot
-	case snapshot != nil:
-		chosen = snapshot
-	case base != nil:
-		chosen = base
-	case walSnapshot != nil:
-		chosen = walSnapshot
-	default:
+	for _, candidate := range []*persistedState{snapshot, base, walSnapshot} {
+		if candidate != nil && (chosen == nil || candidate.CommitID > chosen.CommitID) {
+			chosen = candidate
+		}
+	}
+	if chosen == nil {
 		if !errors.Is(snapshotErr, os.ErrNotExist) || !errors.Is(walErr, os.ErrNotExist) {
 			return nil, 0, 0, 0, errors.Join(snapshotErr, walErr)
 		}
 		return nil, 0, 0, 0, os.ErrNotExist
 	}
 
-	if err := budget.replayWork(persistedStateWork(*chosen)); err != nil {
+	if err := budget.replayState(chosen); err != nil {
 		return nil, 0, 0, 0, err
 	}
 	return decodePersistedStateContext(ctx, *chosen, maxDerivedWork, maxDerivedBytes)
@@ -407,6 +434,23 @@ func persistedStateWork(state persistedState) uint64 {
 	return addSaturated(work, persistedStreamsWork(state.Streams))
 }
 
+func validateRecoveryDatabaseIDs(candidates ...*persistedState) error {
+	var databaseID string
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.DatabaseID == "" {
+			continue
+		}
+		if databaseID == "" {
+			databaseID = candidate.DatabaseID
+			continue
+		}
+		if candidate.DatabaseID != databaseID {
+			return errors.New("checkpoint and WAL database IDs differ")
+		}
+	}
+	return nil
+}
+
 func persistedDeltaWork(delta persistedDelta) uint64 {
 	work := uint64(len(delta.UpsertNodes) + len(delta.DeleteNodes) + len(delta.UpsertEdges) + len(delta.DeleteEdges))
 	work = addSaturated(work, uint64(len(delta.UpsertFTS)+len(delta.DeleteFTS)+len(delta.AppMetadata)))
@@ -426,12 +470,16 @@ func loadWALBaseSnapshotFilesContext(ctx context.Context, files DatabaseFiles, m
 }
 
 func loadWALBaseSnapshotFilesContextWithRecoveryBudget(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64, budget *recoveryBudget) (*persistedState, error) {
+	return loadWALBaseSnapshotFilesContextWithBaseAndRecoveryBudget(ctx, files, maxCanonicalBytes, nil, budget)
+}
+
+func loadWALBaseSnapshotFilesContextWithBaseAndRecoveryBudget(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64, base *persistedState, budget *recoveryBudget) (*persistedState, error) {
 	file, err := os.Open(files.WALBase)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	return loadLatestWALV2ContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, nil, budget)
+	return loadLatestWALV2ContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, base, budget)
 }
 
 var databaseTempKinds = []string{"state-payload", "snapshot-payload", "state", "wal-payload", "wal", "ids", "checkpoint"}
@@ -609,6 +657,50 @@ type PreparedCheckpoint struct {
 	files   DatabaseFiles
 }
 
+// PrepareCheckpointStateFiles performs only the state serialization and fsync
+// work for a checkpoint. The active WAL is rotated separately by the engine,
+// so publishing this candidate never replaces a WAL containing newer commits.
+func PrepareCheckpointStateFiles(files DatabaseFiles, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) (*PreparedCheckpoint, error) {
+	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
+		return nil, err
+	}
+	prefix := strings.TrimSuffix(databaseTempPattern(files, "checkpoint"), "*.tmp")
+	staging, err := os.MkdirTemp(files.Directory, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("create checkpoint staging directory: %w", err)
+	}
+	stagedFiles := DirectoryDatabaseFiles(staging)
+	if err := CheckpointGraphStateFiles(stagedFiles, graph, nextNodeID, nextEdgeID, commitID); err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, err
+	}
+	return &PreparedCheckpoint{staging: staging, files: stagedFiles}, nil
+}
+
+// PublishCheckpointStateFiles atomically installs a prepared state file,
+// leaving the caller's active WAL untouched.
+func (prepared *PreparedCheckpoint) PublishCheckpointStateFiles(files DatabaseFiles) error {
+	return prepared.PublishCheckpointStateFilesWithFault(files, nil)
+}
+
+// PublishCheckpointStateFilesWithFault is the state-only form of prepared
+// checkpoint publication used by the background checkpoint protocol.
+func (prepared *PreparedCheckpoint) PublishCheckpointStateFilesWithFault(files DatabaseFiles, fault CheckpointFault) error {
+	if prepared == nil || prepared.staging == "" {
+		return errors.New("checkpoint preparation is empty")
+	}
+	if err := runCheckpointFault(fault, "state-rename", false); err != nil {
+		return err
+	}
+	if err := os.Rename(prepared.files.State, files.State); err != nil {
+		return fmt.Errorf("publish checkpoint state: %w", err)
+	}
+	if err := runCheckpointFault(fault, "state-rename", true); err != nil {
+		return err
+	}
+	return syncCheckpointDirectory(files.Directory, "state", fault)
+}
+
 // PrepareCheckpointFiles performs the serialization and fsync work for a
 // checkpoint without touching any live database file.
 func PrepareCheckpointFiles(files DatabaseFiles, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) (*PreparedCheckpoint, error) {
@@ -633,6 +725,72 @@ func PrepareCheckpointFiles(files DatabaseFiles, graph *GraphState, nextNodeID, 
 		return nil, err
 	}
 	return &PreparedCheckpoint{staging: staging, files: stagedFiles}, nil
+}
+
+// RotateWALFiles advances the active WAL to a durable base segment and starts
+// a new active segment at commitID. The caller must hold the engine writer
+// lock and close the current WAL writer before invoking it.
+func RotateWALFiles(files DatabaseFiles, databaseID string, commitID uint64) error {
+	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Stat(files.WALBase); err == nil {
+		return errors.New("WAL base already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(files.WAL, files.WALBase); err != nil {
+		return fmt.Errorf("rotate WAL to base: %w", err)
+	}
+	if err := syncDirectory(files.Directory); err != nil {
+		return fmt.Errorf("sync rotated WAL base: %w", err)
+	}
+	if err := rewriteWALStatePayload(files, nil, databaseID, commitID, nil, files.WAL); err != nil {
+		return fmt.Errorf("create rotated WAL marker: %w", err)
+	}
+	return nil
+}
+
+// WALFilesHaveCheckpointMarker reports whether the active WAL begins with a
+// checkpoint marker. Such a marker makes a leftover wal.base redundant.
+func WALFilesHaveCheckpointMarker(files DatabaseFiles) (bool, error) {
+	file, err := os.Open(files.WAL)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	var header [walHeaderSize]byte
+	if _, err := io.ReadFull(file, header[:]); err != nil {
+		return false, err
+	}
+	if !validCurrentWALHeader(header[:]) {
+		return false, errors.New("invalid WAL header")
+	}
+	payloadLength := binary.BigEndian.Uint64(header[20:28])
+	if payloadLength > maxWALFrameBytes || payloadLength > uint64(^uint(0)>>1) {
+		return false, errors.New("WAL frame exceeds size limit")
+	}
+	payload := make([]byte, int(payloadLength))
+	if _, err := io.ReadFull(file, payload); err != nil {
+		return false, err
+	}
+	if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
+		return false, errors.New("WAL checksum mismatch")
+	}
+	var wrapper walPayload
+	if err := json.Unmarshal(payload, &wrapper); err != nil {
+		return false, err
+	}
+	return wrapper.Kind == "checkpoint", nil
+}
+
+// RemoveWALBaseFiles removes a completed rotation base and durably records
+// that removal in the database directory.
+func RemoveWALBaseFiles(files DatabaseFiles) error {
+	if err := os.Remove(files.WALBase); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return syncDirectory(files.Directory)
 }
 
 // PublishCheckpointFiles atomically installs a prepared checkpoint. Callers
@@ -1905,11 +2063,20 @@ func loadLatestWALV2ContextWithRecoveryBudget(ctx context.Context, file *os.File
 				return nil, fmt.Errorf("invalid WAL delta: %w", err)
 			}
 		case "checkpoint":
-			if accumulator != nil || base == nil || base.DatabaseID != databaseID || base.CommitID != commitID {
+			if accumulator != nil {
+				return nil, errors.New("WAL checkpoint base mismatch")
+			}
+			if base == nil || base.DatabaseID != databaseID {
+				return nil, errors.New("WAL checkpoint base mismatch")
+			}
+			if base.CommitID > commitID {
+				return nil, os.ErrNotExist
+			}
+			if base.CommitID != commitID {
 				return nil, errors.New("WAL checkpoint base mismatch")
 			}
 			var err error
-			if err := budget.replayWork(persistedStateWork(*base)); err != nil {
+			if err := budget.replayState(base); err != nil {
 				return nil, err
 			}
 			accumulator, err = newWALAccumulator(ctx, *base)

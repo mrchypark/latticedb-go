@@ -286,6 +286,214 @@ func TestLoadGraphStateRecoveryBudgetsAreCumulative(t *testing.T) {
 	}
 }
 
+func TestLoadGraphStateUsesWALBaseWhenCurrentWALIsMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wal-base-only.ltdb")
+	base := NewGraphState()
+	if err := EnsureDatabaseID(base); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckpointGraphState(path, base, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	committed := NewGraphState()
+	committed.DatabaseID = base.DatabaseID
+	committed.Nodes.Set(1, &NodeRecord{ID: 1})
+	if err := AppendWALCommit(path, committed, 2, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	files := DirectoryDatabaseFiles(path)
+	if err := os.Rename(files.WAL, files.WALBase); err != nil {
+		t.Fatal(err)
+	}
+
+	graph, _, _, commitID, err := LoadGraphStateFilesContext(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commitID != 1 || graph.Nodes.Get(1) == nil {
+		t.Fatalf("recovered WAL base state = commit %d, node=%v", commitID, graph.Nodes.Get(1))
+	}
+}
+
+func TestLoadGraphStateReplaysWALBaseChain(t *testing.T) {
+	const databaseID = "00000000000000000000000000000001"
+	const stateCommit, baseCommit, activeCommit = uint64(3), uint64(5), uint64(6)
+
+	writeChain := func(t *testing.T, active bool) (DatabaseFiles, uint64, uint64) {
+		t.Helper()
+		path := t.TempDir()
+		files := DirectoryDatabaseFiles(path)
+		state := NewGraphState()
+		state.DatabaseID = databaseID
+		stateData, err := SerializeGraphState(state, 1, 1, stateCommit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(files.State, stateData, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		delta := func(commitID, nodeID uint64) []byte {
+			return persistedWALTestRecord(t, databaseID, commitID, walPayload{Kind: "delta", Delta: &persistedDelta{
+				DatabaseID: databaseID, CommitID: commitID, NextNodeID: nodeID + 1, NextEdgeID: 1,
+				UpsertNodes: []persistedNode{{ID: nodeID, Properties: map[string]persistedValue{}}},
+			}})
+		}
+		base := persistedWALTestRecord(t, databaseID, stateCommit, walPayload{Kind: "checkpoint"})
+		base = append(base, delta(4, 1)...)
+		base = append(base, delta(baseCommit, 2)...)
+		if err := os.WriteFile(files.WALBase, base, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		activeData := persistedWALTestRecord(t, databaseID, baseCommit, walPayload{Kind: "checkpoint"})
+		activeData = append(activeData, delta(activeCommit, 3)...)
+		if active {
+			if err := os.WriteFile(files.WAL, activeData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		decodedBytes := uint64(len(stateData) - stateHeaderSize)
+		decodedBytes += uint64(len(base) - 3*walHeaderSize)
+		decodedBytes += uint64(len(activeData) - 2*walHeaderSize)
+		return files, decodedBytes, 8
+	}
+
+	t.Run("repeated chain", func(t *testing.T) {
+		files, _, _ := writeChain(t, true)
+		graph, nextNodeID, _, commitID, err := LoadGraphStateFilesContext(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if commitID != activeCommit || nextNodeID != 4 {
+			t.Fatalf("recovered commit=%d next node=%d", commitID, nextNodeID)
+		}
+		for nodeID := uint64(1); nodeID <= 3; nodeID++ {
+			if graph.Nodes.Get(nodeID) == nil {
+				t.Fatalf("missing recovered node %d", nodeID)
+			}
+		}
+	})
+
+	t.Run("active WAL missing after rotation", func(t *testing.T) {
+		files, _, _ := writeChain(t, false)
+		graph, _, _, commitID, err := LoadGraphStateFilesContext(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if commitID != baseCommit || graph.Nodes.Get(1) == nil || graph.Nodes.Get(2) == nil || graph.Nodes.Get(3) != nil {
+			t.Fatalf("recovered rotated base commit=%d nodes=%v,%v,%v", commitID, graph.Nodes.Get(1), graph.Nodes.Get(2), graph.Nodes.Get(3))
+		}
+	})
+
+	for name, limits := range map[string]RecoveryLimits{
+		"frames below boundary": {MaxFrames: 4},
+		"work below boundary":   {MaxWork: 7},
+		"bytes below boundary":  {MaxDecodedBytes: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			files, _, _ := writeChain(t, true)
+			if _, _, _, _, err := LoadGraphStateFilesContextWithRecoveryLimits(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0), limits); !errors.Is(err, ErrLoadResourceLimit) {
+				t.Fatalf("recovery error=%v, want ErrLoadResourceLimit", err)
+			}
+		})
+	}
+	files, decodedBytes, work := writeChain(t, true)
+	if _, _, _, _, err := LoadGraphStateFilesContextWithRecoveryLimits(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0), RecoveryLimits{MaxDecodedBytes: decodedBytes, MaxFrames: 5, MaxWork: work}); err != nil {
+		t.Fatalf("recovery boundary load: %v", err)
+	}
+}
+
+func TestLoadGraphStateRejectsMixedRecoveryDatabaseIDs(t *testing.T) {
+	const databaseA = "00000000000000000000000000000001"
+	const databaseB = "00000000000000000000000000000002"
+	writeState := func(t *testing.T, files DatabaseFiles, databaseID string, commitID uint64) {
+		t.Helper()
+		graph := NewGraphState()
+		graph.DatabaseID = databaseID
+		data, err := SerializeGraphState(graph, 1, 1, commitID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(files.State, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeWALSnapshot := func(t *testing.T, path, databaseID string, commitID uint64) {
+		t.Helper()
+		snapshot := persistedState{DatabaseID: databaseID, CommitID: commitID, NextNodeID: 1, NextEdgeID: 1}
+		if err := os.WriteFile(path, persistedWALTestRecord(t, databaseID, commitID, walPayload{Kind: "snapshot", Snapshot: &snapshot}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("checkpoint and stale base", func(t *testing.T) {
+		files := DirectoryDatabaseFiles(t.TempDir())
+		writeState(t, files, databaseA, 3)
+		writeWALSnapshot(t, files.WALBase, databaseB, 2)
+		if _, _, _, _, err := LoadGraphStateFilesContext(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0)); err == nil {
+			t.Fatal("mixed checkpoint and wal.base IDs were accepted")
+		}
+	})
+
+	t.Run("WAL candidates without checkpoint", func(t *testing.T) {
+		files := DirectoryDatabaseFiles(t.TempDir())
+		writeWALSnapshot(t, files.WALBase, databaseA, 2)
+		writeWALSnapshot(t, files.WAL, databaseB, 3)
+		if _, _, _, _, err := LoadGraphStateFilesContext(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0)); err == nil {
+			t.Fatal("mixed WAL IDs without checkpoint were accepted")
+		}
+	})
+}
+
+func TestRecoveryBudgetCountsDistinctSameCommitStates(t *testing.T) {
+	const databaseID = "00000000000000000000000000000001"
+	first := &persistedState{DatabaseID: databaseID, CommitID: 1, Nodes: []persistedNode{{ID: 1}}}
+	second := &persistedState{DatabaseID: databaseID, CommitID: 1, Nodes: []persistedNode{{ID: 1}, {ID: 2}}}
+	budget := &recoveryBudget{limits: RecoveryLimits{MaxWork: persistedStateWork(*first)}}
+	if err := budget.replayState(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := budget.replayState(first); err != nil {
+		t.Fatalf("same state was charged twice: %v", err)
+	}
+	if err := budget.replayState(second); !errors.Is(err, ErrLoadResourceLimit) {
+		t.Fatalf("distinct same-commit state error = %v, want ErrLoadResourceLimit", err)
+	}
+}
+
+func TestLoadGraphStateSkipsStaleWALBaseAfterRotation(t *testing.T) {
+	const databaseID = "00000000000000000000000000000001"
+	files := DirectoryDatabaseFiles(t.TempDir())
+	state := NewGraphState()
+	state.DatabaseID = databaseID
+	state.Nodes.Set(1, &NodeRecord{ID: 1})
+	data, err := SerializeGraphState(state, 2, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(files.State, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staleBase := persistedWALTestRecord(t, databaseID, 0, walPayload{Kind: "checkpoint"})
+	if err := os.WriteFile(files.WALBase, staleBase, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	delta := persistedDelta{DatabaseID: databaseID, CommitID: 2, NextNodeID: 3, NextEdgeID: 1,
+		UpsertNodes: []persistedNode{{ID: 2, Properties: map[string]persistedValue{}}}}
+	active := persistedWALTestRecord(t, databaseID, 1, walPayload{Kind: "checkpoint"})
+	active = append(active, persistedWALTestRecord(t, databaseID, 2, walPayload{Kind: "delta", Delta: &delta})...)
+	if err := os.WriteFile(files.WAL, active, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	graph, _, _, commitID, err := LoadGraphStateFilesContext(context.Background(), files, ^uint64(0), ^uint64(0), ^uint64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commitID != 2 || graph.Nodes.Get(1) == nil || graph.Nodes.Get(2) == nil {
+		t.Fatalf("recovered commit=%d nodes=%v,%v", commitID, graph.Nodes.Get(1), graph.Nodes.Get(2))
+	}
+}
+
 func TestSnapshotEstimatorIsConservativeForStreamedPayload(t *testing.T) {
 	graph := NewGraphState()
 	graph.DatabaseID = "0123456789abcdef0123456789abcdef"

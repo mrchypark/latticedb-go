@@ -208,12 +208,7 @@ func TestStreamChangefeedWALStaysBoundedAcrossCheckpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	for value := int64(1); value <= 200; value++ {
-		if err := db.Update(func(tx *Tx) error { return tx.SetProperty(nodeID, "value", value) }); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := db.Checkpoint(); err != nil {
-		t.Fatal(err)
+		updateWithCheckpointRetry(t, db, func(tx *Tx) error { return tx.SetProperty(nodeID, "value", value) })
 	}
 	info, err := os.Stat(filepath.Join(path, "wal.log"))
 	if err != nil {
@@ -244,6 +239,24 @@ func TestStreamChangefeedWALStaysBoundedAcrossCheckpoints(t *testing.T) {
 	changes, err := db.Changes(0, 300, 0)
 	if err != nil || len(changes) != 201 || !hasStreamChange(changes, "node.property_set", nodeID, "value") {
 		t.Fatalf("recovered changes = %d, %v", len(changes), err)
+	}
+}
+
+func updateWithCheckpointRetry(t *testing.T, db *DB, update func(*Tx) error) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := db.Update(update)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrResourceLimit) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("checkpoint did not make progress after WAL bound")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
