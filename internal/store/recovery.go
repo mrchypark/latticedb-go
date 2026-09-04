@@ -41,7 +41,9 @@ type recoveryBudget struct {
 	bytes  uint64
 	frames uint64
 	work   uint64
-	states map[*persistedState]struct{}
+	// ponytail: four-pointer dedup covers the state, two chain bases, and final state; overflow safely overcharges.
+	states     [4]*persistedState
+	stateCount uint8
 }
 
 func (budget *recoveryBudget) add(kind string, used *uint64, limit, amount uint64) error {
@@ -68,16 +70,18 @@ func (budget *recoveryBudget) replayState(state *persistedState) error {
 	if state == nil {
 		return nil
 	}
-	if budget.states == nil {
-		budget.states = make(map[*persistedState]struct{})
-	}
-	if _, seen := budget.states[state]; seen {
-		return nil
+	for index := uint8(0); index < budget.stateCount; index++ {
+		if budget.states[index] == state {
+			return nil
+		}
 	}
 	if err := budget.replayWork(persistedStateWork(*state)); err != nil {
 		return err
 	}
-	budget.states[state] = struct{}{}
+	if budget.stateCount < uint8(len(budget.states)) {
+		budget.states[budget.stateCount] = state
+		budget.stateCount++
+	}
 	return nil
 }
 
@@ -344,7 +348,7 @@ func DeserializeGraphStateWithRecoveryLimits(data []byte, maxCanonicalBytes, max
 	if snapshot.DatabaseID != string(header[32:64]) || snapshot.CommitID != binary.BigEndian.Uint64(header[12:20]) {
 		return nil, 0, 0, 0, errors.New("state header metadata mismatch")
 	}
-	if err := budget.replayState(&snapshot); err != nil {
+	if err := budget.replayWork(persistedStateWork(snapshot)); err != nil {
 		return nil, 0, 0, 0, err
 	}
 	return decodePersistedStateContext(context.Background(), snapshot, maxDerivedWork, maxDerivedBytes)
@@ -1936,7 +1940,7 @@ func loadLatestLegacyWALContextWithRecoveryBudget(ctx context.Context, file *os.
 				return nil, fmt.Errorf("wal commit id %d does not follow %d", entry.CommitID, latest.CommitID)
 			}
 			entryCopy := entry
-			if err := budget.replayState(&entry); err != nil {
+			if err := budget.replayWork(persistedStateWork(entry)); err != nil {
 				return nil, err
 			}
 			latest = &entryCopy
@@ -2035,7 +2039,7 @@ func loadLatestWALV2ContextWithRecoveryBudget(ctx context.Context, file *os.File
 				return nil, errors.New("WAL snapshot history regression")
 			}
 			var err error
-			if err := budget.replayState(wrapper.Snapshot); err != nil {
+			if err := budget.replayWork(persistedStateWork(*wrapper.Snapshot)); err != nil {
 				return nil, err
 			}
 			accumulator, err = newWALAccumulator(ctx, *wrapper.Snapshot)
