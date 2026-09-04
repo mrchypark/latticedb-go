@@ -151,6 +151,52 @@ func (list *EdgeList) RemoveKnown(id uint64) *EdgeList {
 	return &result
 }
 
+// RemoveKnownBatch removes already-validated IDs with one immutable-list fork.
+func (list *EdgeList) RemoveKnownBatch(ids []uint64) *EdgeList {
+	if list == nil || len(ids) == 0 {
+		return list
+	}
+	if list.IsInline() {
+		removed := make(map[uint64]struct{}, len(ids))
+		for _, id := range ids {
+			removed[id] = struct{}{}
+		}
+		values := make([]uint64, 0, len(list.small))
+		for _, id := range list.small {
+			if _, ok := removed[id]; !ok {
+				values = append(values, id)
+			}
+		}
+		if len(values) == len(list.small) {
+			return list
+		}
+		result := *list
+		result.small = values
+		result.count = len(values)
+		result.total = len(values)
+		return &result
+	}
+	result := *list
+	result.removed = result.removed.Fork()
+	removed := 0
+	for _, id := range ids {
+		if result.removed.Has(id) {
+			continue
+		}
+		result.removed.CloneShardOnce(id)
+		result.removed.Set(id, struct{}{})
+		removed++
+	}
+	if removed == 0 {
+		return list
+	}
+	result.count -= removed
+	if result.total <= adjacencySyncCompactLimit && result.removed.Len() > adjacencyChunkSize && result.removed.Len() > result.count {
+		return result.compact()
+	}
+	return &result
+}
+
 func (list *EdgeList) All() iter.Seq[uint64] {
 	return func(yield func(uint64) bool) {
 		if list == nil {

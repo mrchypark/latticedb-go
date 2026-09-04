@@ -4631,6 +4631,62 @@ func TestDeleteRequiresDetachForIncidentEdges(t *testing.T) {
 	})
 }
 
+func TestDeleteNodeBatchesIncidentEdges(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "batch-delete.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var node Node
+	if err := db.Update(func(tx *Tx) error {
+		var err error
+		node, err = tx.CreateNode(CreateNodeOptions{Labels: []string{"Node"}})
+		if err != nil {
+			return err
+		}
+		other, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Node"}})
+		if err != nil {
+			return err
+		}
+		if _, err = tx.CreateEdge(node.ID, other.ID, "LINK", CreateEdgeOptions{Properties: map[string]any{"k": int64(1)}}); err != nil {
+			return err
+		}
+		if _, err = tx.CreateEdge(other.ID, node.ID, "LINK", CreateEdgeOptions{Properties: map[string]any{"k": int64(2)}}); err != nil {
+			return err
+		}
+		_, err = tx.CreateEdge(node.ID, node.ID, "LINK", CreateEdgeOptions{Properties: map[string]any{"k": int64(3)}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateEdgePropertyIndex("LINK", "k"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.DeleteNode(node.ID) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		if exists, err := tx.NodeExists(node.ID); err != nil || exists {
+			t.Fatalf("deleted node exists=%v err=%v", exists, err)
+		}
+		if got := tx.graph.Edges.Len(); got != 0 {
+			t.Fatalf("incident edges remain: %d", got)
+		}
+		for _, value := range []int64{1, 2, 3} {
+			ids, err := tx.FindEdgesByTypeProperty("LINK", "k", value, 1)
+			if err != nil {
+				return err
+			}
+			if len(ids) != 0 {
+				t.Fatalf("deleted edge index value %d = %v", value, ids)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAdditionalCypherSyntaxBatch(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "additional-cypher.ltdb"), OpenOptions{Create: true})
 	if err != nil {
