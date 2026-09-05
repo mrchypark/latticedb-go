@@ -129,6 +129,10 @@ func rebuildVectorIndexContext(ctx context.Context, graph *store.GraphState) err
 }
 
 func rebuildVectorIndexBudget(ctx context.Context, graph *store.GraphState, maxWork, maxBytes uint64) error {
+	return rebuildVectorIndexWithBudget(ctx, graph, &directSearchBudget{ctx: ctx, maxWork: maxWork, maxBytes: maxBytes, annVisitedLimit: ^uint64(0)})
+}
+
+func rebuildVectorIndexWithBudget(ctx context.Context, graph *store.GraphState, budget *directSearchBudget) error {
 	if err := validateGraphVectorsContext(ctx, graph); err != nil {
 		return err
 	}
@@ -139,8 +143,8 @@ func rebuildVectorIndexBudget(ctx context.Context, graph *store.GraphState, maxW
 		}
 	}
 	estimatedBytes := estimateVectorBuildLogicalBytes(graph, live)
-	if estimatedBytes > maxBytes {
-		return fmt.Errorf("%w: vector index build requires approximately %d bytes, limit is %d", ErrResourceLimit, estimatedBytes, maxBytes)
+	if estimatedBytes > budget.maxBytes {
+		return fmt.Errorf("%w: vector index build requires approximately %d bytes, limit is %d", ErrResourceLimit, estimatedBytes, budget.maxBytes)
 	}
 	target := store.CloneGraphStateShallow(graph)
 	target.VectorIndex = store.NewVectorIndex()
@@ -152,7 +156,7 @@ func rebuildVectorIndexBudget(ctx context.Context, graph *store.GraphState, maxW
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
-	budget := &directSearchBudget{ctx: ctx, maxWork: maxWork, maxBytes: maxBytes, bytes: estimatedBytes, annVisitedLimit: ^uint64(0)}
+	budget.bytes = estimatedBytes
 	for index, id := range ids {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -191,6 +195,10 @@ func insertVectorIndexModeBudget(graph *store.GraphState, id uint64, mutable boo
 		tombstoneVectorIndex(graph, id, nil)
 		return nil
 	}
+	return insertVectorIndexVectorBudget(graph, id, vector, mutable, scratch, budget)
+}
+
+func insertVectorIndexVectorBudget(graph *store.GraphState, id uint64, vector []float32, mutable bool, scratch *vectorSearchScratch, budget *directSearchBudget) error {
 	graph.VectorTombstones.CloneShardOnce(id)
 	graph.VectorTombstones.Delete(id)
 	level := vectorLevel(id)
@@ -651,7 +659,7 @@ func (tx *Tx) applyVectorIndexChanges() error {
 	threshold := vectorRebuildThreshold(tx.graph)
 	tombstoneBytes := saturatingMul(uint64(tx.graph.VectorTombstones.Len()), uint64(tx.graph.VectorDimensions)*4)
 	debt := uint64(tx.graph.VectorTombstones.Len()) + tx.graph.VectorMutations
-	if changed && (debt > uint64(threshold) || tombstoneBytes > 64<<20) {
+	if changed && (debt > uint64(threshold) || tombstoneBytes > 64<<20) && (tx.db == nil || !tx.db.vectorRebuildActive()) {
 		return ErrVectorIndexMaintenanceRequired
 	}
 	return nil

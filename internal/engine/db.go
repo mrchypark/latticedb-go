@@ -224,6 +224,8 @@ type DB struct {
 	vectorExactFallbacks             atomic.Uint64
 	vectorRebuilds                   atomic.Uint64
 	vectorRebuildNanos               atomic.Uint64
+	vectorRebuild                    *vectorRebuildState
+	vectorRebuildBeforeBuild         func()
 	activeTx                         atomic.Int64
 	closed                           bool
 	recoveryRequired                 bool
@@ -281,6 +283,23 @@ type checkpointGeneration struct {
 	nextNodeID uint64
 	nextEdgeID uint64
 	commitID   uint64
+}
+
+type vectorRebuildDelta struct {
+	id            uint64
+	before, after []float32
+}
+
+type vectorRebuildState struct {
+	graph             *store.GraphState
+	dimensions        uint16
+	maxWork, maxBytes uint64
+	buildBytes        uint64
+	deltas            []vectorRebuildDelta
+	logWork, logBytes uint64
+	err               error
+	done              chan struct{}
+	cancel            context.CancelFunc
 }
 
 type Tx struct {
@@ -1021,6 +1040,9 @@ func (db *DB) Close() error {
 	if db.activeSnapshot {
 		db.mu.Unlock()
 		return ErrSnapshotActive
+	}
+	if db.vectorRebuild != nil {
+		db.vectorRebuild.cancel()
 	}
 	db.closed = true
 	db.notifyStreamsLocked()
@@ -2451,41 +2473,175 @@ func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-	for !db.writeMu.TryLock() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-	defer func() {
-		db.writeMu.Unlock()
-		db.requestBackgroundCheckpoint()
-	}()
-	db.mu.RLock()
+	db.mu.Lock()
 	if db.closed {
-		db.mu.RUnlock()
+		db.mu.Unlock()
 		return ErrDatabaseClosed
 	}
 	if !db.enableVector || db.disableVectorIndex {
-		db.mu.RUnlock()
+		db.mu.Unlock()
 		return fmt.Errorf("%w: synchronous HNSW mode is not enabled", ErrUnsupportedOption)
 	}
+	if state := db.vectorRebuild; state != nil && state.err == nil {
+		done := state.done
+		db.mu.Unlock()
+		select {
+		case <-done:
+			return state.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	buildCtx, cancel := context.WithCancel(ctx)
 	graph := store.CloneGraphStateShallow(db.graph)
-	maxWork, maxBytes := db.vectorIndexBuildMaxWork, db.vectorIndexBuildMaxLogicalBytes
-	db.mu.RUnlock()
+	state := &vectorRebuildState{graph: graph, dimensions: db.vectorDimensions, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes, buildBytes: estimateVectorBuildLogicalBytes(graph, graph.VectorLiveCount), done: make(chan struct{}), cancel: cancel}
+	db.vectorRebuild = state
+	hook := db.vectorRebuildBeforeBuild
+	db.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	started := time.Now()
-	if err := rebuildVectorIndexBudget(ctx, graph, maxWork, maxBytes); err != nil {
+	err := db.runVectorRebuild(buildCtx, state)
+	cancel()
+	db.mu.Lock()
+	if state.err != nil {
+		err = state.err
+	}
+	if db.closed && errors.Is(err, context.Canceled) {
+		err = ErrDatabaseClosed
+	}
+	if db.vectorRebuild == state {
+		db.vectorRebuild = nil
+	}
+	state.err = err
+	close(state.done)
+	db.mu.Unlock()
+	if err == nil {
+		db.vectorRebuilds.Add(1)
+		db.vectorRebuildNanos.Add(uint64(time.Since(started)))
+		db.requestBackgroundCheckpoint()
+	}
+	return err
+}
+
+func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) error {
+	budget := &directSearchBudget{ctx: ctx, maxWork: state.maxWork, maxBytes: state.maxBytes, annVisitedLimit: ^uint64(0)}
+	if err := rebuildVectorIndexWithBudget(ctx, state.graph, budget); err != nil {
 		return err
 	}
-	db.mu.Lock()
-	db.graph = graph
-	db.vectorRebuilds.Add(1)
-	db.vectorRebuildNanos.Add(uint64(time.Since(started)))
-	db.mu.Unlock()
-	return nil
+	for {
+		db.mu.Lock()
+		if db.closed || db.vectorRebuild != state || state.err != nil || db.disableVectorIndex || db.vectorDimensions != state.dimensions {
+			err := state.err
+			db.mu.Unlock()
+			if err != nil {
+				return err
+			}
+			if db.closed {
+				return ErrDatabaseClosed
+			}
+			return ErrWriteConflict
+		}
+		deltas := state.deltas
+		state.deltas = nil
+		db.mu.Unlock()
+		for _, delta := range deltas {
+			if delta.before == nil && delta.after != nil {
+				state.graph.VectorLiveCount++
+			} else if delta.before != nil && delta.after == nil && state.graph.VectorLiveCount > 0 {
+				state.graph.VectorLiveCount--
+			}
+			if delta.after != nil {
+				if err := insertVectorIndexVectorBudget(state.graph, delta.id, delta.after, true, nil, budget); err != nil {
+					return err
+				}
+			} else {
+				tombstoneVectorIndex(state.graph, delta.id, delta.before)
+			}
+		}
+		if !db.writeMu.TryLock() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		db.mu.Lock()
+		if db.closed || db.vectorRebuild != state || state.err != nil || db.disableVectorIndex || db.vectorDimensions != state.dimensions {
+			db.mu.Unlock()
+			db.writeMu.Unlock()
+			continue
+		}
+		if len(state.deltas) != 0 {
+			db.mu.Unlock()
+			db.writeMu.Unlock()
+			continue
+		}
+		published := store.CloneGraphStateShallow(db.graph)
+		published.VectorIndex = state.graph.VectorIndex
+		published.VectorTombstones = state.graph.VectorTombstones
+		published.VectorLiveCount = state.graph.VectorLiveCount
+		published.VectorMutations = 0
+		db.graph = published
+		db.mu.Unlock()
+		db.writeMu.Unlock()
+		return nil
+	}
+}
+
+func (db *DB) vectorRebuildActive() bool {
+	db.mu.RLock()
+	active := db.vectorRebuild != nil && db.vectorRebuild.err == nil
+	db.mu.RUnlock()
+	return active
+}
+
+func (tx *Tx) vectorRebuildDeltas() []vectorRebuildDelta {
+	if tx.base == nil || tx.changes == nil {
+		return nil
+	}
+	deltas := make([]vectorRebuildDelta, 0, len(tx.changes.upsertNodes)+len(tx.changes.deleteNodes))
+	for _, id := range mapKeys(tx.changes.upsertNodes) {
+		before, beforeOK := selectedVector(tx.base, tx.base.Nodes.Get(id))
+		after, afterOK := selectedVector(tx.graph, tx.graph.Nodes.Get(id))
+		if beforeOK == afterOK && slices.Equal(before, after) {
+			continue
+		}
+		delta := vectorRebuildDelta{id: id}
+		if beforeOK {
+			delta.before = slices.Clone(before)
+		}
+		if afterOK {
+			delta.after = slices.Clone(after)
+		}
+		deltas = append(deltas, delta)
+	}
+	for _, id := range mapKeys(tx.changes.deleteNodes) {
+		if before, ok := selectedVector(tx.base, tx.base.Nodes.Get(id)); ok {
+			deltas = append(deltas, vectorRebuildDelta{id: id, before: slices.Clone(before)})
+		}
+	}
+	return deltas
+}
+
+func (db *DB) appendVectorRebuildDeltasLocked(deltas []vectorRebuildDelta) {
+	state := db.vectorRebuild
+	if state == nil || state.err != nil || len(deltas) == 0 {
+		return
+	}
+	for _, delta := range deltas {
+		bytes := saturatingAdd(32, saturatingMul(uint64(len(delta.before)+len(delta.after)), 4))
+		work := saturatingAdd(uint64(len(delta.before)), uint64(len(delta.after)))
+		if state.buildBytes > state.maxBytes || state.logBytes > state.maxBytes-state.buildBytes || bytes > state.maxBytes-state.buildBytes-state.logBytes || state.logWork > state.maxWork || work > state.maxWork-state.logWork {
+			state.err = ErrResourceLimit
+			state.cancel()
+			return
+		}
+		state.logBytes += bytes
+		state.logWork += work
+		state.deltas = append(state.deltas, delta)
+	}
 }
 
 func (db *DB) cachedQueryPlan(query string) (*queryPlan, error) {
@@ -2662,9 +2818,11 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		}
 		return err
 	}
+	vectorDeltas := tx.vectorRebuildDeltas()
 	tx.db.mu.Lock()
 	tx.db.graph = tx.graph
 	tx.db.commitID = nextCommitID
+	tx.db.appendVectorRebuildDeltasLocked(vectorDeltas)
 	tx.db.dirty = true
 	if len(delta.DeleteEdges) != 0 {
 		if tx.db.enqueueAdjacencyCandidatesLocked(tx.graph, tx.base, delta) {

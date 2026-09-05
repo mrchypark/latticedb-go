@@ -885,6 +885,62 @@ func TestConcurrentVectorReadersRebuildAndCancellation(t *testing.T) {
 	}
 }
 
+func TestBackgroundVectorRebuildReplaysDeltasAndCoalesces(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "background-rebuild.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 2, VectorIndexMode: VectorIndexHNSWSynchronous})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var first, second uint64
+	if err := db.Update(func(tx *Tx) error {
+		if node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"vector": []float32{1, 0}}}); err != nil {
+			return err
+		} else {
+			first = node.ID
+		}
+		if node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"vector": []float32{0, 1}}}); err != nil {
+			return err
+		} else {
+			second = node.ID
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	db.vectorRebuildBeforeBuild = func() { close(started); <-release }
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- db.RebuildVectorIndexContext(context.Background()) }()
+	<-started
+	if err := db.Update(func(tx *Tx) error { return tx.SetVector(first, "vector", []float32{3, 0}) }); err != nil {
+		t.Fatalf("write during rebuild: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.DeleteNode(second) }); err != nil {
+		t.Fatalf("delete during rebuild: %v", err)
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- db.RebuildVectorIndexContext(context.Background()) }()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("coalesced rebuild returned early: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := validateVectorIndex(db.graph); err != nil {
+		t.Fatal(err)
+	}
+	results, err := db.VectorSearch([]float32{3, 0}, VectorSearchOptions{K: 2})
+	if err != nil || len(results) != 1 || results[0].NodeID != first {
+		t.Fatalf("replayed search = %#v, %v", results, err)
+	}
+}
+
 func TestVectorSearchScratchReset(t *testing.T) {
 	scratch := &vectorSearchScratch{
 		frontier: []vectorCandidate{{id: 1}},
