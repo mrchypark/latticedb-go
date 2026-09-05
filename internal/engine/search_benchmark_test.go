@@ -52,6 +52,29 @@ func BenchmarkFTSSearchScaling(b *testing.B) {
 	}
 }
 
+func BenchmarkFTSFuzzyVocabularyPruning(b *testing.B) {
+	for _, size := range []int{10_000, 100_000} {
+		b.Run(fmt.Sprintf("tokens_%d", size), func(b *testing.B) {
+			graph := store.NewGraphState()
+			for index := 0; index < size; index++ {
+				token := fmt.Sprintf("vocabulary-token-%08d-suffix", index)
+				id := uint64(index + 1)
+				graph.FTS.Set(id, &store.FTSRecord{Text: token, Tokens: []string{token}})
+				graph.FTSTokens.Add(token, id)
+			}
+			db := &DB{graph: graph, queryCache: map[string]*queryPlan{}}
+			opts := FTSSearchOptions{Limit: 10, MaxDistance: 1, MinTermLength: 1, MaxWork: ^uint64(0)}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if _, err := db.FTSSearch("x", opts); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkVectorSearchExactMillion(b *testing.B) {
 	db := benchmarkSearchDB(1_000_000, false)
 	b.ReportAllocs()
