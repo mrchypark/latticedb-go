@@ -69,7 +69,7 @@ func main() {
 - A `Tx` is single-owner and must not be used concurrently.
 - `Commit` and `CommitContext` are one-shot: the transaction becomes inactive whether the commit succeeds or fails.
 - Multiple online snapshots may be active per database. Writers can continue after each snapshot captures its generation; callers must close snapshots when finished.
-- `MaxGenerationLeases` and `MaxRetainedGenerationLogicalBytes` optionally bound admission of read, snapshot, and export pins. They never evict an active pin; retained bytes are canonical snapshot bytes, not RSS.
+- `MaxGenerationLeases` and `MaxRetainedGenerationLogicalBytes` optionally bound admission of public read, snapshot, and export pins. Internal checkpoint and index-maintenance candidates are outside these counters. They never evict an active pin; retained bytes are canonical snapshot bytes, not RSS.
 - On Linux, macOS, and Windows, writer opens take an exclusive database-path lock and `ReadOnly` opens take a shared lock. On js, Plan 9, and WASI, this lock is process-local only.
 - `DisableLock` is explicitly unsafe; callers must ensure that the database has a single owner.
 - During a background checkpoint, the active WAL append tail is bounded by `WALCheckpointThresholdBytes` plus one permitted WAL frame; once the bound is reached, commits return `ErrResourceLimit` before WAL mutation and must be retried as a new transaction after checkpoint progress. The marker frame's fixed file overhead is separate from that tail measurement.

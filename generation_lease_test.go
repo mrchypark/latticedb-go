@@ -1,7 +1,9 @@
 package latticedb
 
 import (
+	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 )
@@ -68,5 +70,36 @@ func TestGenerationLeaseDistinctLogicalByteLimit(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExportLimitsReleaseGenerationLease(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "export.ltdb"), OpenOptions{Create: true, MaxGenerationLeases: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	for _, export := range []func() error{
+		func() error {
+			_, err := db.ExportContextWithOptions(ctx, ExportFormatJSON, "", ExportOptions{MaxBytes: 1})
+			return err
+		},
+		func() error {
+			return db.ExportFileContextWithOptions(ctx, ExportFormatCSV, filepath.Join(t.TempDir(), "manifest.json"), ExportOptions{MaxBytes: 1})
+		},
+		func() error { _, err := db.DumpContextWithOptions(ctx, ExportOptions{MaxBytes: 1}); return err },
+		func() error { return db.DumpToContextWithOptions(ctx, io.Discard, ExportOptions{MaxBytes: 1}) },
+		func() error {
+			return db.ExportToContextWithOptions(ctx, ExportFormatJSON, io.Discard, ExportOptions{MaxBytes: 1})
+		},
+	} {
+		if err := export(); !errors.Is(err, ErrExportOutputLimit) {
+			t.Fatalf("export = %v", err)
+		}
+		stats, err := db.GenerationRetentionStats()
+		if err != nil || stats.ActiveLeases != 0 || stats.RetainedLogicalBytes != 0 {
+			t.Fatalf("after export: %+v, %v", stats, err)
+		}
 	}
 }

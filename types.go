@@ -167,13 +167,16 @@ type QueryCacheStats struct {
 }
 
 // GenerationRetentionStats describes logical immutable-generation pins. The
-// byte count is canonical snapshot payload bytes, not process RSS.
+// byte count is canonical snapshot payload bytes for public read, snapshot, and
+// export pins (including the current generation), not process RSS. Internal
+// checkpoint and index-maintenance candidates are excluded.
 type GenerationRetentionStats struct {
 	ActiveLeases         uint64
 	ActiveSnapshotLeases uint64
 	RetainedGenerations  uint64
 	RetainedLogicalBytes uint64
-	OldestLeaseAge       time.Duration
+	// OldestLeaseAge is the age of the oldest continuously pinned generation.
+	OldestLeaseAge time.Duration
 }
 
 type VectorIndexStats struct {

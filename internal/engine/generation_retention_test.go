@@ -35,3 +35,33 @@ func TestGenerationRetentionRemovesFinalLeaseOutOfOrder(t *testing.T) {
 		t.Fatalf("after final release: bytes=%d generations=%d", db.retainedGenerationLogicalBytes, db.generationOrder.Len())
 	}
 }
+
+func TestReleasedHandlesDropGenerationReferences(t *testing.T) {
+	db, err := Open(t.TempDir(), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	snapshot, err := db.BeginSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.graph != nil || snapshot.lease.graph != nil {
+		t.Fatal("closed snapshot retains generation")
+	}
+	for _, readOnly := range []bool{true, false} {
+		tx, err := db.Begin(readOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		if tx.graph != nil || tx.base != nil || tx.changes != nil || tx.generationLease != nil {
+			t.Fatal("closed transaction retains generation")
+		}
+	}
+}

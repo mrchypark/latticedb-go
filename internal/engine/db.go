@@ -1323,8 +1323,14 @@ func (db *DB) acquireGenerationLeaseLocked(graph *store.GraphState, snapshot boo
 	}
 	retention := db.generationLeases[graph]
 	if retention == nil {
+		if graph.SnapshotBytes > math.MaxUint64-db.retainedGenerationLogicalBytes {
+			return nil, fmt.Errorf("%w: retained generation byte accounting overflow", ErrResourceLimit)
+		}
 		if db.maxRetainedGenerationLogicalBytes != 0 && (graph.SnapshotBytes > db.maxRetainedGenerationLogicalBytes || db.retainedGenerationLogicalBytes > db.maxRetainedGenerationLogicalBytes-graph.SnapshotBytes) {
 			return nil, fmt.Errorf("%w: retained generation bytes would exceed %d", ErrResourceLimit, db.maxRetainedGenerationLogicalBytes)
+		}
+		if db.generationLeases == nil {
+			db.generationLeases = make(map[*store.GraphState]*generationRetention)
 		}
 		retention = &generationRetention{logicalBytes: graph.SnapshotBytes, openedAt: time.Now()}
 		retention.element = db.generationOrder.PushBack(retention)
@@ -1385,6 +1391,7 @@ func (lease *GenerationLease) Release() {
 	if lease.snapshot {
 		db.activeSnapshotLeases--
 	}
+	lease.graph = nil
 }
 
 func (db *DB) Begin(readOnly bool) (*Tx, error) {
@@ -2925,6 +2932,8 @@ func (tx *Tx) finish() *DB {
 	}
 	tx.closed = true
 	tx.generationLease.Release()
+	tx.generationLease = nil
+	tx.graph, tx.base, tx.changes = nil, nil, nil
 	tx.db.activeTx.Add(-1)
 	requestCheckpoint := tx.writeLocked && (tx.db.checkpointNeeded.Load() || tx.db.adjacencyMaintenanceNeeded.Load())
 	if tx.writeLocked {
