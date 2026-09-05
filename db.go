@@ -240,6 +240,8 @@ func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
 
 // BeginSnapshot pins one committed generation while database writes continue.
 // Multiple snapshots may be active at once. Close releases the pin.
+// Acquisition waits for internal checkpoint contention; an active application
+// writer still returns ErrWriteTxActive without waiting for the transaction.
 func (db *DB) BeginSnapshot() (*Snapshot, error) {
 	if db == nil || db.inner == nil {
 		return nil, wrapError(ErrDatabaseClosed)
