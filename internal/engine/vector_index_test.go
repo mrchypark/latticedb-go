@@ -940,7 +940,9 @@ func TestBackgroundVectorRebuildReplaysDeltasAndCoalesces(t *testing.T) {
 		t.Fatalf("delete during rebuild: %v", err)
 	}
 	secondDone := make(chan error, 1)
-	go func() { secondDone <- db.RebuildVectorIndexContext(context.Background()) }()
+	waiting := &rebuildWaitContext{Context: context.Background(), entered: make(chan struct{})}
+	go func() { secondDone <- db.RebuildVectorIndexContext(waiting) }()
+	<-waiting.entered
 	select {
 	case err := <-secondDone:
 		t.Fatalf("coalesced rebuild returned early: %v", err)
@@ -1134,4 +1136,17 @@ func TestVectorSearchScratchRejectsOversizedPooledCapacity(t *testing.T) {
 	if vectorSearchScratchFits(scratch, 16, 16, 16) {
 		t.Fatal("oversized pooled scratch fit a small request")
 	}
+}
+
+// Done is evaluated by the coalesced caller's select after it has joined the
+// existing attempt. Waiting for it avoids relying on goroutine scheduling.
+type rebuildWaitContext struct {
+	context.Context
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (ctx *rebuildWaitContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.entered) })
+	return ctx.Context.Done()
 }
