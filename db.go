@@ -84,25 +84,27 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		return nil, wrapError(err)
 	}
 	inner, err := engine.OpenContext(ctx, path, engine.OpenOptions{
-		Create:                           opts.Create,
-		ReadOnly:                         opts.ReadOnly,
-		DisableLock:                      opts.DisableLock,
-		CacheSizeMB:                      opts.CacheSizeMB,
-		PageSize:                         opts.PageSize,
-		EnableVector:                     opts.EnableVector || opts.EnableVectors,
-		VectorIndexMode:                  engine.VectorIndexMode(opts.VectorIndexMode),
-		VectorDimensions:                 opts.VectorDimensions,
-		Durability:                       engine.DurabilityMode(opts.Durability),
-		WALCheckpointThresholdBytes:      opts.WALCheckpointThresholdBytes,
-		ChangefeedMaxBytes:               opts.ChangefeedMaxBytes,
-		MaxDatabaseSnapshotBytes:         opts.MaxDatabaseSnapshotBytes,
-		RecoveryMaxDecodedBytes:          opts.RecoveryMaxDecodedBytes,
-		RecoveryMaxFrames:                opts.RecoveryMaxFrames,
-		RecoveryMaxWork:                  opts.RecoveryMaxWork,
-		VectorIndexBuildMaxWork:          opts.VectorIndexBuildMaxWork,
-		VectorIndexBuildMaxLogicalBytes:  opts.VectorIndexBuildMaxLogicalBytes,
-		DerivedIndexBuildMaxWork:         opts.DerivedIndexBuildMaxWork,
-		DerivedIndexBuildMaxLogicalBytes: opts.DerivedIndexBuildMaxLogicalBytes,
+		Create:                            opts.Create,
+		ReadOnly:                          opts.ReadOnly,
+		DisableLock:                       opts.DisableLock,
+		CacheSizeMB:                       opts.CacheSizeMB,
+		PageSize:                          opts.PageSize,
+		EnableVector:                      opts.EnableVector || opts.EnableVectors,
+		VectorIndexMode:                   engine.VectorIndexMode(opts.VectorIndexMode),
+		VectorDimensions:                  opts.VectorDimensions,
+		Durability:                        engine.DurabilityMode(opts.Durability),
+		WALCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
+		ChangefeedMaxBytes:                opts.ChangefeedMaxBytes,
+		MaxDatabaseSnapshotBytes:          opts.MaxDatabaseSnapshotBytes,
+		RecoveryMaxDecodedBytes:           opts.RecoveryMaxDecodedBytes,
+		RecoveryMaxFrames:                 opts.RecoveryMaxFrames,
+		RecoveryMaxWork:                   opts.RecoveryMaxWork,
+		VectorIndexBuildMaxWork:           opts.VectorIndexBuildMaxWork,
+		VectorIndexBuildMaxLogicalBytes:   opts.VectorIndexBuildMaxLogicalBytes,
+		DerivedIndexBuildMaxWork:          opts.DerivedIndexBuildMaxWork,
+		DerivedIndexBuildMaxLogicalBytes:  opts.DerivedIndexBuildMaxLogicalBytes,
+		MaxGenerationLeases:               opts.MaxGenerationLeases,
+		MaxRetainedGenerationLogicalBytes: opts.MaxRetainedGenerationLogicalBytes,
 	})
 	if err != nil {
 		return nil, wrapError(err)
@@ -116,23 +118,25 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 		return nil, wrapError(err)
 	}
 	inner, err := engine.Deserialize(data, engine.OpenOptions{
-		ReadOnly:                         opts.ReadOnly,
-		CacheSizeMB:                      opts.CacheSizeMB,
-		PageSize:                         opts.PageSize,
-		EnableVector:                     opts.EnableVector || opts.EnableVectors,
-		VectorIndexMode:                  engine.VectorIndexMode(opts.VectorIndexMode),
-		VectorDimensions:                 opts.VectorDimensions,
-		Durability:                       engine.DurabilityMode(opts.Durability),
-		WALCheckpointThresholdBytes:      opts.WALCheckpointThresholdBytes,
-		ChangefeedMaxBytes:               opts.ChangefeedMaxBytes,
-		MaxDatabaseSnapshotBytes:         opts.MaxDatabaseSnapshotBytes,
-		RecoveryMaxDecodedBytes:          opts.RecoveryMaxDecodedBytes,
-		RecoveryMaxFrames:                opts.RecoveryMaxFrames,
-		RecoveryMaxWork:                  opts.RecoveryMaxWork,
-		VectorIndexBuildMaxWork:          opts.VectorIndexBuildMaxWork,
-		VectorIndexBuildMaxLogicalBytes:  opts.VectorIndexBuildMaxLogicalBytes,
-		DerivedIndexBuildMaxWork:         opts.DerivedIndexBuildMaxWork,
-		DerivedIndexBuildMaxLogicalBytes: opts.DerivedIndexBuildMaxLogicalBytes,
+		ReadOnly:                          opts.ReadOnly,
+		CacheSizeMB:                       opts.CacheSizeMB,
+		PageSize:                          opts.PageSize,
+		EnableVector:                      opts.EnableVector || opts.EnableVectors,
+		VectorIndexMode:                   engine.VectorIndexMode(opts.VectorIndexMode),
+		VectorDimensions:                  opts.VectorDimensions,
+		Durability:                        engine.DurabilityMode(opts.Durability),
+		WALCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
+		ChangefeedMaxBytes:                opts.ChangefeedMaxBytes,
+		MaxDatabaseSnapshotBytes:          opts.MaxDatabaseSnapshotBytes,
+		RecoveryMaxDecodedBytes:           opts.RecoveryMaxDecodedBytes,
+		RecoveryMaxFrames:                 opts.RecoveryMaxFrames,
+		RecoveryMaxWork:                   opts.RecoveryMaxWork,
+		VectorIndexBuildMaxWork:           opts.VectorIndexBuildMaxWork,
+		VectorIndexBuildMaxLogicalBytes:   opts.VectorIndexBuildMaxLogicalBytes,
+		DerivedIndexBuildMaxWork:          opts.DerivedIndexBuildMaxWork,
+		DerivedIndexBuildMaxLogicalBytes:  opts.DerivedIndexBuildMaxLogicalBytes,
+		MaxGenerationLeases:               opts.MaxGenerationLeases,
+		MaxRetainedGenerationLogicalBytes: opts.MaxRetainedGenerationLogicalBytes,
 	})
 	if err != nil {
 		return nil, wrapError(err)
@@ -195,8 +199,28 @@ func (db *DB) Checkpoint() error {
 	return wrapError(inner.Checkpoint())
 }
 
+// GenerationRetentionStats reports logical immutable-generation pins. It does
+// not report process RSS or force reclamation of active leases.
+func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
+	inner, err := db.requireOpen()
+	if err != nil {
+		return GenerationRetentionStats{}, wrapError(err)
+	}
+	stats, err := inner.GenerationRetentionStats()
+	if err != nil {
+		return GenerationRetentionStats{}, wrapError(err)
+	}
+	return GenerationRetentionStats{
+		ActiveLeases:         stats.ActiveLeases,
+		ActiveSnapshotLeases: stats.ActiveSnapshotLeases,
+		RetainedGenerations:  stats.RetainedGenerations,
+		RetainedLogicalBytes: stats.RetainedLogicalBytes,
+		OldestLeaseAge:       stats.OldestLeaseAge,
+	}, nil
+}
+
 // BeginSnapshot pins one committed generation while database writes continue.
-// Only one Snapshot may be active for a DB.
+// Multiple snapshots may be active at once. Close releases the pin.
 func (db *DB) BeginSnapshot() (*Snapshot, error) {
 	if db == nil || db.inner == nil {
 		return nil, wrapError(ErrDatabaseClosed)

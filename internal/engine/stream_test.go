@@ -34,10 +34,11 @@ func TestReadStreamConcurrentGenerationAndPayloadIsolation(t *testing.T) {
 	if err := publish(0); err != nil {
 		t.Fatal(err)
 	}
-	frozen, err := db.SnapshotGraph()
+	frozen, lease, err := db.SnapshotGraph()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer lease.Release()
 	check := func(records []StreamRecord) {
 		t.Helper()
 		if len(records) != recordsPerGeneration {

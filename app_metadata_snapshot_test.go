@@ -328,8 +328,9 @@ func TestSnapshotPinsGenerationWhileWritersContinue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.BeginSnapshot(); !errors.Is(err, ErrSnapshotActive) {
-		t.Fatalf("second snapshot = %v", err)
+	second, err := db.BeginSnapshot()
+	if err != nil {
+		t.Fatalf("second snapshot: %v", err)
 	}
 	if err := db.Close(); !errors.Is(err, ErrSnapshotActive) || !db.IsOpen() {
 		t.Fatalf("close with snapshot = %v, open=%t", err, db.IsOpen())
@@ -393,6 +394,9 @@ func TestSnapshotPinsGenerationWhileWritersContinue(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := again.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

@@ -3,6 +3,7 @@ package latticedb
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/mrchypark/latticedb-go/internal/exporter"
 )
@@ -11,6 +12,48 @@ type ExportFormat string
 
 // ErrExportOutputLimit reports that an ExportOptions limit was reached.
 var ErrExportOutputLimit = exporter.ErrOutputLimit
+
+var ErrCSVGenerationPruningUnsupported = exporter.ErrCSVGenerationPruningUnsupported
+
+// CSVGenerationRetention controls explicit pruning of old CSV export
+// generations. Readers must use OpenCSVGenerationContext while pruning is in
+// use; legacy readers have no lease and are not protected.
+type CSVGenerationRetention struct {
+	// KeepLatest preserves this many newest generations in addition to active pins and the current generation.
+	KeepLatest uint
+	// MinAge preserves generations younger than this duration. Negative values are invalid.
+	// At least one retention setting must be positive.
+	MinAge time.Duration
+}
+
+// CSVGenerationLease pins one immutable CSV generation until Close.
+type CSVGenerationLease struct {
+	Generation string
+	NodesPath  string
+	EdgesPath  string
+	inner      *exporter.CSVGenerationLease
+}
+
+func OpenCSVGenerationContext(ctx context.Context, manifestPath string) (*CSVGenerationLease, error) {
+	lease, err := exporter.OpenCSVGenerationContext(ctx, manifestPath)
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	return &CSVGenerationLease{Generation: lease.Generation, NodesPath: lease.NodesPath, EdgesPath: lease.EdgesPath, inner: lease}, nil
+}
+
+// Close is idempotent.
+func (lease *CSVGenerationLease) Close() error {
+	if lease == nil || lease.inner == nil {
+		return nil
+	}
+	return wrapError(lease.inner.Close())
+}
+
+func PruneCSVGenerationsContext(ctx context.Context, manifestPath string, retention CSVGenerationRetention) (int, error) {
+	removed, err := exporter.PruneCSVGenerationsContext(ctx, manifestPath, exporter.CSVGenerationRetention(retention))
+	return removed, wrapError(err)
+}
 
 const (
 	ExportFormatJSON  ExportFormat = "json"
@@ -83,10 +126,11 @@ func (db *DB) ExportContextWithOptions(ctx context.Context, format ExportFormat,
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	defer lease.Release()
 	data, err := exporter.ExportGraphContextWithOptions(ctx, graph, exporter.ExportFormat(format), outputPath, exporter.ExportOptions(opts))
 	return data, wrapError(err)
 }
@@ -104,10 +148,11 @@ func (db *DB) ExportFileContextWithOptions(ctx context.Context, format ExportFor
 	if err != nil {
 		return wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return wrapError(err)
 	}
+	defer lease.Release()
 	return wrapError(exporter.ExportGraphFileContextWithOptions(ctx, graph, exporter.ExportFormat(format), outputPath, exporter.ExportOptions(opts)))
 }
 
@@ -124,10 +169,11 @@ func (db *DB) DumpContextWithOptions(ctx context.Context, opts ExportOptions) ([
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	defer lease.Release()
 	data, err := exporter.DumpGraphContextWithOptions(ctx, graph, exporter.ExportOptions(opts))
 	return data, wrapError(err)
 }
@@ -150,10 +196,11 @@ func (db *DB) DumpToContextWithOptions(ctx context.Context, output io.Writer, op
 	if err != nil {
 		return wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return wrapError(err)
 	}
+	defer lease.Release()
 	return wrapError(exporter.DumpGraphContextToWithOptions(ctx, graph, output, exporter.ExportOptions(opts)))
 }
 
@@ -175,10 +222,11 @@ func (db *DB) ExportToContextWithOptions(ctx context.Context, format ExportForma
 	if err != nil {
 		return wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return wrapError(err)
 	}
+	defer lease.Release()
 	return wrapError(exporter.ExportGraphContextToWithOptions(ctx, graph, exporter.ExportFormat(format), output, exporter.ExportOptions(opts)))
 }
 
