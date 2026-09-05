@@ -2686,7 +2686,7 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 	return snapshot, nil
 }
 
-func buildPersistedAppMetadata(metadata AppMetadata) ([]persistedAppMetadata, error) {
+func buildPersistedAppMetadata(metadata *AppMetadata) ([]persistedAppMetadata, error) {
 	keys := make([]string, 0, metadata.Len())
 	for key := range metadata.All() {
 		if len(key) == 0 || len(key) > maxAppMetadataKeyBytes {

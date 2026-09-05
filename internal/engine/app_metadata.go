@@ -57,6 +57,7 @@ func (tx *Tx) ensureAppMetadataWritable() {
 	if tx.changes.appMetadata != nil {
 		return
 	}
+	tx.graph.AppMetadata = tx.graph.AppMetadata.Fork()
 	tx.changes.appMetadata = make(map[string]appMetadataChange)
 }
 

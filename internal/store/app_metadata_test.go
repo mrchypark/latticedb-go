@@ -7,6 +7,18 @@ import (
 	"testing"
 )
 
+func TestNilAppMetadataCanBeReadAndForked(t *testing.T) {
+	var metadata *AppMetadata
+	if _, ok := metadata.Get("missing"); ok || metadata.Len() != 0 || len(maps.Collect(metadata.All())) != 0 {
+		t.Fatal("nil metadata is not empty")
+	}
+	fork := metadata.Fork()
+	fork.Set("key", []byte("value"))
+	if got, ok := fork.Get("key"); !ok || string(got) != "value" || metadata.Len() != 0 {
+		t.Fatal("fork did not isolate nil metadata")
+	}
+}
+
 func TestAppMetadataForkIsolationWithShardCollisions(t *testing.T) {
 	groups := make(map[uint8][]string)
 	var keys []string

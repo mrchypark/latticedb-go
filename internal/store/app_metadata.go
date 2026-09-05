@@ -16,13 +16,24 @@ type AppMetadata struct {
 	cloned  [4]uint64
 }
 
-func (metadata AppMetadata) Fork() AppMetadata {
-	return AppMetadata{buckets: metadata.buckets.Fork(), length: metadata.length}
+func (metadata *AppMetadata) Fork() *AppMetadata {
+	if metadata == nil {
+		return new(AppMetadata)
+	}
+	return &AppMetadata{buckets: metadata.buckets.Fork(), length: metadata.length}
 }
 
-func (metadata AppMetadata) Len() int { return metadata.length }
+func (metadata *AppMetadata) Len() int {
+	if metadata == nil {
+		return 0
+	}
+	return metadata.length
+}
 
-func (metadata AppMetadata) Get(key string) ([]byte, bool) {
+func (metadata *AppMetadata) Get(key string) ([]byte, bool) {
+	if metadata == nil {
+		return nil, false
+	}
 	value, ok := metadata.buckets.Get(hashString(key) & 255)[key]
 	return value, ok
 }
@@ -63,8 +74,11 @@ func (metadata *AppMetadata) writableBucket(hash uint64) map[string][]byte {
 	return metadata.buckets.Get(hash)
 }
 
-func (metadata AppMetadata) All() iter.Seq2[string, []byte] {
+func (metadata *AppMetadata) All() iter.Seq2[string, []byte] {
 	return func(yield func(string, []byte) bool) {
+		if metadata == nil {
+			return
+		}
 		for _, bucket := range metadata.buckets.All() {
 			for key, value := range bucket {
 				if !yield(key, value) {
