@@ -226,6 +226,31 @@ func BenchmarkColdOpen(b *testing.B) {
 	}
 }
 
+func BenchmarkDeserialize(b *testing.B) {
+	for _, size := range []int{10_000, 100_000} {
+		b.Run(fmt.Sprintf("nodes_%d", size), func(b *testing.B) {
+			db, _ := benchmarkWriteScaleDB(b, size)
+			data, err := db.Serialize()
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				copyDB, err := Deserialize(data, OpenOptions{})
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				if err := copyDB.Close(); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+			}
+		})
+	}
+}
+
 func BenchmarkReaderDuringCommit(b *testing.B) {
 	db, target := benchmarkWriteScaleDB(b, 10_000)
 	b.ReportAllocs()

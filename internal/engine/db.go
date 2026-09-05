@@ -99,6 +99,11 @@ type OpenOptions struct {
 	checkpointBeforeFinalTryLock     func()
 	checkpointComplete               chan struct{}
 	checkpoint                       func(string, *store.GraphState, uint64, uint64, uint64) error
+	preloadedGraph                   *store.GraphState
+	preloadedNextNodeID              uint64
+	preloadedNextEdgeID              uint64
+	preloadedCommitID                uint64
+	preloaded                        bool
 }
 
 type DurabilityMode uint8
@@ -419,11 +424,17 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 			return nil, err
 		}
 	}
-	graph, nextNodeID, nextEdgeID, commitID, err := store.LoadGraphStateFilesContextWithRecoveryLimits(ctx, files, opts.MaxDatabaseSnapshotBytes, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes, store.RecoveryLimits{
-		MaxDecodedBytes: opts.RecoveryMaxDecodedBytes,
-		MaxFrames:       opts.RecoveryMaxFrames,
-		MaxWork:         opts.RecoveryMaxWork,
-	})
+	var graph *store.GraphState
+	var nextNodeID, nextEdgeID, commitID uint64
+	if opts.preloaded {
+		graph, nextNodeID, nextEdgeID, commitID = opts.preloadedGraph, opts.preloadedNextNodeID, opts.preloadedNextEdgeID, opts.preloadedCommitID
+	} else {
+		graph, nextNodeID, nextEdgeID, commitID, err = store.LoadGraphStateFilesContextWithRecoveryLimits(ctx, files, opts.MaxDatabaseSnapshotBytes, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes, store.RecoveryLimits{
+			MaxDecodedBytes: opts.RecoveryMaxDecodedBytes,
+			MaxFrames:       opts.RecoveryMaxFrames,
+			MaxWork:         opts.RecoveryMaxWork,
+		})
+	}
 	if err != nil {
 		if errors.Is(err, store.ErrLoadResourceLimit) || errors.Is(err, store.ErrDerivedIndexResourceLimit) {
 			err = fmt.Errorf("%w: %v", ErrResourceLimit, err)
@@ -1135,6 +1146,11 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 	opts.RecoveryMaxDecodedBytes = 0
 	opts.RecoveryMaxFrames = 0
 	opts.RecoveryMaxWork = 0
+	opts.preloaded = true
+	opts.preloadedGraph = graph
+	opts.preloadedNextNodeID = nextNodeID
+	opts.preloadedNextEdgeID = nextEdgeID
+	opts.preloadedCommitID = commitID
 	db, err := Open(path, opts)
 	if err != nil {
 		_ = os.RemoveAll(path)
