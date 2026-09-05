@@ -48,6 +48,13 @@ type DB struct {
 	path  string
 }
 
+func (db *DB) requireOpen() (*engine.DB, error) {
+	if db == nil || db.inner == nil || !db.inner.IsOpen() {
+		return nil, ErrDatabaseClosed
+	}
+	return db.inner, nil
+}
+
 // Tx is a single-owner transaction handle. Its methods must not be called
 // concurrently; use separate read transactions for concurrent work.
 type Tx struct {
@@ -161,21 +168,25 @@ func (db *DB) Path() string {
 // file produces a path that Open can read and update.
 func (db *DB) Serialize() ([]byte, error) {
 	if db == nil || db.inner == nil {
-		return nil, ErrDatabaseClosed
+		return nil, wrapError(ErrDatabaseClosed)
 	}
 	data, err := db.inner.Serialize()
 	return data, wrapError(err)
 }
 
 func (db *DB) Checkpoint() error {
-	return wrapError(db.inner.Checkpoint())
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.Checkpoint())
 }
 
 // BeginSnapshot pins one committed generation while database writes continue.
 // Only one Snapshot may be active for a DB.
 func (db *DB) BeginSnapshot() (*Snapshot, error) {
 	if db == nil || db.inner == nil {
-		return nil, ErrDatabaseClosed
+		return nil, wrapError(ErrDatabaseClosed)
 	}
 	snapshot, err := db.inner.BeginSnapshot()
 	if err != nil {
@@ -205,7 +216,11 @@ func (snapshot *Snapshot) Close() error {
 }
 
 func (db *DB) Begin(readOnly bool) (*Tx, error) {
-	tx, err := db.inner.Begin(readOnly)
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	tx, err := inner.Begin(readOnly)
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -214,10 +229,11 @@ func (db *DB) Begin(readOnly bool) (*Tx, error) {
 
 // BeginWriteContext waits for the single writer slot until ctx is canceled.
 func (db *DB) BeginWriteContext(ctx context.Context) (*Tx, error) {
-	if db == nil || db.inner == nil {
-		return nil, ErrDatabaseClosed
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
 	}
-	tx, err := db.inner.BeginWriteContext(ctx)
+	tx, err := inner.BeginWriteContext(ctx)
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -225,8 +241,12 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*Tx, error) {
 }
 
 func (db *DB) View(fn func(*Tx) error) error {
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
 	var callbackErr error
-	err := db.inner.View(func(tx *engine.Tx) error {
+	err = inner.View(func(tx *engine.Tx) error {
 		callbackErr = fn(&Tx{inner: tx})
 		return callbackErr
 	})
@@ -237,8 +257,12 @@ func (db *DB) View(fn func(*Tx) error) error {
 }
 
 func (db *DB) Update(fn func(*Tx) error) error {
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
 	var callbackErr error
-	err := db.inner.Update(func(tx *engine.Tx) error {
+	err = inner.Update(func(tx *engine.Tx) error {
 		callbackErr = fn(&Tx{inner: tx})
 		return callbackErr
 	})
@@ -249,8 +273,12 @@ func (db *DB) Update(fn func(*Tx) error) error {
 }
 
 func (db *DB) UpdateContext(ctx context.Context, fn func(*Tx) error) error {
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
 	var callbackErr error
-	err := db.inner.UpdateContext(ctx, func(tx *engine.Tx) error {
+	err = inner.UpdateContext(ctx, func(tx *engine.Tx) error {
 		callbackErr = fn(&Tx{inner: tx})
 		return callbackErr
 	})
@@ -261,7 +289,11 @@ func (db *DB) UpdateContext(ctx context.Context, fn func(*Tx) error) error {
 }
 
 func (db *DB) Query(query string, params map[string]Value) (QueryResult, error) {
-	result, err := db.inner.Query(query, params)
+	inner, err := db.requireOpen()
+	if err != nil {
+		return QueryResult{}, wrapError(err)
+	}
+	result, err := inner.Query(query, params)
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}
@@ -269,7 +301,11 @@ func (db *DB) Query(query string, params map[string]Value) (QueryResult, error) 
 }
 
 func (db *DB) QueryContext(ctx context.Context, query string, params map[string]Value, opts QueryOptions) (QueryResult, error) {
-	result, err := db.inner.QueryContext(ctx, query, params, engine.QueryOptions{MaxRows: opts.MaxRows, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	inner, err := db.requireOpen()
+	if err != nil {
+		return QueryResult{}, wrapError(err)
+	}
+	result, err := inner.QueryContext(ctx, query, params, engine.QueryOptions{MaxRows: opts.MaxRows, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}
@@ -277,7 +313,11 @@ func (db *DB) QueryContext(ctx context.Context, query string, params map[string]
 }
 
 func (db *DB) VectorSearch(vector []float32, opts VectorSearchOptions) ([]VectorSearchResult, error) {
-	results, err := db.inner.VectorSearch(vector, engine.VectorSearchOptions{
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	results, err := inner.VectorSearch(vector, engine.VectorSearchOptions{
 		K:        opts.K,
 		EfSearch: opts.EfSearch,
 		Exact:    opts.Exact,
@@ -291,7 +331,11 @@ func (db *DB) VectorSearch(vector []float32, opts VectorSearchOptions) ([]Vector
 }
 
 func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts VectorSearchOptions) ([]VectorSearchResult, error) {
-	results, err := db.inner.VectorSearchContext(ctx, vector, engine.VectorSearchOptions{K: opts.K, EfSearch: opts.EfSearch, Exact: opts.Exact, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	results, err := inner.VectorSearchContext(ctx, vector, engine.VectorSearchOptions{K: opts.K, EfSearch: opts.EfSearch, Exact: opts.Exact, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -299,7 +343,11 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 }
 
 func (db *DB) FTSSearch(query string, opts FTSSearchOptions) ([]FTSSearchResult, error) {
-	results, err := db.inner.FTSSearch(query, engine.FTSSearchOptions{
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	results, err := inner.FTSSearch(query, engine.FTSSearchOptions{
 		Limit:         opts.Limit,
 		MaxDistance:   opts.MaxDistance,
 		MinTermLength: opts.MinTermLength,
@@ -313,7 +361,11 @@ func (db *DB) FTSSearch(query string, opts FTSSearchOptions) ([]FTSSearchResult,
 }
 
 func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearchOptions) ([]FTSSearchResult, error) {
-	results, err := db.inner.FTSSearchContext(ctx, query, engine.FTSSearchOptions{Limit: opts.Limit, MaxDistance: opts.MaxDistance, MinTermLength: opts.MinTermLength, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	results, err := inner.FTSSearchContext(ctx, query, engine.FTSSearchOptions{Limit: opts.Limit, MaxDistance: opts.MaxDistance, MinTermLength: opts.MinTermLength, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -321,39 +373,67 @@ func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearch
 }
 
 func (db *DB) ReadStream(stream string, afterSequence uint64, limit uint, timeoutMS uint32) ([]StreamRecord, error) {
-	records, err := db.inner.ReadStream(stream, afterSequence, limit, timeoutMS)
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	records, err := inner.ReadStream(stream, afterSequence, limit, timeoutMS)
 	return records, wrapError(err)
 }
 
 // ReadStreamContext reads stream records until a record is available, the byte
 // budget is reached, or ctx is canceled. A zero MaxBytes disables the byte limit.
 func (db *DB) ReadStreamContext(ctx context.Context, stream string, afterSequence uint64, opts StreamReadOptions) (StreamReadResult, error) {
-	result, err := db.inner.ReadStreamContext(ctx, stream, afterSequence, engine.StreamReadOptions{Limit: opts.Limit, MaxBytes: opts.MaxBytes})
+	inner, err := db.requireOpen()
+	if err != nil {
+		return StreamReadResult{}, wrapError(err)
+	}
+	result, err := inner.ReadStreamContext(ctx, stream, afterSequence, engine.StreamReadOptions{Limit: opts.Limit, MaxBytes: opts.MaxBytes})
 	return StreamReadResult{Records: result.Records, LastSequence: result.LastSequence, ByteLimited: result.ByteLimited}, wrapError(err)
 }
 
 func (db *DB) GetStreamOffset(stream, consumer string) (uint64, bool, error) {
-	offset, ok, err := db.inner.GetStreamOffset(stream, consumer)
+	inner, err := db.requireOpen()
+	if err != nil {
+		return 0, false, wrapError(err)
+	}
+	offset, ok, err := inner.GetStreamOffset(stream, consumer)
 	return offset, ok, wrapError(err)
 }
 
 func (db *DB) Changes(afterSequence uint64, limit uint, timeoutMS uint32) ([]StreamRecord, error) {
-	records, err := db.inner.Changes(afterSequence, limit, timeoutMS)
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	records, err := inner.Changes(afterSequence, limit, timeoutMS)
 	return records, wrapError(err)
 }
 
 // ChangesContext is ReadStreamContext for the automatic changefeed.
 func (db *DB) ChangesContext(ctx context.Context, afterSequence uint64, opts StreamReadOptions) (StreamReadResult, error) {
-	result, err := db.inner.ChangesContext(ctx, afterSequence, engine.StreamReadOptions{Limit: opts.Limit, MaxBytes: opts.MaxBytes})
+	inner, err := db.requireOpen()
+	if err != nil {
+		return StreamReadResult{}, wrapError(err)
+	}
+	result, err := inner.ChangesContext(ctx, afterSequence, engine.StreamReadOptions{Limit: opts.Limit, MaxBytes: opts.MaxBytes})
 	return StreamReadResult{Records: result.Records, LastSequence: result.LastSequence, ByteLimited: result.ByteLimited}, wrapError(err)
 }
 
 func (db *DB) CacheClear() error {
-	return wrapError(db.inner.CacheClear())
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.CacheClear())
 }
 
 func (db *DB) CacheStats() (QueryCacheStats, error) {
-	stats, err := db.inner.CacheStats()
+	inner, err := db.requireOpen()
+	if err != nil {
+		return QueryCacheStats{}, wrapError(err)
+	}
+	stats, err := inner.CacheStats()
 	if err != nil {
 		return QueryCacheStats{}, wrapError(err)
 	}
@@ -365,37 +445,59 @@ func (db *DB) CacheStats() (QueryCacheStats, error) {
 }
 
 func (db *DB) CreateNodePropertyIndex(label, property string) error {
-	return wrapError(db.inner.CreateNodePropertyIndex(label, property))
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.CreateNodePropertyIndex(label, property))
 }
 
 func (db *DB) CreateNodePropertyIndexContext(ctx context.Context, label, property string) error {
-	if db == nil || db.inner == nil {
-		return ErrDatabaseClosed
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
 	}
-	return wrapError(db.inner.CreateNodePropertyIndexContext(ctx, label, property))
+	return wrapError(inner.CreateNodePropertyIndexContext(ctx, label, property))
 }
 
 func (db *DB) DropNodePropertyIndex(label, property string) error {
-	return wrapError(db.inner.DropNodePropertyIndex(label, property))
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.DropNodePropertyIndex(label, property))
 }
 
 func (db *DB) CreateEdgePropertyIndex(edgeType, property string) error {
-	return wrapError(db.inner.CreateEdgePropertyIndex(edgeType, property))
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.CreateEdgePropertyIndex(edgeType, property))
 }
 
 func (db *DB) CreateEdgePropertyIndexContext(ctx context.Context, edgeType, property string) error {
-	if db == nil || db.inner == nil {
-		return ErrDatabaseClosed
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
 	}
-	return wrapError(db.inner.CreateEdgePropertyIndexContext(ctx, edgeType, property))
+	return wrapError(inner.CreateEdgePropertyIndexContext(ctx, edgeType, property))
 }
 
 func (db *DB) DropEdgePropertyIndex(edgeType, property string) error {
-	return wrapError(db.inner.DropEdgePropertyIndex(edgeType, property))
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.DropEdgePropertyIndex(edgeType, property))
 }
 
 func (db *DB) VectorIndexStats() (VectorIndexStats, error) {
-	stats, err := db.inner.VectorIndexStats()
+	inner, err := db.requireOpen()
+	if err != nil {
+		return VectorIndexStats{}, wrapError(err)
+	}
+	stats, err := inner.VectorIndexStats()
 	if err != nil {
 		return VectorIndexStats{}, wrapError(err)
 	}
@@ -416,7 +518,11 @@ func (db *DB) VectorIndexStats() (VectorIndexStats, error) {
 }
 
 func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
-	return wrapError(db.inner.RebuildVectorIndexContext(ctx))
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.RebuildVectorIndexContext(ctx))
 }
 
 // Commit makes the transaction inactive, whether it succeeds or fails.

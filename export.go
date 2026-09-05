@@ -60,9 +60,13 @@ func (db *DB) Export(format ExportFormat, outputPath string) ([]byte, error) {
 }
 
 func (db *DB) ExportContext(ctx context.Context, format ExportFormat, outputPath string) ([]byte, error) {
-	graph, err := db.inner.SnapshotGraph()
+	inner, err := db.requireOpen()
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
+	}
+	graph, err := inner.SnapshotGraph()
+	if err != nil {
+		return nil, wrapError(err)
 	}
 	return exporter.ExportGraphContext(ctx, graph, exporter.ExportFormat(format), outputPath)
 }
@@ -72,9 +76,13 @@ func (db *DB) ExportFile(format ExportFormat, outputPath string) error {
 }
 
 func (db *DB) ExportFileContext(ctx context.Context, format ExportFormat, outputPath string) error {
-	graph, err := db.inner.SnapshotGraph()
+	inner, err := db.requireOpen()
 	if err != nil {
-		return err
+		return wrapError(err)
+	}
+	graph, err := inner.SnapshotGraph()
+	if err != nil {
+		return wrapError(err)
 	}
 	return exporter.ExportGraphFileContext(ctx, graph, exporter.ExportFormat(format), outputPath)
 }
@@ -84,9 +92,13 @@ func (db *DB) Dump() ([]byte, error) {
 }
 
 func (db *DB) DumpContext(ctx context.Context) ([]byte, error) {
-	graph, err := db.inner.SnapshotGraph()
+	inner, err := db.requireOpen()
 	if err != nil {
-		return nil, err
+		return nil, wrapError(err)
+	}
+	graph, err := inner.SnapshotGraph()
+	if err != nil {
+		return nil, wrapError(err)
 	}
 	return exporter.DumpGraphContext(ctx, graph)
 }
@@ -98,9 +110,13 @@ func (db *DB) DumpTo(output io.Writer) error {
 // DumpToContext observes cancellation between writes. It cannot interrupt an
 // output writer that is itself blocked in Write.
 func (db *DB) DumpToContext(ctx context.Context, output io.Writer) error {
-	graph, err := db.inner.SnapshotGraph()
+	inner, err := db.requireOpen()
 	if err != nil {
-		return err
+		return wrapError(err)
+	}
+	graph, err := inner.SnapshotGraph()
+	if err != nil {
+		return wrapError(err)
 	}
 	return exporter.DumpGraphContextTo(ctx, graph, output)
 }
@@ -112,9 +128,13 @@ func (db *DB) ExportTo(format ExportFormat, output io.Writer) error {
 // ExportToContext observes cancellation between writes. It cannot interrupt an
 // output writer that is itself blocked in Write.
 func (db *DB) ExportToContext(ctx context.Context, format ExportFormat, output io.Writer) error {
-	graph, err := db.inner.SnapshotGraph()
+	inner, err := db.requireOpen()
 	if err != nil {
-		return err
+		return wrapError(err)
+	}
+	graph, err := inner.SnapshotGraph()
+	if err != nil {
+		return wrapError(err)
 	}
 	return exporter.ExportGraphContextTo(ctx, graph, exporter.ExportFormat(format), output)
 }

@@ -10,10 +10,11 @@ func (db *DB) BeginRead() (*Tx, error)  { return db.Begin(true) }
 func (db *DB) BeginWrite() (*Tx, error) { return db.Begin(false) }
 
 func (db *DB) GetNodesByLabel(label string) ([]NodeID, error) {
-	if db == nil || db.inner == nil {
-		return nil, wrapError(ErrDatabaseClosed)
+	inner, err := db.requireOpen()
+	if err != nil {
+		return nil, wrapError(err)
 	}
-	ids, err := db.inner.GetNodesByLabel(label)
+	ids, err := inner.GetNodesByLabel(label)
 	return ids, wrapError(err)
 }
 
