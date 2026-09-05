@@ -1,6 +1,10 @@
 package latticedb
 
-import "github.com/mrchypark/latticedb-go/internal/engine"
+import (
+	"time"
+
+	"github.com/mrchypark/latticedb-go/internal/engine"
+)
 
 type Value = any
 
@@ -74,6 +78,12 @@ type OpenOptions struct {
 	DerivedIndexBuildMaxWork uint64
 	// DerivedIndexBuildMaxLogicalBytes bounds conservative derived posting metadata, not process RSS.
 	DerivedIndexBuildMaxLogicalBytes uint64
+	// MaxGenerationLeases bounds concurrent read, snapshot, and export generation pins.
+	// Zero leaves admission unbounded.
+	MaxGenerationLeases uint64
+	// MaxRetainedGenerationLogicalBytes bounds distinct pinned generations by
+	// their canonical snapshot bytes, not process RSS. Zero leaves admission unbounded.
+	MaxRetainedGenerationLogicalBytes uint64
 }
 
 type CreateNodeOptions struct {
@@ -154,6 +164,16 @@ type QueryCacheStats struct {
 	Entries uint32
 	Hits    uint64
 	Misses  uint64
+}
+
+// GenerationRetentionStats describes logical immutable-generation pins. The
+// byte count is canonical snapshot payload bytes, not process RSS.
+type GenerationRetentionStats struct {
+	ActiveLeases         uint64
+	ActiveSnapshotLeases uint64
+	RetainedGenerations  uint64
+	RetainedLogicalBytes uint64
+	OldestLeaseAge       time.Duration
 }
 
 type VectorIndexStats struct {

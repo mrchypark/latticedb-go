@@ -19,6 +19,7 @@ type Snapshot struct {
 	nextNodeID uint64
 	nextEdgeID uint64
 	commitID   uint64
+	lease      *GenerationLease
 	closed     bool
 }
 
@@ -41,10 +42,10 @@ func (db *DB) BeginSnapshot() (*Snapshot, error) {
 	if db.recoveryRequired {
 		return nil, ErrRecoveryRequired
 	}
-	if db.activeSnapshot {
-		return nil, ErrSnapshotActive
+	lease, err := db.acquireGenerationLeaseLocked(db.graph, true)
+	if err != nil {
+		return nil, err
 	}
-	db.activeSnapshot = true
 	return &Snapshot{
 		db:         db,
 		graph:      db.graph,
@@ -52,6 +53,7 @@ func (db *DB) BeginSnapshot() (*Snapshot, error) {
 		nextNodeID: db.nextNodeID,
 		nextEdgeID: db.nextEdgeID,
 		commitID:   db.commitID,
+		lease:      lease,
 	}, nil
 }
 
@@ -129,9 +131,7 @@ func (snapshot *Snapshot) Close() error {
 	if snapshot.closed {
 		return nil
 	}
-	snapshot.db.mu.Lock()
-	snapshot.db.activeSnapshot = false
-	snapshot.db.mu.Unlock()
+	snapshot.lease.Release()
 	snapshot.closed = true
 	snapshot.graph = nil
 	return nil
