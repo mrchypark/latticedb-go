@@ -7,7 +7,7 @@ An embedded graph database written entirely in Go. It provides transactional gra
 LatticeDB Go requires Go 1.27 or newer.
 
 ```sh
-go get github.com/mrchypark/latticedb-go@v0.4.0
+go get github.com/mrchypark/latticedb-go@v0.5.0
 ```
 
 ## Quick start
@@ -72,12 +72,13 @@ func main() {
 - `MaxGenerationLeases` and `MaxRetainedGenerationLogicalBytes` optionally bound admission of public read, snapshot, and export pins. Internal checkpoint and index-maintenance candidates are outside these counters. They never evict an active pin; retained bytes are canonical snapshot bytes, not RSS.
 - On Linux, macOS, and Windows, writer opens take an exclusive database-path lock and `ReadOnly` opens take a shared lock. On js, Plan 9, and WASI, this lock is process-local only.
 - `DisableLock` is explicitly unsafe; callers must ensure that the database has a single owner.
+- Direct vector search has one global index and no property selector. Use one consistently named vector property and one embedding space per database. Each node contributes its lexicographically first vector-valued property; multiple vector properties do not create separate searchable namespaces.
 - `RebuildVectorIndexContext` builds off the writer lock and replays bounded vector changes before publication. The initiating context owns a shared attempt; another caller may cancel its own wait. Existing maintenance limits still apply, and log exhaustion aborts the rebuild without rejecting an otherwise valid commit.
 - During a background checkpoint, the active WAL append tail is bounded by `WALCheckpointThresholdBytes` plus one permitted WAL frame; once the bound is reached, commits return `ErrResourceLimit` before WAL mutation and must be retried as a new transaction after checkpoint progress. The marker frame's fixed file overhead is separate from that tail measurement.
 
 The detailed behavioral contract is documented in [docs/engine_conformance.md](docs/engine_conformance.md), with the value model in [docs/value_model.md](docs/value_model.md).
 
-CSV export returns and atomically publishes a JSON manifest whose `nodes` and `edges` paths point into `<output>_generations`. Published generations remain immutable and are not reclaimed automatically because readers do not hold leases.
+CSV export returns and atomically publishes a JSON manifest whose `nodes` and `edges` paths point into `<output>_generations`. Published generations remain immutable and are not reclaimed automatically. For explicit pruning, every reader must hold an `OpenCSVGenerationContext` lease until it finishes reading; `PruneCSVGenerationsContext` protects current and leased generations. Legacy readers are not protected during pruning. Pruning requires native Unix locking and directory sync; unsupported platforms return an error.
 
 ## Development
 
