@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
 func TestQueryIteratorCloseReleasesUnreadRows(t *testing.T) {
@@ -77,4 +79,62 @@ func TestCountRenderAccountsForLiveRowsAtBoundary(t *testing.T) {
 		}
 		releaseQueryBudget(budget)
 	}
+}
+
+func TestQueryClauseScratchReleasesBetweenRows(t *testing.T) {
+	graph := store.NewGraphState()
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"text": "alpha beta", "embedding": []float32{1, 0}}})
+	tx := &Tx{graph: graph}
+	row := queryRow{slots: []boundValue{{Node: graph.Nodes.Get(1)}}, bound: []bool{true}, index: map[string]int{"n": 0}}
+	cases := []struct {
+		name   string
+		clause whereClause
+		params map[string]any
+	}{
+		{"fts", whereClause{Kind: whereFTS, Var: "n", Property: "text", Expr: literalExpr{Value: "alpha"}}, nil},
+		{"vector", whereClause{Kind: whereVector, Var: "n", Property: "embedding", Expr: literalExpr{Value: []float32{1, 0}}}, nil},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			budget := newQueryBudget(context.Background(), QueryOptions{})
+			defer releaseQueryBudget(budget)
+			if err := budget.chargeRows(1); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := test.clause.apply(tx, []queryRow{row}, test.params, budget)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("apply rows=%d err=%v", len(rows), err)
+			}
+			if budget.bytes != queryRowBytes {
+				t.Fatalf("live bytes after %s = %d, want row token only", test.name, budget.bytes)
+			}
+			budget.releaseRows(1)
+			if budget.bytes != 0 {
+				t.Fatalf("live bytes after %s release = %d", test.name, budget.bytes)
+			}
+		})
+	}
+}
+
+func TestNodePatternFullScanCandidateScratchIsScoped(t *testing.T) {
+	graph := store.NewGraphState()
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Labels: []string{"Item"}})
+	tx := &Tx{graph: graph}
+	pattern := nodePattern{Var: "n"}
+	row := queryRow{slots: make([]boundValue, 1), bound: make([]bool, 1), index: map[string]int{"n": 0}}
+	budget := newQueryBudget(context.Background(), QueryOptions{})
+	defer releaseQueryBudget(budget)
+	if err := budget.chargeRows(1); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		rows, err := pattern.apply(tx, []queryRow{row}, budget)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("attempt %d rows=%d err=%v", attempt, len(rows), err)
+		}
+		if budget.bytes != queryRowBytes {
+			t.Fatalf("attempt %d candidate scratch retained %d bytes", attempt, budget.bytes)
+		}
+	}
+	budget.releaseRows(1)
 }

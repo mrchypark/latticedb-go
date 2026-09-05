@@ -302,24 +302,23 @@ type queryIterator interface {
 
 type sliceQueryIterator struct {
 	rows   []queryRow
-	index  int
 	budget *queryBudget
 }
 
 func (it *sliceQueryIterator) Next() (queryRow, bool, error) {
-	if it.index == len(it.rows) {
+	if len(it.rows) == 0 {
 		return queryRow{}, false, nil
 	}
-	row := it.rows[it.index]
-	it.index++
+	row := it.rows[0]
+	it.rows = it.rows[1:]
 	return row, true, nil
 }
 
 func (it *sliceQueryIterator) Close() {
 	if it.budget != nil {
-		it.budget.releaseRows(len(it.rows) - it.index)
+		it.budget.releaseRows(len(it.rows))
 	}
-	it.index = len(it.rows)
+	it.rows = nil
 }
 
 type filterQueryIterator struct {
