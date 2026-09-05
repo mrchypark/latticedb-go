@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -241,6 +242,8 @@ type DB struct {
 	maxGenerationLeases               uint64
 	maxRetainedGenerationLogicalBytes uint64
 	generationLeases                  map[*store.GraphState]*generationRetention
+	generationOrder                   list.List
+	retainedGenerationLogicalBytes    uint64
 	activeGenerationLeases            uint64
 	activeSnapshotLeases              uint64
 	fullSync                          bool
@@ -286,6 +289,7 @@ type generationRetention struct {
 	refs         uint64
 	logicalBytes uint64
 	openedAt     time.Time
+	element      *list.Element
 }
 
 type GenerationRetentionStats struct {
@@ -1319,11 +1323,13 @@ func (db *DB) acquireGenerationLeaseLocked(graph *store.GraphState, snapshot boo
 	}
 	retention := db.generationLeases[graph]
 	if retention == nil {
-		if db.maxRetainedGenerationLogicalBytes != 0 && (graph.SnapshotBytes > db.maxRetainedGenerationLogicalBytes || db.retainedGenerationLogicalBytesLocked() > db.maxRetainedGenerationLogicalBytes-graph.SnapshotBytes) {
+		if db.maxRetainedGenerationLogicalBytes != 0 && (graph.SnapshotBytes > db.maxRetainedGenerationLogicalBytes || db.retainedGenerationLogicalBytes > db.maxRetainedGenerationLogicalBytes-graph.SnapshotBytes) {
 			return nil, fmt.Errorf("%w: retained generation bytes would exceed %d", ErrResourceLimit, db.maxRetainedGenerationLogicalBytes)
 		}
 		retention = &generationRetention{logicalBytes: graph.SnapshotBytes, openedAt: time.Now()}
+		retention.element = db.generationOrder.PushBack(retention)
 		db.generationLeases[graph] = retention
+		db.retainedGenerationLogicalBytes += graph.SnapshotBytes
 	}
 	retention.refs++
 	db.activeGenerationLeases++
@@ -1331,17 +1337,6 @@ func (db *DB) acquireGenerationLeaseLocked(graph *store.GraphState, snapshot boo
 		db.activeSnapshotLeases++
 	}
 	return &GenerationLease{db: db, graph: graph, snapshot: snapshot}, nil
-}
-
-func (db *DB) retainedGenerationLogicalBytesLocked() uint64 {
-	var total uint64
-	for _, retention := range db.generationLeases {
-		if retention.logicalBytes > math.MaxUint64-total {
-			return math.MaxUint64
-		}
-		total += retention.logicalBytes
-	}
-	return total
 }
 
 func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
@@ -1357,16 +1352,10 @@ func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
 		ActiveLeases:         db.activeGenerationLeases,
 		ActiveSnapshotLeases: db.activeSnapshotLeases,
 		RetainedGenerations:  uint64(len(db.generationLeases)),
-		RetainedLogicalBytes: db.retainedGenerationLogicalBytesLocked(),
+		RetainedLogicalBytes: db.retainedGenerationLogicalBytes,
 	}
-	var oldest time.Time
-	for _, retention := range db.generationLeases {
-		if oldest.IsZero() || retention.openedAt.Before(oldest) {
-			oldest = retention.openedAt
-		}
-	}
-	if !oldest.IsZero() {
-		stats.OldestLeaseAge = time.Since(oldest)
+	if oldest := db.generationOrder.Front(); oldest != nil {
+		stats.OldestLeaseAge = time.Since(oldest.Value.(*generationRetention).openedAt)
 	}
 	return stats, nil
 }
@@ -1388,6 +1377,8 @@ func (lease *GenerationLease) Release() {
 		retention.refs--
 		if retention.refs == 0 {
 			delete(db.generationLeases, lease.graph)
+			db.generationOrder.Remove(retention.element)
+			db.retainedGenerationLogicalBytes -= retention.logicalBytes
 		}
 	}
 	db.activeGenerationLeases--
