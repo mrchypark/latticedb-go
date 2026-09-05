@@ -2,12 +2,72 @@ package engine
 
 import (
 	"errors"
+	"math"
 	"path/filepath"
 	"reflect"
 	"testing"
 
 	"github.com/mrchypark/latticedb-go/internal/store"
 )
+
+func TestOrderValuesFormTotalOrder(t *testing.T) {
+	values := []any{
+		math.NaN(), int64(-1), float64(0), int64(1), int64(2), int64(10),
+		false, true,
+		"11", "a", "b",
+		[]byte{0}, []byte{1},
+		[]float32{0}, []float32{1},
+		[]any{int64(0)}, []any{int64(1)},
+		map[string]any{"a": int64(0)}, map[string]any{"a": int64(1)},
+		nil,
+	}
+	for left := range values {
+		for right := range values {
+			comparison := compareOrderValues(values[left], values[right])
+			reverse := compareOrderValues(values[right], values[left])
+			if comparison != -reverse {
+				t.Fatalf("comparison %d,%d = %d, reverse = %d", left, right, comparison, reverse)
+			}
+			if left < right && comparison >= 0 {
+				t.Fatalf("comparison %d,%d = %d, want negative", left, right, comparison)
+			}
+		}
+	}
+	for first := range values {
+		for second := first + 1; second < len(values); second++ {
+			for third := second + 1; third < len(values); third++ {
+				if compareOrderValues(values[first], values[second]) >= 0 || compareOrderValues(values[second], values[third]) >= 0 || compareOrderValues(values[first], values[third]) >= 0 {
+					t.Fatalf("order is not transitive at %d, %d, %d", first, second, third)
+				}
+			}
+		}
+	}
+	if comparison := compareOrderValues(map[string]any{"b": int64(2), "a": int64(1)}, map[string]any{"a": int64(1), "b": int64(2)}); comparison != 0 {
+		t.Fatalf("equal maps compare as %d", comparison)
+	}
+}
+
+func TestQueryOrderValueContract(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-order-values.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	result, err := db.Query(`UNWIND $values AS value RETURN value ORDER BY value`, map[string]any{"values": []any{
+		map[string]any{"a": int64(1)}, []any{int64(1)}, []float32{1}, []byte{1}, "a", true, false, int64(1), nil,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]any, len(result.Rows))
+	for index, row := range result.Rows {
+		got[index] = row["value"]
+	}
+	want := []any{int64(1), false, true, "a", []byte{1}, []float32{1}, []any{int64(1)}, map[string]any{"a": int64(1)}, nil}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ORDER BY values = %#v, want %#v", got, want)
+	}
+}
 
 func TestIndependentMatchPatternsStartWithSmallestLabel(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "query-order.ltdb"), OpenOptions{Create: true})

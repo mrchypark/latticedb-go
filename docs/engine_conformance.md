@@ -318,6 +318,7 @@ An undirected relationship produces one row per matching orientation. A non-self
 - Portable code should use explicit aliases for result column names.
 - `LIMIT` applies to the produced rows for a `RETURN` clause.
 - `SKIP` is applied after ordering and before `LIMIT`.
+- `ORDER BY` defines one ascending total order for query values: numbers (with exact mixed integer/float comparison), booleans, strings, bytes, vectors, lists, maps, then `NULL`. Values of the same vector or list type compare lexicographically; maps compare lexicographically by sorted `(key, value)` entries, recursively. `NULL` therefore sorts last with `ASC` and first with `DESC`.
 - `DISTINCT` removes duplicate projected rows before `SKIP` and `LIMIT`.
 - With `RETURN DISTINCT`, every `ORDER BY` expression must also be projected.
 - `SKIP` and `LIMIT` accept a non-negative integer literal or parameter; other runtime parameter values are execution errors.

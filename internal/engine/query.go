@@ -1,12 +1,14 @@
 package engine
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"maps"
 	"math"
 	"reflect"
 	"slices"
@@ -2429,31 +2431,103 @@ func bindingIDValue(binding boundValue) any {
 }
 
 func compareOrderValues(left, right any) int {
-	if left == nil {
-		if right == nil {
+	leftRank, rightRank := orderValueRank(left), orderValueRank(right)
+	if leftRank != rightRank {
+		return cmp.Compare(leftRank, rightRank)
+	}
+	switch leftRank {
+	case orderNumber:
+		return compareOrderNumbers(left, right)
+	case orderBool:
+		if left.(bool) == right.(bool) {
 			return 0
 		}
+		if !left.(bool) {
+			return -1
+		}
 		return 1
+	case orderString:
+		return strings.Compare(left.(string), right.(string))
+	case orderBytes:
+		return bytes.Compare(left.([]byte), right.([]byte))
+	case orderVector:
+		return slices.Compare(left.([]float32), right.([]float32))
+	case orderList:
+		return slices.CompareFunc(left.([]any), right.([]any), compareOrderValues)
+	case orderMap:
+		return compareOrderMap(left.(map[string]any), right.(map[string]any))
+	default:
+		return 0
 	}
-	if right == nil {
+}
+
+type orderValueKind uint8
+
+const (
+	orderNumber orderValueKind = iota
+	orderBool
+	orderString
+	orderBytes
+	orderVector
+	orderList
+	orderMap
+	orderNull
+)
+
+func orderValueRank(value any) orderValueKind {
+	if value == nil {
+		return orderNull
+	}
+	if _, ok := normalizeInt64(value); ok {
+		return orderNumber
+	}
+	switch value.(type) {
+	case float64:
+		return orderNumber
+	case bool:
+		return orderBool
+	case string:
+		return orderString
+	case []byte:
+		return orderBytes
+	case []float32:
+		return orderVector
+	case []any:
+		return orderList
+	case map[string]any:
+		return orderMap
+	default:
+		panic(fmt.Sprintf("unsupported normalized query value %T", value))
+	}
+}
+
+func compareOrderNumbers(left, right any) int {
+	leftFloat, leftIsFloat := left.(float64)
+	rightFloat, rightIsFloat := right.(float64)
+	if leftIsFloat && math.IsNaN(leftFloat) {
+		if rightIsFloat && math.IsNaN(rightFloat) {
+			return 0
+		}
 		return -1
 	}
-	if comparison, comparable := compareQueryValues(left, right); comparable {
-		return comparison
+	if rightIsFloat && math.IsNaN(rightFloat) {
+		return 1
 	}
-	if leftBool, ok := left.(bool); ok {
-		if rightBool, ok := right.(bool); ok {
-			switch {
-			case leftBool == rightBool:
-				return 0
-			case !leftBool:
-				return -1
-			default:
-				return 1
-			}
+	comparison, _ := compareQueryValues(left, right)
+	return comparison
+}
+
+func compareOrderMap(left, right map[string]any) int {
+	leftKeys, rightKeys := slices.Sorted(maps.Keys(left)), slices.Sorted(maps.Keys(right))
+	for index := range min(len(leftKeys), len(rightKeys)) {
+		if comparison := strings.Compare(leftKeys[index], rightKeys[index]); comparison != 0 {
+			return comparison
+		}
+		if comparison := compareOrderValues(left[leftKeys[index]], right[rightKeys[index]]); comparison != 0 {
+			return comparison
 		}
 	}
-	return strings.Compare(fmt.Sprint(left), fmt.Sprint(right))
+	return cmp.Compare(len(leftKeys), len(rightKeys))
 }
 
 func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
