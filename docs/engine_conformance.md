@@ -189,6 +189,12 @@ Query execution also carries a statement-level atomicity requirement:
 - Committed transactions must survive crash/recovery.
 - Uncommitted or aborted transactions must not become visible after recovery.
 
+`PlatformPersistenceCapabilities` reports which file-lock, symbolic-link and
+multi-link protection, directory-sync, and full-durability primitives the
+active build implements. It describes build capabilities, independent of
+per-open settings such as `DisableLock`, not a guarantee that a filesystem or
+storage device survives power loss.
+
 ## Graph Semantics
 
 ### Labels
