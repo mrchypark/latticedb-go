@@ -7,6 +7,7 @@ import (
 	"syscall"
 
 	"github.com/mrchypark/latticedb-go/internal/engine"
+	"github.com/mrchypark/latticedb-go/internal/exporter"
 )
 
 // ErrorCode identifies a low-level database error. Values match the upstream
@@ -128,6 +129,8 @@ func wrapErrorSlow(err error) error {
 
 func classifyError(err error) (ErrorCode, bool) {
 	switch {
+	case errors.Is(err, exporter.ErrOutputLimit):
+		return ErrorFull, true
 	case errors.Is(err, engine.ErrCommitOutcomeUnknown):
 		return ErrorIO, true
 	case errors.Is(err, engine.ErrWriteTxActive):
