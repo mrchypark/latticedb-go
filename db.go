@@ -212,6 +212,18 @@ func (db *DB) Begin(readOnly bool) (*Tx, error) {
 	return &Tx{inner: tx}, nil
 }
 
+// BeginWriteContext waits for the single writer slot until ctx is canceled.
+func (db *DB) BeginWriteContext(ctx context.Context) (*Tx, error) {
+	if db == nil || db.inner == nil {
+		return nil, ErrDatabaseClosed
+	}
+	tx, err := db.inner.BeginWriteContext(ctx)
+	if err != nil {
+		return nil, wrapError(err)
+	}
+	return &Tx{inner: tx}, nil
+}
+
 func (db *DB) View(fn func(*Tx) error) error {
 	var callbackErr error
 	err := db.inner.View(func(tx *engine.Tx) error {

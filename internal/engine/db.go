@@ -1294,6 +1294,31 @@ func (db *DB) Begin(readOnly bool) (*Tx, error) {
 			}
 		}
 	}
+	return db.beginAfterWriteLock(readOnly)
+}
+
+// BeginWriteContext waits for the single writer slot until ctx is canceled.
+// Begin(false) remains the nonblocking compatibility API.
+func (db *DB) BeginWriteContext(ctx context.Context) (*Tx, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for !db.writeMu.TryLock() {
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return db.beginAfterWriteLock(false)
+}
+
+func (db *DB) beginAfterWriteLock(readOnly bool) (*Tx, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
