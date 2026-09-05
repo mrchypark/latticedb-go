@@ -67,6 +67,30 @@ func TestShardMapDeleteOccupiedShardsInInsertionOrder(t *testing.T) {
 	t.Fatal("reused shard was absent from iteration")
 }
 
+func TestShardMapZeroValueAndForkIsolation(t *testing.T) {
+	var values ShardMap[int]
+	if values.Get(1) != 0 || values.Has(1) || values.Len() != 0 {
+		t.Fatal("zero ShardMap is not empty")
+	}
+	values.Delete(1)
+	values.Set(1, 1)
+
+	fork := values.Fork()
+	fork.CloneShardOnce(1)
+	fork.Set(1, 2)
+	if values.Get(1) != 1 || fork.Get(1) != 2 {
+		t.Fatalf("fork values = base %d, fork %d", values.Get(1), fork.Get(1))
+	}
+
+	var empty ShardMap[int]
+	fork = empty.Fork()
+	fork.CloneShardOnce(2)
+	fork.Set(2, 2)
+	if empty.Has(2) || fork.Get(2) != 2 {
+		t.Fatal("zero ShardMap fork was not isolated")
+	}
+}
+
 func TestPagedMapForkIsolationAndHighIDs(t *testing.T) {
 	base := NewPagedMap[uint64]()
 	for _, id := range []uint64{1, 64, 65, 1 << 48} {
