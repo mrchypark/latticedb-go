@@ -7,6 +7,22 @@ type Value = any
 type DurabilityMode uint8
 type VectorIndexMode uint8
 
+// PersistenceCapabilities reports the persistence primitives implemented by
+// this build target. A true value means LatticeDB uses that primitive; it does
+// not guarantee physical-media or power-loss durability from the filesystem or
+// hardware.
+type PersistenceCapabilities struct {
+	// FileLocking reports cross-process shared and exclusive database path locks.
+	FileLocking bool
+	// LinkIdentityProtection reports symbolic-link resolution and detection and
+	// rejection of multi-linked regular database files.
+	LinkIdentityProtection bool
+	// DirectorySync reports directory synchronization after persistence metadata changes.
+	DirectorySync bool
+	// FullDurability reports whether DurabilityFull has all required persistence primitives on this target.
+	FullDurability bool
+}
+
 const (
 	DurabilityStandard DurabilityMode = iota
 	DurabilityFull

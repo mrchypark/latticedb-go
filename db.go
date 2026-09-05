@@ -23,6 +23,13 @@ func Version() string {
 	return "(devel)"
 }
 
+// PlatformPersistenceCapabilities reports the persistence primitives implemented
+// by the active build target, independent of per-open settings such as
+// DisableLock. It does not guarantee physical-media durability.
+func PlatformPersistenceCapabilities() PersistenceCapabilities {
+	return platformPersistenceCapabilities()
+}
+
 var (
 	ErrReadOnly                       = engine.ErrReadOnly
 	ErrWriteTxActive                  = engine.ErrWriteTxActive
