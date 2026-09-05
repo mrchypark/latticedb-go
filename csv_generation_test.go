@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -68,6 +70,77 @@ func TestCSVGenerationLeasesProtectReadersAndPruneOldGenerations(t *testing.T) {
 	if err != nil || removed != 1 {
 		t.Fatalf("removed after lease close = %d, %v", removed, err)
 	}
+}
+
+func TestCSVGenerationLeaseOwnerDeathReleasesGeneration(t *testing.T) {
+	if os.Getenv("LATTICEDB_CSV_LEASE_HELPER") != "" {
+		lease, err := OpenCSVGenerationContext(context.Background(), os.Getenv("LATTICEDB_CSV_LEASE_MANIFEST"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lease.Close()
+		if err := os.WriteFile(os.Getenv("LATTICEDB_CSV_LEASE_READY"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	if runtime.GOOS == "windows" || runtime.GOOS == "js" || runtime.GOOS == "plan9" || runtime.GOOS == "wasip1" {
+		t.Skip("CSV generation pruning is unsupported on this platform")
+	}
+	db := openExportLimitDB(t)
+	output := filepath.Join(t.TempDir(), "graph.csv")
+	_ = exportCSVGeneration(t, db, output)
+	ready := filepath.Join(t.TempDir(), "ready")
+	child := exec.Command(os.Args[0], "-test.run=^TestCSVGenerationLeaseOwnerDeathReleasesGeneration$")
+	child.Env = append(os.Environ(), "LATTICEDB_CSV_LEASE_HELPER=1", "LATTICEDB_CSV_LEASE_MANIFEST="+output, "LATTICEDB_CSV_LEASE_READY="+ready)
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lease child did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	first, err := OpenCSVGenerationContext(context.Background(), output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenCSVGenerationContext(context.Background(), output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	_ = exportCSVGeneration(t, db, output)
+	_ = exportCSVGeneration(t, db, output)
+	prune := func(want int) {
+		t.Helper()
+		removed, err := PruneCSVGenerationsContext(context.Background(), output, CSVGenerationRetention{KeepLatest: 1})
+		if err != nil || removed != want {
+			t.Fatalf("prune removed=%d err=%v want=%d", removed, err, want)
+		}
+	}
+	prune(1)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	prune(0)
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	prune(0)
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = child.Wait()
+	prune(1)
 }
 
 func TestCSVGenerationPruneAgeAndUnsafeLayout(t *testing.T) {
