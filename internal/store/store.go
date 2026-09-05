@@ -230,7 +230,7 @@ func newPostingShardMap() ShardMap[struct{}] {
 
 func (m ShardMap[V]) Get(id uint64) V {
 	bucket, shard := m.indexes(id)
-	if m.root[bucket] == nil {
+	if m.root == nil || m.root[bucket] == nil {
 		var zero V
 		return zero
 	}
@@ -287,6 +287,9 @@ func (m ShardMap[V]) All() iter.Seq2[uint64, V] {
 
 func (m *ShardMap[V]) Set(id uint64, value V) {
 	bucket, shard := m.indexes(id)
+	if m.root == nil {
+		m.root = new([shardFanout]*shardBucket[V])
+	}
 	if m.root[bucket] == nil {
 		m.root[bucket] = new(shardBucket[V])
 	}
@@ -309,7 +312,7 @@ func (m *ShardMap[V]) Set(id uint64, value V) {
 
 func (m *ShardMap[V]) Delete(id uint64) {
 	bucket, shard := m.indexes(id)
-	if m.root[bucket] == nil {
+	if m.root == nil || m.root[bucket] == nil {
 		return
 	}
 	if _, exists := m.root[bucket].values[shard][id]; exists {
@@ -349,7 +352,10 @@ func (m *ShardMap[V]) CloneShardOnce(id uint64) {
 	if _, cloned := m.clonedShards[index]; cloned {
 		return
 	}
-	if m.clonedShards == nil {
+	if m.root == nil {
+		m.root = new([shardFanout]*shardBucket[V])
+		m.clonedShards = map[uint16]struct{}{}
+	} else if m.clonedShards == nil {
 		root := new([shardFanout]*shardBucket[V])
 		*root = *m.root
 		m.root = root
