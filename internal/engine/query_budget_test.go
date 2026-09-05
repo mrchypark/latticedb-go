@@ -122,7 +122,7 @@ func TestNodePatternFullScanCandidateScratchIsScoped(t *testing.T) {
 	tx := &Tx{graph: graph}
 	pattern := nodePattern{Var: "n"}
 	row := queryRow{slots: make([]boundValue, 1), bound: make([]bool, 1), index: map[string]int{"n": 0}}
-	budget := newQueryBudget(context.Background(), QueryOptions{})
+	budget := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 2*queryRowBytes + 8})
 	defer releaseQueryBudget(budget)
 	if err := budget.chargeRows(1); err != nil {
 		t.Fatal(err)
@@ -137,4 +137,54 @@ func TestNodePatternFullScanCandidateScratchIsScoped(t *testing.T) {
 		}
 	}
 	budget.releaseRows(1)
+}
+
+func TestIndexedCandidateScratchIsScopedAtBoundary(t *testing.T) {
+	db, err := Open(t.TempDir()+"/indexed.ltdb", OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query("CREATE (:Item {key: 1})", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNodePropertyIndex("Item", "key"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	plan, err := parseQuery("MATCH (n:Item) WHERE n.key = 1 RETURN n.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, limit := range []uint64{2*queryRowBytes + 7, 2*queryRowBytes + 8} {
+		budget := newQueryBudget(context.Background(), QueryOptions{MaxBytes: limit})
+		if err := budget.chargeRows(1); err != nil {
+			t.Fatal(err)
+		}
+		pattern := nodePattern{Var: "n", Labels: []string{"Item"}}
+		if _, found, err := plan.indexedNodeIDs(tx, pattern, nil, 1, budget); err != nil || !found {
+			t.Fatalf("index not used: %v, %v", found, err)
+		}
+		iterator := &patternQueryIterator{plan: plan, tx: tx, pattern: pattern, budget: budget, limit: 1}
+		row := queryRow{slots: make([]boundValue, 1), bound: make([]bool, 1), index: map[string]int{"n": 0}}
+		for range 2 {
+			rows, err := iterator.apply(row)
+			if limit == 2*queryRowBytes+7 {
+				if !errors.Is(err, ErrResourceLimit) {
+					t.Fatalf("below boundary = %v", err)
+				}
+			} else if err != nil || len(rows) != 1 {
+				t.Fatalf("at boundary rows=%d, %v", len(rows), err)
+			}
+			if budget.bytes != queryRowBytes {
+				t.Fatalf("candidate scratch retained: %d", budget.bytes)
+			}
+		}
+		budget.releaseRows(1)
+		releaseQueryBudget(budget)
+	}
 }
