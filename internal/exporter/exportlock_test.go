@@ -213,6 +213,200 @@ func TestAllFileExportsHonorPathLock(t *testing.T) {
 	}
 }
 
+func TestSymlinkOutputPublishesTargetAndSharesLock(t *testing.T) {
+	directory := t.TempDir()
+	target := filepath.Join(directory, "graph.json")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(directory, "graph-alias.json")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	unlock, err := acquireExportLock(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := ExportGraphContext(ctx, store.NewGraphState(), ExportFormatJSON, alias); !errors.Is(err, context.DeadlineExceeded) {
+		unlock()
+		t.Fatalf("symlink waiter error = %v", err)
+	}
+	unlock()
+	data, err := ExportGraph(store.NewGraphState(), ExportFormatJSON, alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("export replaced the output symlink")
+	}
+	if targetData, err := os.ReadFile(target); err != nil || !bytes.Equal(targetData, data) {
+		t.Fatalf("target was not published through symlink: %q, %v", targetData, err)
+	}
+}
+
+func TestDanglingOutputSymlinkPublishesTarget(t *testing.T) {
+	directory := t.TempDir()
+	target := filepath.Join(directory, "graph.json")
+	alias := filepath.Join(directory, "graph-alias.json")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	data, err := ExportGraph(store.NewGraphState(), ExportFormatJSON, alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("export replaced the dangling output symlink")
+	}
+	if targetData, err := os.ReadFile(target); err != nil || !bytes.Equal(targetData, data) {
+		t.Fatalf("dangling symlink target was not published: %q, %v", targetData, err)
+	}
+}
+
+func TestHardLinkedOutputIsRejected(t *testing.T) {
+	directory := t.TempDir()
+	target := filepath.Join(directory, "graph.json")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(directory, "graph-alias.json")
+	if err := os.Link(target, alias); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	_, err := ExportGraph(store.NewGraphState(), ExportFormatJSON, target)
+	if err == nil || !strings.Contains(err.Error(), "multiple hard links") {
+		t.Fatalf("hard-linked output error = %v", err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "old" {
+		t.Fatalf("rejected output changed: %q, %v", data, err)
+	}
+}
+
+func TestCaseAliasSharesInProcessLockWhenFilesystemMatches(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "graph.json")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(directory, "GRAPH.JSON")
+	aliasInfo, err := os.Stat(alias)
+	if err != nil {
+		t.Skipf("case alias unavailable: %v", err)
+	}
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(pathInfo, aliasInfo) {
+		t.Skip("filesystem treats case variants as separate paths")
+	}
+	unlock, err := acquireExportLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := acquireExportLockContext(ctx, alias); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("case alias waiter error = %v", err)
+	}
+}
+
+func TestUnicodeNormalizedAliasSharesInProcessLockWhenFilesystemMatches(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "caf\u00e9.json")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(directory, "cafe\u0301.json")
+	aliasInfo, err := os.Stat(alias)
+	if err != nil {
+		t.Skipf("Unicode-normalized alias unavailable: %v", err)
+	}
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(pathInfo, aliasInfo) {
+		t.Skip("filesystem treats Unicode-normalized paths as separate files")
+	}
+	unlock, err := acquireExportLock(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := acquireExportLockContext(ctx, alias); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Unicode-normalized alias waiter error = %v", err)
+	}
+}
+
+func TestSymlinkAliasSharesCrossProcessLock(t *testing.T) {
+	if os.Getenv("LATTICEDB_EXPORT_HELPER") != "" {
+		runExportHelper(t)
+		return
+	}
+	directory := t.TempDir()
+	target := filepath.Join(directory, "graph.csv")
+	alias := filepath.Join(directory, "graph-alias.csv")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	ready := filepath.Join(directory, "ready")
+	holder := exportHelperCommand(t, "hold", target, ready)
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = holder.Process.Kill()
+		_ = holder.Wait()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("lock holder did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	waiter := exportHelperCommand(t, "export", alias, "")
+	if err := waiter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- waiter.Wait() }()
+	select {
+	case err := <-waited:
+		t.Fatalf("symlink alias bypassed the process lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := holder.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = holder.Wait()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("symlink alias did not recover after lock owner death")
+	}
+}
+
 func TestPublishReportsRenameBeforeDirectorySyncFailure(t *testing.T) {
 	directory := t.TempDir()
 	temp := filepath.Join(directory, "temp")
@@ -256,7 +450,11 @@ func TestExportPathLockRegistryReclaimsEntries(t *testing.T) {
 		t.Fatalf("waiter error = %v", err)
 	}
 	exportPathLocks.Lock()
-	entries, refs := len(exportPathLocks.entries), exportPathLocks.entries[path].refs
+	entries = len(exportPathLocks.entries)
+	refs := 0
+	for _, entry := range exportPathLocks.entries {
+		refs = entry.refs
+	}
 	exportPathLocks.Unlock()
 	if entries != 1 || refs != 1 {
 		t.Fatalf("registry while owned: entries=%d refs=%d", entries, refs)

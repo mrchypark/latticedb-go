@@ -179,6 +179,58 @@ func TestPagedMapDeleteLastPageThenReuseFork(t *testing.T) {
 	}
 }
 
+func TestPagedMapDeleteRestoresSmallActiveFork(t *testing.T) {
+	base := NewPagedMap[uint64]()
+	for _, id := range []uint64{1 << 21, 1, 1 << 20} {
+		base.Set(id, id)
+	}
+	fork := base.Fork()
+	fork.CloneShardOnce(1 << 21)
+	fork.Delete(1 << 21)
+
+	if base.Len() != 3 || !base.Has(1<<21) {
+		t.Fatal("fork delete changed base")
+	}
+	var got []uint64
+	for id := range fork.All() {
+		got = append(got, id)
+	}
+	if !slices.Equal(got, []uint64{1, 1 << 20}) {
+		t.Fatalf("iteration after demotion = %v", got)
+	}
+	if fork.smallActiveLen != 2 {
+		t.Fatalf("small active length = %d, want 2", fork.smallActiveLen)
+	}
+	fork.CloneShardOnce(1 << 20)
+	fork.Delete(1 << 20)
+	if fork.smallActiveLen != 1 {
+		t.Fatalf("small active length after second delete = %d, want 1", fork.smallActiveLen)
+	}
+	fork.CloneShardOnce(1)
+	fork.Delete(1)
+	if fork.smallActiveLen != 0 {
+		t.Fatalf("small active length after final delete = %d, want 0", fork.smallActiveLen)
+	}
+	for _, id := range []uint64{1, 1 << 20, 1 << 21} {
+		fork.Set(id, id)
+	}
+	if fork.smallActiveLen != pagedMapActiveOverflow {
+		t.Fatalf("small active length after re-promotion = %d, want overflow", fork.smallActiveLen)
+	}
+}
+
+func TestPagedMapDeleteLeavesOverflowForManyPages(t *testing.T) {
+	values := NewPagedMap[uint64]()
+	for page := range 8 {
+		id := uint64(page) << 20
+		values.Set(id, id)
+	}
+	values.Delete(7 << 20)
+	if values.smallActiveLen != pagedMapActiveOverflow || values.Len() != 7 {
+		t.Fatalf("active state after delete = %d pages, %d values", values.smallActiveLen, values.Len())
+	}
+}
+
 func idsFromOne(count int) []uint64 {
 	ids := make([]uint64, count)
 	for index := range ids {

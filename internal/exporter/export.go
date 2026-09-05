@@ -80,6 +80,10 @@ func ExportGraphContext(ctx context.Context, graph *store.GraphState, format Exp
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	outputPath, err := canonicalExportOutputPath(outputPath)
+	if err != nil {
+		return nil, err
+	}
 	unlock, err := acquireExportLockContext(ctx, outputPath)
 	if err != nil {
 		return nil, err
@@ -104,6 +108,10 @@ func ExportGraphFileContext(ctx context.Context, graph *store.GraphState, format
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	outputPath, err := canonicalExportOutputPath(outputPath)
+	if err != nil {
 		return err
 	}
 	unlock, err := acquireExportLockContext(ctx, outputPath)
