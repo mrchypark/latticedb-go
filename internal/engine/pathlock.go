@@ -17,13 +17,21 @@ var (
 	ErrDatabaseLayoutConflict = errors.New("database layout conflicts with existing owner")
 	pathLocks                 = struct {
 		sync.Mutex
-		paths map[string]struct{}
-	}{paths: map[string]struct{}{}}
+		paths map[string]*pathLockEntry
+	}{paths: map[string]*pathLockEntry{}}
 )
 
 type pathLock struct {
-	path string
-	file *os.File
+	path   string
+	entry  *pathLockEntry
+	file   *os.File
+	shared bool
+}
+
+type pathLockEntry struct {
+	file    *os.File
+	readers int
+	writer  bool
 }
 
 type layoutOwner struct {
@@ -32,7 +40,7 @@ type layoutOwner struct {
 	DatabaseID string `json:"database_id"`
 }
 
-func acquirePathLock(path string, create bool) (*pathLock, string, bool, error) {
+func acquirePathLock(path string, create, readOnly bool) (*pathLock, string, bool, error) {
 	canonical, err := canonicalDBPath(path)
 	if err != nil {
 		return nil, "", false, err
@@ -51,17 +59,20 @@ func acquirePathLock(path string, create bool) (*pathLock, string, bool, error) 
 	}
 
 	pathLocks.Lock()
-	if _, exists := pathLocks.paths[statePath]; exists {
+	if entry, exists := pathLocks.paths[statePath]; exists {
+		if !readOnly || entry.writer {
+			pathLocks.Unlock()
+			return nil, "", false, ErrDatabaseLocked
+		}
+		entry.readers++
 		pathLocks.Unlock()
-		return nil, "", false, ErrDatabaseLocked
+		return &pathLock{path: statePath, entry: entry, file: entry.file, shared: true}, canonical, flat, nil
 	}
-	pathLocks.paths[statePath] = struct{}{}
-	pathLocks.Unlock()
 
 	lockPath := statePath + ".lock"
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err == nil {
-		err = tryLockFile(file)
+		err = tryLockFile(file, readOnly)
 	}
 	if err == nil {
 		err = checkLayoutOwner(statePath, flat, "")
@@ -71,15 +82,19 @@ func acquirePathLock(path string, create bool) (*pathLock, string, bool, error) 
 			_ = unlockFile(file)
 			_ = file.Close()
 		}
-		pathLocks.Lock()
-		delete(pathLocks.paths, statePath)
 		pathLocks.Unlock()
 		if errors.Is(err, ErrDatabaseLayoutConflict) {
 			return nil, "", false, err
 		}
 		return nil, "", false, fmt.Errorf("%w: %v", ErrDatabaseLocked, err)
 	}
-	return &pathLock{path: statePath, file: file}, canonical, flat, nil
+	entry := &pathLockEntry{file: file, readers: 0, writer: !readOnly}
+	if readOnly {
+		entry.readers = 1
+	}
+	pathLocks.paths[statePath] = entry
+	pathLocks.Unlock()
+	return &pathLock{path: statePath, entry: entry, file: file, shared: readOnly}, canonical, flat, nil
 }
 
 func ensureLayoutOwner(statePath string, flat bool, databaseID string) error {
@@ -305,16 +320,27 @@ func syncPathDirectory(path string) error {
 }
 
 func (lock *pathLock) close() error {
-	if lock == nil || lock.file == nil {
+	if lock == nil || lock.entry == nil {
 		return nil
 	}
-	err := unlockFile(lock.file)
-	if closeErr := lock.file.Close(); err == nil {
+	pathLocks.Lock()
+	entry := lock.entry
+	if lock.shared {
+		entry.readers--
+		if entry.readers != 0 {
+			pathLocks.Unlock()
+			lock.entry = nil
+			return nil
+		}
+	}
+	delete(pathLocks.paths, lock.path)
+	err := unlockFile(entry.file)
+	closeErr := entry.file.Close()
+	pathLocks.Unlock()
+	if err == nil {
 		err = closeErr
 	}
-	pathLocks.Lock()
-	delete(pathLocks.paths, lock.path)
-	pathLocks.Unlock()
+	lock.entry = nil
 	lock.file = nil
 	return err
 }

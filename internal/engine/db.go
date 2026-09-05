@@ -400,7 +400,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 			flat, err = prepareDBPath(path, opts.Create)
 		}
 	} else {
-		lock, path, flat, err = acquirePathLock(path, opts.Create)
+		lock, path, flat, err = acquirePathLock(path, opts.Create, opts.ReadOnly)
 	}
 	if err != nil {
 		return nil, err
