@@ -7,7 +7,7 @@ An embedded graph database written entirely in Go. It provides transactional gra
 LatticeDB Go requires Go 1.27 or newer.
 
 ```sh
-go get github.com/mrchypark/latticedb-go@v0.5.0
+go get github.com/mrchypark/latticedb-go@v0.5.1
 ```
 
 ## Quick start
@@ -69,6 +69,8 @@ func main() {
 - A `Tx` is single-owner and must not be used concurrently.
 - `Commit` and `CommitContext` are one-shot: the transaction becomes inactive whether the commit succeeds or fails.
 - Multiple online snapshots may be active per database. Writers can continue after each snapshot captures its generation; callers must close snapshots when finished.
+- `BeginSnapshot` retries internal checkpoint contention using the same bounded acquisition as write transactions. An active application writer still returns `ErrWriteTxActive` without waiting for the transaction.
+- Application metadata updates copy the affected shard instead of the complete key map. This preserves immutable read and snapshot generations; the fixed shard count reduces copying but does not guarantee constant cost for arbitrarily large or skewed key sets.
 - `MaxGenerationLeases` and `MaxRetainedGenerationLogicalBytes` optionally bound admission of public read, snapshot, and export pins. Internal checkpoint and index-maintenance candidates are outside these counters. They never evict an active pin; retained bytes are canonical snapshot bytes, not RSS.
 - On Linux, macOS, and Windows, writer opens take an exclusive database-path lock and `ReadOnly` opens take a shared lock. On js, Plan 9, and WASI, this lock is process-local only.
 - `DisableLock` is explicitly unsafe; callers must ensure that the database has a single owner.

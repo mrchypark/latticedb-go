@@ -27,8 +27,8 @@ func (db *DB) BeginSnapshot() (*Snapshot, error) {
 	if db == nil {
 		return nil, ErrDatabaseClosed
 	}
-	if !db.writeMu.TryLock() {
-		return nil, ErrWriteTxActive
+	if err := db.lockWriterAfterCheckpoint(); err != nil {
+		return nil, err
 	}
 	defer func() {
 		db.writeMu.Unlock()

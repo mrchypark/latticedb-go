@@ -2686,9 +2686,9 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 	return snapshot, nil
 }
 
-func buildPersistedAppMetadata(metadata map[string][]byte) ([]persistedAppMetadata, error) {
-	keys := make([]string, 0, len(metadata))
-	for key := range metadata {
+func buildPersistedAppMetadata(metadata *AppMetadata) ([]persistedAppMetadata, error) {
+	keys := make([]string, 0, metadata.Len())
+	for key := range metadata.All() {
 		if len(key) == 0 || len(key) > maxAppMetadataKeyBytes {
 			return nil, errors.New("invalid application metadata key length")
 		}
@@ -2697,7 +2697,8 @@ func buildPersistedAppMetadata(metadata map[string][]byte) ([]persistedAppMetada
 	slices.Sort(keys)
 	persisted := make([]persistedAppMetadata, 0, len(keys))
 	for _, key := range keys {
-		persisted = append(persisted, persistedAppMetadata{Key: []byte(key), Value: slices.Clone(metadata[key])})
+		value, _ := metadata.Get(key)
+		persisted = append(persisted, persistedAppMetadata{Key: []byte(key), Value: slices.Clone(value)})
 	}
 	return persisted, nil
 }
@@ -2861,7 +2862,7 @@ func persistedPropertyIndexDefinitions(definitions []PropertyIndexDefinition) []
 
 func EstimateSnapshotBytes(graph *GraphState) (uint64, error) {
 	size := uint64(4096)
-	for key, value := range graph.AppMetadata {
+	for key, value := range graph.AppMetadata.All() {
 		size = snapshotAdd(size, appMetadataSnapshotBytes(key, value))
 	}
 	for _, node := range graph.Nodes.All() {
@@ -2897,12 +2898,12 @@ func ApplyDeltaSnapshotBytes(base *GraphState, graph *GraphState, changes GraphD
 	for _, change := range changes.AppMetadata {
 		key := string(change.Key)
 		oldSize := uint64(0)
-		if old, exists := base.AppMetadata[key]; exists {
+		if old, exists := base.AppMetadata.Get(key); exists {
 			oldSize = appMetadataSnapshotBytes(key, old)
 		}
 		newSize := uint64(0)
 		if !change.Delete {
-			value, exists := graph.AppMetadata[key]
+			value, exists := graph.AppMetadata.Get(key)
 			if !exists {
 				return 0, errors.New("application metadata delta value is missing")
 			}
@@ -3101,10 +3102,10 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 			return nil, 0, 0, 0, errors.New("invalid stored application metadata key length")
 		}
 		key := string(entry.Key)
-		if _, exists := graph.AppMetadata[key]; exists {
+		if _, exists := graph.AppMetadata.Get(key); exists {
 			return nil, 0, 0, 0, errors.New("duplicate stored application metadata key")
 		}
-		graph.AppMetadata[key] = slices.Clone(entry.Value)
+		graph.AppMetadata.Set(key, slices.Clone(entry.Value))
 	}
 	var maxNodeID uint64
 	for index, storedNode := range snapshot.Nodes {

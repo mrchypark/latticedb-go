@@ -20,7 +20,7 @@ func (tx *Tx) GetAppMetadata(key []byte) ([]byte, bool, error) {
 	if err := validateAppMetadataKey(key); err != nil {
 		return nil, false, err
 	}
-	value, ok := tx.graph.AppMetadata[string(key)]
+	value, ok := tx.graph.AppMetadata.Get(string(key))
 	return slices.Clone(value), ok, nil
 }
 
@@ -34,7 +34,7 @@ func (tx *Tx) PutAppMetadata(key, value []byte) error {
 	tx.ensureAppMetadataWritable()
 	cloned := slices.Clone(value)
 	textKey := string(key)
-	tx.graph.AppMetadata[textKey] = cloned
+	tx.graph.AppMetadata.Set(textKey, cloned)
 	tx.changes.appMetadata[textKey] = appMetadataChange{value: cloned}
 	return nil
 }
@@ -48,22 +48,17 @@ func (tx *Tx) DeleteAppMetadata(key []byte) error {
 	}
 	tx.ensureAppMetadataWritable()
 	textKey := string(key)
-	delete(tx.graph.AppMetadata, textKey)
+	tx.graph.AppMetadata.Delete(textKey)
 	tx.changes.appMetadata[textKey] = appMetadataChange{delete: true}
 	return nil
 }
 
 func (tx *Tx) ensureAppMetadataWritable() {
-	if tx.appMetadataWritable {
+	if tx.changes.appMetadata != nil {
 		return
 	}
-	metadata := make(map[string][]byte, len(tx.graph.AppMetadata))
-	for key, value := range tx.graph.AppMetadata {
-		metadata[key] = value
-	}
-	tx.graph.AppMetadata = metadata
+	tx.graph.AppMetadata = tx.graph.AppMetadata.Fork()
 	tx.changes.appMetadata = make(map[string]appMetadataChange)
-	tx.appMetadataWritable = true
 }
 
 func validateAppMetadataKey(key []byte) error {

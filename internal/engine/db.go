@@ -359,7 +359,6 @@ type Tx struct {
 	vectorLiveCountApplied bool
 	propertyIndexesApplied bool
 	changefeedApplied      bool
-	appMetadataWritable    bool
 	queryIndexesDisabled   bool
 	generationLease        *GenerationLease
 }
@@ -1596,7 +1595,19 @@ func (lease *GenerationLease) Release() {
 }
 
 func (db *DB) Begin(readOnly bool) (*Tx, error) {
-	if !readOnly && !db.writeMu.TryLock() {
+	if !readOnly {
+		if err := db.lockWriterAfterCheckpoint(); err != nil {
+			return nil, err
+		}
+	}
+	return db.beginAfterWriteLock(readOnly)
+}
+
+// lockWriterAfterCheckpoint waits for internal checkpoint attempts, but keeps
+// contention with application writers nonblocking. Retries are bounded even
+// when another checkpoint attempt starts before the final lock acquisition.
+func (db *DB) lockWriterAfterCheckpoint() error {
+	if !db.writeMu.TryLock() {
 		attemptEpoch := db.checkpointAttemptEpochState()
 		if db.checkpointTryLockFailed != nil {
 			db.checkpointTryLockFailed()
@@ -1609,14 +1620,14 @@ func (db *DB) Begin(readOnly bool) (*Tx, error) {
 			if db.checkpointAttemptEpochChanged(attemptEpoch) {
 				db.waitForCheckpointAttempt()
 				if !db.writeMu.TryLock() {
-					return nil, ErrWriteTxActive
+					return ErrWriteTxActive
 				}
 			} else {
-				return nil, ErrWriteTxActive
+				return ErrWriteTxActive
 			}
 		}
 	}
-	return db.beginAfterWriteLock(readOnly)
+	return nil
 }
 
 // BeginWriteContext waits for the single writer slot until ctx is canceled.

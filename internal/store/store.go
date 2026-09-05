@@ -417,7 +417,8 @@ type GraphState struct {
 	DatabaseID       string
 	VectorDimensions uint16
 	SnapshotBytes    uint64
-	AppMetadata      map[string][]byte
+	// AppMetadata is shared by shallow clones; writers must Fork before mutation.
+	AppMetadata      *AppMetadata
 	Nodes            PagedMap[*NodeRecord]
 	Edges            PagedMap[*EdgeRecord]
 	FTS              PagedMap[*FTSRecord]
@@ -611,7 +612,7 @@ type persistedValue struct {
 func NewGraphState() *GraphState {
 	return &GraphState{
 		SnapshotBytes:    4096,
-		AppMetadata:      map[string][]byte{},
+		AppMetadata:      new(AppMetadata),
 		Nodes:            NewPagedMap[*NodeRecord](),
 		Edges:            NewPagedMap[*EdgeRecord](),
 		FTS:              NewPagedMap[*FTSRecord](),
@@ -748,12 +749,12 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 	}
 }
 
-func CloneAppMetadata(metadata map[string][]byte) map[string][]byte {
-	cloned := make(map[string][]byte, len(metadata))
-	for key, value := range metadata {
-		cloned[key] = slices.Clone(value)
+func CloneAppMetadata(metadata *AppMetadata) *AppMetadata {
+	var cloned AppMetadata
+	for key, value := range metadata.All() {
+		cloned.Set(key, slices.Clone(value))
 	}
-	return cloned
+	return &cloned
 }
 
 func ClonePropertyMap(in map[string]any) map[string]any {
