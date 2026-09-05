@@ -70,9 +70,12 @@ func (db *DB) readStream(ctx context.Context, stream string, afterSequence uint6
 			db.mu.RUnlock()
 			return StreamReadResult{}, ErrRecoveryRequired
 		}
-		read := db.graph.Streams.ReadBounded(stream, afterSequence, opts.Limit, opts.MaxBytes)
+		// Keep the immutable stream generation and its wakeup together. Writers
+		// fork the store, so payload copying does not need to hold the DB lock.
+		streams := db.graph.Streams
 		notify := db.streamNotify
 		db.mu.RUnlock()
+		read := streams.ReadBounded(stream, afterSequence, opts.Limit, opts.MaxBytes)
 		result := StreamReadResult{Records: read.Records, LastSequence: read.LastSequence, ByteLimited: read.ByteLimited}
 		if len(result.Records) != 0 || result.ByteLimited || ctx == nil && timeout == 0 {
 			return result, nil
