@@ -85,12 +85,19 @@ func TestReadStreamConcurrentGenerationAndPayloadIsolation(t *testing.T) {
 	}
 	close(start)
 	workers.Wait()
-	check(frozen.Streams.Read("events", 0, recordsPerGeneration))
+	frozenRecords := frozen.Streams.Read("events", 0, recordsPerGeneration)
+	check(frozenRecords)
+	if frozenRecords[0].Sequence != 1 {
+		t.Fatal("the pinned stream generation advanced")
+	}
 	result, err := db.ReadStream("events", 0, recordsPerGeneration, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	check(result)
+	if result[0].Sequence != 16*recordsPerGeneration+1 {
+		t.Fatal("the final committed stream generation is not visible")
+	}
 }
 
 func TestReadStreamImmediateDoesNotAllocateTimer(t *testing.T) {
