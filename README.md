@@ -7,7 +7,7 @@ An embedded graph database written entirely in Go. It provides transactional gra
 LatticeDB Go requires Go 1.27 or newer.
 
 ```sh
-go get github.com/mrchypark/latticedb-go@v0.5.1
+go get github.com/mrchypark/latticedb-go@v0.5.2
 ```
 
 ## Quick start
