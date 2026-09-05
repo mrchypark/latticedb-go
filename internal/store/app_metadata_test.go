@@ -8,11 +8,11 @@ import (
 )
 
 func TestAppMetadataForkIsolationWithShardCollisions(t *testing.T) {
-	groups := make(map[uint16][]string)
+	groups := make(map[uint8][]string)
 	var keys []string
 	for i := 0; i < 10000; i++ {
 		key := fmt.Sprintf("key/%d", i)
-		shard := uint16(hashString(key))
+		shard := uint8(hashString(key))
 		groups[shard] = append(groups[shard], key)
 		if len(groups[shard]) == 3 {
 			keys = groups[shard]
@@ -22,6 +22,11 @@ func TestAppMetadataForkIsolationWithShardCollisions(t *testing.T) {
 	if len(keys) != 3 {
 		t.Fatal("did not find three keys sharing a shard")
 	}
+	neighbor := "neighbor"
+	for uint8(hashString(neighbor)) == uint8(hashString(keys[0])) {
+		neighbor += "x"
+	}
+	keys = append(keys, neighbor)
 	var base AppMetadata
 	for _, key := range keys {
 		base.Set(key, []byte("old"))
@@ -42,7 +47,7 @@ func TestAppMetadataForkIsolationWithShardCollisions(t *testing.T) {
 	if _, ok := right.Get(keys[0]); ok {
 		t.Fatal("deleted key remains visible")
 	}
-	if got := maps.Collect(left.All()); len(got) != 2 || string(got[keys[0]]) != "new" || string(got[keys[2]]) != "old" || left.Len() != 2 {
+	if got := maps.Collect(left.All()); len(got) != 3 || string(got[keys[0]]) != "new" || string(got[keys[2]]) != "old" || string(got[neighbor]) != "old" || left.Len() != 3 {
 		t.Fatalf("left values = %v, length = %d", got, left.Len())
 	}
 	cleared := left.Fork()
@@ -53,7 +58,7 @@ func TestAppMetadataForkIsolationWithShardCollisions(t *testing.T) {
 		t.Fatal("deleted shard still has entries")
 	}
 	cleared.Set(keys[0], []byte("reinserted"))
-	if got, _ := left.Get(keys[0]); string(got) != "new" || left.Len() != 2 || cleared.Len() != 1 {
+	if got, _ := left.Get(keys[0]); string(got) != "new" || left.Len() != 3 || cleared.Len() != 1 {
 		t.Fatal("reinsertion changed an older generation")
 	}
 	visits := 0

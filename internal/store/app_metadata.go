@@ -7,12 +7,13 @@ import (
 
 // AppMetadata shares immutable values between generations. Callers must clone
 // byte slices before storing or exposing them. Forked writers copy only the
-// touched ShardMap shard and full-hash collision bucket.
-// ponytail: fixed 65,536 shards bound fanout, not occupancy; repartition if
-// metadata grows enough that individual shard copies become expensive.
+// touched hash bucket. Exact string keys distinguish all hash collisions.
+// ponytail: 256 buckets avoid a map per key; repartition if individual bucket
+// copies become expensive for much larger or skewed metadata sets.
 type AppMetadata struct {
 	buckets ShardMap[map[string][]byte]
 	length  int
+	cloned  [4]uint64
 }
 
 func (metadata AppMetadata) Fork() AppMetadata {
@@ -22,38 +23,44 @@ func (metadata AppMetadata) Fork() AppMetadata {
 func (metadata AppMetadata) Len() int { return metadata.length }
 
 func (metadata AppMetadata) Get(key string) ([]byte, bool) {
-	value, ok := metadata.buckets.Get(hashString(key))[key]
+	value, ok := metadata.buckets.Get(hashString(key) & 255)[key]
 	return value, ok
 }
 
 func (metadata *AppMetadata) Set(key string, value []byte) {
-	hash := hashString(key)
-	metadata.buckets.CloneShardOnce(hash)
-	bucket := maps.Clone(metadata.buckets.Get(hash))
-	if bucket == nil {
-		bucket = make(map[string][]byte)
-	}
+	bucket := metadata.writableBucket(hashString(key) & 255)
 	if _, exists := bucket[key]; !exists {
 		metadata.length++
 	}
 	bucket[key] = value
-	metadata.buckets.Set(hash, bucket)
 }
 
 func (metadata *AppMetadata) Delete(key string) {
 	if _, exists := metadata.Get(key); !exists {
 		return
 	}
-	hash := hashString(key)
-	metadata.buckets.CloneShardOnce(hash)
-	bucket := maps.Clone(metadata.buckets.Get(hash))
+	hash := hashString(key) & 255
+	bucket := metadata.writableBucket(hash)
 	delete(bucket, key)
 	metadata.length--
 	if len(bucket) == 0 {
 		metadata.buckets.Delete(hash)
-	} else {
-		metadata.buckets.Set(hash, bucket)
+		metadata.cloned[hash/64] &^= uint64(1) << (hash % 64)
 	}
+}
+
+func (metadata *AppMetadata) writableBucket(hash uint64) map[string][]byte {
+	word, bit := hash/64, uint64(1)<<(hash%64)
+	if metadata.cloned[word]&bit == 0 {
+		metadata.buckets.CloneShardOnce(hash)
+		bucket := maps.Clone(metadata.buckets.Get(hash))
+		if bucket == nil {
+			bucket = make(map[string][]byte)
+		}
+		metadata.buckets.Set(hash, bucket)
+		metadata.cloned[word] |= bit
+	}
+	return metadata.buckets.Get(hash)
 }
 
 func (metadata AppMetadata) All() iter.Seq2[string, []byte] {
