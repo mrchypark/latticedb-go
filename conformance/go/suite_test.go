@@ -870,6 +870,63 @@ func TestConformanceQueryLimitZeroAndNegativeValues(t *testing.T) {
 	requireSingleIntResult(t, rejectedCount, "count", 0)
 }
 
+func TestConformanceQueryOrderValueContract(t *testing.T) {
+	db := openDB(t, filepath.Join(t.TempDir(), "query_order_values.ltdb"), OpenOptions{Create: true})
+	defer closeDB(t, db)
+	values := []Value{
+		map[string]Value{"a": int64(1)}, []Value{int64(1)}, []float32{1}, []byte{1}, "11", true, false, int64(10), int64(2), float64(2), nil,
+	}
+	assertOrder := func(query string, want []Value) {
+		t.Helper()
+		result, err := db.Query(query, map[string]Value{"values": values})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]Value, len(result.Rows))
+		for index, row := range result.Rows {
+			got[index] = row["value"]
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s = %#v, want %#v", query, got, want)
+		}
+	}
+	ascending := []Value{int64(2), float64(2), int64(10), false, true, "11", []byte{1}, []float32{1}, []Value{int64(1)}, map[string]Value{"a": int64(1)}, nil}
+	assertOrder("UNWIND $values AS value RETURN value ORDER BY value ASC", ascending)
+	assertOrder("UNWIND $values AS value RETURN value ORDER BY value DESC", []Value{nil, map[string]Value{"a": int64(1)}, []Value{int64(1)}, []float32{1}, []byte{1}, "11", true, false, int64(10), int64(2), float64(2)})
+	assertOrder("UNWIND $values AS value RETURN value ORDER BY value ASC SKIP 1 LIMIT 2", []Value{float64(2), int64(10)})
+
+	err := db.Update(func(tx Tx) error {
+		for _, kind := range []string{"b", "a", "a"} {
+			if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]Value{"kind": kind}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		query string
+		want  []int64
+	}{
+		{"MATCH (n:Item) RETURN id(n) AS id, n.kind AS kind ORDER BY kind ASC", []int64{2, 3, 1}},
+		{"MATCH (n:Item) RETURN id(n) AS id, n.kind AS kind ORDER BY kind DESC", []int64{1, 2, 3}},
+	} {
+		result, err := db.Query(test.query, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]int64, len(result.Rows))
+		for index, row := range result.Rows {
+			got[index] = row["id"].(int64)
+		}
+		if !slices.Equal(got, test.want) {
+			t.Fatalf("%s = %v, want %v", test.query, got, test.want)
+		}
+	}
+}
+
 func TestConformanceTransactionOwnWritesCommitAndRollback(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "mvcc.ltdb")
 	db := openDB(t, dbPath, OpenOptions{Create: true})
