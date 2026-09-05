@@ -104,6 +104,14 @@ type QueryResult struct {
 	Rows    []map[string]Value
 }
 
+// ExportOptions bounds one export's emitted node and edge records and bytes.
+// MaxBytes includes all CSV generation files and its manifest. Zero leaves the
+// corresponding limit unset.
+type ExportOptions struct {
+	MaxRecords uint64
+	MaxBytes   uint64
+}
+
 type QueryOptions struct {
 	MaxRows uint64
 	MaxWork uint64

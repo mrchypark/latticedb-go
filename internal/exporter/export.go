@@ -28,6 +28,15 @@ const (
 	ExportFormatDOT   ExportFormat = "dot"
 )
 
+// ExportOptions bounds one export's emitted records and bytes. Zero leaves the
+// corresponding limit unset.
+type ExportOptions struct {
+	MaxRecords uint64
+	MaxBytes   uint64
+}
+
+var ErrOutputLimit = errors.New("export output limit exceeded")
+
 type csvManifest struct {
 	Generation string `json:"generation"`
 	Nodes      string `json:"nodes"`
@@ -74,10 +83,17 @@ func ExportGraph(graph *store.GraphState, format ExportFormat, outputPath string
 }
 
 func ExportGraphContext(ctx context.Context, graph *store.GraphState, format ExportFormat, outputPath string) ([]byte, error) {
+	return ExportGraphContextWithOptions(ctx, graph, format, outputPath, ExportOptions{})
+}
+
+func ExportGraphContextWithOptions(ctx context.Context, graph *store.GraphState, format ExportFormat, outputPath string, opts ExportOptions) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := opts.checkRecords(graph); err != nil {
 		return nil, err
 	}
 	outputPath, err := canonicalExportOutputPath(outputPath)
@@ -91,23 +107,30 @@ func ExportGraphContext(ctx context.Context, graph *store.GraphState, format Exp
 	defer unlock()
 	switch format {
 	case ExportFormatJSON:
-		return exportJSONContext(ctx, graph, outputPath)
+		return exportJSONContextWithOptions(ctx, graph, outputPath, opts)
 	case ExportFormatJSONL:
-		return exportJSONLContext(ctx, graph, outputPath)
+		return exportJSONLContextWithOptions(ctx, graph, outputPath, opts)
 	case ExportFormatCSV:
-		return exportCSV(ctx, graph, outputPath)
+		return exportCSVWithOptions(ctx, graph, outputPath, opts)
 	case ExportFormatDOT:
-		return exportDOTContext(ctx, graph, outputPath)
+		return exportDOTContextWithOptions(ctx, graph, outputPath, opts)
 	default:
 		return nil, fmt.Errorf("unsupported export format %q", format)
 	}
 }
 
 func ExportGraphFileContext(ctx context.Context, graph *store.GraphState, format ExportFormat, outputPath string) error {
+	return ExportGraphFileContextWithOptions(ctx, graph, format, outputPath, ExportOptions{})
+}
+
+func ExportGraphFileContextWithOptions(ctx context.Context, graph *store.GraphState, format ExportFormat, outputPath string, opts ExportOptions) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := opts.checkRecords(graph); err != nil {
 		return err
 	}
 	outputPath, err := canonicalExportOutputPath(outputPath)
@@ -121,13 +144,13 @@ func ExportGraphFileContext(ctx context.Context, graph *store.GraphState, format
 	defer unlock()
 	switch format {
 	case ExportFormatJSON:
-		_, err = writeAtomicStreamContext(ctx, outputPath, func(output io.Writer) error { return DumpGraphContextTo(ctx, graph, output) })
+		_, err = writeAtomicStreamContextWithOptions(ctx, outputPath, opts, func(output io.Writer) error { return dumpGraphContextTo(ctx, graph, output) })
 	case ExportFormatJSONL:
-		_, err = writeAtomicStreamContext(ctx, outputPath, func(output io.Writer) error { return exportJSONLContextTo(ctx, graph, output) })
+		_, err = writeAtomicStreamContextWithOptions(ctx, outputPath, opts, func(output io.Writer) error { return exportJSONLContextTo(ctx, graph, output) })
 	case ExportFormatCSV:
-		_, err = exportCSV(ctx, graph, outputPath)
+		_, err = exportCSVWithOptions(ctx, graph, outputPath, opts)
 	case ExportFormatDOT:
-		_, err = writeAtomicStreamContext(ctx, outputPath, func(output io.Writer) error { return exportDOTContextTo(ctx, graph, output) })
+		_, err = writeAtomicStreamContextWithOptions(ctx, outputPath, opts, func(output io.Writer) error { return exportDOTContextTo(ctx, graph, output) })
 	default:
 		err = fmt.Errorf("unsupported export format %q", format)
 	}
@@ -151,15 +174,32 @@ func DumpGraphTo(graph *store.GraphState, output io.Writer) error {
 }
 
 func DumpGraphContext(ctx context.Context, graph *store.GraphState) ([]byte, error) {
+	return DumpGraphContextWithOptions(ctx, graph, ExportOptions{})
+}
+
+func DumpGraphContextWithOptions(ctx context.Context, graph *store.GraphState, opts ExportOptions) ([]byte, error) {
+	if err := opts.checkRecords(graph); err != nil {
+		return nil, err
+	}
 	var output bytes.Buffer
-	if err := DumpGraphContextTo(ctx, graph, &output); err != nil {
+	if err := DumpGraphContextToWithOptions(ctx, graph, &output, opts); err != nil {
 		return nil, err
 	}
 	return output.Bytes(), nil
 }
 
 func DumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.Writer) error {
-	output = contextOutputWriter{ctx: ctx, output: output}
+	return DumpGraphContextToWithOptions(ctx, graph, output, ExportOptions{})
+}
+
+func DumpGraphContextToWithOptions(ctx context.Context, graph *store.GraphState, output io.Writer, opts ExportOptions) error {
+	if err := opts.checkRecords(graph); err != nil {
+		return err
+	}
+	return dumpGraphContextTo(ctx, graph, newExportOutputWriter(ctx, output, opts))
+}
+
+func dumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.Writer) error {
 	if err := writeString(output, `{"nodes":[`); err != nil {
 		return err
 	}
@@ -222,9 +262,17 @@ func ExportGraphTo(graph *store.GraphState, format ExportFormat, output io.Write
 }
 
 func ExportGraphContextTo(ctx context.Context, graph *store.GraphState, format ExportFormat, output io.Writer) error {
+	return ExportGraphContextToWithOptions(ctx, graph, format, output, ExportOptions{})
+}
+
+func ExportGraphContextToWithOptions(ctx context.Context, graph *store.GraphState, format ExportFormat, output io.Writer, opts ExportOptions) error {
+	if err := opts.checkRecords(graph); err != nil {
+		return err
+	}
+	output = newExportOutputWriter(ctx, output, opts)
 	switch format {
 	case ExportFormatJSON:
-		return DumpGraphContextTo(ctx, graph, output)
+		return dumpGraphContextTo(ctx, graph, output)
 	case ExportFormatJSONL:
 		return exportJSONLContextTo(ctx, graph, output)
 	case ExportFormatDOT:
@@ -241,7 +289,11 @@ func SimulateCrash(dbPath string) error {
 }
 
 func exportJSONContext(ctx context.Context, graph *store.GraphState, outputPath string) ([]byte, error) {
-	data, err := DumpGraphContext(ctx, graph)
+	return exportJSONContextWithOptions(ctx, graph, outputPath, ExportOptions{})
+}
+
+func exportJSONContextWithOptions(ctx context.Context, graph *store.GraphState, outputPath string, opts ExportOptions) ([]byte, error) {
+	data, err := DumpGraphContextWithOptions(ctx, graph, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -252,8 +304,12 @@ func exportJSONContext(ctx context.Context, graph *store.GraphState, outputPath 
 }
 
 func exportJSONLContext(ctx context.Context, graph *store.GraphState, outputPath string) ([]byte, error) {
+	return exportJSONLContextWithOptions(ctx, graph, outputPath, ExportOptions{})
+}
+
+func exportJSONLContextWithOptions(ctx context.Context, graph *store.GraphState, outputPath string, opts ExportOptions) ([]byte, error) {
 	var output bytes.Buffer
-	if err := exportJSONLContextTo(ctx, graph, &output); err != nil {
+	if err := exportJSONLContextTo(ctx, graph, newExportOutputWriter(ctx, &output, opts)); err != nil {
 		return nil, err
 	}
 	data := output.Bytes()
@@ -319,6 +375,10 @@ func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output i
 }
 
 func exportCSV(ctx context.Context, graph *store.GraphState, outputPath string) ([]byte, error) {
+	return exportCSVWithOptions(ctx, graph, outputPath, ExportOptions{})
+}
+
+func exportCSVWithOptions(ctx context.Context, graph *store.GraphState, outputPath string, opts ExportOptions) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -343,10 +403,11 @@ func exportCSV(ctx context.Context, graph *store.GraphState, outputPath string) 
 	}()
 	generationNodes := filepath.Join(buildingPath, "nodes.csv")
 	generationEdges := filepath.Join(buildingPath, "edges.csv")
-	if err := writeNodesCSVContext(ctx, graph, generationNodes); err != nil {
+	budget := newExportBudget(opts)
+	if err := writeNodesCSVContextWithBudget(ctx, graph, generationNodes, budget); err != nil {
 		return nil, err
 	}
-	if err := writeEdgesCSVContext(ctx, graph, generationEdges); err != nil {
+	if err := writeEdgesCSVContextWithBudget(ctx, graph, generationEdges, budget); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -373,7 +434,7 @@ func exportCSV(ctx context.Context, graph *store.GraphState, outputPath string) 
 	if err != nil {
 		return nil, err
 	}
-	published, err := writeAtomicContext(ctx, outputPath, manifest)
+	published, err := writeAtomicContextWithBudget(ctx, outputPath, manifest, budget)
 	if published {
 		generationPublished = true
 	}
@@ -386,8 +447,12 @@ func exportCSV(ctx context.Context, graph *store.GraphState, outputPath string) 
 }
 
 func exportDOTContext(ctx context.Context, graph *store.GraphState, outputPath string) ([]byte, error) {
+	return exportDOTContextWithOptions(ctx, graph, outputPath, ExportOptions{})
+}
+
+func exportDOTContextWithOptions(ctx context.Context, graph *store.GraphState, outputPath string, opts ExportOptions) ([]byte, error) {
 	var builder strings.Builder
-	if err := exportDOTContextTo(ctx, graph, &builder); err != nil {
+	if err := exportDOTContextTo(ctx, graph, newExportOutputWriter(ctx, &builder, opts)); err != nil {
 		return nil, err
 	}
 	data := []byte(builder.String())
@@ -446,6 +511,47 @@ func writeBytes(output io.Writer, value []byte) error {
 type contextOutputWriter struct {
 	ctx    context.Context
 	output io.Writer
+}
+
+type exportBudget struct {
+	maxBytes uint64
+	written  uint64
+}
+
+func newExportBudget(opts ExportOptions) *exportBudget {
+	return &exportBudget{maxBytes: opts.MaxBytes}
+}
+
+func newExportOutputWriter(ctx context.Context, output io.Writer, opts ExportOptions) io.Writer {
+	return contextOutputWriter{ctx: ctx, output: &limitedExportWriter{output: output, budget: newExportBudget(opts)}}
+}
+
+type limitedExportWriter struct {
+	output io.Writer
+	budget *exportBudget
+}
+
+func (writer *limitedExportWriter) Write(value []byte) (int, error) {
+	if writer.budget.maxBytes != 0 {
+		if writer.budget.written > writer.budget.maxBytes || uint64(len(value)) > writer.budget.maxBytes-writer.budget.written {
+			return 0, ErrOutputLimit
+		}
+	}
+	written, err := writer.output.Write(value)
+	writer.budget.written += uint64(written)
+	return written, err
+}
+
+func (opts ExportOptions) checkRecords(graph *store.GraphState) error {
+	if opts.MaxRecords == 0 {
+		return nil
+	}
+	nodes := uint64(graph.Nodes.Len())
+	edges := uint64(graph.Edges.Len())
+	if nodes > opts.MaxRecords || edges > opts.MaxRecords-nodes {
+		return ErrOutputLimit
+	}
+	return nil
 }
 
 func (writer contextOutputWriter) Write(value []byte) (int, error) {
@@ -562,6 +668,10 @@ func exportValue(value any) (exportedValue, error) {
 }
 
 func writeNodesCSVContext(ctx context.Context, graph *store.GraphState, path string) error {
+	return writeNodesCSVContextWithBudget(ctx, graph, path, newExportBudget(ExportOptions{}))
+}
+
+func writeNodesCSVContextWithBudget(ctx context.Context, graph *store.GraphState, path string, budget *exportBudget) error {
 	file, tempPath, err := createTempOutput(path)
 	if err != nil {
 		return err
@@ -569,7 +679,7 @@ func writeNodesCSVContext(ctx context.Context, graph *store.GraphState, path str
 	defer os.Remove(tempPath)
 	defer file.Close()
 
-	writer := csv.NewWriter(contextOutputWriter{ctx: ctx, output: file})
+	writer := csv.NewWriter(contextOutputWriter{ctx: ctx, output: &limitedExportWriter{output: file, budget: budget}})
 
 	if err := writer.Write([]string{"id", "labels", "properties"}); err != nil {
 		return err
@@ -605,6 +715,10 @@ func writeNodesCSVContext(ctx context.Context, graph *store.GraphState, path str
 }
 
 func writeEdgesCSVContext(ctx context.Context, graph *store.GraphState, path string) error {
+	return writeEdgesCSVContextWithBudget(ctx, graph, path, newExportBudget(ExportOptions{}))
+}
+
+func writeEdgesCSVContextWithBudget(ctx context.Context, graph *store.GraphState, path string, budget *exportBudget) error {
 	file, tempPath, err := createTempOutput(path)
 	if err != nil {
 		return err
@@ -612,7 +726,7 @@ func writeEdgesCSVContext(ctx context.Context, graph *store.GraphState, path str
 	defer os.Remove(tempPath)
 	defer file.Close()
 
-	writer := csv.NewWriter(contextOutputWriter{ctx: ctx, output: file})
+	writer := csv.NewWriter(contextOutputWriter{ctx: ctx, output: &limitedExportWriter{output: file, budget: budget}})
 
 	if err := writer.Write([]string{"id", "source", "target", "type", "properties"}); err != nil {
 		return err
@@ -646,18 +760,29 @@ func writeEdgesCSVContext(ctx context.Context, graph *store.GraphState, path str
 }
 
 func writeAtomicContext(ctx context.Context, path string, data []byte) (bool, error) {
+	return writeAtomicContextWithBudget(ctx, path, data, newExportBudget(ExportOptions{}))
+}
+
+func writeAtomicContextWithBudget(ctx context.Context, path string, data []byte, budget *exportBudget) (bool, error) {
+	if budget.maxBytes != 0 && (budget.written > budget.maxBytes || uint64(len(data)) > budget.maxBytes-budget.written) {
+		return false, ErrOutputLimit
+	}
 	return writeAtomicStreamContext(ctx, path, func(output io.Writer) error {
-		return writeBytes(output, data)
+		return writeBytes(&limitedExportWriter{output: output, budget: budget}, data)
 	})
 }
 
 func writeAtomicStreamContext(ctx context.Context, path string, write func(io.Writer) error) (bool, error) {
+	return writeAtomicStreamContextWithOptions(ctx, path, ExportOptions{}, write)
+}
+
+func writeAtomicStreamContextWithOptions(ctx context.Context, path string, opts ExportOptions, write func(io.Writer) error) (bool, error) {
 	file, tempPath, err := createTempOutput(path)
 	if err != nil {
 		return false, err
 	}
 	defer os.Remove(tempPath)
-	if err := write(contextOutputWriter{ctx: ctx, output: file}); err != nil {
+	if err := write(newExportOutputWriter(ctx, file, opts)); err != nil {
 		_ = file.Close()
 		return false, err
 	}
