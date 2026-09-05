@@ -704,6 +704,22 @@ func (prepared *PreparedCheckpoint) PublishCheckpointStateFilesWithFault(files D
 // PrepareCheckpointFiles performs the serialization and fsync work for a
 // checkpoint without touching any live database file.
 func PrepareCheckpointFiles(files DatabaseFiles, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) (*PreparedCheckpoint, error) {
+	return prepareCheckpointFilesContext(context.Background(), files, graph, nextNodeID, nextEdgeID, commitID)
+}
+
+// PrepareCheckpointFilesContext writes a private checkpoint candidate and
+// observes cancellation while serializing it. It never changes live files.
+func PrepareCheckpointFilesContext(ctx context.Context, files DatabaseFiles, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) (*PreparedCheckpoint, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return prepareCheckpointFilesContext(ctx, files, graph, nextNodeID, nextEdgeID, commitID)
+}
+
+func prepareCheckpointFilesContext(ctx context.Context, files DatabaseFiles, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) (*PreparedCheckpoint, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
 		return nil, err
 	}
@@ -716,7 +732,11 @@ func PrepareCheckpointFiles(files DatabaseFiles, graph *GraphState, nextNodeID, 
 	// Keep the candidate self-contained. Publishing a separately generated
 	// WAL base introduces a crash window where state and WAL can refer to
 	// different bases; the live WAL remains untouched until publication.
-	if err := CheckpointGraphStateAndWALFiles(stagedFiles, graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := checkpointGraphStateAndWALFilesContext(ctx, stagedFiles, graph, nextNodeID, nextEdgeID, commitID, 0, nil); err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		_ = os.RemoveAll(staging)
 		return nil, err
 	}
@@ -872,6 +892,13 @@ func CheckpointGraphStateAndWALWithFault(dbPath string, graph *GraphState, nextN
 }
 
 func checkpointGraphStateAndWALFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, maxWALBytes uint64, fault CheckpointFault) error {
+	return checkpointGraphStateAndWALFilesContext(context.Background(), files, graph, nextNodeID, nextEdgeID, commitID, maxWALBytes, fault)
+}
+
+func checkpointGraphStateAndWALFilesContext(ctx context.Context, files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, maxWALBytes uint64, fault CheckpointFault) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
 		return err
 	}
@@ -886,7 +913,7 @@ func checkpointGraphStateAndWALFiles(files DatabaseFiles, graph *GraphState, nex
 	defer os.Remove(payloadPath)
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateJSON(io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateJSON(contextWriter{ctx: ctx, Writer: io.MultiWriter(payload, checksum)}, graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	if err := publishStatePayload(files, payload, graph.DatabaseID, commitID, checksum.Sum32(), fault); err != nil {
@@ -907,6 +934,18 @@ func checkpointGraphStateAndWALFiles(files DatabaseFiles, graph *GraphState, nex
 		return err
 	}
 	return nil
+}
+
+type contextWriter struct {
+	ctx context.Context
+	io.Writer
+}
+
+func (writer contextWriter) Write(data []byte) (int, error) {
+	if err := writer.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return writer.Writer.Write(data)
 }
 
 func publishStatePayload(files DatabaseFiles, payload *os.File, databaseID string, commitID uint64, checksum uint32, fault CheckpointFault) error {
