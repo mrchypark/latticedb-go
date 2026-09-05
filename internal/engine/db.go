@@ -346,10 +346,10 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	if opts.ReadOnly && opts.Create {
 		return nil, errors.New("read-only database cannot be created")
 	}
-	if opts.CacheSizeMB != 0 && opts.CacheSizeMB != 100 {
+	if opts.CacheSizeMB != 0 {
 		return nil, fmt.Errorf("%w: CacheSizeMB", ErrUnsupportedOption)
 	}
-	if opts.PageSize != 0 && opts.PageSize != 4096 {
+	if opts.PageSize != 0 {
 		return nil, fmt.Errorf("%w: PageSize", ErrUnsupportedOption)
 	}
 	if opts.VectorDimensions != 0 && !opts.EnableVector {

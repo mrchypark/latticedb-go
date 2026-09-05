@@ -134,6 +134,12 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 }
 
 func validateOpenOptions(opts OpenOptions) error {
+	if opts.CacheSizeMB != 0 {
+		return fmt.Errorf("%w: CacheSizeMB", ErrUnsupportedOption)
+	}
+	if opts.PageSize != 0 {
+		return fmt.Errorf("%w: PageSize", ErrUnsupportedOption)
+	}
 	if opts.DisableWAL {
 		return fmt.Errorf("%w: disabling WAL is unavailable", ErrUnsupportedOption)
 	}
