@@ -2537,11 +2537,12 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 		db.mu.Lock()
 		if db.closed || db.vectorRebuild != state || state.err != nil || db.disableVectorIndex || db.vectorDimensions != state.dimensions {
 			err := state.err
+			closed := db.closed
 			db.mu.Unlock()
 			if err != nil {
 				return err
 			}
-			if db.closed {
+			if closed {
 				return ErrDatabaseClosed
 			}
 			return ErrWriteConflict
@@ -2655,7 +2656,8 @@ func reserveVectorRebuildPersistent(budget *directSearchBudget, bytes, logBytes 
 }
 
 func vectorRebuildDeltaBytes(delta vectorRebuildDelta) uint64 {
-	return saturatingAdd(32, saturatingMul(uint64(len(delta.before)+len(delta.after)), 4))
+	// Includes delta headers and bounded slice growth in addition to copied vectors.
+	return saturatingAdd(192, saturatingMul(uint64(len(delta.before)+len(delta.after)), 4))
 }
 
 func (db *DB) appendVectorRebuildTxLocked(tx *Tx) {
