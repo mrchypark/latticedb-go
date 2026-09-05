@@ -3,8 +3,8 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"os"
 	"reflect"
 	"testing"
@@ -70,6 +70,10 @@ func FuzzLoadLatestWALFrames(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(record)
+	legacyRecord := append([]byte(nil), record...)
+	copy(legacyRecord[:8], legacyWALMagic[:])
+	binary.BigEndian.PutUint16(legacyRecord[8:10], legacyWALVersion)
+	f.Add(legacyRecord)
 	f.Add([]byte("not a WAL frame"))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
@@ -94,8 +98,24 @@ func FuzzLoadLatestWALFrames(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if _, _, _, _, err := decodePersistedStateContext(context.Background(), *state, fuzzMaxWork, fuzzMaxInputBytes); err != nil && !errors.Is(err, ErrLoadResourceLimit) {
+		graph, nextNodeID, nextEdgeID, commitID, err := decodePersistedStateContext(context.Background(), *state, fuzzMaxWork, fuzzMaxInputBytes)
+		if err != nil {
+			return
+		}
+		encoded, err := SerializeGraphState(graph, nextNodeID, nextEdgeID, commitID)
+		if err != nil {
 			t.Fatal(err)
+		}
+		roundTripped, gotNodeID, gotEdgeID, gotCommitID, err := DeserializeGraphStateWithRecoveryLimits(encoded, fuzzMaxInputBytes, fuzzMaxWork, fuzzMaxInputBytes, RecoveryLimits{MaxDecodedBytes: fuzzMaxInputBytes, MaxWork: fuzzMaxWork})
+		if err != nil {
+			t.Fatal(err)
+		}
+		encodedAgain, err := SerializeGraphState(roundTripped, gotNodeID, gotEdgeID, gotCommitID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(encodedAgain, encoded) {
+			t.Fatal("round trip WAL state is not canonical")
 		}
 	})
 }
