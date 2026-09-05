@@ -258,6 +258,45 @@ func TestSerializeBytesOpenAsWritableFile(t *testing.T) {
 	}
 }
 
+func TestDeserializeWritablePreservesIDHighWaterAndClose(t *testing.T) {
+	source, err := Open(filepath.Join(t.TempDir(), "source"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := source.Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Deserialize(data, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{})
+		if err != nil {
+			return err
+		}
+		if node.ID <= 1 {
+			t.Fatalf("deserialized allocator reused ID %d", node.ID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDirectoryAndFlatStateAliasesConflict(t *testing.T) {
 	directoryPath := t.TempDir()
 	directory, err := Open(directoryPath, OpenOptions{Create: true})
