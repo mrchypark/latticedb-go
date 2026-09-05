@@ -417,7 +417,7 @@ type GraphState struct {
 	DatabaseID       string
 	VectorDimensions uint16
 	SnapshotBytes    uint64
-	AppMetadata      map[string][]byte
+	AppMetadata      AppMetadata
 	Nodes            PagedMap[*NodeRecord]
 	Edges            PagedMap[*EdgeRecord]
 	FTS              PagedMap[*FTSRecord]
@@ -611,7 +611,6 @@ type persistedValue struct {
 func NewGraphState() *GraphState {
 	return &GraphState{
 		SnapshotBytes:    4096,
-		AppMetadata:      map[string][]byte{},
 		Nodes:            NewPagedMap[*NodeRecord](),
 		Edges:            NewPagedMap[*EdgeRecord](),
 		FTS:              NewPagedMap[*FTSRecord](),
@@ -727,7 +726,7 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 		DatabaseID:               graph.DatabaseID,
 		VectorDimensions:         graph.VectorDimensions,
 		SnapshotBytes:            graph.SnapshotBytes,
-		AppMetadata:              graph.AppMetadata,
+		AppMetadata:              graph.AppMetadata.Fork(),
 		Nodes:                    graph.Nodes.Fork(),
 		Edges:                    graph.Edges.Fork(),
 		FTS:                      graph.FTS.Fork(),
@@ -748,10 +747,10 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 	}
 }
 
-func CloneAppMetadata(metadata map[string][]byte) map[string][]byte {
-	cloned := make(map[string][]byte, len(metadata))
-	for key, value := range metadata {
-		cloned[key] = slices.Clone(value)
+func CloneAppMetadata(metadata AppMetadata) AppMetadata {
+	var cloned AppMetadata
+	for key, value := range metadata.All() {
+		cloned.Set(key, slices.Clone(value))
 	}
 	return cloned
 }

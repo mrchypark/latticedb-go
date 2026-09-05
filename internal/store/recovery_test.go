@@ -762,7 +762,7 @@ func TestAppMetadataWALDeltaIsIncremental(t *testing.T) {
 		t.Fatal(err)
 	}
 	large := bytes.Repeat([]byte("x"), 1<<20)
-	graph.AppMetadata["large"] = large
+	graph.AppMetadata.Set("large", large)
 	if err := AppendWALDelta(path, graph, 1, 1, 1, GraphDelta{AppMetadata: []AppMetadataChange{{Key: []byte("large"), Value: large}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -770,7 +770,7 @@ func TestAppMetadataWALDeltaIsIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	graph.AppMetadata["small"] = []byte("value")
+	graph.AppMetadata.Set("small", []byte("value"))
 	if err := AppendWALDelta(path, graph, 1, 1, 2, GraphDelta{AppMetadata: []AppMetadataChange{{Key: []byte("small"), Value: []byte("value")}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -785,7 +785,9 @@ func TestAppMetadataWALDeltaIsIncremental(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if commitID != 2 || !bytes.Equal(recovered.AppMetadata["large"], large) || string(recovered.AppMetadata["small"]) != "value" {
+	largeValue, _ := recovered.AppMetadata.Get("large")
+	smallValue, _ := recovered.AppMetadata.Get("small")
+	if commitID != 2 || !bytes.Equal(largeValue, large) || string(smallValue) != "value" {
 		t.Fatal("incremental metadata WAL did not recover both values")
 	}
 }

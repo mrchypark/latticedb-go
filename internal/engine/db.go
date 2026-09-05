@@ -359,7 +359,6 @@ type Tx struct {
 	vectorLiveCountApplied bool
 	propertyIndexesApplied bool
 	changefeedApplied      bool
-	appMetadataWritable    bool
 	queryIndexesDisabled   bool
 	generationLease        *GenerationLease
 }
