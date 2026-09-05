@@ -85,7 +85,7 @@ go test -race ./...
 (cd conformance/go && go test ./...)
 
 # Bounded fuzz smoke (each target caps inputs below 64 KiB and recovery work at 100K; WAL covers current v3 and readable legacy v2 frames)
-go test ./internal/engine -run '^$' -fuzz '^FuzzParseMatchQuery$' -fuzztime=5s -parallel=1
+go test ./internal/engine -run '^$' -fuzz '^FuzzParseQuery$' -fuzztime=5s -parallel=1
 for target in FuzzDeserializeGraphState FuzzLoadLatestWALFrames FuzzNestedValueRoundTrip; do
   go test ./internal/store -run '^$' -fuzz "^${target}$" -fuzztime=5s -parallel=1
 done
