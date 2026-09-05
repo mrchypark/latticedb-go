@@ -2383,12 +2383,8 @@ func adjustNodePropertyBudget(graph, source *store.GraphState, defs store.Proper
 	if record == nil {
 		return
 	}
-	for def := range defs.Definitions() {
-		if !slices.Contains(record.Labels, def.Scope) {
-			continue
-		}
-		value, ok := record.Properties[def.Property]
-		adjustPropertyIndexBudget(graph, def, value, ok, add)
+	for def := range defs.DefinitionsFor(record.Labels, record.Properties) {
+		adjustPropertyIndexBudget(graph, def, record.Properties[def.Property], true, add)
 	}
 }
 
@@ -2397,12 +2393,8 @@ func adjustEdgePropertyBudget(graph, source *store.GraphState, defs store.Proper
 	if record == nil {
 		return
 	}
-	for def := range defs.Definitions() {
-		if record.Type != def.Scope {
-			continue
-		}
-		value, ok := record.Properties[def.Property]
-		adjustPropertyIndexBudget(graph, def, value, ok, add)
+	for def := range defs.DefinitionsFor([]string{record.Type}, record.Properties) {
+		adjustPropertyIndexBudget(graph, def, record.Properties[def.Property], true, add)
 	}
 }
 
@@ -2729,14 +2721,9 @@ func addNodePropertyIndexes(indexes *store.PropertyIndexes, node *store.NodeReco
 	if node == nil {
 		return nil
 	}
-	for definition := range indexes.Definitions() {
-		if !slices.Contains(node.Labels, definition.Scope) {
-			continue
-		}
-		if value, ok := node.Properties[definition.Property]; ok {
-			if err := indexes.Add(definition, value, node.ID); err != nil {
-				return err
-			}
+	for definition := range indexes.DefinitionsFor(node.Labels, node.Properties) {
+		if err := indexes.Add(definition, node.Properties[definition.Property], node.ID); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2746,14 +2733,9 @@ func removeNodePropertyIndexes(indexes *store.PropertyIndexes, node *store.NodeR
 	if node == nil {
 		return nil
 	}
-	for definition := range indexes.Definitions() {
-		if !slices.Contains(node.Labels, definition.Scope) {
-			continue
-		}
-		if value, ok := node.Properties[definition.Property]; ok {
-			if err := indexes.Remove(definition, value, node.ID); err != nil {
-				return err
-			}
+	for definition := range indexes.DefinitionsFor(node.Labels, node.Properties) {
+		if err := indexes.Remove(definition, node.Properties[definition.Property], node.ID); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2763,13 +2745,9 @@ func addEdgePropertyIndexes(indexes *store.PropertyIndexes, edge *store.EdgeReco
 	if edge == nil {
 		return nil
 	}
-	for definition := range indexes.Definitions() {
-		if definition.Scope == edge.Type {
-			if value, ok := edge.Properties[definition.Property]; ok {
-				if err := indexes.Add(definition, value, edge.ID); err != nil {
-					return err
-				}
-			}
+	for definition := range indexes.DefinitionsFor([]string{edge.Type}, edge.Properties) {
+		if err := indexes.Add(definition, edge.Properties[definition.Property], edge.ID); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2779,13 +2757,9 @@ func removeEdgePropertyIndexes(indexes *store.PropertyIndexes, edge *store.EdgeR
 	if edge == nil {
 		return nil
 	}
-	for definition := range indexes.Definitions() {
-		if definition.Scope == edge.Type {
-			if value, ok := edge.Properties[definition.Property]; ok {
-				if err := indexes.Remove(definition, value, edge.ID); err != nil {
-					return err
-				}
-			}
+	for definition := range indexes.DefinitionsFor([]string{edge.Type}, edge.Properties) {
+		if err := indexes.Remove(definition, edge.Properties[definition.Property], edge.ID); err != nil {
+			return err
 		}
 	}
 	return nil

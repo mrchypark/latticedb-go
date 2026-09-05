@@ -5,6 +5,8 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -76,6 +78,55 @@ func TestPropertyIndexesCardinality(t *testing.T) {
 	}
 	if got, found, err := indexes.Cardinality(PropertyIndexDefinition{Scope: "missing"}, "common"); err != nil || found || got != 0 {
 		t.Fatalf("missing definition cardinality = %d, %t, %v", got, found, err)
+	}
+}
+
+func TestPropertyIndexesDefinitionsFor(t *testing.T) {
+	indexes := NewPropertyIndexes()
+	for _, definition := range []PropertyIndexDefinition{
+		{Scope: "Item", Property: "key"},
+		{Scope: "Item", Property: "other"},
+		{Scope: "Other", Property: "key"},
+	} {
+		indexes.Create(definition)
+	}
+	var got []PropertyIndexDefinition
+	for definition := range indexes.DefinitionsFor([]string{"Item"}, map[string]any{"key": int64(1)}) {
+		got = append(got, definition)
+	}
+	if !slices.Equal(got, []PropertyIndexDefinition{{Scope: "Item", Property: "key"}}) {
+		t.Fatalf("DefinitionsFor = %v", got)
+	}
+	got = nil
+	for definition := range indexes.DefinitionsFor([]string{"Item", "Other"}, map[string]any{"key": int64(1), "other": int64(2)}) {
+		got = append(got, definition)
+	}
+	slices.SortFunc(got, func(left, right PropertyIndexDefinition) int {
+		if left.Scope != right.Scope {
+			return strings.Compare(left.Scope, right.Scope)
+		}
+		return strings.Compare(left.Property, right.Property)
+	})
+	want := []PropertyIndexDefinition{{Scope: "Item", Property: "key"}, {Scope: "Item", Property: "other"}, {Scope: "Other", Property: "key"}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("DefinitionsFor = %v, want %v", got, want)
+	}
+	indexes = NewPropertyIndexes()
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "key"}
+	indexes.Create(definition)
+	for i := 0; i < 16; i++ {
+		indexes.Create(PropertyIndexDefinition{Scope: "Item", Property: "unused" + strconv.Itoa(i)})
+	}
+	scopes := []string{"Item"}
+	for i := 1; i < 32; i++ {
+		scopes = append(scopes, "Other"+strconv.Itoa(i))
+	}
+	got = nil
+	for definition := range indexes.DefinitionsFor(scopes, map[string]any{"key": int64(1)}) {
+		got = append(got, definition)
+	}
+	if !slices.Equal(got, []PropertyIndexDefinition{definition}) {
+		t.Fatalf("DefinitionsFor multiple scopes = %v", got)
 	}
 }
 

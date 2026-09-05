@@ -63,6 +63,34 @@ func (indexes PropertyIndexes) Definitions() iter.Seq[PropertyIndexDefinition] {
 	}
 }
 
+// DefinitionsFor visits definitions whose scope and property are both present.
+// Definition scans compare every scope; reverse lookups do so only per property.
+func (indexes PropertyIndexes) DefinitionsFor(scopes []string, properties map[string]any) iter.Seq[PropertyIndexDefinition] {
+	return func(yield func(PropertyIndexDefinition) bool) {
+		if len(scopes) == 0 || len(properties) == 0 {
+			return
+		}
+		if indexes.Len() <= len(properties) {
+			for definition := range indexes.Definitions() {
+				if slices.Contains(scopes, definition.Scope) {
+					if _, ok := properties[definition.Property]; ok && !yield(definition) {
+						return
+					}
+				}
+			}
+			return
+		}
+		for _, scope := range scopes {
+			for property := range properties {
+				definition := PropertyIndexDefinition{Scope: scope, Property: property}
+				if indexes.Has(definition) && !yield(definition) {
+					return
+				}
+			}
+		}
+	}
+}
+
 func (indexes *PropertyIndexes) Create(definition PropertyIndexDefinition) bool {
 	if indexes.Has(definition) {
 		return false
