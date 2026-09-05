@@ -970,9 +970,16 @@ func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
 	defer cancel()
 	state := &vectorRebuildState{dimensions: 2, maxBytes: vectorRebuildDeltaBytes(vectorRebuildDelta{after: []float32{1, 2}}) - 1, maxWork: ^uint64(0), cancel: cancel}
 	db := &DB{vectorRebuild: state}
-	db.appendVectorRebuildDeltasLocked([]vectorRebuildDelta{{id: 1, after: []float32{1, 2}}})
+	base := store.NewGraphState()
+	base.VectorDimensions = 2
+	graph := store.CloneGraphStateShallow(base)
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	db.appendVectorRebuildTxLocked(&Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}})
 	if !errors.Is(state.err, ErrResourceLimit) {
 		t.Fatalf("delta log error = %v", state.err)
+	}
+	if len(state.deltas) != 0 {
+		t.Fatalf("over-budget delta was retained: %#v", state.deltas)
 	}
 
 	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorIndexBytes(1, 2), annVisitedLimit: ^uint64(0)}
@@ -986,6 +993,40 @@ func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
 	budget = &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: 8, annVisitedLimit: ^uint64(0)}
 	if err := reserveVectorRebuildPersistent(budget, 8, 0); err != nil || budget.bytes != 8 {
 		t.Fatalf("exact tombstone reservation = bytes %d, err %v", budget.bytes, err)
+	}
+}
+
+func TestInactiveVectorRebuildDoesNotCloneCommitDeltas(t *testing.T) {
+	base := store.NewGraphState()
+	base.VectorDimensions = 2
+	graph := store.CloneGraphStateShallow(base)
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	tx := &Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}}
+	db := &DB{}
+	if allocations := testing.AllocsPerRun(100, func() { db.appendVectorRebuildTxLocked(tx) }); allocations != 0 {
+		t.Fatalf("inactive delta capture allocations = %f", allocations)
+	}
+}
+
+func TestOverBudgetVectorRebuildDoesNotCloneCommitDelta(t *testing.T) {
+	base := store.NewGraphState()
+	base.VectorDimensions = 2
+	graph := store.CloneGraphStateShallow(base)
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	tx := &Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}}
+	state := &vectorRebuildState{maxBytes: vectorRebuildDeltaBytes(vectorRebuildDelta{after: []float32{1, 2}}) - 1, maxWork: ^uint64(0), cancel: func() {}}
+	db := &DB{vectorRebuild: state}
+	if allocations := testing.AllocsPerRun(100, func() {
+		state.err = nil
+		db.appendVectorRebuildTxLocked(tx)
+	}); allocations != 0 {
+		t.Fatalf("over-budget delta capture allocations = %f", allocations)
+	}
+	if !errors.Is(state.err, ErrResourceLimit) {
+		t.Fatalf("delta log error = %v", state.err)
+	}
+	if len(state.deltas) != 0 {
+		t.Fatalf("over-budget delta was retained: %#v", state.deltas)
 	}
 }
 

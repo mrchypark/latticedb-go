@@ -2654,61 +2654,45 @@ func reserveVectorRebuildPersistent(budget *directSearchBudget, bytes, logBytes 
 	return budget.reserveBytes(bytes)
 }
 
-func (db *DB) vectorRebuildActive() bool {
-	db.mu.RLock()
-	active := db.vectorRebuild != nil && db.vectorRebuild.err == nil
-	db.mu.RUnlock()
-	return active
-}
-
-func (tx *Tx) vectorRebuildDeltas() []vectorRebuildDelta {
-	if tx.base == nil || tx.changes == nil {
-		return nil
-	}
-	deltas := make([]vectorRebuildDelta, 0, len(tx.changes.upsertNodes)+len(tx.changes.deleteNodes))
-	for _, id := range mapKeys(tx.changes.upsertNodes) {
-		before, beforeOK := selectedVector(tx.base, tx.base.Nodes.Get(id))
-		after, afterOK := selectedVector(tx.graph, tx.graph.Nodes.Get(id))
-		if beforeOK == afterOK && slices.Equal(before, after) {
-			continue
-		}
-		delta := vectorRebuildDelta{id: id}
-		if beforeOK {
-			delta.before = slices.Clone(before)
-		}
-		if afterOK {
-			delta.after = slices.Clone(after)
-		}
-		deltas = append(deltas, delta)
-	}
-	for _, id := range mapKeys(tx.changes.deleteNodes) {
-		if before, ok := selectedVector(tx.base, tx.base.Nodes.Get(id)); ok {
-			deltas = append(deltas, vectorRebuildDelta{id: id, before: slices.Clone(before)})
-		}
-	}
-	return deltas
-}
-
 func vectorRebuildDeltaBytes(delta vectorRebuildDelta) uint64 {
 	return saturatingAdd(32, saturatingMul(uint64(len(delta.before)+len(delta.after)), 4))
 }
 
-func (db *DB) appendVectorRebuildDeltasLocked(deltas []vectorRebuildDelta) {
+func (db *DB) appendVectorRebuildTxLocked(tx *Tx) {
 	state := db.vectorRebuild
-	if state == nil || state.err != nil || len(deltas) == 0 {
+	if state == nil || state.err != nil || tx.base == nil || tx.changes == nil {
 		return
 	}
-	for _, delta := range deltas {
+	appendDelta := func(id uint64, before, after []float32) bool {
+		delta := vectorRebuildDelta{id: id, before: before, after: after}
 		bytes := vectorRebuildDeltaBytes(delta)
 		work := saturatingAdd(uint64(len(delta.before)), uint64(len(delta.after)))
 		if state.buildBytes > state.maxBytes || state.replayBytes > state.maxBytes-state.buildBytes || state.logBytes > state.maxBytes-state.buildBytes-state.replayBytes || bytes > state.maxBytes-state.buildBytes-state.replayBytes-state.logBytes || state.logWork > state.maxWork || work > state.maxWork-state.logWork {
 			state.err = ErrResourceLimit
 			state.cancel()
-			return
+			return false
 		}
 		state.logBytes += bytes
 		state.logWork += work
+		delta.before = slices.Clone(before)
+		delta.after = slices.Clone(after)
 		state.deltas = append(state.deltas, delta)
+		return true
+	}
+	for id := range tx.changes.upsertNodes {
+		before, beforeOK := selectedVector(tx.base, tx.base.Nodes.Get(id))
+		after, afterOK := selectedVector(tx.graph, tx.graph.Nodes.Get(id))
+		if beforeOK == afterOK && slices.Equal(before, after) {
+			continue
+		}
+		if !appendDelta(id, before, after) {
+			return
+		}
+	}
+	for id := range tx.changes.deleteNodes {
+		if before, ok := selectedVector(tx.base, tx.base.Nodes.Get(id)); ok && !appendDelta(id, before, nil) {
+			return
+		}
 	}
 }
 
@@ -2886,11 +2870,10 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		}
 		return err
 	}
-	vectorDeltas := tx.vectorRebuildDeltas()
 	tx.db.mu.Lock()
 	tx.db.graph = tx.graph
 	tx.db.commitID = nextCommitID
-	tx.db.appendVectorRebuildDeltasLocked(vectorDeltas)
+	tx.db.appendVectorRebuildTxLocked(tx)
 	tx.db.dirty = true
 	if len(delta.DeleteEdges) != 0 {
 		if tx.db.enqueueAdjacencyCandidatesLocked(tx.graph, tx.base, delta) {
