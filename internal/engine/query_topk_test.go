@@ -210,3 +210,5 @@ func (it *cancelAfterQueryIterator) Next() (queryRow, bool, error) {
 	}
 	return row, true, nil
 }
+
+func (it *cancelAfterQueryIterator) Close() {}

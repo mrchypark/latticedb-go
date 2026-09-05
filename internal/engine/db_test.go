@@ -4162,7 +4162,7 @@ func TestQueryFTSHonorsTokenizationBudgets(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := "MATCH (n) WHERE n.text @@ $query RETURN n"
-	if result, err := db.QueryContext(context.Background(), query, map[string]any{"query": "!!!"}, QueryOptions{MaxBytes: 256}); err != nil || len(result.Rows) != 0 {
+	if result, err := db.QueryContext(context.Background(), query, map[string]any{"query": "!!!"}, QueryOptions{MaxBytes: 512}); err != nil || len(result.Rows) != 0 {
 		t.Fatalf("query punctuation-only FTS rows = %#v, %v", result.Rows, err)
 	}
 	if _, err := db.QueryContext(context.Background(), query, map[string]any{"query": strings.Repeat("alpha ", 100)}, QueryOptions{MaxBytes: 128}); !errors.Is(err, ErrResourceLimit) {

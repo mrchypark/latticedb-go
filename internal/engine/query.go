@@ -42,6 +42,9 @@ type matchPattern interface {
 	apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error)
 }
 
+// queryBudget tracks cumulative work and logical live bytes. Live bytes include
+// returned results, materialized query rows, and scoped scratch; it is not an
+// estimate of process RSS.
 type queryBudget struct {
 	ctx      context.Context
 	maxRows  uint32
@@ -50,6 +53,8 @@ type queryBudget struct {
 	work     uint32
 	bytes    uint32
 }
+
+const queryRowBytes = 128
 
 var queryBudgetPool = sync.Pool{New: func() any { return new(queryBudget) }}
 
@@ -94,10 +99,28 @@ func (budget *queryBudget) check(work uint64, rows int) error {
 	if uint64(rows) > uint64(budget.maxRows) {
 		return fmt.Errorf("%w: query rows exceed %d", ErrResourceLimit, budget.maxRows)
 	}
-	if uint64(rows) > uint64(budget.maxBytes-budget.bytes)/128 {
+	if uint64(rows) > uint64(budget.maxBytes-budget.bytes)/queryRowBytes {
 		return fmt.Errorf("%w: query temporary bytes exceed %d", ErrResourceLimit, budget.maxBytes)
 	}
 	return nil
+}
+
+func (budget *queryBudget) chargeRows(rows int) error {
+	return budget.chargeTemporary(uint64(rows) * queryRowBytes)
+}
+
+func (budget *queryBudget) releaseRows(rows int) {
+	budget.releaseTemporary(uint64(rows) * queryRowBytes)
+}
+
+// transferRows reserves the new materialized rows while the input rows remain
+// live, then transfers their logical ownership to the output buffer.
+func (budget *queryBudget) transferRows(input, output int) error {
+	if err := budget.check(0, output); err != nil {
+		return err
+	}
+	budget.releaseRows(input)
+	return budget.chargeRows(output)
 }
 
 func (budget *queryBudget) chargeResult(bytes uint64) error {
@@ -274,11 +297,13 @@ type queryRow struct {
 
 type queryIterator interface {
 	Next() (queryRow, bool, error)
+	Close()
 }
 
 type sliceQueryIterator struct {
-	rows  []queryRow
-	index int
+	rows   []queryRow
+	index  int
+	budget *queryBudget
 }
 
 func (it *sliceQueryIterator) Next() (queryRow, bool, error) {
@@ -290,10 +315,20 @@ func (it *sliceQueryIterator) Next() (queryRow, bool, error) {
 	return row, true, nil
 }
 
-type filterQueryIterator struct {
-	input queryIterator
-	eval  func(queryRow) (bool, error)
+func (it *sliceQueryIterator) Close() {
+	if it.budget != nil {
+		it.budget.releaseRows(len(it.rows) - it.index)
+	}
+	it.index = len(it.rows)
 }
+
+type filterQueryIterator struct {
+	input  queryIterator
+	eval   func(queryRow) (bool, error)
+	budget *queryBudget
+}
+
+func (it *filterQueryIterator) Close() { it.input.Close() }
 
 func (it *filterQueryIterator) Next() (queryRow, bool, error) {
 	for {
@@ -302,18 +337,26 @@ func (it *filterQueryIterator) Next() (queryRow, bool, error) {
 			return queryRow{}, ok, err
 		}
 		keep, err := it.eval(row)
-		if err != nil || keep {
-			return row, keep, err
+		if err != nil {
+			it.budget.releaseRows(1)
+			return queryRow{}, false, err
 		}
+		if keep {
+			return row, true, nil
+		}
+		it.budget.releaseRows(1)
 	}
 }
 
 type limitQueryIterator struct {
-	input queryIterator
-	skip  int
-	limit int
-	seen  int
+	input  queryIterator
+	skip   int
+	limit  int
+	seen   int
+	budget *queryBudget
 }
+
+func (it *limitQueryIterator) Close() { it.input.Close() }
 
 type patternQueryIterator struct {
 	plan    *queryPlan
@@ -327,6 +370,12 @@ type patternQueryIterator struct {
 	emitted int
 }
 
+func (it *patternQueryIterator) Close() {
+	it.budget.releaseRows(len(it.pending))
+	it.pending = nil
+	it.input.Close()
+}
+
 type whereQueryIterator struct {
 	input   queryIterator
 	tx      *Tx
@@ -334,6 +383,12 @@ type whereQueryIterator struct {
 	params  map[string]any
 	budget  *queryBudget
 	pending []queryRow
+}
+
+func (it *whereQueryIterator) Close() {
+	it.budget.releaseRows(len(it.pending))
+	it.pending = nil
+	it.input.Close()
 }
 
 func (it *whereQueryIterator) Next() (queryRow, bool, error) {
@@ -349,7 +404,11 @@ func (it *whereQueryIterator) Next() (queryRow, bool, error) {
 		}
 		it.pending, err = it.clause.apply(it.tx, []queryRow{row}, it.params, it.budget)
 		if err != nil {
+			it.budget.releaseRows(1)
 			return queryRow{}, false, err
+		}
+		if len(it.pending) == 0 {
+			it.budget.releaseRows(1)
 		}
 	}
 }
@@ -371,6 +430,11 @@ func (it *patternQueryIterator) Next() (queryRow, bool, error) {
 		}
 		it.pending, err = it.apply(row)
 		if err != nil {
+			it.budget.releaseRows(1)
+			return queryRow{}, false, err
+		}
+		if err := it.budget.transferRows(1, len(it.pending)); err != nil {
+			it.budget.releaseRows(1)
 			return queryRow{}, false, err
 		}
 	}
@@ -386,9 +450,11 @@ func (it *patternQueryIterator) apply(row queryRow) ([]queryRow, error) {
 		if nodeIDs, found, err := it.plan.indexedNodeIDs(it.tx, node, it.params, it.limit, it.budget); err != nil {
 			return nil, err
 		} else if found {
-			if err := it.budget.chargeTemporary(uint64(len(nodeIDs)) * 8); err != nil {
+			bytes := uint64(len(nodeIDs)) * 8
+			if err := it.budget.chargeTemporary(bytes); err != nil {
 				return nil, err
 			}
+			defer it.budget.releaseTemporary(bytes)
 			var rows []queryRow
 			for _, nodeID := range nodeIDs {
 				rows, err = node.applyID(it.tx, []queryRow{row}, nodeID, rows, it.budget)
@@ -415,9 +481,11 @@ func (it *limitQueryIterator) Next() (queryRow, bool, error) {
 		if err != nil || !ok {
 			return queryRow{}, ok, err
 		}
+		it.budget.releaseRows(1)
 		it.skip--
 	}
 	if it.limit >= 0 && it.seen == it.limit {
+		it.input.Close()
 		return queryRow{}, false, nil
 	}
 	row, ok, err := it.input.Next()
@@ -432,6 +500,7 @@ func collectQueryRows(it queryIterator) ([]queryRow, error) {
 	for {
 		row, ok, err := it.Next()
 		if err != nil {
+			it.Close()
 			return nil, err
 		}
 		if !ok {
@@ -479,6 +548,7 @@ func (plan *queryPlan) collectTopKRows(it queryIterator, skip, limit int, budget
 			}
 			nextBytes := uint64(nextCapacity) * queryTopKCandidateBytes
 			if err := budget.chargeTemporary(nextBytes); err != nil {
+				budget.releaseRows(1)
 				return nil, err
 			}
 			expanded := make([]orderedQueryRow, len(candidates), nextCapacity)
@@ -488,6 +558,7 @@ func (plan *queryPlan) collectTopKRows(it queryIterator, skip, limit int, budget
 			candidateBytes = nextBytes
 		}
 		candidates = plan.pushTopKRow(candidates, orderedQueryRow{row: row, sequence: sequence}, candidateLimit)
+		budget.releaseRows(1)
 	}
 	slices.SortFunc(candidates, plan.compareOrderedQueryRows)
 	if err := budget.check(0, 0); err != nil {
@@ -1030,14 +1101,23 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		return QueryResult{}, err
 	}
 	rows := []queryRow{plan.newRow()}
+	if err := budget.chargeRows(len(rows)); err != nil {
+		return QueryResult{}, err
+	}
+	var stream queryIterator = &sliceQueryIterator{rows: rows, budget: budget}
+	defer func() { stream.Close() }()
 	if plan.unwindClause != nil {
-		var err error
-		rows, err = plan.unwindClause.apply(rows, params, budget)
+		nextRows, err := plan.unwindClause.apply(rows, params, budget)
 		if err != nil {
 			return QueryResult{}, err
 		}
+		if err := budget.transferRows(len(rows), len(nextRows)); err != nil {
+			return QueryResult{}, err
+		}
+		rows = nextRows
+		stream = &sliceQueryIterator{rows: rows, budget: budget}
 	}
-	match := queryIterator(&sliceQueryIterator{rows: rows})
+	match := stream
 	patterns, err := plan.orderedMatchPatterns(tx, params)
 	if err != nil {
 		return QueryResult{}, err
@@ -1049,7 +1129,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		}
 		match = &patternQueryIterator{plan: plan, tx: tx, input: match, pattern: pattern, params: params, limit: lookupLimit, budget: budget}
 	}
-	var stream queryIterator = match
+	stream = match
 	if len(plan.whereClauses) > 0 {
 		for _, clause := range plan.whereClauses {
 			if clause.Kind == whereVector || clause.Kind == whereFTS {
@@ -1057,11 +1137,14 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 				if err != nil {
 					return QueryResult{}, err
 				}
+				inputRows := len(rows)
 				rows, err = clause.apply(tx, rows, params, budget)
 				if err != nil {
+					budget.releaseRows(inputRows)
 					return QueryResult{}, err
 				}
-				stream = &sliceQueryIterator{rows: rows}
+				budget.releaseRows(inputRows - len(rows))
+				stream = &sliceQueryIterator{rows: rows, budget: budget}
 				continue
 			}
 			stream = &whereQueryIterator{input: stream, tx: tx, clause: clause, params: params, budget: budget}
@@ -1069,7 +1152,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	}
 	if plan.wherePredicate != nil {
 		predicateWork := uint64(len(wherePredicateClauses(plan.wherePredicate)))
-		stream = &filterQueryIterator{input: stream, eval: func(row queryRow) (bool, error) {
+		stream = &filterQueryIterator{input: stream, budget: budget, eval: func(row queryRow) (bool, error) {
 			if err := budget.check(predicateWork, 0); err != nil {
 				return false, err
 			}
@@ -1082,15 +1165,14 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		if plan.limitExpr == nil {
 			iteratorLimit = -1
 		}
-		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit}, budget)
+		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit, budget: budget}, budget)
 	}
 	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit {
 		rows, err := plan.collectTopKRows(stream, skip, limit, budget)
 		if err != nil {
 			return QueryResult{}, err
 		}
-		rowBytes := uint64(len(rows)) * 128
-		defer budget.releaseTemporary(rowBytes)
+		defer budget.releaseRows(len(rows))
 		result, err := plan.returnClause.render(rows, budget)
 		if err != nil {
 			return QueryResult{}, err
@@ -1105,13 +1187,17 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	if err != nil {
 		return QueryResult{}, err
 	}
+	defer func() { budget.releaseRows(len(rows)) }()
 
 	if plan.createNode != nil {
-		var err error
-		rows, err = plan.createNode.apply(tx, rows, params)
+		nextRows, err := plan.createNode.apply(tx, rows, params)
 		if err != nil {
 			return QueryResult{}, err
 		}
+		if err := budget.transferRows(len(rows), len(nextRows)); err != nil {
+			return QueryResult{}, err
+		}
+		rows = nextRows
 	}
 	if plan.createClause != nil {
 		if err := plan.createClause.apply(tx, rows, params); err != nil {
@@ -2667,6 +2753,7 @@ func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) (
 	if err := budget.chargeTemporary(uint64(len(nodeIDs)) * 8); err != nil {
 		return nil, err
 	}
+	defer budget.releaseTemporary(uint64(len(nodeIDs)) * 8)
 	for _, nodeID := range nodeIDs {
 		var err error
 		nextRows, err = pattern.appendNodeRows(rows, tx.graph.Nodes.Get(nodeID), nextRows, budget)
@@ -2820,6 +2907,7 @@ func (pattern edgePattern) applyIDs(tx *Tx, rows []queryRow, edgeIDs []uint64, b
 	if err := budget.chargeTemporary(uint64(len(edgeIDs)) * 8); err != nil {
 		return nil, err
 	}
+	defer budget.releaseTemporary(uint64(len(edgeIDs)) * 8)
 	nextRows := make([]queryRow, 0)
 	for _, row := range rows {
 		for _, edgeID := range edgeIDs {
@@ -3700,6 +3788,7 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 }
 
 func (clause *returnClause) renderIterator(it queryIterator, budget *queryBudget) (QueryResult, error) {
+	defer it.Close()
 	result := QueryResult{Columns: make([]string, 0, len(clause.Projections))}
 	for _, projection := range clause.Projections {
 		result.Columns = append(result.Columns, projection.Alias)
@@ -3712,57 +3801,66 @@ func (clause *returnClause) renderIterator(it queryIterator, budget *queryBudget
 		if !ok {
 			return result, nil
 		}
-		if err := budget.chargeResult(64 + uint64(len(clause.Projections))*32); err != nil {
+		resultRow, err := clause.renderRow(row, budget)
+		budget.releaseRows(1)
+		if err != nil {
 			return QueryResult{}, err
-		}
-		resultRow := make(map[string]any, len(clause.Projections))
-		for _, projection := range clause.Projections {
-			binding, bound := row.get(projection.Var)
-			switch projection.Kind {
-			case projectionBindingID:
-				if value, ok := bindingID(binding); bound && ok {
-					resultRow[projection.Alias] = value
-				} else {
-					resultRow[projection.Alias] = nil
-				}
-			case projectionProperty:
-				value, exists := propertyFromBinding(binding, projection.Property)
-				if !bound || !exists {
-					resultRow[projection.Alias] = nil
-					continue
-				}
-				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
-					return QueryResult{}, err
-				}
-				resultRow[projection.Alias] = store.CloneValue(value)
-			case projectionValue:
-				switch {
-				case !bound:
-					resultRow[projection.Alias] = nil
-				case binding.Node != nil:
-					if err := budget.chargeResult(queryPropertyBytes(binding.Node.Properties)); err != nil {
-						return QueryResult{}, err
-					}
-					resultRow[projection.Alias] = publicNode(binding.Node)
-				case binding.Edge != nil:
-					if err := budget.chargeResult(queryPropertyBytes(binding.Edge.Properties)); err != nil {
-						return QueryResult{}, err
-					}
-					resultRow[projection.Alias] = publicEdge(binding.Edge)
-				case binding.HasValue:
-					if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
-						return QueryResult{}, err
-					}
-					resultRow[projection.Alias] = store.CloneValue(binding.Value)
-				default:
-					resultRow[projection.Alias] = nil
-				}
-			default:
-				return QueryResult{}, fmt.Errorf("unsupported projection kind %q", projection.Kind)
-			}
 		}
 		result.Rows = append(result.Rows, resultRow)
 	}
+}
+
+func (clause *returnClause) renderRow(row queryRow, budget *queryBudget) (map[string]any, error) {
+	if err := budget.chargeResult(64 + uint64(len(clause.Projections))*32); err != nil {
+		return nil, err
+	}
+	resultRow := make(map[string]any, len(clause.Projections))
+	for _, projection := range clause.Projections {
+		binding, bound := row.get(projection.Var)
+		switch projection.Kind {
+		case projectionBindingID:
+			if value, ok := bindingID(binding); bound && ok {
+				resultRow[projection.Alias] = value
+			} else {
+				resultRow[projection.Alias] = nil
+			}
+		case projectionProperty:
+			value, exists := propertyFromBinding(binding, projection.Property)
+			if !bound || !exists {
+				resultRow[projection.Alias] = nil
+				continue
+			}
+			if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+				return nil, err
+			}
+			resultRow[projection.Alias] = store.CloneValue(value)
+		case projectionValue:
+			switch {
+			case !bound:
+				resultRow[projection.Alias] = nil
+			case binding.Node != nil:
+				if err := budget.chargeResult(queryPropertyBytes(binding.Node.Properties)); err != nil {
+					return nil, err
+				}
+				resultRow[projection.Alias] = publicNode(binding.Node)
+			case binding.Edge != nil:
+				if err := budget.chargeResult(queryPropertyBytes(binding.Edge.Properties)); err != nil {
+					return nil, err
+				}
+				resultRow[projection.Alias] = publicEdge(binding.Edge)
+			case binding.HasValue:
+				if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
+					return nil, err
+				}
+				resultRow[projection.Alias] = store.CloneValue(binding.Value)
+			default:
+				resultRow[projection.Alias] = nil
+			}
+		default:
+			return nil, fmt.Errorf("unsupported projection kind %q", projection.Kind)
+		}
+	}
+	return resultRow, nil
 }
 
 func queryPropertyBytes(properties map[string]any) uint64 {
@@ -3774,9 +3872,11 @@ func queryPropertyBytes(properties map[string]any) uint64 {
 }
 
 func distinctResultRows(columns []string, rows []map[string]any, budget *queryBudget) ([]map[string]any, error) {
-	if err := budget.chargeTemporary(uint64(len(rows)) * 32); err != nil {
+	bytes := uint64(len(rows)) * 32
+	if err := budget.chargeTemporary(bytes); err != nil {
 		return nil, err
 	}
+	defer budget.releaseTemporary(bytes)
 	distinct := rows[:0]
 	buckets := make(map[uint64][]int, len(rows))
 	for _, row := range rows {
