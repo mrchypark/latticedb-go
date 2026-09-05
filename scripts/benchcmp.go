@@ -48,7 +48,8 @@ var blockingGates = []performanceGate{
 	{benchmark: "BenchmarkAdjacencyAppendScaling/chunked_10000", unit: "B/op", maxRise: 0.01},
 	{benchmark: "BenchmarkAdjacencyAppendScaling/chunked_10000", unit: "allocs/op"},
 	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "B/op", maxRise: 0.01},
-	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "allocs/op"},
+	// Identical WAL code measured 5643–5644 allocs/op in the main baseline.
+	{benchmark: "BenchmarkLoadLatestWALV2/delta_history/256", unit: "allocs/op", maxAbsoluteRise: 1},
 }
 
 var cpuSuffix = regexp.MustCompile(`-\d+$`)
