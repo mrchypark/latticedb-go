@@ -114,6 +114,37 @@ func BenchmarkPagedMapAllScaling(b *testing.B) {
 	}
 }
 
+func BenchmarkPagedMapDeleteToSmallActive(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		values := NewPagedMap[uint64]()
+		for _, id := range []uint64{1, 1 << 14, 1 << 20} {
+			values.Set(id, id)
+		}
+		values.Delete(1 << 20)
+		for range values.All() {
+		}
+	}
+}
+
+func BenchmarkPagedMapAllAfterDeleteToSmallActive(b *testing.B) {
+	values := NewPagedMap[uint64]()
+	for _, id := range []uint64{1, 1 << 14, 1 << 20} {
+		values.Set(id, id)
+	}
+	values.Delete(1 << 20)
+	b.ReportAllocs()
+	for range b.N {
+		var count int
+		for range values.All() {
+			count++
+		}
+		if count != 2 {
+			b.Fatal("short paged map iteration")
+		}
+	}
+}
+
 func BenchmarkSequentialMapForkSet(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
 		paged := NewPagedMap[uint64]()

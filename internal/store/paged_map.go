@@ -143,6 +143,7 @@ func (m *PagedMap[V]) Delete(id uint64) {
 			delete(m.roots, high)
 		}
 	}
+	m.restoreSmallActive()
 }
 
 func (m PagedMap[V]) Fork() PagedMap[V] {
@@ -333,4 +334,47 @@ func (m *PagedMap[V]) removeActive(key uint64) {
 			return
 		}
 	}
+}
+
+func (m *PagedMap[V]) restoreSmallActive() {
+	// ponytail: scan after page deletion and stop at a third page; track page count if sparse deletes make this hot.
+	if m.smallActiveLen != pagedMapActiveOverflow || m.length > len(m.smallActive)*pagedMapSlots {
+		return
+	}
+	var active [2]uint64
+	count := 0
+	addRoot := func(high uint64, root *pageRoot[V]) bool {
+		if root == nil {
+			return true
+		}
+		for bucket, pages := range root {
+			if pages == nil {
+				continue
+			}
+			for shard, page := range pages {
+				if page == nil {
+					continue
+				}
+				if count == len(active) {
+					return false
+				}
+				active[count] = high<<14 | uint64(bucket)<<7 | uint64(shard)
+				count++
+			}
+		}
+		return true
+	}
+	if !addRoot(0, m.root0) {
+		return
+	}
+	for high, root := range m.roots {
+		if !addRoot(high, root) {
+			return
+		}
+	}
+	if count == len(active) && active[1] < active[0] {
+		active[0], active[1] = active[1], active[0]
+	}
+	m.smallActive = active
+	m.smallActiveLen = uint8(count)
 }
