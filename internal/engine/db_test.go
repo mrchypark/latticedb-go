@@ -3113,6 +3113,45 @@ func TestSameDatabasePathCannotBeOpenedTwice(t *testing.T) {
 	}
 }
 
+func TestReadOnlyDatabasePathCanBeOpenedTwice(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared-readers.ltdb")
+	first, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader1, err := Open(path, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader2, err := Open(path, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, OpenOptions{}); !errors.Is(err, ErrDatabaseLocked) {
+		t.Fatalf("writer Open while readers are active = %v, want ErrDatabaseLocked", err)
+	}
+	if err := reader1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, OpenOptions{}); !errors.Is(err, ErrDatabaseLocked) {
+		t.Fatalf("writer Open after one reader closes = %v, want ErrDatabaseLocked", err)
+	}
+	if err := reader2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatalf("writer Open after last reader closes: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDisableLockExplicitlyAllowsSecondOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unlocked.ltdb")
 	first, err := Open(path, OpenOptions{Create: true})
@@ -3357,7 +3396,7 @@ func TestCheckpointSerializationDoesNotBlockReaders(t *testing.T) {
 
 func TestDatabasePathLockAcrossProcesses(t *testing.T) {
 	if path := os.Getenv("LATTICEDB_LOCK_HELPER_PATH"); path != "" {
-		db, err := Open(path, OpenOptions{})
+		db, err := Open(path, OpenOptions{ReadOnly: os.Getenv("LATTICEDB_LOCK_HELPER_READONLY") == "1"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3409,6 +3448,54 @@ func TestDatabasePathLockAcrossProcesses(t *testing.T) {
 	}
 	if _, err := Open(path, OpenOptions{}); !errors.Is(err, ErrDatabaseLocked) {
 		t.Fatalf("Open while subprocess holds lock = %v, want ErrDatabaseLocked", err)
+	}
+}
+
+func TestReadOnlyDatabasePathLockAcrossProcesses(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "process-shared-readers.ltdb")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ready := filepath.Join(root, "ready")
+	release := filepath.Join(root, "release")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDatabasePathLockAcrossProcesses$")
+	cmd.Env = append(os.Environ(),
+		"LATTICEDB_LOCK_HELPER_PATH="+path,
+		"LATTICEDB_LOCK_HELPER_READONLY=1",
+		"LATTICEDB_LOCK_HELPER_READY="+ready,
+		"LATTICEDB_LOCK_HELPER_RELEASE="+release,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.WriteFile(release, nil, 0o600)
+		_ = cmd.Wait()
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("subprocess did not acquire read-only database lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	reader, err := Open(path, OpenOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("second read-only Open while subprocess holds lock: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, OpenOptions{}); !errors.Is(err, ErrDatabaseLocked) {
+		t.Fatalf("writer Open while cross-process readers are active = %v, want ErrDatabaseLocked", err)
 	}
 }
 

@@ -16,9 +16,13 @@ var (
 	unlockFileEx = kernel32.NewProc("UnlockFileEx")
 )
 
-func tryLockFile(file *os.File) error {
+func tryLockFile(file *os.File, shared bool) error {
 	var overlapped syscall.Overlapped
-	result, _, err := lockFileEx.Call(file.Fd(), lockfileExclusiveLock|1, 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
+	flags := uintptr(1)
+	if !shared {
+		flags |= lockfileExclusiveLock
+	}
+	result, _, err := lockFileEx.Call(file.Fd(), flags, 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
 	if result == 0 {
 		return err
 	}
