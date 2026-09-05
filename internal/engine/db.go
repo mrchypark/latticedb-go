@@ -297,6 +297,8 @@ type vectorRebuildState struct {
 	buildBytes        uint64
 	deltas            []vectorRebuildDelta
 	logWork, logBytes uint64
+	replayBytes       uint64
+	tombstoneBytes    map[uint64]uint64
 	err               error
 	done              chan struct{}
 	cancel            context.CancelFunc
@@ -2495,7 +2497,7 @@ func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
 	// The initiating context owns the shared attempt; coalesced callers can stop waiting without canceling it.
 	buildCtx, cancel := context.WithCancel(ctx)
 	graph := store.CloneGraphStateShallow(db.graph)
-	state := &vectorRebuildState{graph: graph, dimensions: db.vectorDimensions, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes, buildBytes: estimateVectorBuildLogicalBytes(graph, graph.VectorLiveCount), done: make(chan struct{}), cancel: cancel}
+	state := &vectorRebuildState{graph: graph, dimensions: db.vectorDimensions, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes, buildBytes: estimateVectorBuildLogicalBytes(graph, graph.VectorLiveCount), tombstoneBytes: map[uint64]uint64{}, done: make(chan struct{}), cancel: cancel}
 	db.vectorRebuild = state
 	hook := db.vectorRebuildBeforeBuild
 	db.mu.Unlock()
@@ -2555,7 +2557,17 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 				state.graph.VectorLiveCount--
 			}
 			if delta.after != nil {
-				scratchBytes, err := reserveVectorRebuildDelta(budget, state.dimensions, state.graph.VectorIndex.Nodes.Get(delta.id) == nil)
+				db.mu.Lock()
+				if tombstoneBytes := state.tombstoneBytes[delta.id]; tombstoneBytes != 0 {
+					budget.releaseBytes(tombstoneBytes)
+					state.replayBytes -= tombstoneBytes
+					delete(state.tombstoneBytes, delta.id)
+				}
+				scratchBytes, persistentBytes, err := reserveVectorRebuildDelta(budget, state.dimensions, state.graph.VectorIndex.Nodes.Get(delta.id) == nil, state.logBytes)
+				if err == nil {
+					state.replayBytes = saturatingAdd(state.replayBytes, persistentBytes)
+				}
+				db.mu.Unlock()
 				if err != nil {
 					return err
 				}
@@ -2565,6 +2577,17 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 					return err
 				}
 			} else {
+				db.mu.Lock()
+				if state.graph.VectorIndex.Nodes.Get(delta.id) != nil && state.graph.VectorTombstones.Get(delta.id) == nil {
+					tombstoneBytes := saturatingMul(uint64(state.dimensions), 4)
+					if err := reserveVectorRebuildPersistent(budget, tombstoneBytes, state.logBytes); err != nil {
+						db.mu.Unlock()
+						return err
+					}
+					state.replayBytes = saturatingAdd(state.replayBytes, tombstoneBytes)
+					state.tombstoneBytes[delta.id] = tombstoneBytes
+				}
+				db.mu.Unlock()
 				tombstoneVectorIndex(state.graph, delta.id, delta.before)
 			}
 			consumedBytes = saturatingAdd(consumedBytes, vectorRebuildDeltaBytes(delta))
@@ -2602,21 +2625,33 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 	}
 }
 
-func reserveVectorRebuildDelta(budget *directSearchBudget, dimensions uint16, newEntry bool) (uint64, error) {
+func reserveVectorRebuildDelta(budget *directSearchBudget, dimensions uint16, newEntry bool, logBytes uint64) (uint64, uint64, error) {
+	persistentBytes := uint64(0)
 	if newEntry {
-		if err := budget.reserveBytes(estimateVectorIndexBytes(1, dimensions)); err != nil {
-			return 0, err
+		persistentBytes = estimateVectorIndexBytes(1, dimensions)
+		if err := reserveVectorRebuildPersistent(budget, persistentBytes, logBytes); err != nil {
+			return 0, 0, err
 		}
 	}
-	scratchBytes := min(vectorBuildScratchBytes, budget.maxBytes-budget.bytes)
+	if budget.bytes > budget.maxBytes || logBytes > budget.maxBytes-budget.bytes {
+		return 0, 0, fmt.Errorf("%w: vector rebuild scratch exceeds budget", ErrResourceLimit)
+	}
+	scratchBytes := min(vectorBuildScratchBytes, budget.maxBytes-budget.bytes-logBytes)
 	if scratchBytes < 80 {
-		return 0, fmt.Errorf("%w: vector rebuild scratch exceeds budget", ErrResourceLimit)
+		return 0, 0, fmt.Errorf("%w: vector rebuild scratch exceeds budget", ErrResourceLimit)
 	}
 	if err := budget.reserveBytes(scratchBytes); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	budget.annVisitedLimit = scratchBytes / 80
-	return scratchBytes, nil
+	return scratchBytes, persistentBytes, nil
+}
+
+func reserveVectorRebuildPersistent(budget *directSearchBudget, bytes, logBytes uint64) error {
+	if budget.bytes > budget.maxBytes || logBytes > budget.maxBytes-budget.bytes || bytes > budget.maxBytes-budget.bytes-logBytes {
+		return fmt.Errorf("%w: vector rebuild exceeds budget", ErrResourceLimit)
+	}
+	return budget.reserveBytes(bytes)
 }
 
 func (db *DB) vectorRebuildActive() bool {
@@ -2666,7 +2701,7 @@ func (db *DB) appendVectorRebuildDeltasLocked(deltas []vectorRebuildDelta) {
 	for _, delta := range deltas {
 		bytes := vectorRebuildDeltaBytes(delta)
 		work := saturatingAdd(uint64(len(delta.before)), uint64(len(delta.after)))
-		if state.buildBytes > state.maxBytes || state.logBytes > state.maxBytes-state.buildBytes || bytes > state.maxBytes-state.buildBytes-state.logBytes || state.logWork > state.maxWork || work > state.maxWork-state.logWork {
+		if state.buildBytes > state.maxBytes || state.replayBytes > state.maxBytes-state.buildBytes || state.logBytes > state.maxBytes-state.buildBytes-state.replayBytes || bytes > state.maxBytes-state.buildBytes-state.replayBytes-state.logBytes || state.logWork > state.maxWork || work > state.maxWork-state.logWork {
 			state.err = ErrResourceLimit
 			state.cancel()
 			return

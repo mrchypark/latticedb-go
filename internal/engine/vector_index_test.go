@@ -976,8 +976,16 @@ func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
 	}
 
 	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorIndexBytes(1, 2), annVisitedLimit: ^uint64(0)}
-	if _, err := reserveVectorRebuildDelta(budget, 2, true); !errors.Is(err, ErrResourceLimit) {
+	if _, _, err := reserveVectorRebuildDelta(budget, 2, true, 0); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("replay reservation error = %v", err)
+	}
+	budget = &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: 7, annVisitedLimit: ^uint64(0)}
+	if err := reserveVectorRebuildPersistent(budget, 8, 0); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("tombstone reservation error = %v", err)
+	}
+	budget = &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: 8, annVisitedLimit: ^uint64(0)}
+	if err := reserveVectorRebuildPersistent(budget, 8, 0); err != nil || budget.bytes != 8 {
+		t.Fatalf("exact tombstone reservation = bytes %d, err %v", budget.bytes, err)
 	}
 }
 
