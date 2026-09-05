@@ -126,10 +126,11 @@ func (db *DB) ExportContextWithOptions(ctx context.Context, format ExportFormat,
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	defer lease.Release()
 	data, err := exporter.ExportGraphContextWithOptions(ctx, graph, exporter.ExportFormat(format), outputPath, exporter.ExportOptions(opts))
 	return data, wrapError(err)
 }
@@ -147,10 +148,11 @@ func (db *DB) ExportFileContextWithOptions(ctx context.Context, format ExportFor
 	if err != nil {
 		return wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return wrapError(err)
 	}
+	defer lease.Release()
 	return wrapError(exporter.ExportGraphFileContextWithOptions(ctx, graph, exporter.ExportFormat(format), outputPath, exporter.ExportOptions(opts)))
 }
 
@@ -167,10 +169,11 @@ func (db *DB) DumpContextWithOptions(ctx context.Context, opts ExportOptions) ([
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	defer lease.Release()
 	data, err := exporter.DumpGraphContextWithOptions(ctx, graph, exporter.ExportOptions(opts))
 	return data, wrapError(err)
 }
@@ -193,10 +196,11 @@ func (db *DB) DumpToContextWithOptions(ctx context.Context, output io.Writer, op
 	if err != nil {
 		return wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return wrapError(err)
 	}
+	defer lease.Release()
 	return wrapError(exporter.DumpGraphContextToWithOptions(ctx, graph, output, exporter.ExportOptions(opts)))
 }
 
@@ -218,10 +222,11 @@ func (db *DB) ExportToContextWithOptions(ctx context.Context, format ExportForma
 	if err != nil {
 		return wrapError(err)
 	}
-	graph, err := inner.SnapshotGraph()
+	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return wrapError(err)
 	}
+	defer lease.Release()
 	return wrapError(exporter.ExportGraphContextToWithOptions(ctx, graph, exporter.ExportFormat(format), output, exporter.ExportOptions(opts)))
 }
 

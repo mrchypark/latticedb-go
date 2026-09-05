@@ -69,41 +69,43 @@ const defaultDerivedBuildMaxWork = 100_000_000_000
 const defaultDerivedBuildMaxLogicalBytes = 16 << 30
 
 type OpenOptions struct {
-	Create                           bool
-	ReadOnly                         bool
-	DisableLock                      bool
-	CacheSizeMB                      uint32
-	PageSize                         uint32
-	EnableVector                     bool
-	VectorIndexMode                  VectorIndexMode
-	VectorDimensions                 uint16
-	Durability                       DurabilityMode
-	WALCheckpointThresholdBytes      uint64
-	ChangefeedMaxBytes               uint64
-	MaxDatabaseSnapshotBytes         uint64
-	RecoveryMaxDecodedBytes          uint64
-	RecoveryMaxFrames                uint64
-	RecoveryMaxWork                  uint64
-	VectorIndexBuildMaxWork          uint64
-	VectorIndexBuildMaxLogicalBytes  uint64
-	DerivedIndexBuildMaxWork         uint64
-	DerivedIndexBuildMaxLogicalBytes uint64
-	walSync                          func(*os.File) error
-	walWrite                         func(*os.File, []byte) (int, error)
-	walTruncate                      func(*os.File, int64) error
-	walCleanupSync                   func(*os.File) error
-	reserveIDs                       func(store.DatabaseFiles, string, uint64, uint64) error
-	checkpointPrepare                func(string, *store.GraphState, uint64, uint64, uint64) error
-	checkpointPublish                func()
-	checkpointTryLockFailed          func()
-	checkpointBeforeFinalTryLock     func()
-	checkpointComplete               chan struct{}
-	checkpoint                       func(string, *store.GraphState, uint64, uint64, uint64) error
-	preloadedGraph                   *store.GraphState
-	preloadedNextNodeID              uint64
-	preloadedNextEdgeID              uint64
-	preloadedCommitID                uint64
-	preloaded                        bool
+	Create                            bool
+	ReadOnly                          bool
+	DisableLock                       bool
+	CacheSizeMB                       uint32
+	PageSize                          uint32
+	EnableVector                      bool
+	VectorIndexMode                   VectorIndexMode
+	VectorDimensions                  uint16
+	Durability                        DurabilityMode
+	WALCheckpointThresholdBytes       uint64
+	ChangefeedMaxBytes                uint64
+	MaxDatabaseSnapshotBytes          uint64
+	RecoveryMaxDecodedBytes           uint64
+	RecoveryMaxFrames                 uint64
+	RecoveryMaxWork                   uint64
+	VectorIndexBuildMaxWork           uint64
+	VectorIndexBuildMaxLogicalBytes   uint64
+	DerivedIndexBuildMaxWork          uint64
+	DerivedIndexBuildMaxLogicalBytes  uint64
+	MaxGenerationLeases               uint64
+	MaxRetainedGenerationLogicalBytes uint64
+	walSync                           func(*os.File) error
+	walWrite                          func(*os.File, []byte) (int, error)
+	walTruncate                       func(*os.File, int64) error
+	walCleanupSync                    func(*os.File) error
+	reserveIDs                        func(store.DatabaseFiles, string, uint64, uint64) error
+	checkpointPrepare                 func(string, *store.GraphState, uint64, uint64, uint64) error
+	checkpointPublish                 func()
+	checkpointTryLockFailed           func()
+	checkpointBeforeFinalTryLock      func()
+	checkpointComplete                chan struct{}
+	checkpoint                        func(string, *store.GraphState, uint64, uint64, uint64) error
+	preloadedGraph                    *store.GraphState
+	preloadedNextNodeID               uint64
+	preloadedNextEdgeID               uint64
+	preloadedCommitID                 uint64
+	preloaded                         bool
 }
 
 type DurabilityMode uint8
@@ -201,80 +203,116 @@ type FTSSearchResult struct {
 }
 
 type DB struct {
-	mu                               sync.RWMutex
-	writeMu                          sync.Mutex
-	cacheMu                          sync.RWMutex
-	path                             string
-	files                            store.DatabaseFiles
-	graph                            *store.GraphState
-	nextNodeID                       uint64
-	nextEdgeID                       uint64
-	reservedNodeID                   uint64
-	reservedEdgeID                   uint64
-	commitID                         uint64
-	readOnly                         bool
-	enableVector                     bool
-	disableVectorIndex               bool
-	vectorDimensions                 uint16
-	queryCache                       map[string]*queryPlan
-	queryCacheKeys                   [queryCacheEntries]string
-	queryCacheNext                   uint32
-	cacheHits                        atomic.Uint64
-	cacheMisses                      atomic.Uint64
-	vectorExactFallbacks             atomic.Uint64
-	vectorRebuilds                   atomic.Uint64
-	vectorRebuildNanos               atomic.Uint64
-	activeTx                         atomic.Int64
-	closed                           bool
-	recoveryRequired                 bool
-	dirty                            bool
-	checkpointCount                  uint64
-	walCheckpointThresholdBytes      uint64
-	changefeedMaxBytes               uint64
-	maxDatabaseSnapshotBytes         uint64
-	vectorIndexBuildMaxWork          uint64
-	vectorIndexBuildMaxLogicalBytes  uint64
-	derivedIndexBuildMaxWork         uint64
-	derivedIndexBuildMaxLogicalBytes uint64
-	fullSync                         bool
-	walSync                          func(*os.File) error
-	walWrite                         func(*os.File, []byte) (int, error)
-	walTruncate                      func(*os.File, int64) error
-	walCleanupSync                   func(*os.File) error
-	reserveIDs                       func(store.DatabaseFiles, string, uint64, uint64) error
-	checkpointPrepare                func(string, *store.GraphState, uint64, uint64, uint64) error
-	checkpointPublish                func()
-	checkpointTryLockFailed          func()
-	checkpointBeforeFinalTryLock     func()
-	checkpointComplete               chan struct{}
-	checkpoint                       func(string, *store.GraphState, uint64, uint64, uint64) error
-	checkpointWorkerMu               sync.Mutex
-	checkpointQueued                 bool
-	checkpointNeeded                 atomic.Bool
-	adjacencyMaintenanceNeeded       atomic.Bool
-	adjacencyCompactor               *store.AdjacencyCompactor
-	adjacencyCompactorGraph          *store.GraphState
-	adjacencyCompactorCommit         uint64
-	adjacencyMaintenanceQueue        []adjacencyCandidate
-	adjacencyMaintenanceQueued       map[adjacencyCandidate]struct{}
-	adjacencyCompactorCandidate      adjacencyCandidate
-	adjacencyCompactorActive         bool
-	checkpointAttemptCond            sync.Cond
-	checkpointAttemptActive          bool
-	checkpointAttemptEpoch           uint64
-	checkpointWake                   chan struct{}
-	checkpointStop                   chan struct{}
-	checkpointStopOnce               sync.Once
-	checkpointDone                   chan struct{}
-	checkpointPending                *checkpointGeneration
-	checkpointPrepared               *store.PreparedCheckpoint
-	checkpointInFlight               atomic.Bool
-	pathLock                         *pathLock
-	wal                              *store.WALWriter
-	temporary                        bool
-	streamNotify                     chan struct{}
-	activeSnapshot                   bool
+	mu                                sync.RWMutex
+	writeMu                           sync.Mutex
+	cacheMu                           sync.RWMutex
+	path                              string
+	files                             store.DatabaseFiles
+	graph                             *store.GraphState
+	nextNodeID                        uint64
+	nextEdgeID                        uint64
+	reservedNodeID                    uint64
+	reservedEdgeID                    uint64
+	commitID                          uint64
+	readOnly                          bool
+	enableVector                      bool
+	disableVectorIndex                bool
+	vectorDimensions                  uint16
+	queryCache                        map[string]*queryPlan
+	queryCacheKeys                    [queryCacheEntries]string
+	queryCacheNext                    uint32
+	cacheHits                         atomic.Uint64
+	cacheMisses                       atomic.Uint64
+	vectorExactFallbacks              atomic.Uint64
+	vectorRebuilds                    atomic.Uint64
+	vectorRebuildNanos                atomic.Uint64
+	activeTx                          atomic.Int64
+	closed                            bool
+	recoveryRequired                  bool
+	dirty                             bool
+	checkpointCount                   uint64
+	walCheckpointThresholdBytes       uint64
+	changefeedMaxBytes                uint64
+	maxDatabaseSnapshotBytes          uint64
+	vectorIndexBuildMaxWork           uint64
+	vectorIndexBuildMaxLogicalBytes   uint64
+	derivedIndexBuildMaxWork          uint64
+	derivedIndexBuildMaxLogicalBytes  uint64
+	maxGenerationLeases               uint64
+	maxRetainedGenerationLogicalBytes uint64
+	generationLeases                  map[*store.GraphState]*generationRetention
+	generationOrderHead               *generationRetention
+	generationOrderTail               *generationRetention
+	retainedGenerationLogicalBytes    uint64
+	activeGenerationLeases            uint64
+	activeSnapshotLeases              uint64
+	fullSync                          bool
+	walSync                           func(*os.File) error
+	walWrite                          func(*os.File, []byte) (int, error)
+	walTruncate                       func(*os.File, int64) error
+	walCleanupSync                    func(*os.File) error
+	reserveIDs                        func(store.DatabaseFiles, string, uint64, uint64) error
+	checkpointPrepare                 func(string, *store.GraphState, uint64, uint64, uint64) error
+	checkpointPublish                 func()
+	checkpointTryLockFailed           func()
+	checkpointBeforeFinalTryLock      func()
+	checkpointComplete                chan struct{}
+	checkpoint                        func(string, *store.GraphState, uint64, uint64, uint64) error
+	checkpointWorkerMu                sync.Mutex
+	checkpointQueued                  bool
+	checkpointNeeded                  atomic.Bool
+	adjacencyMaintenanceNeeded        atomic.Bool
+	adjacencyCompactor                *store.AdjacencyCompactor
+	adjacencyCompactorGraph           *store.GraphState
+	adjacencyCompactorCommit          uint64
+	adjacencyMaintenanceQueue         []adjacencyCandidate
+	adjacencyMaintenanceQueued        map[adjacencyCandidate]struct{}
+	adjacencyCompactorCandidate       adjacencyCandidate
+	adjacencyCompactorActive          bool
+	checkpointAttemptCond             sync.Cond
+	checkpointAttemptActive           bool
+	checkpointAttemptEpoch            uint64
+	checkpointWake                    chan struct{}
+	checkpointStop                    chan struct{}
+	checkpointStopOnce                sync.Once
+	checkpointDone                    chan struct{}
+	checkpointPending                 *checkpointGeneration
+	checkpointPrepared                *store.PreparedCheckpoint
+	checkpointInFlight                atomic.Bool
+	pathLock                          *pathLock
+	wal                               *store.WALWriter
+	temporary                         bool
+	streamNotify                      chan struct{}
 }
+
+type generationRetention struct {
+	refs         uint64
+	logicalBytes uint64
+	openedAt     time.Time
+	previous     *generationRetention
+	next         *generationRetention
+}
+
+var generationRetentionPool = sync.Pool{New: func() any { return new(generationRetention) }}
+
+type GenerationRetentionStats struct {
+	ActiveLeases         uint64
+	ActiveSnapshotLeases uint64
+	RetainedGenerations  uint64
+	RetainedLogicalBytes uint64
+	OldestLeaseAge       time.Duration
+}
+
+// GenerationLease pins a graph generation until Release. It is used by read
+// transactions, snapshots, and exports; callers must release it exactly once.
+type GenerationLease struct {
+	db       *DB
+	graph    *store.GraphState
+	snapshot bool
+	released bool
+}
+
+var txGenerationLeasePool = sync.Pool{New: func() any { return new(GenerationLease) }}
 
 type checkpointGeneration struct {
 	graph      *store.GraphState
@@ -298,6 +336,7 @@ type Tx struct {
 	changefeedApplied      bool
 	appMetadataWritable    bool
 	queryIndexesDisabled   bool
+	generationLease        *GenerationLease
 }
 
 type adjacencyCandidate struct {
@@ -545,41 +584,44 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	}
 
 	db := &DB{
-		path:                             path,
-		files:                            files,
-		graph:                            graph,
-		nextNodeID:                       nextNodeID,
-		nextEdgeID:                       nextEdgeID,
-		reservedNodeID:                   reservedNodeID,
-		reservedEdgeID:                   reservedEdgeID,
-		commitID:                         commitID,
-		readOnly:                         opts.ReadOnly,
-		enableVector:                     opts.EnableVector || graph.VectorDimensions != 0,
-		disableVectorIndex:               opts.VectorIndexMode == VectorIndexExactOnly,
-		vectorDimensions:                 graph.VectorDimensions,
-		queryCache:                       map[string]*queryPlan{},
-		walCheckpointThresholdBytes:      opts.WALCheckpointThresholdBytes,
-		changefeedMaxBytes:               opts.ChangefeedMaxBytes,
-		maxDatabaseSnapshotBytes:         opts.MaxDatabaseSnapshotBytes,
-		vectorIndexBuildMaxWork:          opts.VectorIndexBuildMaxWork,
-		vectorIndexBuildMaxLogicalBytes:  opts.VectorIndexBuildMaxLogicalBytes,
-		derivedIndexBuildMaxWork:         opts.DerivedIndexBuildMaxWork,
-		derivedIndexBuildMaxLogicalBytes: opts.DerivedIndexBuildMaxLogicalBytes,
-		fullSync:                         opts.Durability == DurabilityFull,
-		walSync:                          opts.walSync,
-		walWrite:                         opts.walWrite,
-		walTruncate:                      opts.walTruncate,
-		walCleanupSync:                   opts.walCleanupSync,
-		reserveIDs:                       opts.reserveIDs,
-		checkpointPrepare:                opts.checkpointPrepare,
-		checkpointPublish:                opts.checkpointPublish,
-		checkpointTryLockFailed:          opts.checkpointTryLockFailed,
-		checkpointBeforeFinalTryLock:     opts.checkpointBeforeFinalTryLock,
-		checkpointComplete:               opts.checkpointComplete,
-		checkpoint:                       opts.checkpoint,
-		pathLock:                         lock,
-		wal:                              wal,
-		streamNotify:                     make(chan struct{}),
+		path:                              path,
+		files:                             files,
+		graph:                             graph,
+		nextNodeID:                        nextNodeID,
+		nextEdgeID:                        nextEdgeID,
+		reservedNodeID:                    reservedNodeID,
+		reservedEdgeID:                    reservedEdgeID,
+		commitID:                          commitID,
+		readOnly:                          opts.ReadOnly,
+		enableVector:                      opts.EnableVector || graph.VectorDimensions != 0,
+		disableVectorIndex:                opts.VectorIndexMode == VectorIndexExactOnly,
+		vectorDimensions:                  graph.VectorDimensions,
+		queryCache:                        map[string]*queryPlan{},
+		walCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
+		changefeedMaxBytes:                opts.ChangefeedMaxBytes,
+		maxDatabaseSnapshotBytes:          opts.MaxDatabaseSnapshotBytes,
+		vectorIndexBuildMaxWork:           opts.VectorIndexBuildMaxWork,
+		vectorIndexBuildMaxLogicalBytes:   opts.VectorIndexBuildMaxLogicalBytes,
+		derivedIndexBuildMaxWork:          opts.DerivedIndexBuildMaxWork,
+		derivedIndexBuildMaxLogicalBytes:  opts.DerivedIndexBuildMaxLogicalBytes,
+		maxGenerationLeases:               opts.MaxGenerationLeases,
+		maxRetainedGenerationLogicalBytes: opts.MaxRetainedGenerationLogicalBytes,
+		generationLeases:                  map[*store.GraphState]*generationRetention{},
+		fullSync:                          opts.Durability == DurabilityFull,
+		walSync:                           opts.walSync,
+		walWrite:                          opts.walWrite,
+		walTruncate:                       opts.walTruncate,
+		walCleanupSync:                    opts.walCleanupSync,
+		reserveIDs:                        opts.reserveIDs,
+		checkpointPrepare:                 opts.checkpointPrepare,
+		checkpointPublish:                 opts.checkpointPublish,
+		checkpointTryLockFailed:           opts.checkpointTryLockFailed,
+		checkpointBeforeFinalTryLock:      opts.checkpointBeforeFinalTryLock,
+		checkpointComplete:                opts.checkpointComplete,
+		checkpoint:                        opts.checkpoint,
+		pathLock:                          lock,
+		wal:                               wal,
+		streamNotify:                      make(chan struct{}),
 	}
 	db.checkpointAttemptCond.L = &db.checkpointWorkerMu
 	if !db.readOnly {
@@ -1018,7 +1060,7 @@ func (db *DB) Close() error {
 		db.mu.Unlock()
 		return ErrTransactionsActive
 	}
-	if db.activeSnapshot {
+	if db.activeSnapshotLeases != 0 {
 		db.mu.Unlock()
 		return ErrSnapshotActive
 	}
@@ -1261,16 +1303,132 @@ func (db *DB) reopenWALAfterCheckpointError(checkpointErr error) error {
 	return checkpointErr
 }
 
-func (db *DB) SnapshotGraph() (*store.GraphState, error) {
+func (db *DB) SnapshotGraph() (*store.GraphState, *GenerationLease, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return nil, nil, ErrDatabaseClosed
+	}
+	if db.recoveryRequired {
+		return nil, nil, ErrRecoveryRequired
+	}
+	lease, err := db.acquireGenerationLeaseLocked(db.graph, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db.graph, lease, nil
+}
+
+func (db *DB) acquireGenerationLeaseLocked(graph *store.GraphState, snapshot bool) (*GenerationLease, error) {
+	lease := new(GenerationLease)
+	if err := db.admitGenerationLeaseLocked(graph, snapshot, lease); err != nil {
+		return nil, err
+	}
+	return lease, nil
+}
+
+// admitGenerationLeaseLocked pins graph in caller-owned lease storage. Read
+// transactions embed that storage so the hot path does not allocate a lease.
+func (db *DB) admitGenerationLeaseLocked(graph *store.GraphState, snapshot bool, lease *GenerationLease) error {
+	if graph == nil || graph.SnapshotBytes == 0 {
+		return fmt.Errorf("%w: generation logical size is unavailable", ErrResourceLimit)
+	}
+	if db.maxGenerationLeases != 0 && db.activeGenerationLeases >= db.maxGenerationLeases {
+		return fmt.Errorf("%w: generation lease limit is %d", ErrResourceLimit, db.maxGenerationLeases)
+	}
+	retention := db.generationLeases[graph]
+	if retention == nil {
+		if graph.SnapshotBytes > math.MaxUint64-db.retainedGenerationLogicalBytes {
+			return fmt.Errorf("%w: retained generation byte accounting overflow", ErrResourceLimit)
+		}
+		if db.maxRetainedGenerationLogicalBytes != 0 && (graph.SnapshotBytes > db.maxRetainedGenerationLogicalBytes || db.retainedGenerationLogicalBytes > db.maxRetainedGenerationLogicalBytes-graph.SnapshotBytes) {
+			return fmt.Errorf("%w: retained generation bytes would exceed %d", ErrResourceLimit, db.maxRetainedGenerationLogicalBytes)
+		}
+		if db.generationLeases == nil {
+			db.generationLeases = make(map[*store.GraphState]*generationRetention)
+		}
+		retention = generationRetentionPool.Get().(*generationRetention)
+		*retention = generationRetention{logicalBytes: graph.SnapshotBytes, openedAt: time.Now(), previous: db.generationOrderTail}
+		if db.generationOrderTail != nil {
+			db.generationOrderTail.next = retention
+		} else {
+			db.generationOrderHead = retention
+		}
+		db.generationOrderTail = retention
+		db.generationLeases[graph] = retention
+		db.retainedGenerationLogicalBytes += graph.SnapshotBytes
+	}
+	retention.refs++
+	db.activeGenerationLeases++
+	if snapshot {
+		db.activeSnapshotLeases++
+	}
+	*lease = GenerationLease{db: db, graph: graph, snapshot: snapshot}
+	return nil
+}
+
+func (db *DB) removeGenerationRetentionLocked(retention *generationRetention) {
+	if retention.previous != nil {
+		retention.previous.next = retention.next
+	} else {
+		db.generationOrderHead = retention.next
+	}
+	if retention.next != nil {
+		retention.next.previous = retention.previous
+	} else {
+		db.generationOrderTail = retention.previous
+	}
+	*retention = generationRetention{}
+	generationRetentionPool.Put(retention)
+}
+
+func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
+	if db == nil {
+		return GenerationRetentionStats{}, ErrDatabaseClosed
+	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
-		return nil, ErrDatabaseClosed
+		return GenerationRetentionStats{}, ErrDatabaseClosed
 	}
-	if db.recoveryRequired {
-		return nil, ErrRecoveryRequired
+	stats := GenerationRetentionStats{
+		ActiveLeases:         db.activeGenerationLeases,
+		ActiveSnapshotLeases: db.activeSnapshotLeases,
+		RetainedGenerations:  uint64(len(db.generationLeases)),
+		RetainedLogicalBytes: db.retainedGenerationLogicalBytes,
 	}
-	return db.graph, nil
+	if oldest := db.generationOrderHead; oldest != nil {
+		stats.OldestLeaseAge = time.Since(oldest.openedAt)
+	}
+	return stats, nil
+}
+
+// Release releases this generation pin. It is idempotent.
+func (lease *GenerationLease) Release() {
+	if lease == nil || lease.db == nil {
+		return
+	}
+	db := lease.db
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if lease.released {
+		return
+	}
+	lease.released = true
+	retention := db.generationLeases[lease.graph]
+	if retention != nil {
+		retention.refs--
+		if retention.refs == 0 {
+			delete(db.generationLeases, lease.graph)
+			db.retainedGenerationLogicalBytes -= retention.logicalBytes
+			db.removeGenerationRetentionLocked(retention)
+		}
+	}
+	db.activeGenerationLeases--
+	if lease.snapshot {
+		db.activeSnapshotLeases--
+	}
+	lease.graph = nil
 }
 
 func (db *DB) Begin(readOnly bool) (*Tx, error) {
@@ -1319,8 +1477,8 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*Tx, error) {
 }
 
 func (db *DB) beginAfterWriteLock(readOnly bool) (*Tx, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	if db.closed {
 		if !readOnly {
@@ -1347,16 +1505,24 @@ func (db *DB) beginAfterWriteLock(readOnly bool) (*Tx, error) {
 		graph = store.CloneGraphStateShallow(graph)
 		changes = newTxChanges(db.commitID)
 	}
-	db.activeTx.Add(1)
-
-	return &Tx{
+	tx := &Tx{
 		db:          db,
 		readOnly:    readOnly,
 		base:        base,
 		graph:       graph,
 		writeLocked: !readOnly,
 		changes:     changes,
-	}, nil
+	}
+	if readOnly {
+		lease := txGenerationLeasePool.Get().(*GenerationLease)
+		if err := db.admitGenerationLeaseLocked(graph, false, lease); err != nil {
+			txGenerationLeasePool.Put(lease)
+			return nil, err
+		}
+		tx.generationLease = lease
+	}
+	db.activeTx.Add(1)
+	return tx, nil
 }
 
 func (db *DB) View(fn func(*Tx) error) error {
@@ -2801,6 +2967,13 @@ func (tx *Tx) finish() *DB {
 		return nil
 	}
 	tx.closed = true
+	if tx.generationLease != nil {
+		tx.generationLease.Release()
+		*tx.generationLease = GenerationLease{}
+		txGenerationLeasePool.Put(tx.generationLease)
+		tx.generationLease = nil
+	}
+	tx.graph, tx.base, tx.changes = nil, nil, nil
 	tx.db.activeTx.Add(-1)
 	requestCheckpoint := tx.writeLocked && (tx.db.checkpointNeeded.Load() || tx.db.adjacencyMaintenanceNeeded.Load())
 	if tx.writeLocked {
