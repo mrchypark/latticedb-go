@@ -70,7 +70,7 @@ type OpenOptions struct {
 	RecoveryMaxFrames uint64
 	// RecoveryMaxWork bounds all replayed snapshot entries and WAL operations during Open. Zero uses 1,000,000,000.
 	RecoveryMaxWork uint64
-	// VectorIndexBuildMaxWork bounds synchronous HNSW distance work.
+	// VectorIndexBuildMaxWork bounds HNSW build and replay distance work.
 	VectorIndexBuildMaxWork uint64
 	// VectorIndexBuildMaxLogicalBytes bounds conservative current+new index metadata, not process RSS.
 	VectorIndexBuildMaxLogicalBytes uint64

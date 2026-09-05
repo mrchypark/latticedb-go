@@ -602,6 +602,18 @@ func TestVectorBuildBudgetAndCancellation(t *testing.T) {
 	if err := rebuildVectorIndexBudget(context.Background(), graph, ^uint64(0), newOnly); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("old+new logical byte budget error = %v", err)
 	}
+	bounded := store.NewGraphState()
+	bounded.VectorDimensions = 2
+	for id := uint64(1); id <= 4; id++ {
+		bounded.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": []float32{float32(id), 0}}})
+	}
+	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorBuildLogicalBytes(bounded, 4), annVisitedLimit: ^uint64(0)}
+	if err := rebuildVectorIndexWithBudget(context.Background(), bounded, budget); err != nil {
+		t.Fatalf("bounded scratch rebuild error = %v", err)
+	}
+	if budget.annVisitedLimit == ^uint64(0) {
+		t.Fatal("initial rebuild left scratch visits unbounded")
+	}
 }
 
 func TestHNSWLevelHasHardUpperBound(t *testing.T) {
@@ -885,6 +897,141 @@ func TestConcurrentVectorReadersRebuildAndCancellation(t *testing.T) {
 	}
 }
 
+func TestBackgroundVectorRebuildReplaysDeltasAndCoalesces(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "background-rebuild.ltdb"), OpenOptions{Create: true, EnableVector: true, VectorDimensions: 2, VectorIndexMode: VectorIndexHNSWSynchronous})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var first, second uint64
+	if err := db.Update(func(tx *Tx) error {
+		if node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"vector": []float32{1, 0}}}); err != nil {
+			return err
+		} else {
+			first = node.ID
+		}
+		if node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"vector": []float32{0, 1}}}); err != nil {
+			return err
+		} else {
+			second = node.ID
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	db.vectorRebuildBeforeBuild = func() { close(started); <-release }
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- db.RebuildVectorIndexContext(context.Background()) }()
+	<-started
+	db.mu.RLock()
+	state := db.vectorRebuild
+	db.mu.RUnlock()
+	if state == nil {
+		t.Fatal("paused rebuild has no state")
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetVector(first, "vector", []float32{3, 0}) }); err != nil {
+		t.Fatalf("write during rebuild: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetVector(first, "vector", []float32{4, 0}) }); err != nil {
+		t.Fatalf("replacement during rebuild: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.DeleteNode(second) }); err != nil {
+		t.Fatalf("delete during rebuild: %v", err)
+	}
+	secondDone := make(chan error, 1)
+	waiting := &rebuildWaitContext{Context: context.Background(), entered: make(chan struct{})}
+	go func() { secondDone <- db.RebuildVectorIndexContext(waiting) }()
+	<-waiting.entered
+	select {
+	case err := <-secondDone:
+		t.Fatalf("coalesced rebuild returned early: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if state.logBytes != 0 {
+		t.Fatalf("consumed delta bytes remain charged: %d", state.logBytes)
+	}
+	if err := validateVectorIndex(db.graph); err != nil {
+		t.Fatal(err)
+	}
+	results, err := db.VectorSearch([]float32{4, 0}, VectorSearchOptions{K: 2})
+	if err != nil || len(results) != 1 || results[0].NodeID != first {
+		t.Fatalf("replayed search = %#v, %v", results, err)
+	}
+}
+
+func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := &vectorRebuildState{dimensions: 2, maxBytes: vectorRebuildDeltaBytes(vectorRebuildDelta{after: []float32{1, 2}}) - 1, maxWork: ^uint64(0), cancel: cancel}
+	db := &DB{vectorRebuild: state}
+	base := store.NewGraphState()
+	base.VectorDimensions = 2
+	graph := store.CloneGraphStateShallow(base)
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	db.appendVectorRebuildTxLocked(&Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}})
+	if !errors.Is(state.err, ErrResourceLimit) {
+		t.Fatalf("delta log error = %v", state.err)
+	}
+	if len(state.deltas) != 0 {
+		t.Fatalf("over-budget delta was retained: %#v", state.deltas)
+	}
+
+	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorIndexBytes(1, 2), annVisitedLimit: ^uint64(0)}
+	if _, _, err := reserveVectorRebuildDelta(budget, 2, true, 0); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("replay reservation error = %v", err)
+	}
+	budget = &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: 7, annVisitedLimit: ^uint64(0)}
+	if err := reserveVectorRebuildPersistent(budget, 8, 0); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("tombstone reservation error = %v", err)
+	}
+	budget = &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: 8, annVisitedLimit: ^uint64(0)}
+	if err := reserveVectorRebuildPersistent(budget, 8, 0); err != nil || budget.bytes != 8 {
+		t.Fatalf("exact tombstone reservation = bytes %d, err %v", budget.bytes, err)
+	}
+}
+
+func TestInactiveVectorRebuildDoesNotCloneCommitDeltas(t *testing.T) {
+	base := store.NewGraphState()
+	base.VectorDimensions = 2
+	graph := store.CloneGraphStateShallow(base)
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	tx := &Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}}
+	db := &DB{}
+	if allocations := testing.AllocsPerRun(100, func() { db.appendVectorRebuildTxLocked(tx) }); allocations != 0 {
+		t.Fatalf("inactive delta capture allocations = %f", allocations)
+	}
+}
+
+func TestOverBudgetVectorRebuildDoesNotCloneCommitDelta(t *testing.T) {
+	base := store.NewGraphState()
+	base.VectorDimensions = 2
+	graph := store.CloneGraphStateShallow(base)
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	tx := &Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}}
+	state := &vectorRebuildState{maxBytes: vectorRebuildDeltaBytes(vectorRebuildDelta{after: []float32{1, 2}}) - 1, maxWork: ^uint64(0), cancel: func() {}}
+	db := &DB{vectorRebuild: state}
+	if allocations := testing.AllocsPerRun(100, func() {
+		state.err = nil
+		db.appendVectorRebuildTxLocked(tx)
+	}); allocations != 0 {
+		t.Fatalf("over-budget delta capture allocations = %f", allocations)
+	}
+	if !errors.Is(state.err, ErrResourceLimit) {
+		t.Fatalf("delta log error = %v", state.err)
+	}
+	if len(state.deltas) != 0 {
+		t.Fatalf("over-budget delta was retained: %#v", state.deltas)
+	}
+}
+
 func TestVectorSearchScratchReset(t *testing.T) {
 	scratch := &vectorSearchScratch{
 		frontier: []vectorCandidate{{id: 1}},
@@ -989,4 +1136,17 @@ func TestVectorSearchScratchRejectsOversizedPooledCapacity(t *testing.T) {
 	if vectorSearchScratchFits(scratch, 16, 16, 16) {
 		t.Fatal("oversized pooled scratch fit a small request")
 	}
+}
+
+// Done is evaluated by the coalesced caller's select after it has joined the
+// existing attempt. Waiting for it avoids relying on goroutine scheduling.
+type rebuildWaitContext struct {
+	context.Context
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (ctx *rebuildWaitContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.entered) })
+	return ctx.Context.Done()
 }
