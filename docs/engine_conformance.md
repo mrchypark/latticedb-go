@@ -371,6 +371,7 @@ This matters more than exact internal planning strategy.
 ### Vector Search
 
 - Vector search is nearest-neighbor search over stored vectors.
+- The current Go direct search API uses one global index without a property selector. Each node contributes its lexicographically first vector-valued property; applications should use a single consistent vector property and embedding space per database. Property-scoped namespaces remain outside the current compatibility contract.
 - Result arrays are ordered by distance ascending.
 - Lower distance is better.
 - When one stored vector is an exact match for the query vector and another is not, the exact match should rank ahead.
@@ -444,7 +445,7 @@ Current export behavior establishes several logical invariants worth preserving 
 - repeated dumps of unchanged logical state are byte-stable
 - CSV export writes a JSON manifest at the requested output path; its `nodes` and `edges` fields are paths relative to the manifest directory
 - each CSV publication uses an immutable directory under `<output>_generations`, and node labels are encoded as a JSON array in the CSV field
-- published CSV generations are retained because readers have no lease protocol; callers that export repeatedly must manage retention only after they know no reader references an older manifest
+- published CSV generations are retained by default; the Go API offers explicit generation leases and pruning. Every reader must hold an `OpenCSVGenerationContext` lease until it finishes reading when `PruneCSVGenerationsContext` is used. Pruning preserves the current generation and active leases; legacy readers are not protected. Native Unix locking and directory sync are required, and unsupported platforms return an error
 
 ### Import Compatibility Boundary
 
