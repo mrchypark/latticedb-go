@@ -3692,6 +3692,9 @@ func (clause *deleteClause) apply(tx *Tx, rows []queryRow) error {
 
 func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryResult, error) {
 	if clause.CountAlias != "" {
+		if err := budget.chargeResult(64 + 32); err != nil {
+			return QueryResult{}, err
+		}
 		count := int64(0)
 		for _, row := range rows {
 			if clause.CountVar == "*" {

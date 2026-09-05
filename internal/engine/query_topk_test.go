@@ -124,9 +124,11 @@ func TestCollectTopKRowsMatchesStableFullSort(t *testing.T) {
 	slices.SortStableFunc(full, plan.compareOrderedRows)
 
 	const skip, limit = 7, 11
-	budget := newQueryBudget(t.Context(), QueryOptions{MaxBytes: 1 << 20})
+	budget := newQueryBudget(t.Context(), QueryOptions{MaxBytes: 2 << 20})
 	defer releaseQueryBudget(budget)
-	got, err := plan.collectTopKRows(&sliceQueryIterator{rows: rows}, skip, limit, budget)
+	input := ownedTopKIterator(t, rows, budget)
+	got, err := plan.collectTopKRows(input, skip, limit, budget)
+	input.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +138,7 @@ func TestCollectTopKRowsMatchesStableFullSort(t *testing.T) {
 	if !reflect.DeepEqual(got, full[:skip+limit]) {
 		t.Fatal("top-K candidates differ from stable full sort")
 	}
-	budget.releaseTemporary(uint64(len(got)) * 128)
+	budget.releaseRows(len(got))
 	if budget.bytes != 0 {
 		t.Fatalf("candidate bytes after collection = %d", budget.bytes)
 	}
@@ -145,7 +147,9 @@ func TestCollectTopKRowsMatchesStableFullSort(t *testing.T) {
 	for index := range ties {
 		ties[index] = topKTestRow(plan, 0, int64(index))
 	}
-	got, err = plan.collectTopKRows(&sliceQueryIterator{rows: ties}, 2, 3, budget)
+	input = ownedTopKIterator(t, ties, budget)
+	got, err = plan.collectTopKRows(input, 2, 3, budget)
+	input.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,34 +158,59 @@ func TestCollectTopKRowsMatchesStableFullSort(t *testing.T) {
 			t.Fatalf("tie %d has id %v, want %d", index, id, index+2)
 		}
 	}
-	budget.releaseTemporary(uint64(len(got)) * 128)
+	budget.releaseRows(len(got))
 }
 
 func TestCollectTopKRowsHonorsBudgetAndCancellation(t *testing.T) {
 	plan := &queryPlan{slots: map[string]int{"rank": 0}, orderClauses: []orderClause{{Kind: projectionValue, Var: "rank"}}}
 	rows := []queryRow{topKTestRow(plan, 2, 0), topKTestRow(plan, 1, 1)}
-	copyBudget := newQueryBudget(t.Context(), QueryOptions{MaxBytes: queryTopKCandidateBytes*2 - 1})
-	if _, err := plan.collectTopKRows(&sliceQueryIterator{rows: rows[:1]}, 0, 1, copyBudget); !errors.Is(err, ErrResourceLimit) {
+	copyBudget := newQueryBudget(t.Context(), QueryOptions{MaxBytes: queryTopKCandidateBytes})
+	copyInput := ownedTopKIterator(t, rows[:1], copyBudget)
+	if _, err := plan.collectTopKRows(copyInput, 0, 1, copyBudget); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("candidate and returned-row bytes = %v, want resource limit", err)
+	}
+	copyInput.Close()
+	if copyBudget.bytes != 0 {
+		t.Fatalf("copy budget bytes after close = %d", copyBudget.bytes)
 	}
 	releaseQueryBudget(copyBudget)
 
-	budget := newQueryBudget(t.Context(), QueryOptions{MaxBytes: queryTopKCandidateBytes*2 - 1})
-	if _, err := plan.collectTopKRows(&sliceQueryIterator{rows: rows}, 0, 2, budget); !errors.Is(err, ErrResourceLimit) {
+	budget := newQueryBudget(t.Context(), QueryOptions{MaxBytes: queryTopKCandidateBytes * 2})
+	input := ownedTopKIterator(t, rows, budget)
+	if _, err := plan.collectTopKRows(input, 0, 2, budget); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("candidate byte limit = %v, want resource limit", err)
+	}
+	input.Close()
+	if budget.bytes != 0 {
+		t.Fatalf("budget bytes after close = %d", budget.bytes)
 	}
 	releaseQueryBudget(budget)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	budget = newQueryBudget(ctx, QueryOptions{})
 	defer releaseQueryBudget(budget)
-	it := &cancelAfterQueryIterator{rows: rows, cancel: cancel, after: 1}
+	if err := budget.chargeRows(len(rows)); err != nil {
+		t.Fatal(err)
+	}
+	it := &cancelAfterQueryIterator{rows: rows, cancel: cancel, after: 1, budget: budget}
 	if _, err := plan.collectTopKRows(it, 0, 2, budget); !errors.Is(err, context.Canceled) {
 		t.Fatalf("mid-stream cancellation = %v, want context cancellation", err)
 	}
 	if it.index != 1 {
 		t.Fatalf("iterator consumed %d rows after cancellation", it.index)
 	}
+	it.Close()
+	if budget.bytes != 0 {
+		t.Fatalf("canceled budget bytes after close = %d", budget.bytes)
+	}
+}
+
+func ownedTopKIterator(t *testing.T, rows []queryRow, budget *queryBudget) *sliceQueryIterator {
+	t.Helper()
+	if err := budget.chargeRows(len(rows)); err != nil {
+		t.Fatal(err)
+	}
+	return &sliceQueryIterator{rows: rows, budget: budget}
 }
 
 func topKTestRow(plan *queryPlan, rank, id int64) queryRow {
@@ -197,6 +226,7 @@ type cancelAfterQueryIterator struct {
 	index  int
 	cancel context.CancelFunc
 	after  int
+	budget *queryBudget
 }
 
 func (it *cancelAfterQueryIterator) Next() (queryRow, bool, error) {
@@ -211,4 +241,7 @@ func (it *cancelAfterQueryIterator) Next() (queryRow, bool, error) {
 	return row, true, nil
 }
 
-func (it *cancelAfterQueryIterator) Close() {}
+func (it *cancelAfterQueryIterator) Close() {
+	it.budget.releaseRows(len(it.rows) - it.index)
+	it.index = len(it.rows)
+}
