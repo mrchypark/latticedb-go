@@ -170,6 +170,15 @@ func (db *DB) Close() error {
 	return wrapError(db.inner.Close())
 }
 
+// CloseContext waits for the writer slot until ctx is canceled. Once closing
+// starts, it completes teardown so the database is either open or closed.
+func (db *DB) CloseContext(ctx context.Context) error {
+	if db == nil || db.inner == nil {
+		return nil
+	}
+	return wrapError(db.inner.CloseContext(ctx))
+}
+
 func (db *DB) IsOpen() bool {
 	return db != nil && db.inner != nil && db.inner.IsOpen()
 }
@@ -197,6 +206,16 @@ func (db *DB) Checkpoint() error {
 		return wrapError(err)
 	}
 	return wrapError(inner.Checkpoint())
+}
+
+// CheckpointContext waits for the writer slot until ctx is canceled. Once
+// checkpoint publication starts, it completes without observing cancellation.
+func (db *DB) CheckpointContext(ctx context.Context) error {
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.CheckpointContext(ctx))
 }
 
 // GenerationRetentionStats reports logical immutable-generation pins. It does
