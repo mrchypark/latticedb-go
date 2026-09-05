@@ -44,9 +44,7 @@ func (lease *CSVGenerationLease) Close() error {
 	if lease == nil || lease.inner == nil {
 		return nil
 	}
-	err := lease.inner.Close()
-	lease.inner = nil
-	return wrapError(err)
+	return wrapError(lease.inner.Close())
 }
 
 func PruneCSVGenerationsContext(ctx context.Context, manifestPath string, retention CSVGenerationRetention) (int, error) {

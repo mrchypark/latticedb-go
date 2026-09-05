@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -69,6 +70,32 @@ func TestCSVGenerationLeasesProtectReadersAndPruneOldGenerations(t *testing.T) {
 	removed, err = PruneCSVGenerationsContext(context.Background(), output, CSVGenerationRetention{KeepLatest: 1})
 	if err != nil || removed != 1 {
 		t.Fatalf("removed after lease close = %d, %v", removed, err)
+	}
+}
+
+func TestCSVGenerationLeaseCloseIsConcurrentAndIdempotent(t *testing.T) {
+	db := openExportLimitDB(t)
+	output := filepath.Join(t.TempDir(), "graph.csv")
+	_ = exportCSVGeneration(t, db, output)
+	lease, err := OpenCSVGenerationContext(context.Background(), output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var group sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			errs <- lease.Close()
+		}()
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
