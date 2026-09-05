@@ -441,6 +441,104 @@ func collectQueryRows(it queryIterator) ([]queryRow, error) {
 	}
 }
 
+type orderedQueryRow struct {
+	row      queryRow
+	sequence int
+}
+
+const queryTopKCandidateBytes = 128
+
+// collectTopKRows retains only the SKIP+LIMIT rows needed for ordered pagination.
+// Its caller releases the returned-row charge after rendering.
+// ponytail: this bounds sort candidates, not upstream expansion buffers; add stage-lifetime accounting when MaxBytes must model end-to-end peak.
+func (plan *queryPlan) collectTopKRows(it queryIterator, skip, limit int, budget *queryBudget) ([]queryRow, error) {
+	candidateLimit := skip + limit
+	var candidates []orderedQueryRow
+	var candidateBytes uint64
+	defer func() { budget.releaseTemporary(candidateBytes) }()
+	for sequence := 0; ; sequence++ {
+		if err := budget.check(0, 0); err != nil {
+			return nil, err
+		}
+		row, ok, err := it.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		if len(candidates) == cap(candidates) && len(candidates) < candidateLimit {
+			capacity := cap(candidates)
+			nextCapacity := 1
+			if capacity != 0 {
+				if capacity > candidateLimit-capacity {
+					nextCapacity = candidateLimit
+				} else {
+					nextCapacity = capacity * 2
+				}
+			}
+			nextBytes := uint64(nextCapacity) * queryTopKCandidateBytes
+			if err := budget.chargeTemporary(nextBytes); err != nil {
+				return nil, err
+			}
+			expanded := make([]orderedQueryRow, len(candidates), nextCapacity)
+			copy(expanded, candidates)
+			candidates = expanded
+			budget.releaseTemporary(candidateBytes)
+			candidateBytes = nextBytes
+		}
+		candidates = plan.pushTopKRow(candidates, orderedQueryRow{row: row, sequence: sequence}, candidateLimit)
+	}
+	slices.SortFunc(candidates, plan.compareOrderedQueryRows)
+	if err := budget.check(0, 0); err != nil {
+		return nil, err
+	}
+	rowBytes := uint64(len(candidates)) * 128
+	if err := budget.chargeTemporary(rowBytes); err != nil {
+		return nil, err
+	}
+	rows := make([]queryRow, len(candidates))
+	for index, candidate := range candidates {
+		rows[index] = candidate.row
+	}
+	return rows, nil
+}
+
+func (plan *queryPlan) pushTopKRow(heap []orderedQueryRow, row orderedQueryRow, limit int) []orderedQueryRow {
+	if len(heap) < limit {
+		heap = append(heap, row)
+		for child := len(heap) - 1; child > 0; {
+			parent := (child - 1) / 2
+			if plan.compareOrderedQueryRows(heap[child], heap[parent]) <= 0 {
+				break
+			}
+			heap[child], heap[parent] = heap[parent], heap[child]
+			child = parent
+		}
+		return heap
+	}
+	if plan.compareOrderedQueryRows(row, heap[0]) >= 0 {
+		return heap
+	}
+	heap[0] = row
+	for parent := 0; ; {
+		worst := parent
+		left := parent*2 + 1
+		right := left + 1
+		if left < len(heap) && plan.compareOrderedQueryRows(heap[left], heap[worst]) > 0 {
+			worst = left
+		}
+		if right < len(heap) && plan.compareOrderedQueryRows(heap[right], heap[worst]) > 0 {
+			worst = right
+		}
+		if worst == parent {
+			return heap
+		}
+		heap[parent], heap[worst] = heap[worst], heap[parent]
+		parent = worst
+	}
+}
+
 type boundValue struct {
 	Node     *store.NodeRecord
 	Edge     *store.EdgeRecord
@@ -986,6 +1084,23 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		}
 		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit}, budget)
 	}
+	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit {
+		rows, err := plan.collectTopKRows(stream, skip, limit, budget)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		rowBytes := uint64(len(rows)) * 128
+		defer budget.releaseTemporary(rowBytes)
+		result, err := plan.returnClause.render(rows, budget)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		if skip > len(result.Rows) {
+			skip = len(result.Rows)
+		}
+		result.Rows = result.Rows[skip:]
+		return result, nil
+	}
 	rows, err = collectQueryRows(stream)
 	if err != nil {
 		return QueryResult{}, err
@@ -1028,18 +1143,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		return QueryResult{}, nil
 	}
 	if len(plan.orderClauses) != 0 {
-		slices.SortStableFunc(rows, func(left, right queryRow) int {
-			for _, clause := range plan.orderClauses {
-				comparison := compareOrderValues(clause.value(left), clause.value(right))
-				if clause.Desc {
-					comparison = -comparison
-				}
-				if comparison != 0 {
-					return comparison
-				}
-			}
-			return compareRowBindings(left, right)
-		})
+		slices.SortStableFunc(rows, plan.compareOrderedRows)
 	}
 	result, err := plan.returnClause.render(rows, budget)
 	if err != nil {
@@ -2528,6 +2632,23 @@ func compareOrderMap(left, right map[string]any) int {
 		}
 	}
 	return cmp.Compare(len(leftKeys), len(rightKeys))
+}
+
+func (plan *queryPlan) compareOrderedRows(left, right queryRow) int {
+	for _, clause := range plan.orderClauses {
+		comparison := compareOrderValues(clause.value(left), clause.value(right))
+		if clause.Desc {
+			comparison = -comparison
+		}
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	return compareRowBindings(left, right)
+}
+
+func (plan *queryPlan) compareOrderedQueryRows(left, right orderedQueryRow) int {
+	return cmp.Or(plan.compareOrderedRows(left.row, right.row), cmp.Compare(left.sequence, right.sequence))
 }
 
 func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
