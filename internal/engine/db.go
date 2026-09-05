@@ -1797,7 +1797,10 @@ func fuzzyTokenMatchBudget(term, token string, maxDistance, minTermLength uint32
 		return false, budget.add(uint64(max(1, min(len(term), len(token)))))
 	}
 	distance, err := levenshteinDistanceBudget(term, token, maxDistance, budget)
-	return distance <= int(maxDistance), err
+	if err != nil {
+		return false, err
+	}
+	return uint64(distance) <= uint64(maxDistance), nil
 }
 
 func levenshteinDistanceBudget(left, right string, maxDistance uint32, budget *directSearchBudget) (int, error) {
@@ -1807,6 +1810,17 @@ func levenshteinDistanceBudget(left, right string, maxDistance uint32, budget *d
 	if err := budget.checkTempBytes(tempBytes); err != nil {
 		return 0, err
 	}
+	lengthGap := max(leftCount, rightCount) - shortCount
+	if lengthGap > uint64(maxDistance) {
+		if err := budget.check(); err != nil {
+			return 0, err
+		}
+		if err := budget.add(saturatingAdd(leftCount, rightCount)); err != nil {
+			return 0, err
+		}
+		return int(lengthGap), nil
+	}
+	// ponytail: equal-length vocabulary still scans keys with budgeted full DP; add an index only with workload evidence.
 	leftRunes, rightRunes := []rune(left), []rune(right)
 	if len(rightRunes) > len(leftRunes) {
 		leftRunes, rightRunes = rightRunes, leftRunes
@@ -1833,7 +1847,7 @@ func levenshteinDistanceBudget(left, right string, maxDistance uint32, budget *d
 			curr[j+1] = min(prev[j+1]+1, curr[j]+1, prev[j]+cost)
 			rowMin = min(rowMin, curr[j+1])
 		}
-		if rowMin > int(maxDistance) {
+		if uint64(rowMin) > uint64(maxDistance) {
 			return rowMin, nil
 		}
 		prev, curr = curr, prev

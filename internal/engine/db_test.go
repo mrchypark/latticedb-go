@@ -1264,11 +1264,12 @@ func TestForegroundUpdateWaitsForCheckpointPublication(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "background-foreground-priority.ltdb")
 	started := make(chan struct{})
 	release := make(chan struct{})
+	var publishOnce sync.Once
 	db, err := Open(path, OpenOptions{
 		Create:                      true,
 		WALCheckpointThresholdBytes: 1,
 		checkpointPublish: func() {
-			close(started)
+			publishOnce.Do(func() { close(started) })
 			<-release
 		},
 	})
