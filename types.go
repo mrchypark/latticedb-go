@@ -36,10 +36,12 @@ const (
 )
 
 type OpenOptions struct {
-	Create      bool
-	ReadOnly    bool
+	Create   bool
+	ReadOnly bool
+	// CacheSizeMB is reserved for source compatibility. Nonzero values are unsupported and return ErrUnsupportedOption.
 	CacheSizeMB uint32
-	PageSize    uint32
+	// PageSize is reserved for source compatibility. Nonzero values are unsupported and return ErrUnsupportedOption.
+	PageSize uint32
 	// EnableWAL is reserved for compatibility; true is unsupported because WAL is always enabled. Leave false (the default).
 	EnableWAL bool
 	// DisableWAL requests an unsupported mode because WAL is always enabled. Leave false (the default).
