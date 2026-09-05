@@ -15,6 +15,10 @@ func TestOpenOptionsUnsupportedRequests(t *testing.T) {
 		{name: "disable WAL", opts: OpenOptions{DisableWAL: true}, want: "disabling WAL"},
 		{name: "enable WAL", opts: OpenOptions{EnableWAL: true}, want: "EnableWAL"},
 		{name: "adjacency cache", opts: OpenOptions{EnableAdjacencyCache: true}, want: "EnableAdjacencyCache"},
+		{name: "legacy cache size", opts: OpenOptions{CacheSizeMB: 100}, want: "CacheSizeMB"},
+		{name: "cache size", opts: OpenOptions{CacheSizeMB: 1}, want: "CacheSizeMB"},
+		{name: "legacy page size", opts: OpenOptions{PageSize: 4096}, want: "PageSize"},
+		{name: "page size", opts: OpenOptions{PageSize: 1}, want: "PageSize"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
