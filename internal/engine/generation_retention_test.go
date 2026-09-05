@@ -23,16 +23,16 @@ func TestGenerationRetentionRemovesFinalLeaseOutOfOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	second.Release()
-	if db.retainedGenerationLogicalBytes != db.graph.SnapshotBytes || db.generationOrder.Len() != 1 {
-		t.Fatalf("after newer final release: bytes=%d generations=%d", db.retainedGenerationLogicalBytes, db.generationOrder.Len())
+	if db.retainedGenerationLogicalBytes != db.graph.SnapshotBytes || generationRetentionCount(db) != 1 {
+		t.Fatalf("after newer final release: bytes=%d generations=%d", db.retainedGenerationLogicalBytes, generationRetentionCount(db))
 	}
 	first.Release()
-	if db.generationOrder.Len() != 1 {
-		t.Fatalf("coalesced generation removed early: %d", db.generationOrder.Len())
+	if generationRetentionCount(db) != 1 {
+		t.Fatalf("coalesced generation removed early: %d", generationRetentionCount(db))
 	}
 	firstAgain.Release()
-	if db.retainedGenerationLogicalBytes != 0 || db.generationOrder.Len() != 0 {
-		t.Fatalf("after final release: bytes=%d generations=%d", db.retainedGenerationLogicalBytes, db.generationOrder.Len())
+	if db.retainedGenerationLogicalBytes != 0 || generationRetentionCount(db) != 0 {
+		t.Fatalf("after final release: bytes=%d generations=%d", db.retainedGenerationLogicalBytes, generationRetentionCount(db))
 	}
 }
 
@@ -64,4 +64,12 @@ func TestReleasedHandlesDropGenerationReferences(t *testing.T) {
 			t.Fatal("closed transaction retains generation")
 		}
 	}
+}
+
+func generationRetentionCount(db *DB) int {
+	count := 0
+	for retention := db.generationOrderHead; retention != nil; retention = retention.next {
+		count++
+	}
+	return count
 }

@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -242,7 +241,8 @@ type DB struct {
 	maxGenerationLeases               uint64
 	maxRetainedGenerationLogicalBytes uint64
 	generationLeases                  map[*store.GraphState]*generationRetention
-	generationOrder                   list.List
+	generationOrderHead               *generationRetention
+	generationOrderTail               *generationRetention
 	retainedGenerationLogicalBytes    uint64
 	activeGenerationLeases            uint64
 	activeSnapshotLeases              uint64
@@ -289,8 +289,11 @@ type generationRetention struct {
 	refs         uint64
 	logicalBytes uint64
 	openedAt     time.Time
-	element      *list.Element
+	previous     *generationRetention
+	next         *generationRetention
 }
+
+var generationRetentionPool = sync.Pool{New: func() any { return new(generationRetention) }}
 
 type GenerationRetentionStats struct {
 	ActiveLeases         uint64
@@ -308,6 +311,8 @@ type GenerationLease struct {
 	snapshot bool
 	released bool
 }
+
+var txGenerationLeasePool = sync.Pool{New: func() any { return new(GenerationLease) }}
 
 type checkpointGeneration struct {
 	graph      *store.GraphState
@@ -1315,25 +1320,41 @@ func (db *DB) SnapshotGraph() (*store.GraphState, *GenerationLease, error) {
 }
 
 func (db *DB) acquireGenerationLeaseLocked(graph *store.GraphState, snapshot bool) (*GenerationLease, error) {
+	lease := new(GenerationLease)
+	if err := db.admitGenerationLeaseLocked(graph, snapshot, lease); err != nil {
+		return nil, err
+	}
+	return lease, nil
+}
+
+// admitGenerationLeaseLocked pins graph in caller-owned lease storage. Read
+// transactions embed that storage so the hot path does not allocate a lease.
+func (db *DB) admitGenerationLeaseLocked(graph *store.GraphState, snapshot bool, lease *GenerationLease) error {
 	if graph == nil || graph.SnapshotBytes == 0 {
-		return nil, fmt.Errorf("%w: generation logical size is unavailable", ErrResourceLimit)
+		return fmt.Errorf("%w: generation logical size is unavailable", ErrResourceLimit)
 	}
 	if db.maxGenerationLeases != 0 && db.activeGenerationLeases >= db.maxGenerationLeases {
-		return nil, fmt.Errorf("%w: generation lease limit is %d", ErrResourceLimit, db.maxGenerationLeases)
+		return fmt.Errorf("%w: generation lease limit is %d", ErrResourceLimit, db.maxGenerationLeases)
 	}
 	retention := db.generationLeases[graph]
 	if retention == nil {
 		if graph.SnapshotBytes > math.MaxUint64-db.retainedGenerationLogicalBytes {
-			return nil, fmt.Errorf("%w: retained generation byte accounting overflow", ErrResourceLimit)
+			return fmt.Errorf("%w: retained generation byte accounting overflow", ErrResourceLimit)
 		}
 		if db.maxRetainedGenerationLogicalBytes != 0 && (graph.SnapshotBytes > db.maxRetainedGenerationLogicalBytes || db.retainedGenerationLogicalBytes > db.maxRetainedGenerationLogicalBytes-graph.SnapshotBytes) {
-			return nil, fmt.Errorf("%w: retained generation bytes would exceed %d", ErrResourceLimit, db.maxRetainedGenerationLogicalBytes)
+			return fmt.Errorf("%w: retained generation bytes would exceed %d", ErrResourceLimit, db.maxRetainedGenerationLogicalBytes)
 		}
 		if db.generationLeases == nil {
 			db.generationLeases = make(map[*store.GraphState]*generationRetention)
 		}
-		retention = &generationRetention{logicalBytes: graph.SnapshotBytes, openedAt: time.Now()}
-		retention.element = db.generationOrder.PushBack(retention)
+		retention = generationRetentionPool.Get().(*generationRetention)
+		*retention = generationRetention{logicalBytes: graph.SnapshotBytes, openedAt: time.Now(), previous: db.generationOrderTail}
+		if db.generationOrderTail != nil {
+			db.generationOrderTail.next = retention
+		} else {
+			db.generationOrderHead = retention
+		}
+		db.generationOrderTail = retention
 		db.generationLeases[graph] = retention
 		db.retainedGenerationLogicalBytes += graph.SnapshotBytes
 	}
@@ -1342,7 +1363,23 @@ func (db *DB) acquireGenerationLeaseLocked(graph *store.GraphState, snapshot boo
 	if snapshot {
 		db.activeSnapshotLeases++
 	}
-	return &GenerationLease{db: db, graph: graph, snapshot: snapshot}, nil
+	*lease = GenerationLease{db: db, graph: graph, snapshot: snapshot}
+	return nil
+}
+
+func (db *DB) removeGenerationRetentionLocked(retention *generationRetention) {
+	if retention.previous != nil {
+		retention.previous.next = retention.next
+	} else {
+		db.generationOrderHead = retention.next
+	}
+	if retention.next != nil {
+		retention.next.previous = retention.previous
+	} else {
+		db.generationOrderTail = retention.previous
+	}
+	*retention = generationRetention{}
+	generationRetentionPool.Put(retention)
 }
 
 func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
@@ -1360,8 +1397,8 @@ func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
 		RetainedGenerations:  uint64(len(db.generationLeases)),
 		RetainedLogicalBytes: db.retainedGenerationLogicalBytes,
 	}
-	if oldest := db.generationOrder.Front(); oldest != nil {
-		stats.OldestLeaseAge = time.Since(oldest.Value.(*generationRetention).openedAt)
+	if oldest := db.generationOrderHead; oldest != nil {
+		stats.OldestLeaseAge = time.Since(oldest.openedAt)
 	}
 	return stats, nil
 }
@@ -1383,8 +1420,8 @@ func (lease *GenerationLease) Release() {
 		retention.refs--
 		if retention.refs == 0 {
 			delete(db.generationLeases, lease.graph)
-			db.generationOrder.Remove(retention.element)
 			db.retainedGenerationLogicalBytes -= retention.logicalBytes
+			db.removeGenerationRetentionLocked(retention)
 		}
 	}
 	db.activeGenerationLeases--
@@ -1461,14 +1498,6 @@ func (db *DB) beginAfterWriteLock(readOnly bool) (*Tx, error) {
 	}
 
 	graph := db.graph
-	var lease *GenerationLease
-	if readOnly {
-		var err error
-		lease, err = db.acquireGenerationLeaseLocked(graph, false)
-		if err != nil {
-			return nil, err
-		}
-	}
 	var base *store.GraphState
 	var changes *txChanges
 	if !readOnly {
@@ -1476,17 +1505,24 @@ func (db *DB) beginAfterWriteLock(readOnly bool) (*Tx, error) {
 		graph = store.CloneGraphStateShallow(graph)
 		changes = newTxChanges(db.commitID)
 	}
+	tx := &Tx{
+		db:          db,
+		readOnly:    readOnly,
+		base:        base,
+		graph:       graph,
+		writeLocked: !readOnly,
+		changes:     changes,
+	}
+	if readOnly {
+		lease := txGenerationLeasePool.Get().(*GenerationLease)
+		if err := db.admitGenerationLeaseLocked(graph, false, lease); err != nil {
+			txGenerationLeasePool.Put(lease)
+			return nil, err
+		}
+		tx.generationLease = lease
+	}
 	db.activeTx.Add(1)
-
-	return &Tx{
-		db:              db,
-		readOnly:        readOnly,
-		base:            base,
-		graph:           graph,
-		writeLocked:     !readOnly,
-		changes:         changes,
-		generationLease: lease,
-	}, nil
+	return tx, nil
 }
 
 func (db *DB) View(fn func(*Tx) error) error {
@@ -2931,8 +2967,12 @@ func (tx *Tx) finish() *DB {
 		return nil
 	}
 	tx.closed = true
-	tx.generationLease.Release()
-	tx.generationLease = nil
+	if tx.generationLease != nil {
+		tx.generationLease.Release()
+		*tx.generationLease = GenerationLease{}
+		txGenerationLeasePool.Put(tx.generationLease)
+		tx.generationLease = nil
+	}
 	tx.graph, tx.base, tx.changes = nil, nil, nil
 	tx.db.activeTx.Add(-1)
 	requestCheckpoint := tx.writeLocked && (tx.db.checkpointNeeded.Load() || tx.db.adjacencyMaintenanceNeeded.Load())
