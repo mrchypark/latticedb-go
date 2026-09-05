@@ -2482,7 +2482,7 @@ func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
 		db.mu.Unlock()
 		return fmt.Errorf("%w: synchronous HNSW mode is not enabled", ErrUnsupportedOption)
 	}
-	if state := db.vectorRebuild; state != nil && state.err == nil {
+	if state := db.vectorRebuild; state != nil {
 		done := state.done
 		db.mu.Unlock()
 		select {
@@ -2492,6 +2492,7 @@ func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	// The initiating context owns the shared attempt; coalesced callers can stop waiting without canceling it.
 	buildCtx, cancel := context.WithCancel(ctx)
 	graph := store.CloneGraphStateShallow(db.graph)
 	state := &vectorRebuildState{graph: graph, dimensions: db.vectorDimensions, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes, buildBytes: estimateVectorBuildLogicalBytes(graph, graph.VectorLiveCount), done: make(chan struct{}), cancel: cancel}
@@ -2547,6 +2548,9 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 		state.deltas = nil
 		db.mu.Unlock()
 		for _, delta := range deltas {
+			if err := reserveVectorRebuildDelta(budget, state.dimensions); err != nil {
+				return err
+			}
 			if delta.before == nil && delta.after != nil {
 				state.graph.VectorLiveCount++
 			} else if delta.before != nil && delta.after == nil && state.graph.VectorLiveCount > 0 {
@@ -2590,6 +2594,17 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 	}
 }
 
+func reserveVectorRebuildDelta(budget *directSearchBudget, dimensions uint16) error {
+	if err := budget.reserveBytes(estimateVectorIndexBytes(1, dimensions)); err != nil {
+		return err
+	}
+	budget.annVisitedLimit = (budget.maxBytes - budget.bytes) / 80
+	if budget.annVisitedLimit == 0 {
+		return fmt.Errorf("%w: vector rebuild scratch exceeds budget", ErrResourceLimit)
+	}
+	return nil
+}
+
 func (db *DB) vectorRebuildActive() bool {
 	db.mu.RLock()
 	active := db.vectorRebuild != nil && db.vectorRebuild.err == nil
@@ -2631,7 +2646,7 @@ func (db *DB) appendVectorRebuildDeltasLocked(deltas []vectorRebuildDelta) {
 		return
 	}
 	for _, delta := range deltas {
-		bytes := saturatingAdd(32, saturatingMul(uint64(len(delta.before)+len(delta.after)), 4))
+		bytes := saturatingAdd(32, saturatingAdd(saturatingMul(uint64(len(delta.before)+len(delta.after)), 4), estimateVectorIndexBytes(1, state.dimensions)))
 		work := saturatingAdd(uint64(len(delta.before)), uint64(len(delta.after)))
 		if state.buildBytes > state.maxBytes || state.logBytes > state.maxBytes-state.buildBytes || bytes > state.maxBytes-state.buildBytes-state.logBytes || state.logWork > state.maxWork || work > state.maxWork-state.logWork {
 			state.err = ErrResourceLimit

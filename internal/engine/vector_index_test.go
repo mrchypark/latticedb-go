@@ -941,6 +941,22 @@ func TestBackgroundVectorRebuildReplaysDeltasAndCoalesces(t *testing.T) {
 	}
 }
 
+func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := &vectorRebuildState{dimensions: 2, maxBytes: estimateVectorIndexBytes(1, 2) - 1, maxWork: ^uint64(0), cancel: cancel}
+	db := &DB{vectorRebuild: state}
+	db.appendVectorRebuildDeltasLocked([]vectorRebuildDelta{{id: 1, after: []float32{1, 2}}})
+	if !errors.Is(state.err, ErrResourceLimit) {
+		t.Fatalf("delta log error = %v", state.err)
+	}
+
+	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorIndexBytes(1, 2), annVisitedLimit: ^uint64(0)}
+	if err := reserveVectorRebuildDelta(budget, 2); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("replay reservation error = %v", err)
+	}
+}
+
 func TestVectorSearchScratchReset(t *testing.T) {
 	scratch := &vectorSearchScratch{
 		frontier: []vectorCandidate{{id: 1}},

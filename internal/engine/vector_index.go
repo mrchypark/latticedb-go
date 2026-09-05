@@ -659,7 +659,7 @@ func (tx *Tx) applyVectorIndexChanges() error {
 	threshold := vectorRebuildThreshold(tx.graph)
 	tombstoneBytes := saturatingMul(uint64(tx.graph.VectorTombstones.Len()), uint64(tx.graph.VectorDimensions)*4)
 	debt := uint64(tx.graph.VectorTombstones.Len()) + tx.graph.VectorMutations
-	if changed && (debt > uint64(threshold) || tombstoneBytes > 64<<20) && (tx.db == nil || !tx.db.vectorRebuildActive()) {
+	if changed && (debt > uint64(threshold) || tombstoneBytes > 64<<20) {
 		return ErrVectorIndexMaintenanceRequired
 	}
 	return nil
