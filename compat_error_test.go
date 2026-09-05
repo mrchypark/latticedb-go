@@ -9,7 +9,7 @@ import (
 )
 
 func TestUpstreamStructuredErrorsAndDefaultStorageOptions(t *testing.T) {
-	db, err := Open(t.TempDir(), OpenOptions{Create: true, CacheSizeMB: 100, PageSize: 4096})
+	db, err := Open(t.TempDir(), OpenOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
 	}
