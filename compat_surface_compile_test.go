@@ -36,7 +36,7 @@ var (
 var compatUpstreamMethods = []any{
 	Version, Open, Deserialize, ExportFile, ExportFileContext,
 	(*DB).Serialize, (*DB).Close, (*DB).IsOpen, (*DB).Path, (*DB).Checkpoint,
-	(*DB).BeginRead, (*DB).BeginWrite, (*DB).Begin, (*DB).View, (*DB).Update,
+	(*DB).BeginRead, (*DB).BeginWrite, (*DB).BeginWriteContext, (*DB).Begin, (*DB).View, (*DB).Update,
 	(*DB).Query, (*DB).ExportFile, (*DB).ExportFileContext, (*DB).CacheClear, (*DB).CacheStats,
 	(*DB).CreateNodePropertyIndex, (*DB).CreateNodePropertyIndexContext, (*DB).DropNodePropertyIndex,
 	(*DB).CreateEdgePropertyIndex, (*DB).CreateEdgePropertyIndexContext, (*DB).DropEdgePropertyIndex,
