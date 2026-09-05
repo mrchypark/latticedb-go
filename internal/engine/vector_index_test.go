@@ -602,6 +602,18 @@ func TestVectorBuildBudgetAndCancellation(t *testing.T) {
 	if err := rebuildVectorIndexBudget(context.Background(), graph, ^uint64(0), newOnly); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("old+new logical byte budget error = %v", err)
 	}
+	bounded := store.NewGraphState()
+	bounded.VectorDimensions = 2
+	for id := uint64(1); id <= 4; id++ {
+		bounded.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": []float32{float32(id), 0}}})
+	}
+	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorBuildLogicalBytes(bounded, 4), annVisitedLimit: ^uint64(0)}
+	if err := rebuildVectorIndexWithBudget(context.Background(), bounded, budget); err != nil {
+		t.Fatalf("bounded scratch rebuild error = %v", err)
+	}
+	if budget.annVisitedLimit == ^uint64(0) {
+		t.Fatal("initial rebuild left scratch visits unbounded")
+	}
 }
 
 func TestHNSWLevelHasHardUpperBound(t *testing.T) {
@@ -912,8 +924,17 @@ func TestBackgroundVectorRebuildReplaysDeltasAndCoalesces(t *testing.T) {
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- db.RebuildVectorIndexContext(context.Background()) }()
 	<-started
+	db.mu.RLock()
+	state := db.vectorRebuild
+	db.mu.RUnlock()
+	if state == nil {
+		t.Fatal("paused rebuild has no state")
+	}
 	if err := db.Update(func(tx *Tx) error { return tx.SetVector(first, "vector", []float32{3, 0}) }); err != nil {
 		t.Fatalf("write during rebuild: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetVector(first, "vector", []float32{4, 0}) }); err != nil {
+		t.Fatalf("replacement during rebuild: %v", err)
 	}
 	if err := db.Update(func(tx *Tx) error { return tx.DeleteNode(second) }); err != nil {
 		t.Fatalf("delete during rebuild: %v", err)
@@ -932,10 +953,13 @@ func TestBackgroundVectorRebuildReplaysDeltasAndCoalesces(t *testing.T) {
 	if err := <-secondDone; err != nil {
 		t.Fatal(err)
 	}
+	if state.logBytes != 0 {
+		t.Fatalf("consumed delta bytes remain charged: %d", state.logBytes)
+	}
 	if err := validateVectorIndex(db.graph); err != nil {
 		t.Fatal(err)
 	}
-	results, err := db.VectorSearch([]float32{3, 0}, VectorSearchOptions{K: 2})
+	results, err := db.VectorSearch([]float32{4, 0}, VectorSearchOptions{K: 2})
 	if err != nil || len(results) != 1 || results[0].NodeID != first {
 		t.Fatalf("replayed search = %#v, %v", results, err)
 	}
@@ -944,7 +968,7 @@ func TestBackgroundVectorRebuildReplaysDeltasAndCoalesces(t *testing.T) {
 func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	state := &vectorRebuildState{dimensions: 2, maxBytes: estimateVectorIndexBytes(1, 2) - 1, maxWork: ^uint64(0), cancel: cancel}
+	state := &vectorRebuildState{dimensions: 2, maxBytes: vectorRebuildDeltaBytes(vectorRebuildDelta{after: []float32{1, 2}}) - 1, maxWork: ^uint64(0), cancel: cancel}
 	db := &DB{vectorRebuild: state}
 	db.appendVectorRebuildDeltasLocked([]vectorRebuildDelta{{id: 1, after: []float32{1, 2}}})
 	if !errors.Is(state.err, ErrResourceLimit) {
@@ -952,7 +976,7 @@ func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
 	}
 
 	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorIndexBytes(1, 2), annVisitedLimit: ^uint64(0)}
-	if err := reserveVectorRebuildDelta(budget, 2); !errors.Is(err, ErrResourceLimit) {
+	if _, err := reserveVectorRebuildDelta(budget, 2, true); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("replay reservation error = %v", err)
 	}
 }

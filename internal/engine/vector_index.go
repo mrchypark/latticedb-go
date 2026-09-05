@@ -18,6 +18,7 @@ const (
 	vectorIndexConstructionEF = 200
 	vectorIndexSearchEF       = 64
 	vectorIndexMaxLevel       = 16
+	vectorBuildScratchBytes   = 128 << 10
 )
 
 type vectorCandidate struct {
@@ -157,6 +158,10 @@ func rebuildVectorIndexWithBudget(ctx context.Context, graph *store.GraphState, 
 	}
 	slices.Sort(ids)
 	budget.bytes = estimatedBytes
+	if budget.bytes < vectorBuildScratchBytes || budget.maxBytes-budget.bytes+vectorBuildScratchBytes < 80 {
+		return fmt.Errorf("%w: vector index build scratch exceeds budget", ErrResourceLimit)
+	}
+	budget.annVisitedLimit = (budget.maxBytes - (budget.bytes - vectorBuildScratchBytes)) / 80
 	for index, id := range ids {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -174,6 +179,7 @@ func rebuildVectorIndexWithBudget(ctx context.Context, graph *store.GraphState, 
 	graph.VectorTombstones = target.VectorTombstones
 	graph.VectorLiveCount = live
 	graph.VectorMutations = 0
+	budget.releaseBytes(vectorBuildScratchBytes)
 	return nil
 }
 
@@ -697,7 +703,7 @@ func estimateVectorBuildLogicalBytes(graph *store.GraphState, live uint64) uint6
 	oldBytes := estimateVectorIndexBytes(uint64(graph.VectorIndex.Nodes.Len()), graph.VectorDimensions)
 	tombstoneBytes := saturatingMul(uint64(graph.VectorTombstones.Len()), uint64(graph.VectorDimensions)*4)
 	idsBytes := saturatingMul(uint64(graph.Nodes.Len()), 8)
-	return saturatingAdd(saturatingAdd(newBytes, oldBytes), saturatingAdd(tombstoneBytes, saturatingAdd(idsBytes, 128<<10)))
+	return saturatingAdd(saturatingAdd(newBytes, oldBytes), saturatingAdd(tombstoneBytes, saturatingAdd(idsBytes, vectorBuildScratchBytes)))
 }
 
 func vectorRebuildThreshold(graph *store.GraphState) int {
