@@ -33,6 +33,7 @@ func exportCSVGeneration(t *testing.T, db *DB, output string) csvGenerationManif
 }
 
 func TestCSVGenerationLeasesProtectReadersAndPruneOldGenerations(t *testing.T) {
+	requireCSVPruning(t)
 	db := openExportLimitDB(t)
 	output := filepath.Join(t.TempDir(), "graph.csv")
 	first := exportCSVGeneration(t, db, output)
@@ -171,6 +172,7 @@ func TestCSVGenerationLeaseOwnerDeathReleasesGeneration(t *testing.T) {
 }
 
 func TestCSVGenerationPruneAgeAndUnsafeLayout(t *testing.T) {
+	requireCSVPruning(t)
 	db := openExportLimitDB(t)
 	output := filepath.Join(t.TempDir(), "graph.csv")
 	old := exportCSVGeneration(t, db, output)
@@ -199,5 +201,28 @@ func TestCSVGenerationPruneAgeAndUnsafeLayout(t *testing.T) {
 	cancel()
 	if _, err := PruneCSVGenerationsContext(canceled, output, CSVGenerationRetention{KeepLatest: 1}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled prune = %v", err)
+	}
+}
+
+func requireCSVPruning(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" || runtime.GOOS == "js" || runtime.GOOS == "plan9" || runtime.GOOS == "wasip1" {
+		if _, err := PruneCSVGenerationsContext(context.Background(), "", CSVGenerationRetention{KeepLatest: 1}); !errors.Is(err, ErrCSVGenerationPruningUnsupported) {
+			t.Fatalf("unsupported prune = %v", err)
+		}
+		t.Skip("native durable pruning unsupported")
+	}
+}
+
+func TestCSVGenerationRetentionValidatesBounds(t *testing.T) {
+	requireCSVPruning(t)
+	db := openExportLimitDB(t)
+	output := filepath.Join(t.TempDir(), "graph.csv")
+	exportCSVGeneration(t, db, output)
+	if _, err := PruneCSVGenerationsContext(context.Background(), output, CSVGenerationRetention{KeepLatest: 1, MinAge: -1}); err == nil {
+		t.Fatal("negative age accepted")
+	}
+	if n, err := PruneCSVGenerationsContext(context.Background(), output, CSVGenerationRetention{KeepLatest: ^uint(0)}); err != nil || n != 0 {
+		t.Fatalf("large keep = %d, %v", n, err)
 	}
 }

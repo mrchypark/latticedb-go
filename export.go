@@ -19,8 +19,11 @@ var ErrCSVGenerationPruningUnsupported = exporter.ErrCSVGenerationPruningUnsuppo
 // generations. Readers must use OpenCSVGenerationContext while pruning is in
 // use; legacy readers have no lease and are not protected.
 type CSVGenerationRetention struct {
+	// KeepLatest preserves this many newest generations in addition to active pins and the current generation.
 	KeepLatest uint
-	MinAge     time.Duration
+	// MinAge preserves generations younger than this duration. Negative values are invalid.
+	// At least one retention setting must be positive.
+	MinAge time.Duration
 }
 
 // CSVGenerationLease pins one immutable CSV generation until Close.

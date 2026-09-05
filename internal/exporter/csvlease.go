@@ -85,15 +85,15 @@ func (lease *CSVGenerationLease) Close() error {
 		return nil
 	}
 	lease.mu.Lock()
+	defer lease.mu.Unlock()
 	file := lease.file
 	lease.file = nil
-	lease.mu.Unlock()
 	if file == nil {
 		return nil
 	}
 	csvGenerationLeases.Lock()
+	defer csvGenerationLeases.Unlock()
 	delete(csvGenerationLeases.entries, lease)
-	csvGenerationLeases.Unlock()
 	_ = unlockExportFile(file)
 	err := file.Close()
 	removeErr := os.Remove(file.Name())
@@ -107,7 +107,10 @@ func PruneCSVGenerationsContext(ctx context.Context, manifestPath string, retent
 	if !csvGenerationPruningSupported() {
 		return 0, ErrCSVGenerationPruningUnsupported
 	}
-	if retention.KeepLatest == 0 && retention.MinAge <= 0 {
+	if retention.MinAge < 0 {
+		return 0, errors.New("CSV generation MinAge must not be negative")
+	}
+	if retention.KeepLatest == 0 && retention.MinAge == 0 {
 		return 0, errors.New("CSV generation pruning requires KeepLatest or MinAge")
 	}
 	if ctx == nil {
@@ -151,17 +154,19 @@ func PruneCSVGenerationsContext(ctx context.Context, manifestPath string, retent
 		}
 		generations = append(generations, generation)
 	}
-	sort.Slice(generations, func(left, right int) bool { return generations[left].mtime.After(generations[right].mtime) })
-	kept := make(map[string]bool, retention.KeepLatest)
-	for index := range generations {
-		if uint(index) < retention.KeepLatest {
-			kept[generations[index].name] = true
+	sort.Slice(generations, func(left, right int) bool {
+		if generations[left].mtime.Equal(generations[right].mtime) {
+			return generations[left].name > generations[right].name
 		}
-	}
+		return generations[left].mtime.After(generations[right].mtime)
+	})
 	now := time.Now()
 	removed := 0
-	for _, generation := range generations {
-		if generation.name == current.name || kept[generation.name] {
+	for index, generation := range generations {
+		if err := ctx.Err(); err != nil {
+			return removed, err
+		}
+		if generation.name == current.name || uint(index) < retention.KeepLatest {
 			continue
 		}
 		if retention.MinAge > 0 && now.Sub(generation.mtime) < retention.MinAge {
@@ -265,6 +270,9 @@ func inspectCSVGeneration(root, name string) (csvGeneration, error) {
 			return csvGeneration{}, fmt.Errorf("%w: unexpected generation entry %q", ErrInvalidCSVGeneration, entry.Name())
 		}
 		leaseInfo, err := os.Lstat(filepath.Join(path, entry.Name()))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil || !leaseInfo.Mode().IsRegular() || leaseInfo.Mode()&os.ModeSymlink != 0 {
 			return csvGeneration{}, fmt.Errorf("%w: lease file", ErrInvalidCSVGeneration)
 		}
@@ -289,6 +297,8 @@ func regularCSVGenerationFile(path string) (os.FileInfo, error) {
 }
 
 func cleanupCSVLeases(generationPath string) (bool, error) {
+	csvGenerationLeases.Lock()
+	defer csvGenerationLeases.Unlock()
 	entries, err := os.ReadDir(generationPath)
 	if err != nil {
 		return false, err
@@ -302,7 +312,6 @@ func cleanupCSVLeases(generationPath string) (bool, error) {
 		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return false, fmt.Errorf("%w: lease file", ErrInvalidCSVGeneration)
 		}
-		csvGenerationLeases.Lock()
 		activeHere := false
 		for lease := range csvGenerationLeases.entries {
 			if os.SameFile(info, lease.info) {
@@ -310,7 +319,6 @@ func cleanupCSVLeases(generationPath string) (bool, error) {
 				break
 			}
 		}
-		csvGenerationLeases.Unlock()
 		if activeHere {
 			return true, nil
 		}
