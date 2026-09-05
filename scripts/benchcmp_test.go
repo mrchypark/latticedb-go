@@ -223,6 +223,10 @@ func TestCheckGatesReportsButDoesNotBlockWALLatency(t *testing.T) {
 		"BenchmarkLoadLatestWALV2/delta_history/256 allocs/op": 101,
 	})
 	current["BenchmarkLoadLatestWALV2/delta_history/256"]["ns/op"] = []float64{200}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err != nil {
+		t.Fatalf("measured one-allocation WAL drift was blocked: %v", err)
+	}
+	current["BenchmarkLoadLatestWALV2/delta_history/256"]["allocs/op"] = []float64{102}
 
 	err := checkGates(current, previous, new(bytes.Buffer))
 	if err == nil || !strings.Contains(err.Error(), "BenchmarkLoadLatestWALV2/delta_history/256 allocs/op") {
