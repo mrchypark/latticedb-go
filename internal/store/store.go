@@ -398,6 +398,7 @@ type valueWalk struct {
 	active   map[valueVisit]struct{}
 	elements int
 	bytes    int
+	reserve  func(uint64) error
 }
 
 type valueVisit struct {
@@ -813,7 +814,17 @@ func NormalizeValue(value any) (any, error) {
 	return normalizeValue(value, 0, newValueWalk())
 }
 
+// NormalizeValueWithReserve reserves owned storage before each normalized copy.
+func NormalizeValueWithReserve(value any, reserve func(uint64) error) (any, error) {
+	walk := newValueWalk()
+	walk.reserve = reserve
+	return normalizeValue(value, 0, walk)
+}
+
 func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
+	if err := walk.reserveBytes(0); err != nil {
+		return nil, err
+	}
 	if depth > maxValueDepth {
 		return nil, fmt.Errorf("%w: nesting exceeds %d", ErrValueLimit, maxValueDepth)
 	}
@@ -870,6 +881,9 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 		if err := walk.addBytes(len(v)); err != nil {
 			return nil, err
 		}
+		if err := walk.reserveBytes(uint64(len(v))); err != nil {
+			return nil, err
+		}
 		return append([]byte(nil), v...), nil
 	case []float32:
 		if len(v) > maxValueBytes/4 {
@@ -878,7 +892,15 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 		if err := walk.addBytes(len(v) * 4); err != nil {
 			return nil, err
 		}
-		for _, item := range v {
+		if err := walk.reserveBytes(uint64(len(v)) * 4); err != nil {
+			return nil, err
+		}
+		for index, item := range v {
+			if index%64 == 0 {
+				if err := walk.reserveBytes(0); err != nil {
+					return nil, err
+				}
+			}
 			if math.IsNaN(float64(item)) || math.IsInf(float64(item), 0) {
 				return nil, errors.New("vector contains non-finite value")
 			}
@@ -889,6 +911,9 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 			return nil, err
 		}
 		defer walk.leave(reflect.ValueOf(v))
+		if err := walk.reserveBytes(uint64(len(v)) * 16); err != nil {
+			return nil, err
+		}
 		list := make([]any, len(v))
 		for i, item := range v {
 			normalized, err := normalizeValue(item, depth+1, walk)
@@ -903,6 +928,9 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 			return nil, err
 		}
 		defer walk.leave(reflect.ValueOf(v))
+		if err := walk.reserveBytes(uint64(len(v)) * 32); err != nil {
+			return nil, err
+		}
 		out := make(map[string]any, len(v))
 		for key, item := range v {
 			if !utf8.ValidString(key) {
@@ -933,6 +961,9 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 		} else if err := walk.add(rv.Len()); err != nil {
 			return nil, err
 		}
+		if err := walk.reserveBytes(uint64(rv.Len()) * 16); err != nil {
+			return nil, err
+		}
 		list := make([]any, rv.Len())
 		for i := 0; i < rv.Len(); i++ {
 			normalized, err := normalizeValue(rv.Index(i).Interface(), depth+1, walk)
@@ -950,6 +981,9 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 			return nil, err
 		}
 		defer walk.leave(rv)
+		if err := walk.reserveBytes(uint64(rv.Len()) * 32); err != nil {
+			return nil, err
+		}
 		out := make(map[string]any, rv.Len())
 		iter := rv.MapRange()
 		for iter.Next() {
@@ -986,6 +1020,13 @@ func (walk *valueWalk) addBytes(count int) error {
 	}
 	walk.bytes += count
 	return nil
+}
+
+func (walk *valueWalk) reserveBytes(count uint64) error {
+	if walk.reserve == nil {
+		return nil
+	}
+	return walk.reserve(count)
 }
 
 func (walk *valueWalk) enter(value reflect.Value, count int) error {

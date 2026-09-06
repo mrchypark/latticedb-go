@@ -489,10 +489,12 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	}
 	var graph *store.GraphState
 	var nextNodeID, nextEdgeID, commitID uint64
+	walAppendReady := false
 	if opts.preloaded {
 		graph, nextNodeID, nextEdgeID, commitID = opts.preloadedGraph, opts.preloadedNextNodeID, opts.preloadedNextEdgeID, opts.preloadedCommitID
+		walAppendReady = true
 	} else {
-		graph, nextNodeID, nextEdgeID, commitID, err = store.LoadGraphStateFilesContextWithRecoveryLimits(ctx, files, opts.MaxDatabaseSnapshotBytes, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes, store.RecoveryLimits{
+		graph, nextNodeID, nextEdgeID, commitID, walAppendReady, err = store.LoadGraphStateFilesContextWithRecoveryLimitsAndWALAppendReady(ctx, files, opts.MaxDatabaseSnapshotBytes, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes, store.RecoveryLimits{
 			MaxDecodedBytes: opts.RecoveryMaxDecodedBytes,
 			MaxFrames:       opts.RecoveryMaxFrames,
 			MaxWork:         opts.RecoveryMaxWork,
@@ -574,8 +576,8 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	nextNodeID = max(nextNodeID, reservedNodeID)
 	nextEdgeID = max(nextEdgeID, reservedEdgeID)
 	if !opts.ReadOnly {
-		if !store.WALFilesReadyForAppend(files) {
-			if err := store.CheckpointGraphStateAndWALFiles(files, graph, nextNodeID, nextEdgeID, commitID); err != nil {
+		if !walAppendReady {
+			if err := store.CheckpointGraphStateAndWALFilesContext(ctx, files, graph, nextNodeID, nextEdgeID, commitID); err != nil {
 				_ = lock.close()
 				return nil, err
 			}
@@ -3398,6 +3400,10 @@ func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 }
 
 func (tx *Tx) DeleteNode(nodeID uint64) error {
+	return tx.deleteNodeWithBudget(nodeID, nil)
+}
+
+func (tx *Tx) deleteNodeWithBudget(nodeID uint64, budget *queryBudget) error {
 	if err := tx.ensureWritable(); err != nil {
 		return err
 	}
@@ -3414,6 +3420,11 @@ func (tx *Tx) DeleteNode(nodeID uint64) error {
 	tx.markDelete(&tx.changes.upsertNodes, &tx.changes.deleteNodes, idExists(tx.base, nodeID, true), nodeID)
 	if record := tx.graph.FTS.Get(nodeID); record != nil {
 		for _, token := range record.Tokens {
+			if budget != nil {
+				if err := budget.check(1, 0); err != nil {
+					return err
+				}
+			}
 			tx.graph.FTSTokens.Remove(token, nodeID)
 		}
 		tx.ensureFTSWritable(nodeID)
@@ -3424,13 +3435,20 @@ func (tx *Tx) DeleteNode(nodeID uint64) error {
 	for _, adjacency := range []*store.EdgeList{tx.graph.Outgoing.Get(nodeID), tx.graph.Incoming.Get(nodeID)} {
 		for chunk := range adjacency.Chunks() {
 			for _, edgeID := range chunk {
+				if budget != nil {
+					if err := budget.check(1, 0); err != nil {
+						return err
+					}
+				}
 				if !adjacency.IsRemoved(edgeID) {
 					edges[edgeID] = struct{}{}
 				}
 			}
 		}
 	}
-	tx.deleteEdgesBatch(edges)
+	if err := tx.deleteEdgesBatchWithBudget(edges, budget); err != nil {
+		return err
+	}
 	tx.ensureOutgoingWritable(nodeID)
 	tx.ensureIncomingWritable(nodeID)
 	tx.graph.Outgoing.Delete(nodeID)
@@ -3978,9 +3996,18 @@ func (tx *Tx) deleteEdge(edgeID uint64) {
 }
 
 func (tx *Tx) deleteEdgesBatch(edgeIDs map[uint64]struct{}) {
+	_ = tx.deleteEdgesBatchWithBudget(edgeIDs, nil)
+}
+
+func (tx *Tx) deleteEdgesBatchWithBudget(edgeIDs map[uint64]struct{}, budget *queryBudget) error {
 	outgoing := map[uint64][]uint64{}
 	incoming := map[uint64][]uint64{}
 	for edgeID := range edgeIDs {
+		if budget != nil {
+			if err := budget.check(1, 0); err != nil {
+				return err
+			}
+		}
 		edge := tx.graph.Edges.Get(edgeID)
 		if edge == nil {
 			continue
@@ -3993,6 +4020,11 @@ func (tx *Tx) deleteEdgesBatch(edgeIDs map[uint64]struct{}) {
 		incoming[edge.TargetID] = append(incoming[edge.TargetID], edgeID)
 	}
 	for nodeID, ids := range outgoing {
+		if budget != nil {
+			if err := budget.check(1, 0); err != nil {
+				return err
+			}
+		}
 		tx.ensureOutgoingWritable(nodeID)
 		list := tx.graph.Outgoing.Get(nodeID).RemoveKnownBatch(ids)
 		if list.Len() == 0 {
@@ -4002,6 +4034,11 @@ func (tx *Tx) deleteEdgesBatch(edgeIDs map[uint64]struct{}) {
 		}
 	}
 	for nodeID, ids := range incoming {
+		if budget != nil {
+			if err := budget.check(1, 0); err != nil {
+				return err
+			}
+		}
 		tx.ensureIncomingWritable(nodeID)
 		list := tx.graph.Incoming.Get(nodeID).RemoveKnownBatch(ids)
 		if list.Len() == 0 {
@@ -4010,6 +4047,7 @@ func (tx *Tx) deleteEdgesBatch(edgeIDs map[uint64]struct{}) {
 			tx.graph.Incoming.Set(nodeID, list)
 		}
 	}
+	return nil
 }
 
 func (tx *Tx) ensureWritable() error {

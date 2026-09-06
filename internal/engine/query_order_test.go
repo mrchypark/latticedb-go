@@ -217,14 +217,16 @@ func TestIndependentMatchPatternsUseWherePropertyCardinality(t *testing.T) {
 	if err := db.CreateNodePropertyIndex("Item", "kind"); err != nil {
 		t.Fatal(err)
 	}
-	result, err := db.QueryContext(t.Context(), `MATCH (b:Item), (r:Item) WHERE r.kind = "rare" RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`, nil, QueryOptions{MaxWork: 250})
+	// Count predicate comparisons as well as candidate visits; the unplanned
+	// repeated indexed lookup still exceeds this linear-work allowance.
+	result, err := db.QueryContext(t.Context(), `MATCH (b:Item), (r:Item) WHERE r.kind = "rare" RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`, nil, QueryOptions{MaxWork: 450})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(result.Rows) != 101 || result.Rows[0]["rid"] != int64(100) {
 		t.Fatalf("where cardinality rows = %#v", result.Rows)
 	}
-	if _, err := db.QueryContext(t.Context(), `MATCH (b:Item), (r:Item) WHERE r.kind = "rare" RETURN r.id AS rid, b.id AS bid`, nil, QueryOptions{MaxWork: 250}); !errors.Is(err, ErrResourceLimit) {
+	if _, err := db.QueryContext(t.Context(), `MATCH (b:Item), (r:Item) WHERE r.kind = "rare" RETURN r.id AS rid, b.id AS bid`, nil, QueryOptions{MaxWork: 450}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("source-order query unexpectedly succeeded: %v", err)
 	}
 }

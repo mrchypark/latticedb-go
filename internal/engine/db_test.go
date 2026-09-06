@@ -3919,11 +3919,12 @@ func TestQueryVectorBudgetChargesDimension(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := "MATCH (n) WHERE n.embedding <=> $vector RETURN n"
+	// Include parameter-map/value reservations and vector validation chunks.
 	params := map[string]any{"vector": []float32{1, 0, 0, 0}}
-	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 5}); err != nil || len(result.Rows) != 1 {
+	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 9}); err != nil || len(result.Rows) != 1 {
 		t.Fatalf("dimension boundary query = %#v, %v", result, err)
 	}
-	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 4}); !errors.Is(err, ErrResourceLimit) || len(result.Rows) != 0 {
+	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 8}); !errors.Is(err, ErrResourceLimit) || len(result.Rows) != 0 {
 		t.Fatalf("dimension budget query = %#v, %v", result, err)
 	}
 }
@@ -3942,11 +3943,12 @@ func TestQueryVectorBudget4096Dimensions(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := "MATCH (n) WHERE n.embedding <=> $vector RETURN n"
+	// Include parameter-map/value reservations and vector validation chunks.
 	params := map[string]any{"vector": vector}
-	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 4097}); err != nil || len(result.Rows) != 1 {
+	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 4164}); err != nil || len(result.Rows) != 1 {
 		t.Fatalf("4096D query = %#v, %v", result, err)
 	}
-	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 4096}); !errors.Is(err, ErrResourceLimit) || len(result.Rows) != 0 {
+	if result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxWork: 4163}); !errors.Is(err, ErrResourceLimit) || len(result.Rows) != 0 {
 		t.Fatalf("4096D budget query = %#v, %v", result, err)
 	}
 }

@@ -51,10 +51,12 @@ func TestQueryCountResultAccountsForLiveRows(t *testing.T) {
 	defer db.Close()
 	query := `UNWIND $values AS value RETURN count(*) AS count`
 	params := map[string]any{"values": []any{}}
-	if _, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxBytes: queryRowBytes - 1}); !errors.Is(err, ErrResourceLimit) {
+	// One normalized parameter map entry remains live beside the row token.
+	const boundary = queryRowBytes + 32
+	if _, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxBytes: boundary - 1}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("count below query boundary = %v", err)
 	}
-	result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxBytes: queryRowBytes})
+	result, err := db.QueryContext(context.Background(), query, params, QueryOptions{MaxBytes: boundary})
 	if err != nil || len(result.Rows) != 1 || result.Rows[0]["count"] != int64(0) {
 		t.Fatalf("count at query boundary = %#v, %v", result.Rows, err)
 	}

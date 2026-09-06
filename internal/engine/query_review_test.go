@@ -52,19 +52,21 @@ func TestQueryBoundEndpointUsesAdjacency(t *testing.T) {
 	}
 
 	query := `MATCH (a), (a)-[:KEEP {active: true}]->(b) WHERE id(a) = $id RETURN b.name AS name`
-	result, err := db.QueryContext(t.Context(), query, map[string]any{"id": int64(a)}, QueryOptions{MaxWork: 8})
+	// These bounds include parameter/predicate work but remain below a scan of
+	// the unrelated edge population.
+	result, err := db.QueryContext(t.Context(), query, map[string]any{"id": int64(a)}, QueryOptions{MaxWork: 16})
 	if err != nil || !reflect.DeepEqual(result.Rows, []map[string]any{{"name": "b"}, {"name": "a"}}) {
 		t.Fatalf("source-bound traversal = %#v, %v", result.Rows, err)
 	}
 
 	query = `MATCH (b), (a)-[:KEEP {active: true}]->(b) WHERE id(b) = $id RETURN a.name AS name`
-	result, err = db.QueryContext(t.Context(), query, map[string]any{"id": int64(b)}, QueryOptions{MaxWork: 7})
+	result, err = db.QueryContext(t.Context(), query, map[string]any{"id": int64(b)}, QueryOptions{MaxWork: 16})
 	if err != nil || !reflect.DeepEqual(result.Rows, []map[string]any{{"name": "a"}}) {
 		t.Fatalf("target-bound traversal = %#v, %v", result.Rows, err)
 	}
 
 	query = `MATCH (a), (a)-[:KEEP {active: true}]-(b) WHERE id(a) = $id RETURN b.name AS name`
-	result, err = db.QueryContext(t.Context(), query, map[string]any{"id": int64(a)}, QueryOptions{MaxWork: 12})
+	result, err = db.QueryContext(t.Context(), query, map[string]any{"id": int64(a)}, QueryOptions{MaxWork: 24})
 	if err != nil || !reflect.DeepEqual(result.Rows, []map[string]any{{"name": "b"}, {"name": "a"}, {"name": "c"}}) {
 		t.Fatalf("undirected traversal = %#v, %v", result.Rows, err)
 	}
@@ -130,7 +132,7 @@ func TestInlineLiteralPropertiesUsePropertyIndexes(t *testing.T) {
 		`MATCH (n:Item {key: $key}) RETURN n.key AS key`,
 		`MATCH (n:Item) WHERE n.key = $key RETURN n.key AS key`,
 	} {
-		result, err := db.QueryContext(t.Context(), query, map[string]any{"key": "wanted"}, QueryOptions{MaxWork: 4})
+		result, err := db.QueryContext(t.Context(), query, map[string]any{"key": "wanted"}, QueryOptions{MaxWork: 16})
 		if err != nil || !reflect.DeepEqual(result.Rows, []map[string]any{{"key": "wanted"}}) {
 			t.Fatalf("indexed node query %q = %#v, %v", query, result.Rows, err)
 		}
@@ -140,7 +142,7 @@ func TestInlineLiteralPropertiesUsePropertyIndexes(t *testing.T) {
 		`MATCH ()-[r:LINK {key: $key}]->() RETURN r.key AS key`,
 		`MATCH ()-[r:LINK]->() WHERE r.key = $key RETURN r.key AS key`,
 	} {
-		result, err := db.QueryContext(t.Context(), query, map[string]any{"key": "wanted"}, QueryOptions{MaxWork: 4})
+		result, err := db.QueryContext(t.Context(), query, map[string]any{"key": "wanted"}, QueryOptions{MaxWork: 16})
 		if err != nil || !reflect.DeepEqual(result.Rows, []map[string]any{{"key": "wanted"}}) {
 			t.Fatalf("indexed edge query %q = %#v, %v", query, result.Rows, err)
 		}
@@ -148,13 +150,13 @@ func TestInlineLiteralPropertiesUsePropertyIndexes(t *testing.T) {
 	if err := db.DropNodePropertyIndex("Item", "key"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.QueryContext(t.Context(), `MATCH (n:Item {key: "wanted"}) RETURN n.key AS key`, nil, QueryOptions{MaxWork: 4}); !errors.Is(err, ErrResourceLimit) {
+	if _, err := db.QueryContext(t.Context(), `MATCH (n:Item {key: "wanted"}) RETURN n.key AS key`, nil, QueryOptions{MaxWork: 16}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("unindexed node query error = %v", err)
 	}
 	if err := db.DropEdgePropertyIndex("LINK", "key"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.QueryContext(t.Context(), `MATCH ()-[r:LINK {key: "wanted"}]->() RETURN r.key AS key`, nil, QueryOptions{MaxWork: 4}); !errors.Is(err, ErrResourceLimit) {
+	if _, err := db.QueryContext(t.Context(), `MATCH ()-[r:LINK {key: "wanted"}]->() RETURN r.key AS key`, nil, QueryOptions{MaxWork: 16}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("unindexed edge query error = %v", err)
 	}
 }

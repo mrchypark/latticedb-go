@@ -58,6 +58,16 @@ func (budget *recoveryBudget) decodedBytes(amount uint64) error {
 	return budget.add("decoded bytes", &budget.bytes, budget.limits.MaxDecodedBytes, amount)
 }
 
+func (budget *recoveryBudget) remainingDecodedBytes() uint64 {
+	if budget.limits.MaxDecodedBytes == 0 {
+		return ^uint64(0)
+	}
+	if budget.bytes >= budget.limits.MaxDecodedBytes {
+		return 0
+	}
+	return budget.limits.MaxDecodedBytes - budget.bytes
+}
+
 func (budget *recoveryBudget) frame() error {
 	return budget.add("WAL frame count", &budget.frames, budget.limits.MaxFrames, 1)
 }
@@ -364,39 +374,47 @@ func LoadGraphStateFilesContext(ctx context.Context, files DatabaseFiles, maxCan
 
 // LoadGraphStateFilesContextWithRecoveryLimits loads state with cumulative recovery budgets.
 func LoadGraphStateFilesContextWithRecoveryLimits(ctx context.Context, files DatabaseFiles, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes uint64, limits RecoveryLimits) (*GraphState, uint64, uint64, uint64, error) {
+	graph, nextNodeID, nextEdgeID, commitID, _, err := LoadGraphStateFilesContextWithRecoveryLimitsAndWALAppendReady(ctx, files, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes, limits)
+	return graph, nextNodeID, nextEdgeID, commitID, err
+}
+
+// LoadGraphStateFilesContextWithRecoveryLimitsAndWALAppendReady loads state
+// with cumulative recovery budgets and reports whether its active WAL ended on
+// a complete current-format frame boundary.
+func LoadGraphStateFilesContextWithRecoveryLimitsAndWALAppendReady(ctx context.Context, files DatabaseFiles, maxCanonicalBytes, maxDerivedWork, maxDerivedBytes uint64, limits RecoveryLimits) (*GraphState, uint64, uint64, uint64, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	budget := &recoveryBudget{limits: limits}
 	snapshot, snapshotErr := loadCheckpointSnapshotFilesContextWithRecoveryBudget(ctx, files, maxCanonicalBytes, budget)
 	if errors.Is(snapshotErr, ErrLoadResourceLimit) {
-		return nil, 0, 0, 0, snapshotErr
+		return nil, 0, 0, 0, false, snapshotErr
 	}
 	base := snapshot
 	if snapshot != nil {
 		if err := budget.replayState(snapshot); err != nil {
-			return nil, 0, 0, 0, err
+			return nil, 0, 0, 0, false, err
 		}
 	}
 	walBase, baseErr := loadWALBaseSnapshotFilesContextWithBaseAndRecoveryBudget(ctx, files, maxCanonicalBytes, base, budget)
 	if errors.Is(baseErr, ErrLoadResourceLimit) {
-		return nil, 0, 0, 0, baseErr
+		return nil, 0, 0, 0, false, baseErr
 	}
 	if baseErr == nil {
 		if base == nil || walBase.CommitID >= base.CommitID {
 			base = walBase
 		}
 	} else if !errors.Is(baseErr, os.ErrNotExist) {
-		return nil, 0, 0, 0, baseErr
+		return nil, 0, 0, 0, false, baseErr
 	}
-	walSnapshot, walErr := loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudget(ctx, files, maxCanonicalBytes, base, budget)
+	walSnapshot, walAppendReady, walErr := loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudgetAndAppendReady(ctx, files, maxCanonicalBytes, base, budget)
 	if walSnapshot == nil && walErr != nil && !errors.Is(walErr, os.ErrNotExist) {
-		return nil, 0, 0, 0, walErr
+		return nil, 0, 0, 0, false, walErr
 	}
 
 	var chosen *persistedState
 	if err := validateRecoveryDatabaseIDs(snapshot, walBase, walSnapshot); err != nil {
-		return nil, 0, 0, 0, err
+		return nil, 0, 0, 0, false, err
 	}
 	for _, candidate := range []*persistedState{snapshot, base, walSnapshot} {
 		if candidate != nil && (chosen == nil || candidate.CommitID > chosen.CommitID) {
@@ -405,15 +423,16 @@ func LoadGraphStateFilesContextWithRecoveryLimits(ctx context.Context, files Dat
 	}
 	if chosen == nil {
 		if !errors.Is(snapshotErr, os.ErrNotExist) || !errors.Is(walErr, os.ErrNotExist) {
-			return nil, 0, 0, 0, errors.Join(snapshotErr, walErr)
+			return nil, 0, 0, 0, false, errors.Join(snapshotErr, walErr)
 		}
-		return nil, 0, 0, 0, os.ErrNotExist
+		return nil, 0, 0, 0, false, os.ErrNotExist
 	}
 
 	if err := budget.replayState(chosen); err != nil {
-		return nil, 0, 0, 0, err
+		return nil, 0, 0, 0, false, err
 	}
-	return decodePersistedStateContext(ctx, *chosen, maxDerivedWork, maxDerivedBytes)
+	graph, nextNodeID, nextEdgeID, commitID, err := decodePersistedStateContext(ctx, *chosen, maxDerivedWork, maxDerivedBytes)
+	return graph, nextNodeID, nextEdgeID, commitID, walAppendReady, err
 }
 
 func persistedStreamsWork(streams persistedStreams) uint64 {
@@ -648,6 +667,16 @@ func CheckpointGraphStateAndWAL(dbPath string, graph *GraphState, nextNodeID uin
 
 func CheckpointGraphStateAndWALFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
 	return checkpointGraphStateAndWALFiles(files, graph, nextNodeID, nextEdgeID, commitID, 0, nil)
+}
+
+// CheckpointGraphStateAndWALFilesContext observes cancellation while building
+// the replacement checkpoint and before publication begins. Once a state file
+// rename starts, it finishes the ordered durable publication.
+func CheckpointGraphStateAndWALFilesContext(ctx context.Context, files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return checkpointGraphStateAndWALFilesContext(ctx, files, graph, nextNodeID, nextEdgeID, commitID, 0, nil)
 }
 
 // CheckpointGraphStateAndCompactWAL avoids mirroring a checkpoint larger than
@@ -929,7 +958,10 @@ func checkpointGraphStateAndWALFilesContext(ctx context.Context, files DatabaseF
 	if err := writePersistedStateJSON(contextWriter{ctx: ctx, Writer: io.MultiWriter(payload, checksum)}, graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
-	if err := publishStatePayload(files, payload, graph.DatabaseID, commitID, checksum.Sum32(), fault); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := publishStatePayloadContext(ctx, files, payload, graph.DatabaseID, commitID, checksum.Sum32(), fault); err != nil {
 		return err
 	}
 	if info, err := payload.Stat(); err != nil {
@@ -961,7 +993,10 @@ func (writer contextWriter) Write(data []byte) (int, error) {
 	return writer.Writer.Write(data)
 }
 
-func publishStatePayload(files DatabaseFiles, payload *os.File, databaseID string, commitID uint64, checksum uint32, fault CheckpointFault) error {
+func publishStatePayloadContext(ctx context.Context, files DatabaseFiles, payload *os.File, databaseID string, commitID uint64, checksum uint32, fault CheckpointFault) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	info, err := payload.Stat()
 	if err != nil {
 		return err
@@ -976,6 +1011,9 @@ func publishStatePayload(files DatabaseFiles, payload *os.File, databaseID strin
 	if err := runCheckpointFault(fault, "state-create", false); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	temp, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "state"))
 	if err != nil {
 		return err
@@ -983,6 +1021,10 @@ func publishStatePayload(files DatabaseFiles, payload *os.File, databaseID strin
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
 	if err := runCheckpointFault(fault, "state-create", true); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		_ = temp.Close()
 		return err
 	}
@@ -994,7 +1036,7 @@ func publishStatePayload(files DatabaseFiles, payload *os.File, databaseID strin
 		_ = temp.Close()
 		return err
 	}
-	if _, err := io.Copy(temp, payload); err != nil {
+	if _, err := io.Copy(contextWriter{ctx: ctx, Writer: temp}, &contextReader{ctx: ctx, reader: payload}); err != nil {
 		_ = temp.Close()
 		return err
 	}
@@ -1003,6 +1045,9 @@ func publishStatePayload(files DatabaseFiles, payload *os.File, databaseID strin
 		return err
 	}
 	if err := syncCloseCheckpointFile(temp, "state", fault); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := runCheckpointFault(fault, "state-rename", false); err != nil {
@@ -1874,26 +1919,33 @@ func loadLatestWALSnapshotFilesContextWithBase(ctx context.Context, files Databa
 }
 
 func loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudget(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64, base *persistedState, budget *recoveryBudget) (*persistedState, error) {
+	state, _, err := loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudgetAndAppendReady(ctx, files, maxCanonicalBytes, base, budget)
+	return state, err
+}
+
+func loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudgetAndAppendReady(ctx context.Context, files DatabaseFiles, maxCanonicalBytes uint64, base *persistedState, budget *recoveryBudget) (*persistedState, bool, error) {
 	file, err := os.Open(files.WAL)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer file.Close()
 
 	var magic [8]byte
 	if _, err := io.ReadFull(file, magic[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, os.ErrNotExist
+			return nil, false, os.ErrNotExist
 		}
-		return nil, fmt.Errorf("read wal magic: %w", err)
+		return nil, false, fmt.Errorf("read wal magic: %w", err)
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("rewind wal: %w", err)
+		return nil, false, fmt.Errorf("rewind wal: %w", err)
 	}
 	if magic == walMagic || magic == legacyWALMagic {
-		return loadLatestWALV2ContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, base, budget)
+		state, ready, err := loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx, file, maxCanonicalBytes, base, budget)
+		return state, ready && magic == walMagic, err
 	}
-	return loadLatestLegacyWALContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, budget)
+	state, err := loadLatestLegacyWALContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, budget)
+	return state, false, err
 }
 
 func WALReadyForAppend(dbPath string) bool {
@@ -1973,9 +2025,9 @@ func loadLatestLegacyWALContextWithRecoveryBudget(ctx context.Context, file *os.
 	reader := bufio.NewReader(&contextReader{ctx: ctx, reader: file})
 	var latest *persistedState
 	for {
-		line, err := reader.ReadBytes('\n')
-		if uint64(len(line)) > maxCanonicalBytes {
-			return nil, ErrLoadResourceLimit
+		line, err := readLegacyWALLine(reader, min(maxCanonicalBytes, budget.remainingDecodedBytes()))
+		if err == ErrLoadResourceLimit {
+			return nil, err
 		}
 		if len(line) > 0 && err == nil {
 			if err := budget.frame(); err != nil {
@@ -2010,6 +2062,20 @@ func loadLatestLegacyWALContextWithRecoveryBudget(ctx context.Context, file *os.
 	return latest, nil
 }
 
+func readLegacyWALLine(reader *bufio.Reader, limit uint64) ([]byte, error) {
+	var line []byte
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if uint64(len(fragment)) > limit-uint64(len(line)) {
+			return nil, ErrLoadResourceLimit
+		}
+		line = append(line, fragment...)
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return line, err
+		}
+	}
+}
+
 func loadLatestWALV2(file *os.File) (*persistedState, error) {
 	return loadLatestWALV2Context(context.Background(), file, maxWALFrameBytes)
 }
@@ -2023,60 +2089,84 @@ func loadLatestWALV2ContextWithBase(ctx context.Context, file *os.File, maxCanon
 }
 
 func loadLatestWALV2ContextWithRecoveryBudget(ctx context.Context, file *os.File, maxCanonicalBytes uint64, base *persistedState, budget *recoveryBudget) (*persistedState, error) {
+	state, _, err := loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx, file, maxCanonicalBytes, base, budget)
+	return state, err
+}
+
+func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context, file *os.File, maxCanonicalBytes uint64, base *persistedState, budget *recoveryBudget) (*persistedState, bool, error) {
 	info, err := file.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat WAL: %w", err)
+		return nil, false, fmt.Errorf("stat WAL: %w", err)
 	}
 	var accumulator *walAccumulator
+	currentFormat := true
 	var header [walHeaderSize]byte
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if _, err := io.ReadFull(file, header[:]); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if errors.Is(err, io.EOF) {
 				break
 			}
-			return nil, fmt.Errorf("read wal header: %w", err)
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				if accumulator == nil {
+					return nil, false, os.ErrNotExist
+				}
+				state := accumulator.persistedState()
+				return &state, false, nil
+			}
+			return nil, false, fmt.Errorf("read wal header: %w", err)
 		}
 		if !validWALHeader(header[:]) {
-			return nil, errors.New("invalid WAL frame header")
+			return nil, false, errors.New("invalid WAL frame header")
+		}
+		if !validCurrentWALHeader(header[:]) {
+			currentFormat = false
 		}
 		payloadLength := binary.BigEndian.Uint64(header[20:28])
 		if payloadLength > maxWALFrameBytes || payloadLength > maxCanonicalBytes || payloadLength > uint64(^uint(0)>>1) {
-			return nil, fmt.Errorf("%w: WAL frame exceeds size limit", ErrLoadResourceLimit)
+			return nil, false, fmt.Errorf("%w: WAL frame exceeds size limit", ErrLoadResourceLimit)
 		}
 		offset, err := file.Seek(0, io.SeekCurrent)
 		if err != nil {
-			return nil, fmt.Errorf("locate WAL payload: %w", err)
+			return nil, false, fmt.Errorf("locate WAL payload: %w", err)
 		}
 		if payloadLength > uint64(max(int64(0), info.Size()-offset)) {
-			break
+			if accumulator == nil {
+				return nil, false, os.ErrNotExist
+			}
+			state := accumulator.persistedState()
+			return &state, false, nil
 		}
 		if err := budget.frame(); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := budget.decodedBytes(payloadLength); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		payload := make([]byte, int(payloadLength))
 		if _, err := io.ReadFull(&contextReader{ctx: ctx, reader: file}, payload); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				break
+				if accumulator == nil {
+					return nil, false, os.ErrNotExist
+				}
+				state := accumulator.persistedState()
+				return &state, false, nil
 			}
-			return nil, fmt.Errorf("read wal payload: %w", err)
+			return nil, false, fmt.Errorf("read wal payload: %w", err)
 		}
 		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
-			return nil, errors.New("WAL checksum mismatch")
+			return nil, false, errors.New("WAL checksum mismatch")
 		}
 		var wrapper walPayload
 		if err := unmarshalContext(ctx, payload, &wrapper); err != nil {
-			return nil, fmt.Errorf("decode WAL payload: %w", err)
+			return nil, false, fmt.Errorf("decode WAL payload: %w", err)
 		}
 		if wrapper.Kind == "" {
 			var snapshot persistedState
 			if err := unmarshalContext(ctx, payload, &snapshot); err != nil {
-				return nil, fmt.Errorf("decode legacy v2 WAL payload: %w", err)
+				return nil, false, fmt.Errorf("decode legacy v2 WAL payload: %w", err)
 			}
 			wrapper = walPayload{Kind: "snapshot", Snapshot: &snapshot}
 		}
@@ -2085,65 +2175,65 @@ func loadLatestWALV2ContextWithRecoveryBudget(ctx context.Context, file *os.File
 		switch wrapper.Kind {
 		case "snapshot":
 			if wrapper.Snapshot == nil || wrapper.Snapshot.CommitID != commitID || wrapper.Snapshot.DatabaseID != databaseID {
-				return nil, errors.New("WAL snapshot metadata mismatch")
+				return nil, false, errors.New("WAL snapshot metadata mismatch")
 			}
 			if accumulator != nil && (databaseID != accumulator.state.DatabaseID || accumulator.state.CommitID == ^uint64(0) || commitID != accumulator.state.CommitID+1) {
-				return nil, errors.New("WAL snapshot history regression")
+				return nil, false, errors.New("WAL snapshot history regression")
 			}
 			var err error
 			if err := budget.replayWork(persistedStateWork(*wrapper.Snapshot)); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			accumulator, err = newWALAccumulator(ctx, *wrapper.Snapshot)
 			if err != nil {
-				return nil, fmt.Errorf("invalid WAL snapshot: %w", err)
+				return nil, false, fmt.Errorf("invalid WAL snapshot: %w", err)
 			}
 		case "delta":
 			if wrapper.Delta == nil || wrapper.Delta.CommitID != commitID || wrapper.Delta.DatabaseID != databaseID {
-				return nil, errors.New("WAL delta metadata mismatch")
+				return nil, false, errors.New("WAL delta metadata mismatch")
 			}
 			if accumulator == nil {
-				return nil, errors.New("WAL delta has no base snapshot")
+				return nil, false, errors.New("WAL delta has no base snapshot")
 			}
 			if databaseID != accumulator.state.DatabaseID || accumulator.state.CommitID == ^uint64(0) || commitID != accumulator.state.CommitID+1 {
-				return nil, errors.New("WAL delta history regression")
+				return nil, false, errors.New("WAL delta history regression")
 			}
 			if err := budget.replayWork(persistedDeltaWork(*wrapper.Delta)); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if err := accumulator.apply(*wrapper.Delta); err != nil {
-				return nil, fmt.Errorf("invalid WAL delta: %w", err)
+				return nil, false, fmt.Errorf("invalid WAL delta: %w", err)
 			}
 		case "checkpoint":
 			if accumulator != nil {
-				return nil, errors.New("WAL checkpoint base mismatch")
+				return nil, false, errors.New("WAL checkpoint base mismatch")
 			}
 			if base == nil || base.DatabaseID != databaseID {
-				return nil, errors.New("WAL checkpoint base mismatch")
+				return nil, false, errors.New("WAL checkpoint base mismatch")
 			}
 			if base.CommitID > commitID {
-				return nil, os.ErrNotExist
+				return nil, false, os.ErrNotExist
 			}
 			if base.CommitID != commitID {
-				return nil, errors.New("WAL checkpoint base mismatch")
+				return nil, false, errors.New("WAL checkpoint base mismatch")
 			}
 			var err error
 			if err := budget.replayState(base); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			accumulator, err = newWALAccumulator(ctx, *base)
 			if err != nil {
-				return nil, fmt.Errorf("invalid WAL checkpoint base: %w", err)
+				return nil, false, fmt.Errorf("invalid WAL checkpoint base: %w", err)
 			}
 		default:
-			return nil, fmt.Errorf("unknown WAL payload kind %q", wrapper.Kind)
+			return nil, false, fmt.Errorf("unknown WAL payload kind %q", wrapper.Kind)
 		}
 	}
 	if accumulator == nil {
-		return nil, os.ErrNotExist
+		return nil, false, os.ErrNotExist
 	}
 	state := accumulator.persistedState()
-	return &state, nil
+	return &state, currentFormat, nil
 }
 
 type walAccumulator struct {

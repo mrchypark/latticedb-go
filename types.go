@@ -124,8 +124,10 @@ type ExportOptions struct {
 
 type QueryOptions struct {
 	MaxRows uint64
+	// MaxWork bounds logical execution work, including comparisons and mutations.
 	MaxWork uint64
-	// MaxBytes limits logical query materialization, not the process RSS.
+	// MaxBytes limits owned query working storage and results, including normalized
+	// parameter copies. It does not bound process RSS or committed database size.
 	MaxBytes uint64
 }
 
