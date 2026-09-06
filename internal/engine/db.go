@@ -966,7 +966,6 @@ func (db *DB) runBackgroundCheckpoint() {
 			db.checkpointTryLockFailed()
 		}
 		db.finishCheckpointAttempt()
-		db.requestBackgroundCheckpoint()
 		return
 	}
 	defer func() {
@@ -2517,8 +2516,7 @@ func buildPropertyIndex(ctx context.Context, source *store.GraphState, node bool
 	if !indexes.Create(definition) {
 		return indexes, 0, 0, fmt.Errorf("%w: property index already exists", ErrAlreadyExists)
 	}
-	work := uint64(1)
-	logicalBytes := saturatingAdd(uint64(len(definition.Scope)+len(definition.Property)), 192)
+	work, logicalBytes := propertyIndexDefinitionCost(definition)
 	if exceedsDerivedBudget(source, db, work, logicalBytes) {
 		return indexes, 0, 0, fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
 	}
@@ -2589,16 +2587,17 @@ func (db *DB) updatePropertyIndex(node, create bool, scope, property string) err
 				for id := range tx.base.Labels.All(scope) {
 					record := tx.base.Nodes.Get(id)
 					value, ok := record.Properties[property]
-					adjustPropertyIndexBudget(tx.graph, definition, value, ok, false)
+					adjustPropertyIndexBudget(tx.graph, value, ok, false)
 				}
 			} else {
 				for id := range tx.base.EdgeTypes.All(scope) {
 					record := tx.base.Edges.Get(id)
 					value, ok := record.Properties[property]
-					adjustPropertyIndexBudget(tx.graph, definition, value, ok, false)
+					adjustPropertyIndexBudget(tx.graph, value, ok, false)
 				}
 			}
-			adjustPropertyIndexBudget(tx.graph, definition, nil, false, false)
+			work, logicalBytes := propertyIndexDefinitionCost(definition)
+			adjustDerivedCost(tx.graph, work, logicalBytes, false)
 			if node {
 				tx.changes.dropNodeIndexes[definition] = struct{}{}
 			} else {
@@ -2609,8 +2608,7 @@ func (db *DB) updatePropertyIndex(node, create bool, scope, property string) err
 		if !indexes.Create(definition) {
 			return fmt.Errorf("%w: property index already exists", ErrAlreadyExists)
 		}
-		work := uint64(1)
-		logicalBytes := saturatingAdd(uint64(len(scope)+len(property)), 192)
+		work, logicalBytes := propertyIndexDefinitionCost(definition)
 		if exceedsDerivedBudget(tx.graph, db, work, logicalBytes) {
 			return fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
 		}
@@ -2672,7 +2670,11 @@ func exceedsDerivedBudget(graph *store.GraphState, db *DB, work, bytes uint64) b
 	return work > db.derivedIndexBuildMaxWork || bytes > db.derivedIndexBuildMaxLogicalBytes || graph.DerivedIndexWork > db.derivedIndexBuildMaxWork-work || graph.DerivedIndexLogicalBytes > db.derivedIndexBuildMaxLogicalBytes-bytes
 }
 
-func propertyIndexCost(def store.PropertyIndexDefinition, value any, hasValue bool) (uint64, uint64) {
+func propertyIndexDefinitionCost(def store.PropertyIndexDefinition) (uint64, uint64) {
+	return 1, saturatingAdd(uint64(len(def.Scope)+len(def.Property)), 192)
+}
+
+func propertyIndexCost(value any, hasValue bool) (uint64, uint64) {
 	work, bytes := uint64(1), uint64(0)
 	if hasValue {
 		valueBytes := store.EstimatePropertyIndexValueBytes(value)
@@ -2682,8 +2684,8 @@ func propertyIndexCost(def store.PropertyIndexDefinition, value any, hasValue bo
 	return work, bytes
 }
 
-func adjustPropertyIndexBudget(graph *store.GraphState, def store.PropertyIndexDefinition, value any, present bool, add bool) {
-	work, bytes := propertyIndexCost(def, value, present)
+func adjustPropertyIndexBudget(graph *store.GraphState, value any, present bool, add bool) {
+	work, bytes := propertyIndexCost(value, present)
 	if add {
 		graph.DerivedIndexWork = saturatingAdd(graph.DerivedIndexWork, work)
 		graph.DerivedIndexLogicalBytes = saturatingAdd(graph.DerivedIndexLogicalBytes, bytes)
@@ -2738,8 +2740,11 @@ func adjustNodePropertyBudget(graph, source *store.GraphState, defs store.Proper
 	if record == nil {
 		return
 	}
-	for def := range defs.DefinitionsFor(record.Labels, record.Properties) {
-		adjustPropertyIndexBudget(graph, def, record.Properties[def.Property], true, add)
+	for def := range defs.Definitions() {
+		if slices.Contains(record.Labels, def.Scope) {
+			value, present := record.Properties[def.Property]
+			adjustPropertyIndexBudget(graph, value, present, add)
+		}
 	}
 }
 
@@ -2748,8 +2753,11 @@ func adjustEdgePropertyBudget(graph, source *store.GraphState, defs store.Proper
 	if record == nil {
 		return
 	}
-	for def := range defs.DefinitionsFor([]string{record.Type}, record.Properties) {
-		adjustPropertyIndexBudget(graph, def, record.Properties[def.Property], true, add)
+	for def := range defs.Definitions() {
+		if def.Scope == record.Type {
+			value, present := record.Properties[def.Property]
+			adjustPropertyIndexBudget(graph, value, present, add)
+		}
 	}
 }
 
@@ -3922,26 +3930,22 @@ func (tx *Tx) GetIncomingEdgesByType(nodeID uint64, edgeType string, limit uint)
 }
 
 func (tx *Tx) edgesByType(edgeIDs *store.EdgeList, edgeType string, limit uint) []Edge {
-	typedIDs := tx.graph.EdgeTypes.Get(edgeType)
-	results := make([]Edge, 0, min(edgeIDs.Len(), len(typedIDs)))
-	typedIndex := 0
+	capacity := min(edgeIDs.Len(), tx.graph.EdgeTypes.Len(edgeType))
+	if limit != 0 && limit < uint(capacity) {
+		capacity = int(limit)
+	}
+	results := make([]Edge, 0, capacity)
 	for chunk := range edgeIDs.Chunks() {
 		for _, edgeID := range chunk {
 			if edgeIDs.IsRemoved(edgeID) {
 				continue
 			}
-			for typedIndex < len(typedIDs) && typedIDs[typedIndex] < edgeID {
-				typedIndex++
-			}
-			if typedIndex == len(typedIDs) {
-				return results
-			}
-			if typedIDs[typedIndex] == edgeID {
-				results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+			edge := tx.graph.Edges.Get(edgeID)
+			if edge.Type == edgeType {
+				results = append(results, publicEdge(edge))
 				if limit != 0 && uint(len(results)) == limit {
 					return results
 				}
-				typedIndex++
 			}
 		}
 	}
