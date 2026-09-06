@@ -79,7 +79,7 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, params map[string]
 		fork.graph = store.CloneGraphStateShallow(tx.graph)
 		fork.base = tx.graph
 		fork.changes = &txChanges{baseCommitID: tx.changes.baseCommitID}
-		fork.queryIndexesDisabled = hasGraphChanges(tx.changes)
+		fork.queryIndexesDisabled = tx.queryIndexesDisabled
 		executionTx = &fork
 	}
 	result, err := plan.execute(executionTx, params, budget)

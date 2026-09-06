@@ -86,15 +86,16 @@ func TestIndependentMatchPatternsStartWithSmallestLabel(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Include planning work while keeping the allowance below source-order expansion.
 	query := `MATCH (b:Broad), (r:Rare) RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`
-	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 102})
+	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 150})
 	if err != nil {
 		t.Fatalf("rare-first query failed: %v", err)
 	}
 	if len(result.Rows) != 100 {
 		t.Fatalf("rows = %d, want 100", len(result.Rows))
 	}
-	if _, err := db.QueryContext(t.Context(), `MATCH (b:Broad), (r:Rare) RETURN r.id AS rid, b.id AS bid`, nil, QueryOptions{MaxWork: 102}); !errors.Is(err, ErrResourceLimit) {
+	if _, err := db.QueryContext(t.Context(), `MATCH (b:Broad), (r:Rare) RETURN r.id AS rid, b.id AS bid`, nil, QueryOptions{MaxWork: 150}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("unordered query unexpectedly succeeded: %v", err)
 	}
 }

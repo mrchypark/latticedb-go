@@ -30,7 +30,7 @@ func TestUnwindSharesNormalizedPayloadWithoutAnotherCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	clause := unwindClause{Expr: paramExpr{Name: "items"}, Var: "item"}
-	rows, err := clause.apply([]queryRow{{slots: make([]boundValue, 1), bound: make([]bool, 1), index: map[string]int{"item": 0}}}, params, budget)
+	rows, err := clause.apply([]queryRow{{slots: make([]boundValue, 1), index: map[string]int{"item": 0}}}, params, budget)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("UNWIND rows=%d err=%v", len(rows), err)
 	}
@@ -45,7 +45,7 @@ func TestUnwindSharesNormalizedPayloadWithoutAnotherCopy(t *testing.T) {
 }
 
 func TestQueryValueComparisonsConsumeWorkPerNestedValue(t *testing.T) {
-	row := queryRow{slots: []boundValue{{Value: map[string]any{"value": map[string]any{"scores": []any{int64(1), int64(2)}}}, HasValue: true}}, bound: []bool{true}, index: map[string]int{"n": 0}}
+	row := queryRow{slots: []boundValue{{Value: map[string]any{"value": map[string]any{"scores": []any{int64(1), int64(2)}}}, HasValue: true, Bound: true}}, index: map[string]int{"n": 0}}
 	clause := whereClause{Kind: whereEquals, Var: "n", Property: "value", Expr: literalExpr{Value: map[string]any{"scores": []any{int64(1), int64(2)}}}}
 	for _, maxWork := range []uint64{4, 5} {
 		budget := newQueryBudget(context.Background(), QueryOptions{MaxWork: maxWork})
@@ -61,7 +61,7 @@ func TestQueryValueComparisonsConsumeWorkPerNestedValue(t *testing.T) {
 }
 
 func TestQueryInComparisonConsumesWorkPerCandidate(t *testing.T) {
-	row := queryRow{slots: []boundValue{{Value: map[string]any{"value": int64(3)}, HasValue: true}}, bound: []bool{true}, index: map[string]int{"n": 0}}
+	row := queryRow{slots: []boundValue{{Value: map[string]any{"value": int64(3)}, HasValue: true, Bound: true}}, index: map[string]int{"n": 0}}
 	clause := whereClause{Kind: whereIn, Var: "n", Property: "value", Expr: literalExpr{Value: []any{int64(1), int64(2), int64(3)}}}
 	for _, maxWork := range []uint64{3, 4} {
 		budget := newQueryBudget(context.Background(), QueryOptions{MaxWork: maxWork})

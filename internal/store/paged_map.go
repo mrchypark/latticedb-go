@@ -104,6 +104,45 @@ func (m *PagedMap[V]) All() iter.Seq2[uint64, V] {
 	}
 }
 
+// orderedRoots visits root zero followed by caller-maintained ascending high
+// roots. Callers that already keep roots ordered avoid materializing a sorted
+// map-key list for each lookup.
+func (m *PagedMap[V]) orderedRoots(roots []uint64) iter.Seq2[uint64, V] {
+	return func(yield func(uint64, V) bool) {
+		yieldRoot := func(high uint64, root *pageRoot[V]) bool {
+			if root == nil {
+				return true
+			}
+			for bucketIndex, bucket := range root {
+				if bucket == nil {
+					continue
+				}
+				for shard, page := range bucket {
+					if page == nil {
+						continue
+					}
+					key := high<<14 | uint64(bucketIndex)<<7 | uint64(shard)
+					for occupied := page.occupied; occupied != 0; occupied &= occupied - 1 {
+						slot := uint(bits.TrailingZeros64(occupied))
+						if !yield(key<<6|uint64(slot), page.values[slot]) {
+							return false
+						}
+					}
+				}
+			}
+			return true
+		}
+		if !yieldRoot(0, m.root0) {
+			return
+		}
+		for _, high := range roots {
+			if !yieldRoot(high, m.roots[high]) {
+				return
+			}
+		}
+	}
+}
+
 func (m *PagedMap[V]) Set(id uint64, value V) {
 	key, slot := id>>6, uint(id&63)
 	page := m.ensurePage(key)

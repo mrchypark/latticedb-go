@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -302,7 +303,6 @@ const (
 
 type queryRow struct {
 	slots []boundValue
-	bound []bool
 	index map[string]int
 	Order float64
 }
@@ -632,6 +632,7 @@ type boundValue struct {
 	Edge     *store.EdgeRecord
 	Value    any
 	HasValue bool
+	Bound    bool
 }
 
 type valueExpr interface {
@@ -686,12 +687,12 @@ func parseQuery(query string) (*queryPlan, error) {
 }
 
 func (plan *queryPlan) newRow() queryRow {
-	return queryRow{slots: make([]boundValue, len(plan.slots)), bound: make([]bool, len(plan.slots)), index: plan.slots}
+	return queryRow{slots: make([]boundValue, len(plan.slots)), index: plan.slots}
 }
 
 func (row queryRow) get(name string) (boundValue, bool) {
 	slot, ok := row.index[name]
-	if !ok || !row.bound[slot] {
+	if !ok || !row.slots[slot].Bound {
 		return boundValue{}, false
 	}
 	return row.slots[slot], true
@@ -699,7 +700,8 @@ func (row queryRow) get(name string) (boundValue, bool) {
 
 func (row *queryRow) set(name string, value boundValue) {
 	if slot, ok := row.index[name]; ok {
-		row.slots[slot], row.bound[slot] = value, true
+		value.Bound = true
+		row.slots[slot] = value
 	}
 }
 
@@ -1136,7 +1138,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		stream = &sliceQueryIterator{rows: rows, budget: budget}
 	}
 	match := stream
-	patterns, err := plan.orderedMatchPatterns(tx, params)
+	patterns, err := plan.orderedMatchPatterns(tx, params, budget)
 	if err != nil {
 		return QueryResult{}, err
 	}
@@ -1271,11 +1273,33 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 
 // orderedMatchPatterns keeps each connected path in source order and only
 // changes the order of independent read-only components with explicit sorting.
-func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any) ([]matchPattern, error) {
-	if plan.mutates() || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) < 2 {
+func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any, budgets ...*queryBudget) ([]matchPattern, error) {
+	var budget *queryBudget
+	if len(budgets) != 0 {
+		budget = budgets[0]
+	}
+	if plan.unwindClause != nil || plan.mutates() || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) == 0 {
 		return plan.matchPatterns, nil
 	}
-	if plan.hasMissingPatternParam(tx, params) {
+	search, err := plan.hasSearchPatternClause(budget)
+	if err != nil {
+		return nil, err
+	}
+	if search {
+		return plan.matchPatterns, nil
+	}
+	missing, err := plan.hasMissingPatternParam(tx, params, budget)
+	if err != nil {
+		return nil, err
+	}
+	if missing {
+		return plan.matchPatterns, nil
+	}
+	unsafeID, err := plan.hasUnsafeBindingNodeID(params, budget)
+	if err != nil {
+		return nil, err
+	}
+	if unsafeID {
 		return plan.matchPatterns, nil
 	}
 	type component struct {
@@ -1285,13 +1309,22 @@ func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any) ([]ma
 	}
 	components := make([]component, 0, len(plan.matchPatterns))
 	for index, pattern := range plan.matchPatterns {
+		if err := checkPlanningBudget(budget); err != nil {
+			return nil, err
+		}
 		components = append(components, component{patterns: []matchPattern{pattern}, first: index})
 	}
 	for i := 0; i < len(components); i++ {
 		for j := i + 1; j < len(components); {
+			if err := checkPlanningBudget(budget); err != nil {
+				return nil, err
+			}
 			overlap := false
 			for _, left := range components[i].patterns {
 				for _, right := range components[j].patterns {
+					if err := checkPlanningBudget(budget); err != nil {
+						return nil, err
+					}
 					overlap = overlap || bindingsOverlap(patternBindings(left), patternBindings(right))
 				}
 			}
@@ -1303,13 +1336,10 @@ func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any) ([]ma
 			components = append(components[:j], components[j+1:]...)
 		}
 	}
-	if len(components) < 2 {
-		return plan.matchPatterns, nil
-	}
 	for i := range components {
 		components[i].estimate = tx.graph.Nodes.Len() + tx.graph.Edges.Len()
 		for _, pattern := range components[i].patterns {
-			estimate, err := plan.patternCardinality(tx, pattern, params)
+			estimate, err := plan.patternCardinalityWithBudget(tx, pattern, params, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -1318,29 +1348,297 @@ func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any) ([]ma
 			}
 		}
 	}
-	slices.SortStableFunc(components, func(left, right component) int {
-		return cmp.Or(cmp.Compare(left.estimate, right.estimate), cmp.Compare(left.first, right.first))
-	})
+	// Component construction is already quadratic. Keep the final stable sort
+	// equally bounded by the shared query budget rather than hiding work in the
+	// standard library sorter.
+	for index := 1; index < len(components); index++ {
+		current := components[index]
+		position := index
+		for position > 0 {
+			if err := checkPlanningBudget(budget); err != nil {
+				return nil, err
+			}
+			left := components[position-1]
+			if left.estimate < current.estimate || (left.estimate == current.estimate && left.first <= current.first) {
+				break
+			}
+			components[position] = left
+			position--
+		}
+		components[position] = current
+	}
 	ordered := make([]matchPattern, 0, len(plan.matchPatterns))
 	for _, component := range components {
+		patterns, reordered, err := plan.orderedConnectedPathPatterns(tx, component.patterns, params, budget)
+		if err != nil {
+			return nil, err
+		}
+		if reordered {
+			ordered = append(ordered, patterns...)
+			continue
+		}
 		ordered = append(ordered, component.patterns...)
 	}
 	return ordered, nil
 }
 
-func (plan *queryPlan) hasMissingPatternParam(tx *Tx, params map[string]any) bool {
+func (plan *queryPlan) hasSearchPatternClause(budget *queryBudget) (bool, error) {
 	for _, clause := range plan.whereClauses {
-		param, ok := clause.Expr.(paramExpr)
-		if !ok {
-			continue
+		if err := checkPlanningBudget(budget); err != nil {
+			return false, err
 		}
-		if _, exists := params[param.Name]; exists {
+		if clause.Kind == whereVector || clause.Kind == whereFTS {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// orderedConnectedPathPatterns seeds a simple path with its most selective
+// node. The executor already traverses directed edges from either bound
+// endpoint, so emitting that seed before the path edges is sufficient; no
+// iterator or edge semantics need to change.
+func (plan *queryPlan) orderedConnectedPathPatterns(tx *Tx, patterns []matchPattern, params map[string]any, budget *queryBudget) ([]matchPattern, bool, error) {
+	total, err := plan.connectedPathOrderIsTotal(patterns, budget)
+	if err != nil {
+		return nil, false, err
+	}
+	dynamic, err := connectedPathHasDynamicProperties(patterns, budget)
+	if err != nil {
+		return nil, false, err
+	}
+	if !total || dynamic {
+		return nil, false, nil
+	}
+	type edgeItem struct {
+		pattern  edgePattern
+		index    int
+		estimate int
+	}
+	edges := make([]edgeItem, 0, len(patterns))
+	nodes := map[string]nodePattern{}
+	nodeOrder := make([]string, 0, len(patterns)+1)
+	adjacent := map[string][]int{}
+	addNode := func(node nodePattern) bool {
+		if node.Var == "" {
+			return false
+		}
+		if _, exists := nodes[node.Var]; !exists {
+			nodes[node.Var] = node
+			nodeOrder = append(nodeOrder, node.Var)
+		}
+		return true
+	}
+	for index, item := range patterns {
+		if err := checkPlanningBudget(budget); err != nil {
+			return nil, false, err
+		}
+		edge, ok := item.(edgePattern)
+		if !ok || !addNode(edge.Left) || !addNode(edge.Right) {
+			return nil, false, nil
+		}
+		estimate, err := plan.patternCardinalityWithBudget(tx, edge, params, budget)
+		if err != nil {
+			return nil, false, err
+		}
+		edgeIndex := len(edges)
+		edges = append(edges, edgeItem{pattern: edge, index: index, estimate: estimate})
+		adjacent[edge.Left.Var] = append(adjacent[edge.Left.Var], edgeIndex)
+		adjacent[edge.Right.Var] = append(adjacent[edge.Right.Var], edgeIndex)
+	}
+	if len(edges) == 0 || len(nodes) != len(edges)+1 {
+		return nil, false, nil
+	}
+	for _, name := range nodeOrder {
+		if err := checkPlanningBudget(budget); err != nil {
+			return nil, false, err
+		}
+		degree := len(adjacent[name])
+		if degree == 0 || degree > 2 {
+			return nil, false, nil
+		}
+	}
+
+	seed := nodeOrder[0]
+	seedEstimate, seedDegree, err := plan.nodeSeedEstimate(tx, nodes[seed], params, budget)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, name := range nodeOrder[1:] {
+		estimate, degree, err := plan.nodeSeedEstimate(tx, nodes[name], params, budget)
+		if err != nil {
+			return nil, false, err
+		}
+		if estimate < seedEstimate || (estimate == seedEstimate && degree < seedDegree) {
+			seed, seedEstimate, seedDegree = name, estimate, degree
+		}
+	}
+	// This is an endpoint-cardinality heuristic. Do not add a synthetic scan
+	// unless its seed is more selective than the source edge scan it replaces.
+	if seedEstimate >= edges[0].estimate {
+		return nil, false, nil
+	}
+
+	ordered := make([]matchPattern, 0, len(edges)+1)
+	ordered = append(ordered, nodes[seed])
+	bound := map[string]struct{}{seed: {}}
+	used := make([]bool, len(edges))
+	for range edges {
+		candidate := -1
+		for index, edge := range edges {
+			if err := checkPlanningBudget(budget); err != nil {
+				return nil, false, err
+			}
+			if used[index] {
+				continue
+			}
+			_, leftBound := bound[edge.pattern.Left.Var]
+			_, rightBound := bound[edge.pattern.Right.Var]
+			if !leftBound && !rightBound {
+				continue
+			}
+			if candidate < 0 || edge.estimate < edges[candidate].estimate || (edge.estimate == edges[candidate].estimate && edge.index < edges[candidate].index) {
+				candidate = index
+			}
+		}
+		if candidate < 0 {
+			return nil, false, nil
+		}
+		edge := edges[candidate]
+		used[candidate] = true
+		bound[edge.pattern.Left.Var] = struct{}{}
+		bound[edge.pattern.Right.Var] = struct{}{}
+		ordered = append(ordered, edge.pattern)
+	}
+	return ordered, true, nil
+}
+
+func (plan *queryPlan) nodeSeedEstimate(tx *Tx, node nodePattern, params map[string]any, budget *queryBudget) (int, int, error) {
+	if err := checkPlanningBudget(budget); err != nil {
+		return 0, 0, err
+	}
+	estimate, err := plan.patternCardinalityWithBudget(tx, node, params, budget)
+	if err != nil {
+		return 0, 0, err
+	}
+	id, known, err := plan.bindingNodeID(node.Var, params)
+	if err != nil || !known {
+		return estimate, int(^uint(0) >> 1), err
+	}
+	// Exact node IDs have one candidate. Their first expansion cost is the
+	// O(1) adjacency cardinality, used only to break equal seed estimates.
+	degree := tx.graph.Outgoing.Get(id).Len() + tx.graph.Incoming.Get(id).Len()
+	return min(estimate, 1), degree, nil
+}
+
+func connectedPathHasDynamicProperties(patterns []matchPattern, budget *queryBudget) (bool, error) {
+	static := func(properties map[string]valueExpr) (bool, error) {
+		for _, expr := range properties {
+			if err := checkPlanningBudget(budget); err != nil {
+				return false, err
+			}
+			switch expr.(type) {
+			case literalExpr, paramExpr:
+			default:
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	for _, item := range patterns {
+		if err := checkPlanningBudget(budget); err != nil {
+			return false, err
+		}
+		edge, ok := item.(edgePattern)
+		if !ok {
+			return true, nil
+		}
+		for _, properties := range []map[string]valueExpr{edge.Left.PropertyExprs, edge.PropertyExprs, edge.Right.PropertyExprs} {
+			dynamic, err := static(properties)
+			if err != nil || dynamic {
+				return dynamic, err
+			}
+		}
+	}
+	return false, nil
+}
+
+// The stable ORDER BY fallback only compares the lowest bound ID, which is
+// insufficient to preserve tied fan-out rows after a path reorder. Require an
+// explicit unique ID key for every user-visible path binding instead.
+func (plan *queryPlan) connectedPathOrderIsTotal(patterns []matchPattern, budget *queryBudget) (bool, error) {
+	orderedIDs := map[string]struct{}{}
+	for _, clause := range plan.orderClauses {
+		if err := checkPlanningBudget(budget); err != nil {
+			return false, err
+		}
+		if clause.Kind == projectionBindingID {
+			orderedIDs[clause.Var] = struct{}{}
+		}
+	}
+	for _, item := range patterns {
+		if err := checkPlanningBudget(budget); err != nil {
+			return false, err
+		}
+		edge, ok := item.(edgePattern)
+		if !ok {
+			return false, nil
+		}
+		for _, name := range []string{edge.Left.Var, edge.EdgeVar, edge.Right.Var} {
+			if name == "" || name[0] == 0 {
+				continue
+			}
+			if _, exists := orderedIDs[name]; !exists {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+func (plan *queryPlan) hasMissingPatternParam(tx *Tx, params map[string]any, budget *queryBudget) (bool, error) {
+	hasNode := func(pattern nodePattern, clause *whereClause) bool {
+		if pattern.Var != clause.Var {
+			return false
+		}
+		if clause.Kind == whereBindingID {
+			return true
+		}
+		if clause.Kind != whereEquals {
+			return false
+		}
+		for _, label := range pattern.Labels {
+			if tx.graph.NodeProperties.Has(store.PropertyIndexDefinition{Scope: label, Property: clause.Property}) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, clause := range plan.whereClauses {
+		if err := checkPlanningBudget(budget); err != nil {
+			return false, err
+		}
+		missing, err := missingValueExprParam(clause.Expr, params, budget)
+		if err != nil {
+			return false, err
+		}
+		if !missing {
 			continue
 		}
 		if clause.Kind == whereBindingID {
 			for _, item := range plan.matchPatterns {
-				if pattern, ok := item.(nodePattern); ok && pattern.Var == clause.Var {
-					return true
+				if err := checkPlanningBudget(budget); err != nil {
+					return false, err
+				}
+				switch pattern := item.(type) {
+				case nodePattern:
+					if hasNode(pattern, clause) {
+						return true, nil
+					}
+				case edgePattern:
+					if hasNode(pattern.Left, clause) || hasNode(pattern.Right, clause) {
+						return true, nil
+					}
 				}
 			}
 			continue
@@ -1349,23 +1647,77 @@ func (plan *queryPlan) hasMissingPatternParam(tx *Tx, params map[string]any) boo
 			continue
 		}
 		for _, item := range plan.matchPatterns {
+			if err := checkPlanningBudget(budget); err != nil {
+				return false, err
+			}
 			switch pattern := item.(type) {
 			case nodePattern:
-				if pattern.Var == clause.Var {
-					for _, label := range pattern.Labels {
-						if tx.graph.NodeProperties.Has(store.PropertyIndexDefinition{Scope: label, Property: clause.Property}) {
-							return true
-						}
-					}
+				if hasNode(pattern, clause) {
+					return true, nil
 				}
 			case edgePattern:
+				if hasNode(pattern.Left, clause) || hasNode(pattern.Right, clause) {
+					return true, nil
+				}
 				if pattern.EdgeVar == clause.Var && tx.graph.EdgeProperties.Has(store.PropertyIndexDefinition{Scope: pattern.EdgeType, Property: clause.Property}) {
-					return true
+					return true, nil
 				}
 			}
 		}
 	}
-	return false
+	return false, nil
+}
+
+func missingValueExprParam(expr valueExpr, params map[string]any, budget *queryBudget) (bool, error) {
+	if err := checkPlanningBudget(budget); err != nil {
+		return false, err
+	}
+	switch expr := expr.(type) {
+	case paramExpr:
+		_, exists := params[expr.Name]
+		return !exists, nil
+	case mapLiteralExpr:
+		for _, entry := range expr.Entries {
+			missing, err := missingValueExprParam(entry, params, budget)
+			if err != nil || missing {
+				return missing, err
+			}
+		}
+	}
+	return false, nil
+}
+
+// Keep source traversal when an exact ID is invalid. A synthetic node seed
+// would otherwise report the ID error before an empty path can short-circuit.
+func (plan *queryPlan) hasUnsafeBindingNodeID(params map[string]any, budget *queryBudget) (bool, error) {
+	for _, clause := range plan.whereClauses {
+		if err := checkPlanningBudget(budget); err != nil {
+			return false, err
+		}
+		if clause.Kind != whereBindingID {
+			continue
+		}
+		switch clause.Expr.(type) {
+		case literalExpr, paramExpr:
+		default:
+			continue
+		}
+		value, err := clause.Expr.eval(queryRow{}, params)
+		if err != nil {
+			return true, nil
+		}
+		if _, ok := normalizeInt64(value); !ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func checkPlanningBudget(budget *queryBudget) error {
+	if budget == nil {
+		return nil
+	}
+	return budget.check(1, 0)
 }
 
 func patternBindings(pattern matchPattern) []string {
@@ -1398,6 +1750,10 @@ func bindingsOverlap(left, right []string) bool {
 }
 
 func (plan *queryPlan) patternCardinality(tx *Tx, pattern matchPattern, params map[string]any) (int, error) {
+	return plan.patternCardinalityWithBudget(tx, pattern, params, nil)
+}
+
+func (plan *queryPlan) patternCardinalityWithBudget(tx *Tx, pattern matchPattern, params map[string]any, budget *queryBudget) (int, error) {
 	cardinality := tx.graph.Nodes.Len() + tx.graph.Edges.Len()
 	consider := func(value int) {
 		if value < cardinality {
@@ -1405,6 +1761,9 @@ func (plan *queryPlan) patternCardinality(tx *Tx, pattern matchPattern, params m
 		}
 	}
 	propertyCardinality := func(indexes store.PropertyIndexes, definition store.PropertyIndexDefinition, expr valueExpr) error {
+		if err := checkPlanningBudget(budget); err != nil {
+			return err
+		}
 		if !indexes.Has(definition) {
 			return nil
 		}
@@ -1442,6 +1801,9 @@ func (plan *queryPlan) patternCardinality(tx *Tx, pattern matchPattern, params m
 	}
 	whereCardinality := func(indexes store.PropertyIndexes, scope, variable string) error {
 		for _, clause := range plan.whereClauses {
+			if err := checkPlanningBudget(budget); err != nil {
+				return err
+			}
 			if clause.Kind != whereEquals || clause.Var != variable {
 				continue
 			}
@@ -1454,9 +1816,15 @@ func (plan *queryPlan) patternCardinality(tx *Tx, pattern matchPattern, params m
 	switch pattern := pattern.(type) {
 	case nodePattern:
 		for _, label := range pattern.Labels {
+			if err := checkPlanningBudget(budget); err != nil {
+				return 0, err
+			}
 			consider(tx.graph.Labels.Len(label))
 		}
 		for _, label := range pattern.Labels {
+			if err := checkPlanningBudget(budget); err != nil {
+				return 0, err
+			}
 			if err := whereCardinality(tx.graph.NodeProperties, label, pattern.Var); err != nil {
 				return 0, err
 			}
@@ -1516,7 +1884,7 @@ func normalizeQueryParamsWithBudget(params map[string]any, budget *queryBudget) 
 }
 
 func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[string]any, limit uint, budget *queryBudget) ([]uint64, bool, error) {
-	if tx.queryIndexesDisabled || hasGraphChanges(tx.changes) {
+	if tx.queryIndexesDisabled {
 		return nil, false, nil
 	}
 	if pattern.Var == "" || len(pattern.Labels) == 0 {
@@ -1552,25 +1920,17 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 			if !tx.graph.NodeProperties.Has(definition) {
 				continue
 			}
-			bytes, err := reservePropertyIndexPosting(tx.graph.NodeProperties, definition, value, lookupLimit, budget)
+			ids, bytes, err := indexedNodePosting(tx, definition, value, lookupLimit, budget)
 			if err != nil {
 				return nil, false, err
 			}
 			postingBytes = saturatingAdd(postingBytes, bytes)
-			ids, err := tx.FindNodesByLabelProperty(label, clause.Property, value, lookupLimit)
-			if err != nil {
-				return nil, false, err
-			}
 			if alternate, ok := alternateNumericIndexValue(value); ok {
-				bytes, err := reservePropertyIndexPosting(tx.graph.NodeProperties, definition, alternate, lookupLimit, budget)
+				more, bytes, err := indexedNodePosting(tx, definition, alternate, lookupLimit, budget)
 				if err != nil {
 					return nil, false, err
 				}
 				postingBytes = saturatingAdd(postingBytes, bytes)
-				more, err := tx.FindNodesByLabelProperty(label, clause.Property, alternate, lookupLimit)
-				if err != nil {
-					return nil, false, err
-				}
 				combinedBytes := uint64(len(ids)+len(more)) * 8
 				if err := budget.chargeTemporary(combinedBytes); err != nil {
 					return nil, false, err
@@ -1672,6 +2032,9 @@ func (plan *queryPlan) boundedFilteredNodeIDs(tx *Tx, pattern nodePattern, defin
 		}
 		resultCap += more
 	}
+	if tx.changes != nil {
+		resultCap += len(tx.changes.upsertNodes)
+	}
 	if limit != ^uint(0) && uint(resultCap) > limit {
 		resultCap = int(limit)
 	}
@@ -1698,7 +2061,12 @@ func (plan *queryPlan) boundedFilteredNodeIDs(tx *Tx, pattern nodePattern, defin
 				visitErr = matchErr
 				return false
 			}
-			if nodeMatchesPropertyIndex(node, definition, indexValue) && matches {
+			indexMatches, indexErr := nodeMatchesIndexedProperty(node, definition, indexValue, budget)
+			if indexErr != nil {
+				visitErr = indexErr
+				return false
+			}
+			if indexMatches && matches {
 				results = insertPropertyIndexID(results, id, limit)
 			}
 			return true
@@ -1726,7 +2094,11 @@ func (plan *queryPlan) boundedFilteredNodeIDs(tx *Tx, pattern nodePattern, defin
 			if matchErr != nil {
 				return nil, matchErr
 			}
-			if nodeMatchesQueryProperty(node, definition, normalized) && matches {
+			indexMatches, indexErr := nodeMatchesIndexedProperty(node, definition, normalized, budget)
+			if indexErr != nil {
+				return nil, indexErr
+			}
+			if indexMatches && matches {
 				results = insertPropertyIndexID(results, id, limit)
 			}
 		}
@@ -1774,16 +2146,8 @@ func (plan *queryPlan) nodeMatchesBoundedFilter(node *store.NodeRecord, pattern 
 	return true, nil
 }
 
-func nodeMatchesQueryProperty(node *store.NodeRecord, definition store.PropertyIndexDefinition, value any) bool {
-	if node == nil || !slices.Contains(node.Labels, definition.Scope) {
-		return false
-	}
-	stored, ok := node.Properties[definition.Property]
-	return ok && queryValuesEqual(stored, value)
-}
-
 func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[string]any, budget *queryBudget) ([]uint64, bool, error) {
-	if tx.queryIndexesDisabled || hasGraphChanges(tx.changes) {
+	if tx.queryIndexesDisabled {
 		return nil, false, nil
 	}
 	if pattern.EdgeVar == "" || pattern.EdgeType == "" {
@@ -1812,25 +2176,17 @@ func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[st
 		if !tx.graph.EdgeProperties.Has(definition) {
 			continue
 		}
-		bytes, err := reservePropertyIndexPosting(tx.graph.EdgeProperties, definition, value, ^uint(0), budget)
+		ids, bytes, err := indexedEdgePosting(tx, definition, value, ^uint(0), budget)
 		if err != nil {
 			return nil, false, err
 		}
 		postingBytes = saturatingAdd(postingBytes, bytes)
-		ids, err := tx.FindEdgesByTypeProperty(pattern.EdgeType, clause.Property, value, ^uint(0))
-		if err != nil {
-			return nil, false, err
-		}
 		if alternate, ok := alternateNumericIndexValue(value); ok {
-			bytes, err := reservePropertyIndexPosting(tx.graph.EdgeProperties, definition, alternate, ^uint(0), budget)
+			more, bytes, err := indexedEdgePosting(tx, definition, alternate, ^uint(0), budget)
 			if err != nil {
 				return nil, false, err
 			}
 			postingBytes = saturatingAdd(postingBytes, bytes)
-			more, err := tx.FindEdgesByTypeProperty(pattern.EdgeType, clause.Property, alternate, ^uint(0))
-			if err != nil {
-				return nil, false, err
-			}
 			combinedBytes := uint64(len(ids)+len(more)) * 8
 			if err := budget.chargeTemporary(combinedBytes); err != nil {
 				return nil, false, err
@@ -1856,6 +2212,199 @@ func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[st
 		}
 	}
 	return ids, true, nil
+}
+
+func indexedNodePosting(tx *Tx, definition store.PropertyIndexDefinition, value any, limit uint, budget *queryBudget) ([]uint64, uint64, error) {
+	if !hasGraphChanges(tx.changes) {
+		bytes, err := reservePropertyIndexPosting(tx.graph.NodeProperties, definition, value, limit, budget)
+		if err != nil {
+			return nil, 0, err
+		}
+		ids, err := tx.FindNodesByLabelProperty(definition.Scope, definition.Property, value, limit)
+		if err != nil {
+			budget.releaseTemporary(bytes)
+			return nil, 0, err
+		}
+		return ids, bytes, nil
+	}
+	count, found, err := tx.graph.NodeProperties.Cardinality(definition, value)
+	if err != nil || !found {
+		return nil, 0, err
+	}
+	if tx.changes != nil {
+		count += len(tx.changes.upsertNodes)
+	}
+	if limit != ^uint(0) && uint(count) > limit {
+		count = int(limit)
+	}
+	bytes := uint64(count) * 8
+	if err := budget.chargeTemporary(bytes); err != nil {
+		return nil, 0, err
+	}
+	ids := make([]uint64, 0, count)
+	visited := 0
+	var visitErr error
+	_, err = tx.graph.NodeProperties.Visit(definition, value, func(id uint64) bool {
+		if visited&63 == 0 {
+			if visitErr = budget.check(1, len(ids)); visitErr != nil {
+				return false
+			}
+		}
+		visited++
+		if tx.changes != nil {
+			if _, changed := tx.changes.upsertNodes[id]; changed {
+				return true
+			}
+		}
+		matches, matchErr := nodeMatchesIndexedProperty(tx.graph.Nodes.Get(id), definition, value, budget)
+		if matchErr != nil {
+			visitErr = matchErr
+			return false
+		}
+		if matches {
+			ids = appendIndexedPostingID(ids, id, limit)
+		}
+		return true
+	})
+	if err != nil || visitErr != nil {
+		budget.releaseTemporary(bytes)
+		if err != nil {
+			return nil, 0, err
+		}
+		return nil, 0, visitErr
+	}
+	if tx.changes != nil {
+		visited = 0
+		for id := range tx.changes.upsertNodes {
+			if visited&63 == 0 {
+				if err := budget.check(1, len(ids)); err != nil {
+					budget.releaseTemporary(bytes)
+					return nil, 0, err
+				}
+			}
+			visited++
+			matches, err := nodeMatchesIndexedProperty(tx.graph.Nodes.Get(id), definition, value, budget)
+			if err != nil {
+				budget.releaseTemporary(bytes)
+				return nil, 0, err
+			}
+			if matches {
+				ids = appendIndexedPostingID(ids, id, limit)
+			}
+		}
+	}
+	return ids, bytes, nil
+}
+
+func indexedEdgePosting(tx *Tx, definition store.PropertyIndexDefinition, value any, limit uint, budget *queryBudget) ([]uint64, uint64, error) {
+	if !hasGraphChanges(tx.changes) {
+		bytes, err := reservePropertyIndexPosting(tx.graph.EdgeProperties, definition, value, limit, budget)
+		if err != nil {
+			return nil, 0, err
+		}
+		ids, err := tx.FindEdgesByTypeProperty(definition.Scope, definition.Property, value, limit)
+		if err != nil {
+			budget.releaseTemporary(bytes)
+			return nil, 0, err
+		}
+		return ids, bytes, nil
+	}
+	count, found, err := tx.graph.EdgeProperties.Cardinality(definition, value)
+	if err != nil || !found {
+		return nil, 0, err
+	}
+	if tx.changes != nil {
+		count += len(tx.changes.upsertEdges)
+	}
+	if limit != ^uint(0) && uint(count) > limit {
+		count = int(limit)
+	}
+	bytes := uint64(count) * 8
+	if err := budget.chargeTemporary(bytes); err != nil {
+		return nil, 0, err
+	}
+	ids := make([]uint64, 0, count)
+	visited := 0
+	var visitErr error
+	_, err = tx.graph.EdgeProperties.Visit(definition, value, func(id uint64) bool {
+		if visited&63 == 0 {
+			if visitErr = budget.check(1, len(ids)); visitErr != nil {
+				return false
+			}
+		}
+		visited++
+		if tx.changes != nil {
+			if _, changed := tx.changes.upsertEdges[id]; changed {
+				return true
+			}
+		}
+		matches, matchErr := edgeMatchesIndexedProperty(tx.graph.Edges.Get(id), definition, value, budget)
+		if matchErr != nil {
+			visitErr = matchErr
+			return false
+		}
+		if matches {
+			ids = appendIndexedPostingID(ids, id, limit)
+		}
+		return true
+	})
+	if err != nil || visitErr != nil {
+		budget.releaseTemporary(bytes)
+		if err != nil {
+			return nil, 0, err
+		}
+		return nil, 0, visitErr
+	}
+	if tx.changes != nil {
+		visited = 0
+		for id := range tx.changes.upsertEdges {
+			if visited&63 == 0 {
+				if err := budget.check(1, len(ids)); err != nil {
+					budget.releaseTemporary(bytes)
+					return nil, 0, err
+				}
+			}
+			visited++
+			matches, err := edgeMatchesIndexedProperty(tx.graph.Edges.Get(id), definition, value, budget)
+			if err != nil {
+				budget.releaseTemporary(bytes)
+				return nil, 0, err
+			}
+			if matches {
+				ids = appendIndexedPostingID(ids, id, limit)
+			}
+		}
+	}
+	return ids, bytes, nil
+}
+
+func nodeMatchesIndexedProperty(node *store.NodeRecord, definition store.PropertyIndexDefinition, value any, budget *queryBudget) (bool, error) {
+	if node == nil || !slices.Contains(node.Labels, definition.Scope) {
+		return false, nil
+	}
+	stored, ok := node.Properties[definition.Property]
+	if !ok {
+		return false, nil
+	}
+	return queryValuesEqualWithBudget(stored, value, budget)
+}
+
+func edgeMatchesIndexedProperty(edge *store.EdgeRecord, definition store.PropertyIndexDefinition, value any, budget *queryBudget) (bool, error) {
+	if edge == nil || edge.Type != definition.Scope {
+		return false, nil
+	}
+	stored, ok := edge.Properties[definition.Property]
+	if !ok {
+		return false, nil
+	}
+	return queryValuesEqualWithBudget(stored, value, budget)
+}
+
+func appendIndexedPostingID(ids []uint64, id uint64, limit uint) []uint64 {
+	if limit == ^uint(0) {
+		return append(ids, id)
+	}
+	return insertPropertyIndexID(ids, id, limit)
 }
 
 func reservePropertyIndexPosting(indexes store.PropertyIndexes, definition store.PropertyIndexDefinition, value any, limit uint, budget *queryBudget) (uint64, error) {
@@ -3861,7 +4410,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 
 func refreshRowBindings(tx *Tx, row *queryRow) {
 	for slot, binding := range row.slots {
-		if !row.bound[slot] {
+		if !binding.Bound {
 			continue
 		}
 		switch {
@@ -4267,11 +4816,16 @@ func queryPropertyBytes(properties map[string]any) uint64 {
 }
 
 func distinctResultRows(columns []string, rows []map[string]any, budget *queryBudget) ([]map[string]any, error) {
-	bytes := uint64(len(rows)) * 32
+	if err := budget.check(1, 0); err != nil {
+		return nil, err
+	}
+	bytes := uint64(len(rows)) * 64
 	if err := budget.chargeTemporary(bytes); err != nil {
 		return nil, err
 	}
 	defer budget.releaseTemporary(bytes)
+	var bucketBytes uint64
+	defer func() { budget.releaseTemporary(bucketBytes) }()
 	distinct := rows[:0]
 	buckets := make(map[uint64][]int, len(rows))
 	for _, row := range rows {
@@ -4280,7 +4834,9 @@ func distinctResultRows(columns []string, rows []map[string]any, budget *queryBu
 		}
 		key := fnv.New64a()
 		for _, column := range columns {
-			writeDistinctValueKey(key, row[column])
+			if err := writeDistinctValueKey(key, row[column], budget); err != nil {
+				return nil, err
+			}
 		}
 		encoded := key.Sum64()
 		duplicate := false
@@ -4300,45 +4856,239 @@ func distinctResultRows(columns []string, rows []map[string]any, budget *queryBu
 		if duplicate {
 			continue
 		}
-		buckets[encoded] = append(buckets[encoded], len(distinct))
+		bucket := buckets[encoded]
+		if len(bucket) == cap(bucket) {
+			if err := budget.check(1, 0); err != nil {
+				return nil, err
+			}
+			growth := 1
+			if cap(bucket) > 0 {
+				growth = cap(bucket)
+			}
+			reserved := uint64(growth) * 8
+			if err := budget.chargeTemporary(reserved); err != nil {
+				return nil, err
+			}
+			bucketBytes += reserved
+		}
+		buckets[encoded] = append(bucket, len(distinct))
 		distinct = append(distinct, row)
 	}
 	return distinct, nil
 }
 
-func writeDistinctValueKey(writer io.Writer, value any) {
+func writeDistinctValueKey(writer io.Writer, value any, budget *queryBudget) error {
+	if err := budget.check(1, 0); err != nil {
+		return err
+	}
 	switch value := value.(type) {
 	case nil:
-		fmt.Fprint(writer, "nil;")
+		writeDistinctKeyString(writer, "nil")
+	case bool:
+		writeDistinctKeyString(writer, "bool")
+		if value {
+			writeDistinctKeyUint64(writer, 1)
+		} else {
+			writeDistinctKeyUint64(writer, 0)
+		}
 	case int64:
-		fmt.Fprintf(writer, "number:%d;", value)
+		writeDistinctKeyString(writer, "number")
+		writeDistinctKeyUint64(writer, uint64(value))
 	case float64:
 		if value >= -9223372036854775808 && value < 9223372036854775808 && integerEqualsFloat(int64(value), value) {
-			fmt.Fprintf(writer, "number:%d;", int64(value))
-			return
+			writeDistinctKeyString(writer, "number")
+			writeDistinctKeyUint64(writer, uint64(int64(value)))
+			return nil
 		}
-		fmt.Fprintf(writer, "float:%x;", math.Float64bits(value))
+		writeDistinctKeyString(writer, "float")
+		if value == 0 {
+			value = 0
+		}
+		writeDistinctKeyUint64(writer, math.Float64bits(value))
+	case string:
+		writeDistinctKeyString(writer, "string")
+		if err := writeDistinctKeyValueString(writer, value, budget); err != nil {
+			return err
+		}
+	case []byte:
+		if value == nil {
+			writeDistinctKeyString(writer, "bytes:nil")
+			return nil
+		}
+		writeDistinctKeyString(writer, "bytes")
+		if err := writeDistinctKeyBytes(writer, value, budget); err != nil {
+			return err
+		}
+	case []float32:
+		if value == nil {
+			writeDistinctKeyString(writer, "vector:nil")
+			return nil
+		}
+		writeDistinctKeyString(writer, "vector")
+		writeDistinctKeyUint64(writer, uint64(len(value)))
+		for index, item := range value {
+			if index%64 == 0 {
+				if err := budget.check(1, 0); err != nil {
+					return err
+				}
+			}
+			if item == 0 {
+				item = 0
+			}
+			writeDistinctKeyUint64(writer, uint64(math.Float32bits(item)))
+		}
 	case []any:
-		fmt.Fprintf(writer, "list:%d[", len(value))
+		writeDistinctKeyString(writer, "list")
+		writeDistinctKeyUint64(writer, uint64(len(value)))
 		for _, item := range value {
-			writeDistinctValueKey(writer, item)
+			if err := writeDistinctValueKey(writer, item, budget); err != nil {
+				return err
+			}
 		}
-		fmt.Fprint(writer, "]")
 	case map[string]any:
+		bytes := uint64(len(value)) * 32
+		if err := budget.chargeTemporary(bytes); err != nil {
+			return err
+		}
+		defer budget.releaseTemporary(bytes)
 		keys := make([]string, 0, len(value))
 		for key := range value {
+			if err := budget.check(1, 0); err != nil {
+				return err
+			}
 			keys = append(keys, key)
 		}
-		slices.Sort(keys)
-		fmt.Fprintf(writer, "map:%d{", len(keys))
-		for _, key := range keys {
-			fmt.Fprintf(writer, "%d:%s=", len(key), key)
-			writeDistinctValueKey(writer, value[key])
+		scratch := make([]string, len(keys))
+		keys, err := sortDistinctMapKeys(keys, scratch, budget)
+		if err != nil {
+			return err
 		}
-		fmt.Fprint(writer, "}")
+		writeDistinctKeyString(writer, "map")
+		writeDistinctKeyUint64(writer, uint64(len(keys)))
+		for _, key := range keys {
+			if err := writeDistinctKeyValueString(writer, key, budget); err != nil {
+				return err
+			}
+			if err := writeDistinctValueKey(writer, value[key], budget); err != nil {
+				return err
+			}
+		}
+	case Node:
+		writeDistinctKeyString(writer, "node")
+		writeDistinctKeyUint64(writer, value.ID)
+		writeDistinctKeyUint64(writer, uint64(len(value.Labels)))
+		for index, label := range value.Labels {
+			if index%64 == 0 {
+				if err := budget.check(1, 0); err != nil {
+					return err
+				}
+			}
+			if err := writeDistinctKeyValueString(writer, label, budget); err != nil {
+				return err
+			}
+		}
+		if err := writeDistinctValueKey(writer, value.Properties, budget); err != nil {
+			return err
+		}
+	case Edge:
+		writeDistinctKeyString(writer, "edge")
+		writeDistinctKeyUint64(writer, value.ID)
+		writeDistinctKeyUint64(writer, value.SourceID)
+		writeDistinctKeyUint64(writer, value.TargetID)
+		if err := writeDistinctKeyValueString(writer, value.Type, budget); err != nil {
+			return err
+		}
+		if err := writeDistinctValueKey(writer, value.Properties, budget); err != nil {
+			return err
+		}
 	default:
-		fmt.Fprintf(writer, "%T:%#v;", value, value)
+		return fmt.Errorf("unsupported DISTINCT value type %T", value)
 	}
+	return nil
+}
+
+func writeDistinctKeyString(writer io.Writer, value string) {
+	writeDistinctKeyUint64(writer, uint64(len(value)))
+	_, _ = io.WriteString(writer, value)
+}
+
+func writeDistinctKeyValueString(writer io.Writer, value string, budget *queryBudget) error {
+	writeDistinctKeyUint64(writer, uint64(len(value)))
+	for start := 0; start < len(value); start += 4096 {
+		end := min(start+4096, len(value))
+		if err := budget.check(uint64((end-start+63)/64), 0); err != nil {
+			return err
+		}
+		_, _ = io.WriteString(writer, value[start:end])
+	}
+	return nil
+}
+
+func writeDistinctKeyBytes(writer io.Writer, value []byte, budget *queryBudget) error {
+	writeDistinctKeyUint64(writer, uint64(len(value)))
+	for start := 0; start < len(value); start += 4096 {
+		end := min(start+4096, len(value))
+		if err := budget.check(uint64((end-start+63)/64), 0); err != nil {
+			return err
+		}
+		_, _ = writer.Write(value[start:end])
+	}
+	return nil
+}
+
+func writeDistinctKeyUint64(writer io.Writer, value uint64) {
+	var encoded [8]byte
+	binary.LittleEndian.PutUint64(encoded[:], value)
+	_, _ = writer.Write(encoded[:])
+}
+
+func sortDistinctMapKeys(keys, scratch []string, budget *queryBudget) ([]string, error) {
+	if len(keys) < 2 {
+		return keys, nil
+	}
+	from, to := keys, scratch
+	for width := 1; width < len(keys); {
+		for start := 0; start < len(keys); start += width * 2 {
+			middle := min(start+width, len(keys))
+			end := min(start+width*2, len(keys))
+			left, right, out := start, middle, start
+			for left < middle && right < end {
+				if err := budget.check(1, 0); err != nil {
+					return nil, err
+				}
+				if from[left] <= from[right] {
+					to[out] = from[left]
+					left++
+				} else {
+					to[out] = from[right]
+					right++
+				}
+				out++
+			}
+			for left < middle {
+				if out%64 == 0 {
+					if err := budget.check(1, 0); err != nil {
+						return nil, err
+					}
+				}
+				to[out], left, out = from[left], left+1, out+1
+			}
+			for right < end {
+				if out%64 == 0 {
+					if err := budget.check(1, 0); err != nil {
+						return nil, err
+					}
+				}
+				to[out], right, out = from[right], right+1, out+1
+			}
+		}
+		from, to = to, from
+		if width >= len(keys)/2 {
+			break
+		}
+		width *= 2
+	}
+	return from, nil
 }
 
 func resultRowsEqual(columns []string, left, right map[string]any) bool {
@@ -5087,7 +5837,7 @@ func propertyFromBinding(binding boundValue, property string) (any, bool) {
 }
 
 func (row queryRow) clone() queryRow {
-	return queryRow{slots: slices.Clone(row.slots), bound: slices.Clone(row.bound), index: row.index, Order: row.Order}
+	return queryRow{slots: slices.Clone(row.slots), index: row.index, Order: row.Order}
 }
 
 func compareRowBindings(left queryRow, right queryRow) int {
@@ -5105,8 +5855,8 @@ func compareRowBindings(left queryRow, right queryRow) int {
 
 func lowestBindingID(row queryRow) uint64 {
 	var lowest uint64
-	for slot, binding := range row.slots {
-		if !row.bound[slot] {
+	for _, binding := range row.slots {
+		if !binding.Bound {
 			continue
 		}
 		var candidate uint64

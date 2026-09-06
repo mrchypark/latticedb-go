@@ -87,7 +87,7 @@ func TestQueryClauseScratchReleasesBetweenRows(t *testing.T) {
 	graph := store.NewGraphState()
 	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"text": "alpha beta", "embedding": []float32{1, 0}}})
 	tx := &Tx{graph: graph}
-	row := queryRow{slots: []boundValue{{Node: graph.Nodes.Get(1)}}, bound: []bool{true}, index: map[string]int{"n": 0}}
+	row := queryRow{slots: []boundValue{{Node: graph.Nodes.Get(1), Bound: true}}, index: map[string]int{"n": 0}}
 	cases := []struct {
 		name   string
 		clause whereClause
@@ -123,7 +123,7 @@ func TestNodePatternFullScanCandidateScratchIsScoped(t *testing.T) {
 	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Labels: []string{"Item"}})
 	tx := &Tx{graph: graph}
 	pattern := nodePattern{Var: "n"}
-	row := queryRow{slots: make([]boundValue, 1), bound: make([]bool, 1), index: map[string]int{"n": 0}}
+	row := queryRow{slots: make([]boundValue, 1), index: map[string]int{"n": 0}}
 	budget := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 2*queryRowBytes + 8})
 	defer releaseQueryBudget(budget)
 	if err := budget.chargeRows(1); err != nil {
@@ -172,7 +172,7 @@ func TestIndexedCandidateScratchIsScopedAtBoundary(t *testing.T) {
 			t.Fatalf("index not used: %v, %v", found, err)
 		}
 		iterator := &patternQueryIterator{plan: plan, tx: tx, pattern: pattern, budget: budget, limit: 1}
-		row := queryRow{slots: make([]boundValue, 1), bound: make([]bool, 1), index: map[string]int{"n": 0}}
+		row := queryRow{slots: make([]boundValue, 1), index: map[string]int{"n": 0}}
 		for range 2 {
 			rows, err := iterator.apply(row)
 			if limit == 2*queryRowBytes+7 {
