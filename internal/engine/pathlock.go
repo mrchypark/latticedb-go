@@ -30,6 +30,7 @@ type pathLock struct {
 
 type pathLockEntry struct {
 	file    *os.File
+	info    os.FileInfo
 	readers int
 	writer  bool
 }
@@ -70,6 +71,20 @@ func acquirePathLock(path string, create, readOnly bool) (*pathLock, string, boo
 	}
 
 	lockPath := statePath + ".lock"
+	key, entry, err := findPathLockEntry(lockPath)
+	if err != nil {
+		pathLocks.Unlock()
+		return nil, "", false, err
+	}
+	if entry != nil {
+		if !readOnly || entry.writer {
+			pathLocks.Unlock()
+			return nil, "", false, ErrDatabaseLocked
+		}
+		entry.readers++
+		pathLocks.Unlock()
+		return &pathLock{path: key, entry: entry, file: entry.file, shared: true}, canonical, flat, nil
+	}
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err == nil {
 		err = tryLockFile(file, readOnly)
@@ -88,13 +103,39 @@ func acquirePathLock(path string, create, readOnly bool) (*pathLock, string, boo
 		}
 		return nil, "", false, fmt.Errorf("%w: %v", ErrDatabaseLocked, err)
 	}
-	entry := &pathLockEntry{file: file, readers: 0, writer: !readOnly}
+	info, err := file.Stat()
+	if err != nil {
+		_ = unlockFile(file)
+		_ = file.Close()
+		pathLocks.Unlock()
+		return nil, "", false, err
+	}
+	entry = &pathLockEntry{file: file, info: info, readers: 0, writer: !readOnly}
 	if readOnly {
 		entry.readers = 1
 	}
 	pathLocks.paths[statePath] = entry
 	pathLocks.Unlock()
 	return &pathLock{path: statePath, entry: entry, file: file, shared: readOnly}, canonical, flat, nil
+}
+
+// findPathLockEntry runs while pathLocks is held. It compares only the
+// candidate lock file's identity with cached descriptors, so it never opens a
+// second descriptor that could affect a process-scoped POSIX record lock.
+func findPathLockEntry(lockPath string) (string, *pathLockEntry, error) {
+	info, err := os.Stat(lockPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	for key, entry := range pathLocks.paths {
+		if os.SameFile(info, entry.info) {
+			return key, entry, nil
+		}
+	}
+	return "", nil, nil
 }
 
 func ensureLayoutOwner(statePath string, flat bool, databaseID string) error {

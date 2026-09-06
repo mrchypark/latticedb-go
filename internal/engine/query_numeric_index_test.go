@@ -164,14 +164,16 @@ func TestQueryStringOnlyCompositeUsesInlinePropertyIndex(t *testing.T) {
 	}
 	query := `MATCH (n:Item {value: $value}) RETURN n.value AS value`
 	params := map[string]any{"value": map[string]any{"name": "wanted"}}
-	result, err := db.QueryContext(t.Context(), query, params, QueryOptions{MaxWork: 4})
+	// Include normalized values and recursive property comparisons while keeping
+	// the bound below the 128-candidate unindexed scan.
+	result, err := db.QueryContext(t.Context(), query, params, QueryOptions{MaxWork: 16})
 	if err != nil || !reflect.DeepEqual(result.Rows, []map[string]any{{"value": params["value"]}}) {
 		t.Fatalf("indexed query = %#v, %v", result.Rows, err)
 	}
 	if err := db.DropNodePropertyIndex("Item", "value"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.QueryContext(t.Context(), query, params, QueryOptions{MaxWork: 4}); !errors.Is(err, ErrResourceLimit) {
+	if _, err := db.QueryContext(t.Context(), query, params, QueryOptions{MaxWork: 16}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("unindexed query error = %v", err)
 	}
 }

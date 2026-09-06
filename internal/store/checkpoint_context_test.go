@@ -61,3 +61,27 @@ func TestCheckpointPreparationCancellationCleansStaging(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckpointContextCancelsBeforeStatePublication(t *testing.T) {
+	files := DirectoryDatabaseFiles(t.TempDir())
+	graph := NewGraphState()
+	if err := EnsureDatabaseID(graph); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	err := checkpointGraphStateAndWALFilesContext(ctx, files, graph, 1, 1, 0, 0, func(stage string, after bool) error {
+		if stage == "state-create" && !after {
+			cancel()
+		}
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkpoint error = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(files.State); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state was published after cancellation: %v", err)
+	}
+	if _, err := os.Stat(files.WAL); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("WAL was published after cancellation: %v", err)
+	}
+}

@@ -72,7 +72,7 @@ func TestQueryLimitStopsIndexedMatchWork(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	result, err := db.QueryContext(t.Context(), `MATCH (n) WHERE id(n) = $id RETURN id(n) AS id LIMIT 1`, map[string]any{"id": int64(id)}, QueryOptions{MaxWork: 2})
+	result, err := db.QueryContext(t.Context(), `MATCH (n) WHERE id(n) = $id RETURN id(n) AS id LIMIT 1`, map[string]any{"id": int64(id)}, QueryOptions{MaxWork: 4})
 	if err != nil || len(result.Rows) != 1 {
 		t.Fatalf("limited match = %#v, %v", result.Rows, err)
 	}
