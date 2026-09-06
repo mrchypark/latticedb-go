@@ -127,12 +127,7 @@ func writeLayoutOwner(markerPath string, owner layoutOwner) error {
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
-	if err := temporary.Chmod(0o600); err == nil {
-		_, err = temporary.Write(data)
-	}
-	if err == nil {
-		err = temporary.Sync()
-	}
+	err = writeLayoutOwnerContents(temporary, data)
 	if closeErr := temporary.Close(); err == nil {
 		err = closeErr
 	}
@@ -143,6 +138,16 @@ func writeLayoutOwner(markerPath string, owner layoutOwner) error {
 		err = syncPathDirectory(filepath.Dir(markerPath))
 	}
 	return err
+}
+
+func writeLayoutOwnerContents(temporary *os.File, data []byte) error {
+	if err := temporary.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		return err
+	}
+	return temporary.Sync()
 }
 
 func checkLayoutOwner(statePath string, flat bool, databaseID string) error {

@@ -1495,6 +1495,9 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 		if err != nil {
 			return nil, false, err
 		}
+		if hasNestedNumericValue(value) {
+			continue
+		}
 		for _, label := range pattern.Labels {
 			definition := store.PropertyIndexDefinition{Scope: label, Property: clause.Property}
 			if !tx.graph.NodeProperties.Has(definition) {
@@ -1690,6 +1693,9 @@ func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[st
 		if err != nil {
 			return nil, false, err
 		}
+		if hasNestedNumericValue(value) {
+			continue
+		}
 		definition := store.PropertyIndexDefinition{Scope: pattern.EdgeType, Property: clause.Property}
 		if !tx.graph.EdgeProperties.Has(definition) {
 			continue
@@ -1746,6 +1752,37 @@ func alternateNumericIndexValue(value any) (any, bool) {
 		}
 	}
 	return nil, false
+}
+
+// hasNestedNumericValue reports composite values whose numeric equality does
+// not match the property index's typed composite keys.
+func hasNestedNumericValue(value any) bool {
+	switch value := value.(type) {
+	case []any:
+		for _, item := range value {
+			if containsNumericValue(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for _, item := range value {
+			if containsNumericValue(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsNumericValue(value any) bool {
+	switch value := value.(type) {
+	case int64, float64:
+		return true
+	case []any, map[string]any:
+		return hasNestedNumericValue(value)
+	default:
+		return false
+	}
 }
 
 func (plan *queryPlan) bindingNodeID(name string, params map[string]any) (uint64, bool, error) {

@@ -126,6 +126,9 @@ func (db *DB) ExportContextWithOptions(ctx context.Context, format ExportFormat,
 	if err != nil {
 		return nil, wrapError(err)
 	}
+	if err := inner.ValidateExportDestination(outputPath); err != nil {
+		return nil, wrapError(err)
+	}
 	graph, lease, err := inner.SnapshotGraph()
 	if err != nil {
 		return nil, wrapError(err)
@@ -146,6 +149,9 @@ func (db *DB) ExportFileContext(ctx context.Context, format ExportFormat, output
 func (db *DB) ExportFileContextWithOptions(ctx context.Context, format ExportFormat, outputPath string, opts ExportOptions) error {
 	inner, err := db.requireOpen()
 	if err != nil {
+		return wrapError(err)
+	}
+	if err := inner.ValidateExportDestination(outputPath); err != nil {
 		return wrapError(err)
 	}
 	graph, lease, err := inner.SnapshotGraph()

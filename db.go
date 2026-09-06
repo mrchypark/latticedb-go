@@ -787,6 +787,16 @@ func convertEdge(edge engine.Edge) Edge {
 }
 
 func convertQueryResult(result engine.QueryResult) QueryResult {
+	for _, row := range result.Rows {
+		for column, value := range row {
+			switch value := value.(type) {
+			case engine.Node:
+				row[column] = convertNode(value)
+			case engine.Edge:
+				row[column] = convertEdge(value)
+			}
+		}
+	}
 	return QueryResult{
 		Columns: result.Columns,
 		Rows:    result.Rows,

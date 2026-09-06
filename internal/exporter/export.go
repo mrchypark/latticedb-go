@@ -70,6 +70,9 @@ type exportedValue struct {
 }
 
 func Export(dbPath string, format ExportFormat, outputPath string) ([]byte, error) {
+	if err := validateDirectoryExportDestination(dbPath, outputPath); err != nil {
+		return nil, err
+	}
 	graph, _, _, _, err := store.LoadGraphState(dbPath)
 	if err != nil {
 		return nil, err

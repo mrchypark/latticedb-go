@@ -38,10 +38,11 @@ type StreamOperation struct {
 const streamChunkSize = uint64(64)
 
 type streamLog struct {
-	tail  *streamChunk
-	first uint64
-	count uint64
-	bytes uint64
+	tail          *streamChunk
+	first         uint64
+	count         uint64
+	bytes         uint64
+	snapshotBytes uint64
 }
 
 type streamChunk struct {
@@ -62,6 +63,7 @@ type StreamStore struct {
 	clonedStreams map[string]struct{}
 	clonedOffsets map[string]struct{}
 	logicalBytes  uint64
+	snapshotBytes uint64
 }
 
 type persistedStreams struct {
@@ -125,10 +127,11 @@ func errorsNewStreamName() error { return fmt.Errorf("invalid stream name, kind,
 
 func (store StreamStore) Fork() StreamStore {
 	return StreamStore{
-		streams:      store.streams,
-		next:         store.next,
-		offsets:      store.offsets,
-		logicalBytes: store.logicalBytes,
+		streams:       store.streams,
+		next:          store.next,
+		offsets:       store.offsets,
+		logicalBytes:  store.logicalBytes,
+		snapshotBytes: store.snapshotBytes,
 	}
 }
 
@@ -251,6 +254,7 @@ func (store *StreamStore) Publish(name, kind string, payload any) uint64 {
 	log := store.streams[name]
 	record := StreamRecord{Sequence: sequence, Kind: kind, Payload: CloneValue(payload)}
 	recordBytes := streamRecordBytes(record)
+	recordSnapshotBytes := streamRecordSnapshotBytes(record)
 	if log.tail == nil || len(log.tail.records) == int(streamChunkSize) {
 		log.tail = newStreamChunk(log.tail, []StreamRecord{record})
 	} else {
@@ -264,9 +268,12 @@ func (store *StreamStore) Publish(name, kind string, payload any) uint64 {
 	}
 	log.count++
 	log.bytes = snapshotAdd(log.bytes, recordBytes)
+	log.snapshotBytes = snapshotAdd(log.snapshotBytes, recordSnapshotBytes)
 	store.logicalBytes = snapshotAdd(store.logicalBytes, recordBytes)
+	store.snapshotBytes = snapshotAdd(store.snapshotBytes, recordSnapshotBytes)
 	if newStream {
 		store.logicalBytes = snapshotAdd(store.logicalBytes, uint64(len(name))+64)
+		store.snapshotBytes = snapshotAdd(store.snapshotBytes, streamSnapshotBytes(name))
 	}
 	store.streams[name] = log
 	return sequence
@@ -277,12 +284,14 @@ func (store *StreamStore) SetOffset(name, consumer string, sequence uint64) {
 		store.cloneStream(name)
 		store.next[name] = 1
 		store.logicalBytes = snapshotAdd(store.logicalBytes, uint64(len(name))+64)
+		store.snapshotBytes = snapshotAdd(store.snapshotBytes, streamSnapshotBytes(name))
 	}
 	_, existed := store.offsets[name][consumer]
 	store.cloneOffset(name)
 	store.offsets[name][consumer] = sequence
 	if !existed {
 		store.logicalBytes = snapshotAdd(store.logicalBytes, uint64(len(name)+len(consumer))+48)
+		store.snapshotBytes = snapshotAdd(store.snapshotBytes, streamOffsetSnapshotBytes(name, consumer))
 	}
 }
 
@@ -291,6 +300,7 @@ func (store *StreamStore) Trim(name string, through uint64) {
 	if store.next[name] == 0 {
 		store.next[name] = 1
 		store.logicalBytes = snapshotAdd(store.logicalBytes, uint64(len(name))+64)
+		store.snapshotBytes = snapshotAdd(store.snapshotBytes, streamSnapshotBytes(name))
 	}
 	log := store.streams[name]
 	if log.count == 0 || through < log.first {
@@ -304,6 +314,7 @@ func (store *StreamStore) Trim(name string, through uint64) {
 	}
 	var tail *streamChunk
 	var retainedBytes uint64
+	var retainedSnapshotBytes uint64
 	for index := len(chunks) - 1; index >= 0; index-- {
 		records := chunks[index].records
 		start := 0
@@ -315,6 +326,7 @@ func (store *StreamStore) Trim(name string, through uint64) {
 			tail = newStreamChunk(tail, retained)
 			for _, record := range retained {
 				retainedBytes = snapshotAdd(retainedBytes, streamRecordBytes(record))
+				retainedSnapshotBytes = snapshotAdd(retainedSnapshotBytes, streamRecordSnapshotBytes(record))
 			}
 		}
 	}
@@ -325,14 +337,18 @@ func (store *StreamStore) Trim(name string, through uint64) {
 		log.first = 0
 	}
 	log.tail = tail
-	if store.logicalBytes == ^uint64(0) || log.bytes > store.logicalBytes {
+	if store.logicalBytes == ^uint64(0) || log.bytes > store.logicalBytes || store.snapshotBytes == ^uint64(0) || log.snapshotBytes > store.snapshotBytes {
 		log.bytes = retainedBytes
+		log.snapshotBytes = retainedSnapshotBytes
 		store.streams[name] = log
 		store.logicalBytes = calculateStreamStoreBytes(*store)
+		store.snapshotBytes = calculateStreamStoreSnapshotBytes(*store)
 		return
 	}
 	store.logicalBytes = snapshotAdd(store.logicalBytes-log.bytes, retainedBytes)
+	store.snapshotBytes = snapshotAdd(store.snapshotBytes-log.snapshotBytes, retainedSnapshotBytes)
 	log.bytes = retainedBytes
+	log.snapshotBytes = retainedSnapshotBytes
 	store.streams[name] = log
 }
 
@@ -569,6 +585,7 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 		}
 		for _, record := range records {
 			log.bytes = snapshotAdd(log.bytes, streamRecordBytes(record))
+			log.snapshotBytes = snapshotAdd(log.snapshotBytes, streamRecordSnapshotBytes(record))
 		}
 		store.streams[stream.Name] = log
 		store.next[stream.Name] = stream.Next
@@ -593,11 +610,50 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 		store.offsets[offset.Stream][offset.Consumer] = offset.Sequence
 	}
 	store.logicalBytes = calculateStreamStoreBytes(store)
+	store.snapshotBytes = calculateStreamStoreSnapshotBytes(store)
 	return store, nil
 }
 
 func streamStoreBytes(store StreamStore) uint64 {
 	return store.logicalBytes
+}
+
+// streamStoreSnapshotBytes bounds the JSON representation used by snapshots.
+// It is deliberately separate from logicalBytes, which defines the public
+// stream read and retention byte budget.
+func streamStoreSnapshotBytes(store StreamStore) uint64 {
+	return store.snapshotBytes
+}
+
+func calculateStreamStoreSnapshotBytes(store StreamStore) uint64 {
+	var size uint64
+	for name := range store.next {
+		log := store.streams[name]
+		size = snapshotAdd(size, streamSnapshotBytes(name))
+		for chunk := log.tail; chunk != nil; chunk = chunk.previous {
+			for _, record := range chunk.records {
+				size = snapshotAdd(size, streamRecordSnapshotBytes(record))
+			}
+		}
+	}
+	for stream, consumers := range store.offsets {
+		for consumer := range consumers {
+			size = snapshotAdd(size, streamOffsetSnapshotBytes(stream, consumer))
+		}
+	}
+	return size
+}
+
+func streamSnapshotBytes(name string) uint64 {
+	return snapshotAdd(snapshotMul(uint64(len(name)), 6), 64)
+}
+
+func streamOffsetSnapshotBytes(stream, consumer string) uint64 {
+	return snapshotAdd(snapshotAdd(snapshotMul(uint64(len(stream)), 6), snapshotMul(uint64(len(consumer)), 6)), 48)
+}
+
+func streamRecordSnapshotBytes(record StreamRecord) uint64 {
+	return snapshotAdd(snapshotMul(uint64(len(record.Kind)), 6), snapshotAdd(48, estimateValueBytes(record.Payload)))
 }
 
 func calculateStreamStoreBytes(store StreamStore) uint64 {

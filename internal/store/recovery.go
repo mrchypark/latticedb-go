@@ -489,6 +489,19 @@ func databaseTempPattern(files DatabaseFiles, kind string) string {
 	return ".latticedb-" + hex.EncodeToString(token[:]) + "-" + kind + "-*.tmp"
 }
 
+// DatabaseTempPrefixes returns the path prefixes reserved for checkpoint
+// staging files. Directory-backed databases also own the legacy prefixes.
+func DatabaseTempPrefixes(files DatabaseFiles, includeLegacy bool) []string {
+	prefixes := make([]string, 0, len(databaseTempKinds)*2)
+	for _, kind := range databaseTempKinds {
+		prefixes = append(prefixes, filepath.Join(files.Directory, strings.TrimSuffix(databaseTempPattern(files, kind), "*.tmp")))
+		if includeLegacy {
+			prefixes = append(prefixes, filepath.Join(files.Directory, "."+kind+"-"))
+		}
+	}
+	return prefixes
+}
+
 // CleanupDatabaseTempFiles removes checkpoint files abandoned by a crashed writer.
 // Legacy generic names are safe only for directory-backed databases, whose lock owns the directory.
 func CleanupDatabaseTempFiles(files DatabaseFiles, includeLegacy bool) error {
@@ -2882,7 +2895,13 @@ func EstimateSnapshotBytes(graph *GraphState) (uint64, error) {
 	for nodeID, record := range graph.FTS.All() {
 		size = snapshotAdd(size, ftsSnapshotBytes(nodeID, record.Text))
 	}
-	size = snapshotAdd(size, streamStoreBytes(graph.Streams))
+	for definition := range graph.NodeProperties.Definitions() {
+		size = snapshotAdd(size, propertyIndexSnapshotBytes(definition))
+	}
+	for definition := range graph.EdgeProperties.Definitions() {
+		size = snapshotAdd(size, propertyIndexSnapshotBytes(definition))
+	}
+	size = snapshotAdd(size, streamStoreSnapshotBytes(graph.Streams))
 	return size, nil
 }
 
@@ -2987,8 +3006,28 @@ func ApplyDeltaSnapshotBytes(base *GraphState, graph *GraphState, changes GraphD
 			}
 		}
 	}
+	for _, definition := range changes.CreateNodeIndexes {
+		if err := adjust(0, propertyIndexSnapshotBytes(definition)); err != nil {
+			return 0, err
+		}
+	}
+	for _, definition := range changes.DropNodeIndexes {
+		if err := adjust(propertyIndexSnapshotBytes(definition), 0); err != nil {
+			return 0, err
+		}
+	}
+	for _, definition := range changes.CreateEdgeIndexes {
+		if err := adjust(0, propertyIndexSnapshotBytes(definition)); err != nil {
+			return 0, err
+		}
+	}
+	for _, definition := range changes.DropEdgeIndexes {
+		if err := adjust(propertyIndexSnapshotBytes(definition), 0); err != nil {
+			return 0, err
+		}
+	}
 	if changes.StreamsChanged {
-		if err := adjust(streamStoreBytes(base.Streams), streamStoreBytes(graph.Streams)); err != nil {
+		if err := adjust(streamStoreSnapshotBytes(base.Streams), streamStoreSnapshotBytes(graph.Streams)); err != nil {
 			return 0, err
 		}
 	}
@@ -2996,7 +3035,15 @@ func ApplyDeltaSnapshotBytes(base *GraphState, graph *GraphState, changes GraphD
 }
 
 func appMetadataSnapshotBytes(key string, value []byte) uint64 {
-	return snapshotAdd(snapshotAdd(64, uint64(len(key))), uint64(len(value)))
+	return snapshotAdd(64, snapshotAdd(base64SnapshotBytes(uint64(len(key))), base64SnapshotBytes(uint64(len(value)))))
+}
+
+func base64SnapshotBytes(length uint64) uint64 {
+	return snapshotMul((snapshotAdd(length, 2) / 3), 4)
+}
+
+func propertyIndexSnapshotBytes(definition PropertyIndexDefinition) uint64 {
+	return snapshotAdd(64, snapshotAdd(snapshotMul(uint64(len(definition.Scope)), 6), snapshotMul(uint64(len(definition.Property)), 6)))
 }
 
 func nodeSnapshotBytes(node *NodeRecord) (uint64, error) {
