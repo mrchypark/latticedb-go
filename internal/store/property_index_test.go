@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,6 +79,103 @@ func TestPropertyIndexesCardinality(t *testing.T) {
 	}
 	if got, found, err := indexes.Cardinality(PropertyIndexDefinition{Scope: "missing"}, "common"); err != nil || found || got != 0 {
 		t.Fatalf("missing definition cardinality = %d, %t, %v", got, found, err)
+	}
+}
+
+func TestPropertyIndexLookupLimitReturnsOrderedPrefixAcrossMutations(t *testing.T) {
+	indexes := NewPropertyIndexes()
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+	indexes.Create(definition)
+	for id := uint64(1_000); id > 0; id-- {
+		if err := indexes.Add(definition, "common", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	full, found, err := indexes.Lookup(definition, "common")
+	if err != nil || !found || len(full) != 1_000 {
+		t.Fatalf("full lookup = %d IDs, found=%v, err=%v", len(full), found, err)
+	}
+	for _, limit := range []uint{1, 3, 128} {
+		ids, found, err := indexes.LookupLimit(definition, "common", limit)
+		if err != nil || !found || !slices.Equal(ids, full[:limit]) {
+			t.Fatalf("limit %d = %v, want %v, found=%v, err=%v", limit, ids, full[:limit], found, err)
+		}
+	}
+	fork := indexes.Fork()
+	if err := fork.Remove(definition, "common", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := fork.Remove(definition, "common", 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := fork.Add(definition, "common", 2); err != nil {
+		t.Fatal(err)
+	}
+	forkIDs, found, err := fork.LookupLimit(definition, "common", 3)
+	if err != nil || !found || !slices.Equal(forkIDs, []uint64{2, 3, 4}) {
+		t.Fatalf("fork limited lookup = %v, found=%v err=%v", forkIDs, found, err)
+	}
+	baseIDs, found, err := indexes.Lookup(definition, "common")
+	if err != nil || !found || len(baseIDs) != 1_000 {
+		t.Fatalf("base lookup after fork delete = %d, found=%v, err=%v", len(baseIDs), found, err)
+	}
+
+	// IDs in later radix roots must still follow the first root, independent of
+	// map iteration order.
+	sparse := NewPropertyIndexes()
+	sparse.Create(definition)
+	for _, id := range []uint64{2<<20 + 1, 1 << 20, 2, 1<<20 + 1} {
+		if err := sparse.Add(definition, "sparse", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, found, err := sparse.LookupLimit(definition, "sparse", 3)
+	if err != nil || !found || !slices.Equal(got, []uint64{2, 1 << 20, 1<<20 + 1}) {
+		t.Fatalf("sparse limited lookup = %v, found=%v, err=%v", got, found, err)
+	}
+	for root := uint64(3); root <= 128; root++ {
+		if err := sparse.Add(definition, "sparse", root<<20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, found, err = sparse.LookupLimit(definition, "sparse", 1)
+	if err != nil || !found || !slices.Equal(got, []uint64{2}) {
+		t.Fatalf("many-root limited lookup = %v, found=%v, err=%v", got, found, err)
+	}
+	sparseFork := sparse.Fork()
+	if err := sparseFork.Remove(definition, "sparse", 2); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err = sparseFork.LookupLimit(definition, "sparse", 1)
+	if err != nil || !found || !slices.Equal(got, []uint64{1 << 20}) {
+		t.Fatalf("sparse fork limited lookup = %v, found=%v, err=%v", got, found, err)
+	}
+	got, found, err = sparse.LookupLimit(definition, "sparse", 1)
+	if err != nil || !found || !slices.Equal(got, []uint64{2}) {
+		t.Fatalf("base sparse lookup after fork delete = %v, found=%v, err=%v", got, found, err)
+	}
+
+	// A previously dense radix posting must shed high-root overhead when later
+	// writes spread it across many roots.
+	dense := NewPropertyIndexes()
+	dense.Create(definition)
+	for id := uint64(1); id <= smallPostingLimit+1; id++ {
+		if err := dense.Add(definition, "dense-wide", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for root := uint64(1); root <= 8; root++ {
+		if err := dense.Add(definition, "dense-wide", root<<20|7); err != nil {
+			t.Fatal(err)
+		}
+	}
+	denseKey, err := makePropertyValueKey("dense-wide")
+	if err != nil {
+		t.Fatal(err)
+	}
+	densePosting := dense.definitions[definition].values.Get(hashPropertyValueKey(denseKey))[denseKey]
+	if densePosting.large != nil || densePosting.chunks == nil {
+		t.Fatalf("wide radix posting did not convert to chunks: %#v", densePosting)
 	}
 }
 
@@ -219,4 +317,170 @@ func BenchmarkPropertyValueKeyComposite(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkPropertyIndexLookupLimitCommonPosting(b *testing.B) {
+	indexes := NewPropertyIndexes()
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+	indexes.Create(definition)
+	for id := uint64(1); id <= 100_000; id++ {
+		if err := indexes.Add(definition, "common", id); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for _, limit := range []uint{1, 10, 100_000} {
+		b.Run(strconv.FormatUint(uint64(limit), 10), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if ids, found, err := indexes.LookupLimit(definition, "common", limit); err != nil || !found || len(ids) != int(limit) {
+					b.Fatalf("LookupLimit ids=%d found=%v err=%v", len(ids), found, err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkPropertyIndexForkAddCommonPosting(b *testing.B) {
+	indexes := NewPropertyIndexes()
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+	indexes.Create(definition)
+	for id := uint64(1); id <= 100_000; id++ {
+		if err := indexes.Add(definition, "common", id); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		fork := indexes.Fork()
+		if err := fork.Add(definition, "common", uint64(100_001+i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPropertyIndexLookupLimitSparseRoots(b *testing.B) {
+	indexes := NewPropertyIndexes()
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+	indexes.Create(definition)
+	for root := uint64(1); root <= 10_000; root++ {
+		if err := indexes.Add(definition, "common", root<<20); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ids, found, err := indexes.LookupLimit(definition, "common", 1)
+		if err != nil || !found || !slices.Equal(ids, []uint64{1 << 20}) {
+			b.Fatalf("LookupLimit ids=%v found=%v err=%v", ids, found, err)
+		}
+	}
+}
+
+func BenchmarkPropertyIndexBuildUniqueValues(b *testing.B) {
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+	for _, sparse := range []bool{false, true} {
+		name := "dense"
+		if sparse {
+			name = "sparse"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				indexes := NewPropertyIndexes()
+				indexes.Create(definition)
+				for id := uint64(1); id <= 10_000; id++ {
+					postingID := id
+					if sparse {
+						postingID <<= 20
+					}
+					if err := indexes.Add(definition, int64(id), postingID); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkPropertyIndexRetainedHeap(b *testing.B) {
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+	for _, scenario := range []struct {
+		name  string
+		value func(uint64) any
+		id    func(uint64) uint64
+	}{
+		{name: "common", value: func(uint64) any { return "common" }, id: func(id uint64) uint64 { return id }},
+		{name: "unique", value: func(id uint64) any { return int64(id) }, id: func(id uint64) uint64 { return id }},
+		{name: "sparse", value: func(uint64) any { return "common" }, id: func(id uint64) uint64 { return id << 20 }},
+	} {
+		b.Run(scenario.name, func(b *testing.B) {
+			b.StopTimer()
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			indexes := NewPropertyIndexes()
+			indexes.Create(definition)
+			for id := uint64(1); id <= 10_000; id++ {
+				if err := indexes.Add(definition, scenario.value(id), scenario.id(id)); err != nil {
+					b.Fatal(err)
+				}
+			}
+			runtime.GC()
+			runtime.ReadMemStats(&after)
+			runtime.KeepAlive(indexes)
+			// Report the GC heap delta, not timing or an RSS limit. Subtract as
+			// signed floating-point values so background GC noise cannot wrap.
+			b.ReportMetric(float64(after.HeapAlloc)-float64(before.HeapAlloc), "retained-B")
+			b.StartTimer()
+			for range b.N {
+				runtime.KeepAlive(indexes)
+			}
+		})
+	}
+}
+
+func BenchmarkPropertyIndexSparsePostingWrites(b *testing.B) {
+	definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+	b.Run("build_reverse", func(b *testing.B) {
+		for range b.N {
+			indexes := NewPropertyIndexes()
+			indexes.Create(definition)
+			for index := uint64(100_000); index > 0; index-- {
+				if err := indexes.Add(definition, "common", sparsePostingID(index)); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+
+	indexes := NewPropertyIndexes()
+	indexes.Create(definition)
+	for index := uint64(1); index <= 100_000; index++ {
+		if err := indexes.Add(definition, "common", sparsePostingID(index)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.Run("fork_add", func(b *testing.B) {
+		for range b.N {
+			fork := indexes.Fork()
+			if err := fork.Add(definition, "common", sparsePostingID(100_001)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("fork_delete", func(b *testing.B) {
+		for range b.N {
+			fork := indexes.Fork()
+			if err := fork.Remove(definition, "common", sparsePostingID(50_000)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func sparsePostingID(index uint64) uint64 {
+	return index<<20 | index&0xffff
 }

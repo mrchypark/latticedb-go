@@ -181,6 +181,23 @@ type GenerationRetentionStats struct {
 	OldestLeaseAge time.Duration
 }
 
+// OperationalStats reports database-owned writer wait, transaction, snapshot,
+// and immutable-generation retention state. It does not estimate process RSS.
+type OperationalStats struct {
+	// WriterWaits counts BeginWriteContext calls that had to wait for the writer slot.
+	WriterWaits uint64
+	// ActiveWriterWaits counts BeginWriteContext callers currently waiting for the writer slot.
+	ActiveWriterWaits    uint64
+	OldestWriterWaitAge  time.Duration
+	ActiveTransactions   uint64
+	OldestTransactionAge time.Duration
+	// ActiveSnapshots counts snapshot and export generation pins.
+	ActiveSnapshots      uint64
+	OldestSnapshotAge    time.Duration
+	RetainedGenerations  uint64
+	RetainedLogicalBytes uint64
+}
+
 type VectorIndexStats struct {
 	LiveEntries                uint64
 	IndexEntries               uint64

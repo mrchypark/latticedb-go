@@ -222,6 +222,9 @@ type DB struct {
 	queryCache                        map[string]*queryPlan
 	queryCacheKeys                    [queryCacheEntries]string
 	queryCacheNext                    uint32
+	queryCacheSources                 map[string]string
+	queryCacheSourceKeys              [queryCacheEntries]string
+	queryCacheSourceNext              uint32
 	cacheHits                         atomic.Uint64
 	cacheMisses                       atomic.Uint64
 	vectorExactFallbacks              atomic.Uint64
@@ -248,6 +251,12 @@ type DB struct {
 	retainedGenerationLogicalBytes    uint64
 	activeGenerationLeases            uint64
 	activeSnapshotLeases              uint64
+	activeTransactions                map[*Tx]time.Time
+	activeLeases                      map[*GenerationLease]time.Time
+	writerWaits                       map[uint64]time.Time
+	nextWriterWait                    uint64
+	writerWaitCount                   uint64
+	now                               func() time.Time
 	fullSync                          bool
 	walSync                           func(*os.File) error
 	walWrite                          func(*os.File, []byte) (int, error)
@@ -306,6 +315,20 @@ type GenerationRetentionStats struct {
 	RetainedGenerations  uint64
 	RetainedLogicalBytes uint64
 	OldestLeaseAge       time.Duration
+}
+
+// OperationalStats reports database-owned wait and pin lifetimes. It does not
+// estimate process RSS or any work outside this database instance.
+type OperationalStats struct {
+	WriterWaits          uint64
+	ActiveWriterWaits    uint64
+	OldestWriterWaitAge  time.Duration
+	ActiveTransactions   uint64
+	OldestTransactionAge time.Duration
+	ActiveSnapshots      uint64
+	OldestSnapshotAge    time.Duration
+	RetainedGenerations  uint64
+	RetainedLogicalBytes uint64
 }
 
 // GenerationLease pins a graph generation until Release. It is used by read
@@ -633,6 +656,9 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		maxGenerationLeases:               opts.MaxGenerationLeases,
 		maxRetainedGenerationLogicalBytes: opts.MaxRetainedGenerationLogicalBytes,
 		generationLeases:                  map[*store.GraphState]*generationRetention{},
+		activeTransactions:                map[*Tx]time.Time{},
+		activeLeases:                      map[*GenerationLease]time.Time{},
+		writerWaits:                       map[uint64]time.Time{},
 		fullSync:                          opts.Durability == DurabilityFull,
 		walSync:                           opts.walSync,
 		walWrite:                          opts.walWrite,
@@ -1512,7 +1538,7 @@ func (db *DB) admitGenerationLeaseLocked(graph *store.GraphState, snapshot bool,
 			db.generationLeases = make(map[*store.GraphState]*generationRetention)
 		}
 		retention = generationRetentionPool.Get().(*generationRetention)
-		*retention = generationRetention{logicalBytes: graph.SnapshotBytes, openedAt: time.Now(), previous: db.generationOrderTail}
+		*retention = generationRetention{logicalBytes: graph.SnapshotBytes, openedAt: db.timeNow(), previous: db.generationOrderTail}
 		if db.generationOrderTail != nil {
 			db.generationOrderTail.next = retention
 		} else {
@@ -1528,7 +1554,25 @@ func (db *DB) admitGenerationLeaseLocked(graph *store.GraphState, snapshot bool,
 		db.activeSnapshotLeases++
 	}
 	*lease = GenerationLease{db: db, graph: graph, snapshot: snapshot}
+	if db.activeLeases == nil {
+		db.activeLeases = make(map[*GenerationLease]time.Time)
+	}
+	db.activeLeases[lease] = db.timeNow()
 	return nil
+}
+
+func (db *DB) timeNow() time.Time {
+	if db.now != nil {
+		return db.now()
+	}
+	return time.Now()
+}
+
+func metricAge(now, started time.Time) time.Duration {
+	if now.Before(started) {
+		return 0
+	}
+	return now.Sub(started)
 }
 
 func (db *DB) removeGenerationRetentionLocked(retention *generationRetention) {
@@ -1562,7 +1606,39 @@ func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
 		RetainedLogicalBytes: db.retainedGenerationLogicalBytes,
 	}
 	if oldest := db.generationOrderHead; oldest != nil {
-		stats.OldestLeaseAge = time.Since(oldest.openedAt)
+		stats.OldestLeaseAge = metricAge(db.timeNow(), oldest.openedAt)
+	}
+	return stats, nil
+}
+
+func (db *DB) OperationalStats() (OperationalStats, error) {
+	if db == nil {
+		return OperationalStats{}, ErrDatabaseClosed
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return OperationalStats{}, ErrDatabaseClosed
+	}
+	now := db.timeNow()
+	stats := OperationalStats{
+		WriterWaits:          db.writerWaitCount,
+		ActiveWriterWaits:    uint64(len(db.writerWaits)),
+		ActiveTransactions:   uint64(len(db.activeTransactions)),
+		RetainedGenerations:  uint64(len(db.generationLeases)),
+		RetainedLogicalBytes: db.retainedGenerationLogicalBytes,
+	}
+	for _, started := range db.writerWaits {
+		stats.OldestWriterWaitAge = max(stats.OldestWriterWaitAge, metricAge(now, started))
+	}
+	for _, started := range db.activeTransactions {
+		stats.OldestTransactionAge = max(stats.OldestTransactionAge, metricAge(now, started))
+	}
+	for lease, started := range db.activeLeases {
+		if lease.snapshot {
+			stats.ActiveSnapshots++
+			stats.OldestSnapshotAge = max(stats.OldestSnapshotAge, metricAge(now, started))
+		}
 	}
 	return stats, nil
 }
@@ -1579,6 +1655,7 @@ func (lease *GenerationLease) Release() {
 		return
 	}
 	lease.released = true
+	delete(db.activeLeases, lease)
 	retention := db.generationLeases[lease.graph]
 	if retention != nil {
 		retention.refs--
@@ -1640,16 +1717,43 @@ func (db *DB) BeginWriteContext(ctx context.Context) (*Tx, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var waitID uint64
 	for !db.writeMu.TryLock() {
+		if waitID == 0 {
+			waitID = db.beginWriterWait()
+		}
 		timer := time.NewTimer(time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			db.finishWriterWait(waitID)
 			return nil, ctx.Err()
 		case <-timer.C:
 		}
 	}
+	db.finishWriterWait(waitID)
 	return db.beginAfterWriteLock(false)
+}
+
+func (db *DB) beginWriterWait() uint64 {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.nextWriterWait++
+	if db.writerWaits == nil {
+		db.writerWaits = make(map[uint64]time.Time)
+	}
+	db.writerWaits[db.nextWriterWait] = db.timeNow()
+	db.writerWaitCount++
+	return db.nextWriterWait
+}
+
+func (db *DB) finishWriterWait(id uint64) {
+	if id == 0 {
+		return
+	}
+	db.mu.Lock()
+	delete(db.writerWaits, id)
+	db.mu.Unlock()
 }
 
 func (db *DB) beginAfterWriteLock(readOnly bool) (*Tx, error) {
@@ -1697,6 +1801,10 @@ func (db *DB) beginAfterWriteLock(readOnly bool) (*Tx, error) {
 		}
 		tx.generationLease = lease
 	}
+	if db.activeTransactions == nil {
+		db.activeTransactions = make(map[*Tx]time.Time)
+	}
+	db.activeTransactions[tx] = db.timeNow()
 	db.activeTx.Add(1)
 	return tx, nil
 }
@@ -2388,6 +2496,9 @@ func (db *DB) CacheClear() error {
 	db.queryCache = map[string]*queryPlan{}
 	db.queryCacheKeys = [queryCacheEntries]string{}
 	db.queryCacheNext = 0
+	db.queryCacheSources = nil
+	db.queryCacheSourceKeys = [queryCacheEntries]string{}
+	db.queryCacheSourceNext = 0
 	db.cacheHits.Store(0)
 	db.cacheMisses.Store(0)
 	return nil
@@ -3026,8 +3137,10 @@ func (db *DB) appendVectorRebuildTxLocked(tx *Tx) {
 }
 
 func (db *DB) cachedQueryPlan(query string) (*queryPlan, error) {
+	source := query
 	db.cacheMu.RLock()
-	plan, ok := db.queryCache[query]
+	key := db.queryCacheSources[source]
+	plan, ok := db.queryCache[key]
 	if ok {
 		db.cacheHits.Add(1)
 	}
@@ -3040,9 +3153,15 @@ func (db *DB) cachedQueryPlan(query string) (*queryPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	key, err = canonicalQueryPlanKey(plan)
+	if err != nil {
+		// A future AST value unsupported by the key encoder may still execute;
+		// skip caching it rather than changing the parser's accepted language.
+		return plan, nil
+	}
 
 	db.cacheMu.Lock()
-	if cached, loaded := db.queryCache[query]; loaded {
+	if cached, loaded := db.queryCache[key]; loaded {
 		db.cacheHits.Add(1)
 		plan = cached
 	} else {
@@ -3050,11 +3169,22 @@ func (db *DB) cachedQueryPlan(query string) (*queryPlan, error) {
 			// ponytail: FIFO bounds memory without LRU bookkeeping; add LRU only if measured hit rate suffers.
 			delete(db.queryCache, db.queryCacheKeys[db.queryCacheNext])
 		}
-		db.queryCacheKeys[db.queryCacheNext] = query
+		db.queryCacheKeys[db.queryCacheNext] = key
 		db.queryCacheNext = (db.queryCacheNext + 1) % queryCacheEntries
-		db.queryCache[query] = plan
+		db.queryCache[key] = plan
 		db.cacheMisses.Add(1)
 	}
+	// Source aliases keep repeated queries off the parser path, independently
+	// bounded to the same FIFO capacity as canonical plans.
+	if db.queryCacheSources == nil {
+		db.queryCacheSources = make(map[string]string)
+	}
+	if _, exists := db.queryCacheSources[source]; !exists {
+		delete(db.queryCacheSources, db.queryCacheSourceKeys[db.queryCacheSourceNext])
+		db.queryCacheSourceKeys[db.queryCacheSourceNext] = source
+		db.queryCacheSourceNext = (db.queryCacheSourceNext + 1) % queryCacheEntries
+	}
+	db.queryCacheSources[source] = key
 	db.cacheMu.Unlock()
 	return plan, nil
 }
@@ -3339,6 +3469,10 @@ func (tx *Tx) finish() *DB {
 		return nil
 	}
 	tx.closed = true
+	db := tx.db
+	db.mu.Lock()
+	delete(db.activeTransactions, tx)
+	db.mu.Unlock()
 	if tx.generationLease != nil {
 		tx.generationLease.Release()
 		*tx.generationLease = GenerationLease{}
@@ -3346,14 +3480,14 @@ func (tx *Tx) finish() *DB {
 		tx.generationLease = nil
 	}
 	tx.graph, tx.base, tx.changes = nil, nil, nil
-	tx.db.activeTx.Add(-1)
-	requestCheckpoint := tx.writeLocked && (tx.db.checkpointNeeded.Load() || tx.db.adjacencyMaintenanceNeeded.Load())
+	db.activeTx.Add(-1)
+	requestCheckpoint := tx.writeLocked && (db.checkpointNeeded.Load() || db.adjacencyMaintenanceNeeded.Load())
 	if tx.writeLocked {
 		tx.writeLocked = false
-		tx.db.writeMu.Unlock()
+		db.writeMu.Unlock()
 	}
 	if requestCheckpoint {
-		return tx.db
+		return db
 	}
 	return nil
 }

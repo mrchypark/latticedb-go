@@ -215,8 +215,7 @@ func ownedTopKIterator(t *testing.T, rows []queryRow, budget *queryBudget) *slic
 
 func topKTestRow(plan *queryPlan, rank, id int64) queryRow {
 	return queryRow{
-		slots: []boundValue{{Value: rank, HasValue: true}, {Value: id, HasValue: true}},
-		bound: []bool{true, true},
+		slots: []boundValue{{Value: rank, HasValue: true, Bound: true}, {Value: id, HasValue: true, Bound: true}},
 		index: plan.slots,
 	}
 }

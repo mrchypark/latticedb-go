@@ -25,7 +25,7 @@ type propertyValueKey struct {
 }
 
 type propertyIndexData struct {
-	values       ShardMap[map[propertyValueKey]postingList]
+	values       ShardMap[map[propertyValueKey]propertyPosting]
 	clonedHashes map[uint64]struct{}
 	clonedValues map[propertyValueKey]struct{}
 }
@@ -40,6 +40,8 @@ func NewPropertyIndexes() PropertyIndexes {
 	return PropertyIndexes{definitions: map[PropertyIndexDefinition]propertyIndexData{}}
 }
 
+// Fork creates a writable child of an immutable source generation, matching
+// PagedMap and ShardMap: keep the source unchanged while the child is in use.
 func (indexes PropertyIndexes) Fork() PropertyIndexes {
 	return PropertyIndexes{definitions: indexes.definitions}
 }
@@ -96,7 +98,7 @@ func (indexes *PropertyIndexes) Create(definition PropertyIndexDefinition) bool 
 		return false
 	}
 	indexes.cloneRoot()
-	indexes.definitions[definition] = propertyIndexData{values: NewShardMap[map[propertyValueKey]postingList]()}
+	indexes.definitions[definition] = propertyIndexData{values: NewShardMap[map[propertyValueKey]propertyPosting]()}
 	indexes.cloned[definition] = struct{}{}
 	return true
 }
@@ -124,10 +126,10 @@ func (indexes *PropertyIndexes) Add(definition PropertyIndexDefinition, value an
 	bucket := data.writableBucket(hashed)
 	list := bucket[key]
 	if _, cloned := data.clonedValues[key]; !cloned {
-		list = forkPostingList(list)
+		list = forkPropertyPosting(list)
 		data.clonedValues[key] = struct{}{}
 	}
-	addPosting(&list, id)
+	list.add(id)
 	bucket[key] = list
 	indexes.definitions[definition] = data
 	return nil
@@ -151,10 +153,10 @@ func (indexes *PropertyIndexes) Remove(definition PropertyIndexDefinition, value
 	bucket := data.writableBucket(hashed)
 	list = bucket[key]
 	if _, cloned := data.clonedValues[key]; !cloned {
-		list = forkPostingList(list)
+		list = forkPropertyPosting(list)
 		data.clonedValues[key] = struct{}{}
 	}
-	removePosting(&list, id)
+	list.remove(id)
 	if list.len() == 0 {
 		delete(bucket, key)
 		delete(data.clonedValues, key)
@@ -183,7 +185,6 @@ func (indexes PropertyIndexes) Lookup(definition PropertyIndexDefinition, value 
 	for id := range list.all() {
 		ids = append(ids, id)
 	}
-	slices.Sort(ids)
 	return ids, true, nil
 }
 
@@ -233,32 +234,19 @@ func (indexes PropertyIndexes) LookupLimit(definition PropertyIndexDefinition, v
 	if limit == 0 {
 		return nil, true, nil
 	}
-	capacity := 64
+	list := data.values.Get(hashPropertyValueKey(key))[key]
+	capacity := list.len()
 	if limit < uint(capacity) {
 		capacity = int(limit)
 	}
 	ids := make([]uint64, 0, capacity)
-	for id := range data.values.Get(hashPropertyValueKey(key))[key].all() {
-		ids = insertPostingID(ids, id, limit)
+	for id := range list.all() {
+		ids = append(ids, id)
+		if uint(len(ids)) == limit {
+			break
+		}
 	}
 	return ids, true, nil
-}
-
-func insertPostingID(ids []uint64, id uint64, limit uint) []uint64 {
-	if uint(len(ids)) == limit && id >= ids[len(ids)-1] {
-		return ids
-	}
-	index, found := slices.BinarySearch(ids, id)
-	if found {
-		return ids
-	}
-	if uint(len(ids)) == limit {
-		ids = ids[:len(ids)-1]
-	}
-	ids = append(ids, 0)
-	copy(ids[index+1:], ids[index:])
-	ids[index] = id
-	return ids
 }
 
 func PropertyValuesEqual(left, right any) bool {
@@ -297,7 +285,7 @@ func (indexes *PropertyIndexes) writableDefinition(definition PropertyIndexDefin
 	return indexes.definitions[definition], true
 }
 
-func (data *propertyIndexData) writableBucket(hashed uint64) map[propertyValueKey]postingList {
+func (data *propertyIndexData) writableBucket(hashed uint64) map[propertyValueKey]propertyPosting {
 	data.values.CloneShardOnce(hashed)
 	if data.clonedHashes == nil {
 		data.clonedHashes = map[uint64]struct{}{}
@@ -306,7 +294,7 @@ func (data *propertyIndexData) writableBucket(hashed uint64) map[propertyValueKe
 	if _, cloned := data.clonedHashes[hashed]; !cloned {
 		bucket := maps.Clone(data.values.Get(hashed))
 		if bucket == nil {
-			bucket = map[propertyValueKey]postingList{}
+			bucket = map[propertyValueKey]propertyPosting{}
 		}
 		data.values.Set(hashed, bucket)
 		data.clonedHashes[hashed] = struct{}{}
@@ -314,44 +302,331 @@ func (data *propertyIndexData) writableBucket(hashed uint64) map[propertyValueKe
 	return data.values.Get(hashed)
 }
 
-func forkPostingList(list postingList) postingList {
-	if list.large.root != nil {
-		list.large = list.large.Fork()
-	} else if list.small == nil {
-		list.small = map[uint64]struct{}{}
-	} else {
-		list.small = maps.Clone(list.small)
-	}
-	return list
+// propertyPosting keeps the common small posting compact and ordered. Larger
+// postings promote to a copy-on-write radix table, whose ordered iterator can
+// stop after a requested low-ID prefix.
+type propertyPosting struct {
+	small  []uint64
+	chunks *propertyPostingChunks
+	large  *propertyPostingRadix
 }
 
-func addPosting(list *postingList, id uint64) {
-	if list.large.root != nil {
-		list.large.CloneShardOnce(id)
-		list.large.Set(id, struct{}{})
-		return
-	}
-	if list.small == nil {
-		list.small = map[uint64]struct{}{}
-	}
-	list.small[id] = struct{}{}
-	if len(list.small) <= smallPostingLimit {
-		return
-	}
-	list.large = newPostingShardMap()
-	for postingID := range list.small {
-		list.large.Set(postingID, struct{}{})
-	}
-	list.small = nil
+const propertyPostingChunkSize = 256
+
+type propertyPostingRadix struct {
+	ids         PagedMap[struct{}]
+	roots       []uint64
+	rootsCloned bool
 }
 
-func removePosting(list *postingList, id uint64) {
-	if list.large.root != nil {
-		list.large.CloneShardOnce(id)
-		list.large.Delete(id)
+type propertyPostingChunks struct {
+	chunks       []*propertyPostingChunk
+	length       int
+	directoryCOW bool
+	cloned       map[int]struct{}
+}
+
+type propertyPostingChunk struct {
+	ids []uint64
+}
+
+func (posting propertyPosting) has(id uint64) bool {
+	if posting.large != nil {
+		return posting.large.ids.Has(id)
+	}
+	if posting.chunks != nil {
+		return posting.chunks.has(id)
+	}
+	_, found := slices.BinarySearch(posting.small, id)
+	return found
+}
+
+func (posting propertyPosting) len() int {
+	if posting.large != nil {
+		return posting.large.ids.Len()
+	}
+	if posting.chunks != nil {
+		return posting.chunks.length
+	}
+	return len(posting.small)
+}
+
+func (posting propertyPosting) all() iter.Seq[uint64] {
+	return func(yield func(uint64) bool) {
+		if posting.large != nil {
+			for id := range posting.large.ids.orderedRoots(posting.large.roots) {
+				if !yield(id) {
+					return
+				}
+			}
+			return
+		}
+		if posting.chunks != nil {
+			for _, chunk := range posting.chunks.chunks {
+				for _, id := range chunk.ids {
+					if !yield(id) {
+						return
+					}
+				}
+			}
+			return
+		}
+		for _, id := range posting.small {
+			if !yield(id) {
+				return
+			}
+		}
+	}
+}
+
+func forkPropertyPosting(posting propertyPosting) propertyPosting {
+	if posting.large != nil {
+		forked := *posting.large
+		forked.ids = posting.large.ids.Fork()
+		forked.rootsCloned = false
+		posting.large = &forked
+		return posting
+	}
+	if posting.chunks != nil {
+		forked := *posting.chunks
+		forked.directoryCOW = false
+		forked.cloned = nil
+		posting.chunks = &forked
+		return posting
+	}
+	posting.small = slices.Clone(posting.small)
+	return posting
+}
+
+func (posting *propertyPosting) add(id uint64) {
+	if posting.large != nil {
+		posting.large.add(id)
+		if posting.large.shouldUseChunks() {
+			posting.chunks = newPropertyPostingChunksFromRadix(posting.large)
+			posting.large = nil
+		}
 		return
 	}
-	delete(list.small, id)
+	if posting.chunks != nil {
+		posting.chunks.add(id)
+		return
+	}
+	index, found := slices.BinarySearch(posting.small, id)
+	if found {
+		return
+	}
+	posting.small = append(posting.small, 0)
+	copy(posting.small[index+1:], posting.small[index:])
+	posting.small[index] = id
+	if len(posting.small) <= smallPostingLimit {
+		return
+	}
+	if !propertyPostingShouldPromote(posting.small) {
+		posting.chunks = newPropertyPostingChunks(posting.small)
+		posting.small = nil
+		return
+	}
+	large := &propertyPostingRadix{}
+	for _, postingID := range posting.small {
+		large.add(postingID)
+	}
+	posting.small = nil
+	posting.large = large
+}
+
+// Sparse IDs would allocate one radix root per distant range. Keep those
+// postings as a compact sorted slice; dense postings promote for bounded
+// ordered prefix reads.
+func propertyPostingShouldPromote(ids []uint64) bool {
+	return (ids[len(ids)-1]>>20)-(ids[0]>>20) < 8
+}
+
+func newPropertyPostingChunks(ids []uint64) *propertyPostingChunks {
+	posting := &propertyPostingChunks{length: len(ids), directoryCOW: true}
+	for len(ids) > 0 {
+		length := min(len(ids), propertyPostingChunkSize)
+		chunk := &propertyPostingChunk{ids: make([]uint64, length, propertyPostingChunkSize)}
+		copy(chunk.ids, ids[:length])
+		posting.chunks = append(posting.chunks, chunk)
+		ids = ids[length:]
+	}
+	return posting
+}
+
+func newPropertyPostingChunksFromRadix(radix *propertyPostingRadix) *propertyPostingChunks {
+	ids := make([]uint64, 0, radix.ids.Len())
+	for id := range radix.ids.orderedRoots(radix.roots) {
+		ids = append(ids, id)
+	}
+	return newPropertyPostingChunks(ids)
+}
+
+func (posting *propertyPostingChunks) has(id uint64) bool {
+	index := posting.index(id)
+	if index == len(posting.chunks) {
+		return false
+	}
+	_, found := slices.BinarySearch(posting.chunks[index].ids, id)
+	return found
+}
+
+func (posting *propertyPostingChunks) add(id uint64) {
+	index := posting.index(id)
+	if index == len(posting.chunks) {
+		index--
+	}
+	chunk := posting.writableChunk(index)
+	insert, found := slices.BinarySearch(chunk.ids, id)
+	if found {
+		return
+	}
+	if len(chunk.ids) < propertyPostingChunkSize {
+		chunk.ids = append(chunk.ids, 0)
+		copy(chunk.ids[insert+1:], chunk.ids[insert:])
+		chunk.ids[insert] = id
+		posting.length++
+		return
+	}
+	merged := make([]uint64, len(chunk.ids)+1)
+	copy(merged, chunk.ids[:insert])
+	merged[insert] = id
+	copy(merged[insert+1:], chunk.ids[insert:])
+	leftLength := len(merged) / 2
+	left := &propertyPostingChunk{ids: make([]uint64, leftLength, propertyPostingChunkSize)}
+	right := &propertyPostingChunk{ids: make([]uint64, len(merged)-leftLength, propertyPostingChunkSize)}
+	copy(left.ids, merged[:leftLength])
+	copy(right.ids, merged[leftLength:])
+	posting.cloneDirectory()
+	posting.chunks[index] = left
+	posting.chunks = append(posting.chunks, nil)
+	copy(posting.chunks[index+2:], posting.chunks[index+1:])
+	posting.chunks[index+1] = right
+	posting.cloned = nil
+	posting.length++
+}
+
+func (posting *propertyPostingChunks) remove(id uint64) {
+	index := posting.index(id)
+	if index == len(posting.chunks) {
+		return
+	}
+	chunk := posting.writableChunk(index)
+	remove, found := slices.BinarySearch(chunk.ids, id)
+	if !found {
+		return
+	}
+	copy(chunk.ids[remove:], chunk.ids[remove+1:])
+	chunk.ids = chunk.ids[:len(chunk.ids)-1]
+	posting.length--
+	if len(chunk.ids) != 0 {
+		return
+	}
+	posting.cloneDirectory()
+	copy(posting.chunks[index:], posting.chunks[index+1:])
+	posting.chunks[len(posting.chunks)-1] = nil
+	posting.chunks = posting.chunks[:len(posting.chunks)-1]
+	posting.cloned = nil
+}
+
+func (posting *propertyPostingChunks) index(id uint64) int {
+	low, high := 0, len(posting.chunks)
+	for low < high {
+		middle := low + (high-low)/2
+		if posting.chunks[middle].ids[len(posting.chunks[middle].ids)-1] < id {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low
+}
+
+func (posting *propertyPostingChunks) writableChunk(index int) *propertyPostingChunk {
+	posting.cloneDirectory()
+	if posting.cloned == nil {
+		posting.cloned = map[int]struct{}{}
+	}
+	if _, cloned := posting.cloned[index]; !cloned {
+		source := posting.chunks[index]
+		chunk := &propertyPostingChunk{ids: make([]uint64, len(source.ids), propertyPostingChunkSize)}
+		copy(chunk.ids, source.ids)
+		posting.chunks[index] = chunk
+		posting.cloned[index] = struct{}{}
+	}
+	return posting.chunks[index]
+}
+
+func (posting *propertyPostingChunks) cloneDirectory() {
+	if posting.directoryCOW {
+		return
+	}
+	// ponytail: the first sparse write copies O(chunks) directory pointers;
+	// use a persistent directory only if larger posting benchmarks justify it.
+	posting.chunks = slices.Clone(posting.chunks)
+	posting.directoryCOW = true
+}
+
+func (posting *propertyPosting) remove(id uint64) {
+	if posting.large != nil {
+		posting.large.remove(id)
+		if posting.large.shouldUseChunks() {
+			posting.chunks = newPropertyPostingChunksFromRadix(posting.large)
+			posting.large = nil
+		}
+		return
+	}
+	if posting.chunks != nil {
+		posting.chunks.remove(id)
+		return
+	}
+	index, found := slices.BinarySearch(posting.small, id)
+	if !found {
+		return
+	}
+	copy(posting.small[index:], posting.small[index+1:])
+	posting.small = posting.small[:len(posting.small)-1]
+}
+
+func (posting *propertyPostingRadix) add(id uint64) {
+	high := id >> 20
+	newRoot := high != 0 && posting.ids.root(high) == nil
+	posting.ids.CloneShardOnce(id)
+	posting.ids.Set(id, struct{}{})
+	if newRoot {
+		posting.cloneRoots()
+		index, _ := slices.BinarySearch(posting.roots, high)
+		posting.roots = append(posting.roots, 0)
+		copy(posting.roots[index+1:], posting.roots[index:])
+		posting.roots[index] = high
+	}
+}
+
+func (posting *propertyPostingRadix) remove(id uint64) {
+	high := id >> 20
+	posting.ids.CloneShardOnce(id)
+	posting.ids.Delete(id)
+	if high == 0 || posting.ids.root(high) != nil {
+		return
+	}
+	posting.cloneRoots()
+	index, found := slices.BinarySearch(posting.roots, high)
+	if !found {
+		return
+	}
+	copy(posting.roots[index:], posting.roots[index+1:])
+	posting.roots = posting.roots[:len(posting.roots)-1]
+}
+
+func (posting *propertyPostingRadix) cloneRoots() {
+	if posting.rootsCloned {
+		return
+	}
+	posting.roots = slices.Clone(posting.roots)
+	posting.rootsCloned = true
+}
+
+func (posting *propertyPostingRadix) shouldUseChunks() bool {
+	return len(posting.roots) >= 8 && len(posting.roots)*propertyPostingChunkSize > posting.ids.Len()
 }
 
 func makePropertyValueKey(value any) (propertyValueKey, error) {

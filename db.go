@@ -238,6 +238,30 @@ func (db *DB) GenerationRetentionStats() (GenerationRetentionStats, error) {
 	}, nil
 }
 
+// OperationalStats reports database-owned writer wait, transaction, snapshot,
+// and immutable-generation retention state. It does not estimate process RSS.
+func (db *DB) OperationalStats() (OperationalStats, error) {
+	inner, err := db.requireOpen()
+	if err != nil {
+		return OperationalStats{}, wrapError(err)
+	}
+	stats, err := inner.OperationalStats()
+	if err != nil {
+		return OperationalStats{}, wrapError(err)
+	}
+	return OperationalStats{
+		WriterWaits:          stats.WriterWaits,
+		ActiveWriterWaits:    stats.ActiveWriterWaits,
+		OldestWriterWaitAge:  stats.OldestWriterWaitAge,
+		ActiveTransactions:   stats.ActiveTransactions,
+		OldestTransactionAge: stats.OldestTransactionAge,
+		ActiveSnapshots:      stats.ActiveSnapshots,
+		OldestSnapshotAge:    stats.OldestSnapshotAge,
+		RetainedGenerations:  stats.RetainedGenerations,
+		RetainedLogicalBytes: stats.RetainedLogicalBytes,
+	}, nil
+}
+
 // BeginSnapshot pins one committed generation while database writes continue.
 // Multiple snapshots may be active at once. Close releases the pin.
 // Acquisition waits for internal checkpoint contention; an active application

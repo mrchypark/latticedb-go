@@ -3961,8 +3961,8 @@ func TestQueryVectorBudgetZeroDimensionHasUnitCost(t *testing.T) {
 	tx := &Tx{graph: graph}
 	clause := &whereClause{Kind: whereVector, Var: "n", Property: "embedding", Expr: paramExpr{Name: "vector"}}
 	rows := []queryRow{
-		{slots: []boundValue{{Node: graph.Nodes.Get(1)}}, bound: []bool{true}, index: map[string]int{"n": 0}},
-		{slots: []boundValue{{Node: graph.Nodes.Get(2)}}, bound: []bool{true}, index: map[string]int{"n": 0}},
+		{slots: []boundValue{{Node: graph.Nodes.Get(1), Bound: true}}, index: map[string]int{"n": 0}},
+		{slots: []boundValue{{Node: graph.Nodes.Get(2), Bound: true}}, index: map[string]int{"n": 0}},
 	}
 	budget := newQueryBudget(context.Background(), QueryOptions{MaxWork: 1})
 	filtered, err := clause.apply(tx, rows, map[string]any{"vector": []float32{}}, budget)

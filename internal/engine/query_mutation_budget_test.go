@@ -113,8 +113,7 @@ func TestSetClauseCancellationStopsNestedValueNormalization(t *testing.T) {
 		t.Fatal(err)
 	}
 	row := queryRow{
-		slots: []boundValue{{Node: tx.graph.Nodes.Get(node.ID)}},
-		bound: []bool{true},
+		slots: []boundValue{{Node: tx.graph.Nodes.Get(node.ID), Bound: true}},
 		index: map[string]int{"n": 0},
 	}
 	ctx := &cancelAfterQueryChecks{remaining: 2, done: make(chan struct{})}
