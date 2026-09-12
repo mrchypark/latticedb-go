@@ -129,9 +129,9 @@ func BenchmarkVectorSearchANNFallback10K(b *testing.B) {
 func BenchmarkVectorSearchSparseComplete10K(b *testing.B) {
 	graph := store.NewGraphState()
 	graph.VectorDimensions = 16
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"embedding": make([]float32, 16)}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"embedding": make([]float32, 16)})})
 	for id := uint64(2); id <= 10_000; id++ {
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"name": "non-vector"}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"name": "non-vector"})})
 	}
 	rebuildVectorIndex(graph)
 	db := &DB{graph: graph, enableVector: true, vectorDimensions: 16, queryCache: map[string]*queryPlan{}}
@@ -166,7 +166,7 @@ func benchmarkSearchDBWithDimensions(size, dimensions int, indexed bool) *DB {
 	graph.VectorDimensions = uint16(dimensions)
 	for index := 1; index <= size; index++ {
 		id := uint64(index)
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"embedding": make([]float32, dimensions)}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"embedding": make([]float32, dimensions)})})
 		text := "common token"
 		if index == 1 {
 			text = "common rare token"

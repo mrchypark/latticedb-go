@@ -131,7 +131,7 @@ func selectedNamespaceVector(graph *store.GraphState, node *store.NodeRecord) ([
 	if graph.VectorNamespace.Scope != "" && !slices.Contains(node.Labels, graph.VectorNamespace.Scope) {
 		return nil, false
 	}
-	vector, ok := node.Properties[graph.VectorNamespace.Property].([]float32)
+	vector, ok := node.Properties.Vector(graph.VectorNamespace.Property)
 	return vector, ok && len(vector) == int(graph.VectorNamespace.Dimensions)
 }
 

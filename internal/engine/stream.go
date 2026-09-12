@@ -359,28 +359,28 @@ func (tx *Tx) trackedPropertyKeys(entity string, id uint64) []string {
 	return tx.changes.edgePropertyKeys[id]
 }
 
-func (tx *Tx) countPropertyChanges(before, after map[string]any, keys []string) uint64 {
+func (tx *Tx) countPropertyChanges(before, after store.Properties, keys []string) uint64 {
 	var count uint64
 	if keys != nil {
 		for _, key := range keys {
-			oldValue, oldOK := before[key]
-			newValue, newOK := after[key]
+			oldValue, oldOK := before.Lookup(key)
+			newValue, newOK := after.Lookup(key)
 			if oldOK != newOK || oldOK && !reflect.DeepEqual(oldValue, newValue) {
 				count++
 			}
 		}
 		return count
 	}
-	for key := range before {
-		oldValue, oldOK := before[key]
-		newValue, newOK := after[key]
+	for key := range before.All() {
+		oldValue, oldOK := before.Lookup(key)
+		newValue, newOK := after.Lookup(key)
 		if oldOK && newOK && reflect.DeepEqual(oldValue, newValue) {
 			continue
 		}
 		count++
 	}
-	for key := range after {
-		if _, oldOK := before[key]; oldOK {
+	for key := range after.All() {
+		if _, oldOK := before.Lookup(key); oldOK {
 			continue
 		}
 		count++
@@ -503,14 +503,14 @@ func (tx *Tx) appendLabelChanges(nodeID uint64, before, after *store.NodeRecord)
 	}
 }
 
-func (tx *Tx) appendPropertyChanges(entity string, id uint64, before, after map[string]any) {
+func (tx *Tx) appendPropertyChanges(entity string, id uint64, before, after store.Properties) {
 	keys := tx.trackedPropertyKeys(entity, id)
 	if keys == nil {
-		keys = make([]string, 0, len(before)+len(after))
-		for key := range before {
+		keys = make([]string, 0, before.Len()+after.Len())
+		for key := range before.All() {
 			keys = append(keys, key)
 		}
-		for key := range after {
+		for key := range after.All() {
 			keys = append(keys, key)
 		}
 		slices.Sort(keys)
@@ -519,8 +519,8 @@ func (tx *Tx) appendPropertyChanges(entity string, id uint64, before, after map[
 		slices.Sort(keys)
 	}
 	for _, key := range keys {
-		oldValue, oldOK := before[key]
-		newValue, newOK := after[key]
+		oldValue, oldOK := before.Lookup(key)
+		newValue, newOK := after.Lookup(key)
 		if oldOK == newOK && (!oldOK || reflect.DeepEqual(oldValue, newValue)) {
 			continue
 		}
@@ -599,16 +599,16 @@ func (tx *Tx) recordStreamOperation(operation store.StreamOperation) {
 
 func hasIDs(values map[uint64]struct{}) bool { return len(values) != 0 }
 
-func beforeProperties(node *store.NodeRecord) map[string]any {
+func beforeProperties(node *store.NodeRecord) store.Properties {
 	if node == nil {
-		return nil
+		return store.Properties{}
 	}
 	return node.Properties
 }
 
-func beforePropertiesEdge(edge *store.EdgeRecord) map[string]any {
+func beforePropertiesEdge(edge *store.EdgeRecord) store.Properties {
 	if edge == nil {
-		return nil
+		return store.Properties{}
 	}
 	return edge.Properties
 }

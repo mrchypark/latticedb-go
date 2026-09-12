@@ -2754,7 +2754,7 @@ func TestReadTransactionKeepsWholeGraphSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := read.graph.Nodes.Get(first.ID).Properties["vector"].([]float32); got[0] != 1 || got[1] != 0 {
+	if got := read.graph.Nodes.Get(first.ID).Properties.Get("vector").([]float32); got[0] != 1 || got[1] != 0 {
 		t.Fatalf("old vector = %v", got)
 	}
 	if got := read.graph.FTS.Get(first.ID).Text; got != "before" {
@@ -2766,7 +2766,7 @@ func TestReadTransactionKeepsWholeGraphSnapshot(t *testing.T) {
 	db.mu.RLock()
 	current := db.graph
 	db.mu.RUnlock()
-	if got := current.Nodes.Get(first.ID).Properties["vector"].([]float32); got[0] != 0 || got[1] != 1 {
+	if got := current.Nodes.Get(first.ID).Properties.Get("vector").([]float32); got[0] != 0 || got[1] != 1 {
 		t.Fatalf("current vector = %v", got)
 	}
 	if current.FTS.Get(first.ID).Text != "after" || current.Edges.Get(edge.ID) != nil || current.Outgoing.Has(first.ID) || current.Incoming.Has(second.ID) {
@@ -3962,7 +3962,7 @@ func TestQueryVectorBudget4096Dimensions(t *testing.T) {
 func TestQueryVectorBudgetZeroDimensionHasUnitCost(t *testing.T) {
 	graph := store.NewGraphState()
 	for id := uint64(1); id <= 2; id++ {
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"embedding": []float32{}}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"embedding": []float32{}})})
 	}
 	tx := &Tx{graph: graph}
 	clause := &whereClause{Kind: whereVector, Var: "n", Property: "embedding", Expr: paramExpr{Name: "vector"}}

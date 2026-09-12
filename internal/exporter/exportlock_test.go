@@ -471,7 +471,7 @@ func TestExportPathLockRegistryReclaimsEntries(t *testing.T) {
 func TestExportContextCancelsBodyBeforeManifest(t *testing.T) {
 	output := filepath.Join(t.TempDir(), "cancel-body.csv")
 	base := store.NewGraphState()
-	base.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"version": int64(1)}})
+	base.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"version": int64(1)})})
 	if _, err := ExportGraph(base, ExportFormatCSV, output); err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +481,7 @@ func TestExportContextCancelsBodyBeforeManifest(t *testing.T) {
 	}
 	large := store.NewGraphState()
 	for id := uint64(1); id <= 2_000; id++ {
-		large.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"value": int64(id)}})
+		large.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"value": int64(id)})})
 	}
 	ctx := &cancelExportAfterChecks{limit: 20}
 	if _, err := ExportGraphContext(ctx, large, ExportFormatCSV, output); !errors.Is(err, context.Canceled) {
@@ -544,7 +544,7 @@ func runExportHelper(t *testing.T) {
 		}
 	}
 	graph := store.NewGraphState()
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{})})
 	if _, err := ExportGraph(graph, ExportFormatCSV, output); err != nil {
 		t.Fatal(err)
 	}

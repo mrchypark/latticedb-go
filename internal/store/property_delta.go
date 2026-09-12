@@ -430,12 +430,12 @@ func preparePropertyDelta(ctx context.Context, accumulator *walAccumulator, delt
 // allocating a normalized copy. Graph properties have already crossed the
 // normalization boundary; this repeats only the resource accounting needed
 // before a property patch is emitted.
-func validateNormalizedPropertyMapLimits(properties map[string]any) error {
+func validateNormalizedPropertyMapLimits(properties Properties) error {
 	walk := &valueWalk{}
-	if err := walk.add(len(properties)); err != nil {
+	if err := walk.add(properties.Len()); err != nil {
 		return err
 	}
-	for key, value := range properties {
+	for key, value := range properties.All() {
 		if !utf8.ValidString(key) {
 			return fmt.Errorf("property %q: key contains invalid UTF-8", key)
 		}
@@ -509,7 +509,7 @@ func validateNormalizedPropertyValueLimits(value any, depth int, walk *valueWalk
 	}
 }
 
-func buildPersistedPropertyChange(id uint64, keys []string, properties map[string]any) (persistedPropertyChange, error) {
+func buildPersistedPropertyChange(id uint64, keys []string, properties Properties) (persistedPropertyChange, error) {
 	if err := ValidateEntityID(id); err != nil {
 		return persistedPropertyChange{}, err
 	}
@@ -526,7 +526,7 @@ func buildPersistedPropertyChange(id uint64, keys []string, properties map[strin
 			return persistedPropertyChange{}, fmt.Errorf("duplicate property key %q", key)
 		}
 		seen[key] = struct{}{}
-		value, ok := properties[key]
+		value, ok := properties.Lookup(key)
 		if !ok {
 			change.Remove = append(change.Remove, key)
 			continue

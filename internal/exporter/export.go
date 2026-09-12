@@ -224,7 +224,7 @@ func dumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.
 			}
 		}
 		first = false
-		properties, err := exportPropertyMap(node.Properties)
+		properties, err := exportProperties(node.Properties)
 		if err != nil {
 			return err
 		}
@@ -247,7 +247,7 @@ func dumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.
 			}
 		}
 		first = false
-		properties, err := exportPropertyMap(edge.Properties)
+		properties, err := exportProperties(edge.Properties)
 		if err != nil {
 			return err
 		}
@@ -340,7 +340,7 @@ func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output i
 			}
 		}
 		index++
-		props, err := exportPropertyMap(node.Properties)
+		props, err := exportProperties(node.Properties)
 		if err != nil {
 			return err
 		}
@@ -365,7 +365,7 @@ func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output i
 			}
 		}
 		index++
-		props, err := exportPropertyMap(edge.Properties)
+		props, err := exportProperties(edge.Properties)
 		if err != nil {
 			return err
 		}
@@ -595,6 +595,21 @@ func exportPropertyMap(in map[string]any) (map[string]exportedValue, error) {
 	return out, nil
 }
 
+func exportProperties(in store.Properties) (map[string]exportedValue, error) {
+	if in.Len() == 0 {
+		return map[string]exportedValue{}, nil
+	}
+	out := make(map[string]exportedValue, in.Len())
+	for key, value := range in.All() {
+		encoded, err := exportValue(value)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = encoded
+	}
+	return out, nil
+}
+
 func sortedLabels(labels []string) []string {
 	if len(labels) == 0 {
 		return nil
@@ -677,7 +692,7 @@ func writeNodesCSVContextWithBudget(ctx context.Context, graph *store.GraphState
 			}
 		}
 		index++
-		props, err := exportPropertyMap(node.Properties)
+		props, err := exportProperties(node.Properties)
 		if err != nil {
 			return err
 		}
@@ -725,7 +740,7 @@ func writeEdgesCSVContextWithBudget(ctx context.Context, graph *store.GraphState
 			}
 		}
 		index++
-		props, err := exportPropertyMap(edge.Properties)
+		props, err := exportProperties(edge.Properties)
 		if err != nil {
 			return err
 		}

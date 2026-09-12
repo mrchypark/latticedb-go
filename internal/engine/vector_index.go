@@ -580,7 +580,7 @@ func selectedVector(graph *store.GraphState, node *store.NodeRecord) ([]float32,
 	if graph.VectorNamespace != nil {
 		return selectedNamespaceVector(graph, node)
 	}
-	vector, ok := search.FirstVectorProperty(node.Properties)
+	vector, ok := node.Properties.FirstVector()
 	return vector, ok && (graph.VectorDimensions == 0 || len(vector) == int(graph.VectorDimensions))
 }
 
@@ -617,14 +617,14 @@ func validateNodeVectors(dimensions uint16, node *store.NodeRecord) error {
 		return fmt.Errorf("node %d: %w", node.ID, err)
 	}
 	if dimensions == 0 {
-		for key, value := range node.Properties {
+		for key, value := range node.Properties.All() {
 			if _, ok := value.([]float32); ok {
 				return fmt.Errorf("vector property %q requires configured dimensions", key)
 			}
 		}
 		return nil
 	}
-	for _, value := range node.Properties {
+	for _, value := range node.Properties.All() {
 		if vector, ok := value.([]float32); ok && len(vector) != int(dimensions) {
 			return fmt.Errorf("vector length %d does not match configured dimensions %d", len(vector), dimensions)
 		}
@@ -632,9 +632,9 @@ func validateNodeVectors(dimensions uint16, node *store.NodeRecord) error {
 	return nil
 }
 
-func validateVectorProperties(props map[string]any) error {
+func validateVectorProperties(props store.Properties) error {
 	keys := make([]string, 0, 1)
-	for key, value := range props {
+	for key, value := range props.All() {
 		if _, ok := value.([]float32); ok {
 			keys = append(keys, key)
 		}
@@ -650,13 +650,8 @@ func validateVectorPropertyUpdate(node *store.NodeRecord, key string, value any)
 	if node == nil {
 		return nil
 	}
-	props := make(map[string]any, len(node.Properties)+1)
-	for existingKey, existingValue := range node.Properties {
-		if existingKey != key {
-			props[existingKey] = existingValue
-		}
-	}
-	props[key] = value
+	props := node.Properties.Clone()
+	props.Set(key, value)
 	return validateVectorProperties(props)
 }
 

@@ -27,7 +27,7 @@ func TestVectorIndexRecallAndDeletion(t *testing.T) {
 			random ^= random << 17
 			vector[dimension] = float32(random&0xffff) / 0xffff
 		}
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": vector}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"vector": vector})})
 		insertVectorIndex(graph, id)
 	}
 	refreshVectorLiveCount(graph)
@@ -35,7 +35,7 @@ func TestVectorIndexRecallAndDeletion(t *testing.T) {
 	if err := validateVectorIndex(graph); err != nil {
 		t.Fatal(err)
 	}
-	query := graph.Nodes.Get(9_999).Properties["vector"].([]float32)
+	query := graph.Nodes.Get(9_999).Properties.Get("vector").([]float32)
 	exact, err := db.VectorSearch(query, VectorSearchOptions{K: 10, Exact: true})
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +59,7 @@ func TestVectorIndexRecallAndDeletion(t *testing.T) {
 	}
 
 	entry := graph.VectorIndex.EntryID
-	entryVector := graph.Nodes.Get(entry).Properties["vector"].([]float32)
+	entryVector := graph.Nodes.Get(entry).Properties.Get("vector").([]float32)
 	graph.Nodes.Delete(entry)
 	tombstoneVectorIndex(graph, entry, entryVector)
 	if err := validateVectorIndex(graph); err != nil {
@@ -87,7 +87,7 @@ func TestVectorNeighborPruningUsesUpdatedVector(t *testing.T) {
 		3: {2, 0},
 		4: {0, 3},
 	} {
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": vector}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"vector": vector})})
 		graph.VectorIndex.Nodes.Set(id, &store.VectorIndexNode{Level: 0, Neighbors: [][]uint64{nil}, Vector: vector})
 	}
 	graph.VectorIndex.Nodes.Get(1).Neighbors[0] = []uint64{2, 4}
@@ -216,8 +216,8 @@ func TestVectorPropertyContract(t *testing.T) {
 
 	graph := store.NewGraphState()
 	graph.VectorDimensions = 2
-	graph.Nodes.Set(2, &store.NodeRecord{ID: 2, Properties: map[string]any{"z": []float32{1, 0}, "a": []float32{0, 1}}})
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"z": []float32{1, 0}, "a": []float32{0, 1}}})
+	graph.Nodes.Set(2, &store.NodeRecord{ID: 2, Properties: store.PropertiesFromMap(map[string]any{"z": []float32{1, 0}, "a": []float32{0, 1}})})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"z": []float32{1, 0}, "a": []float32{0, 1}})})
 	err = validateGraphVectors(graph)
 	if err == nil || !strings.Contains(err.Error(), "node 1") {
 		t.Fatalf("validation error = %v, want deterministic node 1 error", err)
@@ -472,7 +472,7 @@ func TestVectorIndexChurnInvariantsAndDeterministicRebuild(t *testing.T) {
 			random ^= random << 17
 			vector[index] = float32(random&0xffff) / 0xffff
 		}
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": vector}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"vector": vector})})
 	}
 	rebuildVectorIndex(graph)
 	fingerprint := vectorIndexFingerprint(graph)
@@ -485,13 +485,13 @@ func TestVectorIndexChurnInvariantsAndDeterministicRebuild(t *testing.T) {
 	for id := uint64(1); id <= 1_000; id++ {
 		node := graph.Nodes.Get(id)
 		if id%4 == 0 {
-			vector := slices.Clone(node.Properties["vector"].([]float32))
+			vector := slices.Clone(node.Properties.Get("vector").([]float32))
 			graph.Nodes.Delete(id)
 			tombstoneVectorIndex(graph, id, vector)
 		} else if id%5 == 0 {
-			vector := slices.Clone(node.Properties["vector"].([]float32))
+			vector := slices.Clone(node.Properties.Get("vector").([]float32))
 			vector[0] += 0.01
-			node.Properties["vector"] = vector
+			node.Properties.Set("vector", vector)
 			insertVectorIndex(graph, id)
 		}
 	}
@@ -507,7 +507,7 @@ func TestVectorIndexChurnInvariantsAndDeterministicRebuild(t *testing.T) {
 		if node == nil {
 			continue
 		}
-		query := node.Properties["vector"].([]float32)
+		query := node.Properties.Get("vector").([]float32)
 		exact, err := db.VectorSearch(query, VectorSearchOptions{K: 10, Exact: true})
 		if err != nil {
 			t.Fatal(err)
@@ -560,12 +560,12 @@ func TestOpenRejectsPersistedMalformedVector(t *testing.T) {
 func TestVectorMutationDebtRequiresExplicitMaintenance(t *testing.T) {
 	graph := store.NewGraphState()
 	graph.VectorDimensions = 2
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{1, 2}})})
 	rebuildVectorIndex(graph)
 	base := graph
 	graph = store.CloneGraphStateShallow(base)
 	graph.Nodes.CloneShardOnce(1)
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{2, 3}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{2, 3}})})
 	graph.VectorMutations = 4097
 	tx := &Tx{graph: graph, base: base, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}}
 	if err := tx.applyVectorIndexChanges(); !errors.Is(err, ErrVectorIndexMaintenanceRequired) {
@@ -582,8 +582,8 @@ func TestVectorMutationDebtRequiresExplicitMaintenance(t *testing.T) {
 func TestVectorBuildBudgetAndCancellation(t *testing.T) {
 	graph := store.NewGraphState()
 	graph.VectorDimensions = 4096
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": make([]float32, 4096)}})
-	graph.Nodes.Set(2, &store.NodeRecord{ID: 2, Properties: map[string]any{"vector": make([]float32, 4096)}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": make([]float32, 4096)})})
+	graph.Nodes.Set(2, &store.NodeRecord{ID: 2, Properties: store.PropertiesFromMap(map[string]any{"vector": make([]float32, 4096)})})
 	if err := rebuildVectorIndexBudget(context.Background(), graph, ^uint64(0), 1); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("build byte budget error = %v", err)
 	}
@@ -605,7 +605,7 @@ func TestVectorBuildBudgetAndCancellation(t *testing.T) {
 	bounded := store.NewGraphState()
 	bounded.VectorDimensions = 2
 	for id := uint64(1); id <= 4; id++ {
-		bounded.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": []float32{float32(id), 0}}})
+		bounded.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{float32(id), 0}})})
 	}
 	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorBuildLogicalBytes(bounded, 4), annVisitedLimit: ^uint64(0)}
 	if err := rebuildVectorIndexWithBudget(context.Background(), bounded, budget); err != nil {
@@ -624,7 +624,7 @@ func TestHNSWLevelHasHardUpperBound(t *testing.T) {
 	}
 	graph := store.NewGraphState()
 	graph.VectorDimensions = 2
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{1, 2}})})
 	graph.VectorIndex.EntryID = 1
 	graph.VectorIndex.MaxLevel = vectorIndexMaxLevel + 1
 	graph.VectorIndex.Nodes.Set(1, &store.VectorIndexNode{Level: vectorIndexMaxLevel + 1, Neighbors: make([][]uint64, vectorIndexMaxLevel+2)})
@@ -664,14 +664,14 @@ func TestVectorDebtUsesVectorPopulationNotAllNodes(t *testing.T) {
 	graph := store.NewGraphState()
 	graph.VectorDimensions = 2
 	for id := uint64(1); id <= 10_000; id++ {
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{})})
 	}
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{1, 2}})})
 	rebuildVectorIndex(graph)
 	base := graph
 	graph = store.CloneGraphStateShallow(base)
 	graph.Nodes.CloneShardOnce(1)
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{2, 3}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{2, 3}})})
 	graph.VectorMutations = 4097
 	tx := &Tx{graph: graph, base: base, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}}
 	if err := tx.applyVectorIndexChanges(); !errors.Is(err, ErrVectorIndexMaintenanceRequired) {
@@ -975,7 +975,7 @@ func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
 	base := store.NewGraphState()
 	base.VectorDimensions = 2
 	graph := store.CloneGraphStateShallow(base)
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{1, 2}})})
 	db.appendVectorRebuildTxLocked(&Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}})
 	if !errors.Is(state.err, ErrResourceLimit) {
 		t.Fatalf("delta log error = %v", state.err)
@@ -1002,7 +1002,7 @@ func TestInactiveVectorRebuildDoesNotCloneCommitDeltas(t *testing.T) {
 	base := store.NewGraphState()
 	base.VectorDimensions = 2
 	graph := store.CloneGraphStateShallow(base)
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{1, 2}})})
 	tx := &Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}}
 	db := &DB{}
 	if allocations := testing.AllocsPerRun(100, func() { db.appendVectorRebuildTxLocked(tx) }); allocations != 0 {
@@ -1014,7 +1014,7 @@ func TestOverBudgetVectorRebuildDoesNotCloneCommitDelta(t *testing.T) {
 	base := store.NewGraphState()
 	base.VectorDimensions = 2
 	graph := store.CloneGraphStateShallow(base)
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"vector": []float32{1, 2}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{1, 2}})})
 	tx := &Tx{base: base, graph: graph, changes: &txChanges{upsertNodes: map[uint64]struct{}{1: {}}}}
 	state := &vectorRebuildState{maxBytes: vectorRebuildDeltaBytes(vectorRebuildDelta{after: []float32{1, 2}}) - 1, maxWork: ^uint64(0), cancel: func() {}}
 	db := &DB{vectorRebuild: state}
@@ -1046,7 +1046,7 @@ func TestVectorSearchScratchReset(t *testing.T) {
 
 func TestVectorSearchLayerScratchAllocations(t *testing.T) {
 	db := benchmarkSearchDB(1_000, true)
-	query := db.graph.Nodes.Get(500).Properties["embedding"].([]float32)
+	query := db.graph.Nodes.Get(500).Properties.Get("embedding").([]float32)
 	scratch := &vectorSearchScratch{visited: make(map[uint64]struct{})}
 	if results := vectorSearchLayerScratch(db.graph, query, db.graph.VectorIndex.EntryID, 0, vectorIndexSearchEF, 0, scratch); len(results) == 0 {
 		t.Fatal("warmup vector search returned no results")
@@ -1074,11 +1074,11 @@ func TestVectorSearchRejectsNonFiniteQueryWithoutMutation(t *testing.T) {
 }
 
 func TestZeroVectorDimensionsRejectActiveVectors(t *testing.T) {
-	scalar := &store.NodeRecord{ID: 1, Properties: map[string]any{"name": "ok"}}
+	scalar := &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"name": "ok"})}
 	if err := validateNodeVectors(0, scalar); err != nil {
 		t.Fatalf("scalar node rejected: %v", err)
 	}
-	vector := &store.NodeRecord{ID: 2, Properties: map[string]any{"embedding": []float32{1, 2}}}
+	vector := &store.NodeRecord{ID: 2, Properties: store.PropertiesFromMap(map[string]any{"embedding": []float32{1, 2}})}
 	if err := validateNodeVectors(0, vector); err == nil {
 		t.Fatal("zero-dimension validator accepted vector node")
 	}

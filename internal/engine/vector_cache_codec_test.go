@@ -21,7 +21,7 @@ func TestVectorCacheRejectsCorruptionWithoutPublication(t *testing.T) {
 	graph := store.NewGraphState()
 	graph.DatabaseID, graph.VectorDimensions = "cache-test", 2
 	for id := uint64(1); id <= 8; id++ {
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"vector": []float32{float32(id), 0}}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{float32(id), 0}})})
 		if err := insertVectorIndex(graph, id); err != nil {
 			t.Fatal(err)
 		}
@@ -114,7 +114,7 @@ func TestVectorCacheGhostsNamespacesAndCancellation(t *testing.T) {
 	key := VectorNamespace{Property: "vector", Scope: "A", Dimensions: 2}
 	graph.VectorNamespaces = emptyVectorNamespaceStates([]VectorNamespace{key})
 	for id := uint64(1); id <= 8; id++ {
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Labels: []string{"A"}, Properties: map[string]any{"vector": []float32{float32(id), 1}}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Labels: []string{"A"}, Properties: store.PropertiesFromMap(map[string]any{"vector": []float32{float32(id), 1}})})
 	}
 	refreshVectorLiveCount(graph)
 	if err := rebuildAllVectorIndexesBudget(context.Background(), graph, defaultVectorBuildMaxWork, defaultVectorBuildMaxLogicalBytes); err != nil {

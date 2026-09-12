@@ -91,7 +91,7 @@ func TestFTSBudgetRejectPreservesLedger(t *testing.T) {
 			t.Fatalf("reopen postings: %v", ids)
 		}
 		n := tx.graph.Nodes.Get(id)
-		if n == nil || n.Properties["body"] != "hello" {
+		if n == nil || n.Properties.Get("body") != "hello" {
 			t.Fatalf("reopen node body: %v", n)
 		}
 		return nil
@@ -143,8 +143,8 @@ func TestFTSPostBuildBudgetFailsAfterLockAcquired(t *testing.T) {
 		if n == nil {
 			t.Fatal("canonical node missing after failed FTS open")
 		}
-		if n.Properties["v"] != int64(1) {
-			t.Fatalf("node property lost: %v", n.Properties["v"])
+		if n.Properties.Get("v") != int64(1) {
+			t.Fatalf("node property lost: %v", n.Properties.Get("v"))
 		}
 		return nil
 	}); err != nil {
@@ -154,8 +154,8 @@ func TestFTSPostBuildBudgetFailsAfterLockAcquired(t *testing.T) {
 
 func TestFTSCancellationPropagatesFromTokenizer(t *testing.T) {
 	graph := store.NewGraphState()
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"body": "alpha"}})
-	graph.Nodes.Set(2, &store.NodeRecord{ID: 2, Properties: map[string]any{"body": "beta"}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"body": "alpha"})})
+	graph.Nodes.Set(2, &store.NodeRecord{ID: 2, Properties: store.PropertiesFromMap(map[string]any{"body": "beta"})})
 	db := &DB{derivedIndexBuildMaxWork: 4096, derivedIndexBuildMaxLogicalBytes: 4096}
 	ctx := &cancelAfterQueryChecks{remaining: 1, done: make(chan struct{})}
 

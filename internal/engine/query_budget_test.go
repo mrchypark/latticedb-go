@@ -85,7 +85,7 @@ func TestCountRenderAccountsForLiveRowsAtBoundary(t *testing.T) {
 
 func TestQueryClauseScratchReleasesBetweenRows(t *testing.T) {
 	graph := store.NewGraphState()
-	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: map[string]any{"text": "alpha beta", "embedding": []float32{1, 0}}})
+	graph.Nodes.Set(1, &store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"text": "alpha beta", "embedding": []float32{1, 0}})})
 	tx := &Tx{graph: graph}
 	row := queryRow{slots: []boundValue{{Node: graph.Nodes.Get(1), Bound: true}}, index: map[string]int{"n": 0}}
 	cases := []struct {

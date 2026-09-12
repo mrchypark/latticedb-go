@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"maps"
 	"math"
 	"os"
 	"slices"
@@ -2649,13 +2648,13 @@ func buildPropertyIndex(ctx context.Context, source *store.GraphState, node bool
 		if exceedsDerivedBudget(source, db, work, logicalBytes) {
 			return indexes, 0, 0, fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
 		}
-		var properties map[string]any
+		var props store.Properties
 		if node {
-			properties = source.Nodes.Get(id).Properties
+			props = source.Nodes.Get(id).Properties
 		} else {
-			properties = source.Edges.Get(id).Properties
+			props = source.Edges.Get(id).Properties
 		}
-		value, ok := properties[definition.Property]
+		value, ok := props.Lookup(definition.Property)
 		if !ok {
 			continue
 		}
@@ -2701,13 +2700,13 @@ func (db *DB) updatePropertyIndex(node, create bool, scope, property string) err
 			if node {
 				for id := range tx.base.Labels.All(scope) {
 					record := tx.base.Nodes.Get(id)
-					value, ok := record.Properties[property]
+					value, ok := record.Properties.Lookup(property)
 					adjustPropertyIndexBudget(tx.graph, value, ok, false)
 				}
 			} else {
 				for id := range tx.base.EdgeTypes.All(scope) {
 					record := tx.base.Edges.Get(id)
-					value, ok := record.Properties[property]
+					value, ok := record.Properties.Lookup(property)
 					adjustPropertyIndexBudget(tx.graph, value, ok, false)
 				}
 			}
@@ -2734,7 +2733,7 @@ func (db *DB) updatePropertyIndex(node, create bool, scope, property string) err
 					return fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
 				}
 				record := tx.graph.Nodes.Get(id)
-				value, ok := record.Properties[property]
+				value, ok := record.Properties.Lookup(property)
 				if !ok {
 					continue
 				}
@@ -2755,7 +2754,7 @@ func (db *DB) updatePropertyIndex(node, create bool, scope, property string) err
 					return fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
 				}
 				record := tx.graph.Edges.Get(id)
-				value, ok := record.Properties[property]
+				value, ok := record.Properties.Lookup(property)
 				if !ok {
 					continue
 				}
@@ -2853,7 +2852,7 @@ func adjustNodePropertyBudget(graph, source *store.GraphState, defs store.Proper
 	}
 	for def := range defs.Definitions() {
 		if slices.Contains(record.Labels, def.Scope) {
-			value, present := record.Properties[def.Property]
+			value, present := record.Properties.Lookup(def.Property)
 			adjustPropertyIndexBudget(graph, value, present, add)
 		}
 	}
@@ -2866,7 +2865,7 @@ func adjustEdgePropertyBudget(graph, source *store.GraphState, defs store.Proper
 	}
 	for def := range defs.Definitions() {
 		if def.Scope == record.Type {
-			value, present := record.Properties[def.Property]
+			value, present := record.Properties.Lookup(def.Property)
 			adjustPropertyIndexBudget(graph, value, present, add)
 		}
 	}
@@ -3478,7 +3477,7 @@ func addNodePropertyIndexes(indexes *store.PropertyIndexes, node *store.NodeReco
 		return nil
 	}
 	for definition := range indexes.DefinitionsFor(node.Labels, node.Properties) {
-		if err := indexes.Add(definition, node.Properties[definition.Property], node.ID); err != nil {
+		if err := indexes.Add(definition, node.Properties.Get(definition.Property), node.ID); err != nil {
 			return err
 		}
 	}
@@ -3490,7 +3489,7 @@ func removeNodePropertyIndexes(indexes *store.PropertyIndexes, node *store.NodeR
 		return nil
 	}
 	for definition := range indexes.DefinitionsFor(node.Labels, node.Properties) {
-		if err := indexes.Remove(definition, node.Properties[definition.Property], node.ID); err != nil {
+		if err := indexes.Remove(definition, node.Properties.Get(definition.Property), node.ID); err != nil {
 			return err
 		}
 	}
@@ -3502,7 +3501,7 @@ func addEdgePropertyIndexes(indexes *store.PropertyIndexes, edge *store.EdgeReco
 		return nil
 	}
 	for definition := range indexes.DefinitionsFor([]string{edge.Type}, edge.Properties) {
-		if err := indexes.Add(definition, edge.Properties[definition.Property], edge.ID); err != nil {
+		if err := indexes.Add(definition, edge.Properties.Get(definition.Property), edge.ID); err != nil {
 			return err
 		}
 	}
@@ -3514,7 +3513,7 @@ func removeEdgePropertyIndexes(indexes *store.PropertyIndexes, edge *store.EdgeR
 		return nil
 	}
 	for definition := range indexes.DefinitionsFor([]string{edge.Type}, edge.Properties) {
-		if err := indexes.Remove(definition, edge.Properties[definition.Property], edge.ID); err != nil {
+		if err := indexes.Remove(definition, edge.Properties.Get(definition.Property), edge.ID); err != nil {
 			return err
 		}
 	}
@@ -3574,7 +3573,7 @@ func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 		return Node{}, err
 	}
 
-	props, err := store.NormalizeProperties(opts.Properties)
+	props, err := store.NormalizePropertyStorage(opts.Properties)
 	if err != nil {
 		return Node{}, err
 	}
@@ -3582,7 +3581,7 @@ func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 		if err := validateVectorProperties(props); err != nil {
 			return Node{}, err
 		}
-		for _, value := range props {
+		for _, value := range props.All() {
 			if vector, ok := value.([]float32); ok && tx.db.vectorDimensions > 0 && len(vector) != int(tx.db.vectorDimensions) {
 				return Node{}, fmt.Errorf("vector length %d does not match configured dimensions %d", len(vector), tx.db.vectorDimensions)
 			}
@@ -3719,7 +3718,7 @@ func (tx *Tx) SetProperty(nodeID uint64, key string, value any) error {
 			return err
 		}
 	}
-	node.Properties[store.InternString(key)] = normalized
+	node.Properties.Set(key, normalized)
 	tx.trackNodeProperty(nodeID, key)
 	return nil
 }
@@ -3729,7 +3728,7 @@ func (tx *Tx) GetProperty(nodeID uint64, key string) (any, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	value, ok := node.Properties[key]
+	value, ok := node.Properties.Lookup(key)
 	if !ok {
 		return nil, false, nil
 	}
@@ -3800,7 +3799,7 @@ func nodeMatchesPropertyIndex(node *store.NodeRecord, definition store.PropertyI
 	if node == nil || !slices.Contains(node.Labels, definition.Scope) {
 		return false
 	}
-	stored, ok := node.Properties[definition.Property]
+	stored, ok := node.Properties.Lookup(definition.Property)
 	return ok && store.PropertyValuesEqual(stored, value)
 }
 
@@ -3828,7 +3827,7 @@ func (tx *Tx) SetVector(nodeID uint64, key string, vector []float32) error {
 	if err := validateVectorPropertyUpdate(node, key, normalized); err != nil {
 		return err
 	}
-	node.Properties[store.InternString(key)] = normalized
+	node.Properties.Set(key, normalized)
 	tx.trackNodeProperty(nodeID, key)
 	return nil
 }
@@ -3941,7 +3940,7 @@ func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts
 		return Edge{}, err
 	}
 
-	props, err := store.NormalizeProperties(opts.Properties)
+	props, err := store.NormalizePropertyStorage(opts.Properties)
 	if err != nil {
 		return Edge{}, err
 	}
@@ -3973,7 +3972,7 @@ func (tx *Tx) GetEdgeProperty(edgeID uint64, key string) (any, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	value, ok := edge.Properties[key]
+	value, ok := edge.Properties.Lookup(key)
 	if !ok {
 		return nil, false, nil
 	}
@@ -4061,7 +4060,7 @@ func edgeMatchesPropertyIndex(edge *store.EdgeRecord, definition store.PropertyI
 	if edge == nil || edge.Type != definition.Scope {
 		return false
 	}
-	stored, ok := edge.Properties[definition.Property]
+	stored, ok := edge.Properties.Lookup(definition.Property)
 	return ok && store.PropertyValuesEqual(stored, value)
 }
 
@@ -4080,7 +4079,7 @@ func (tx *Tx) SetEdgeProperty(edgeID uint64, key string, value any) error {
 	if err != nil {
 		return err
 	}
-	edge.Properties[store.InternString(key)] = normalized
+	edge.Properties.Set(key, normalized)
 	tx.trackEdgeProperty(edgeID, key)
 	return nil
 }
@@ -4096,7 +4095,7 @@ func (tx *Tx) RemoveEdgeProperty(edgeID uint64, key string) error {
 	if err != nil {
 		return err
 	}
-	delete(edge.Properties, key)
+	edge.Properties.Delete(key)
 	tx.trackEdgeProperty(edgeID, key)
 	return nil
 }
@@ -4319,14 +4318,11 @@ func (tx *Tx) writableNode(nodeID uint64, propertiesOnly bool) (*store.NodeRecor
 		node = &store.NodeRecord{
 			ID:         node.ID,
 			Labels:     slices.Clone(node.Labels),
-			Properties: maps.Clone(node.Properties),
+			Properties: node.Properties.Clone(),
 		}
 		tx.ensureNodesWritable(nodeID)
 		tx.graph.Nodes.Set(nodeID, node)
 		tx.markUpsert(&tx.changes.upsertNodes, &tx.changes.deleteNodes, nodeID)
-	}
-	if node.Properties == nil {
-		node.Properties = map[string]any{}
 	}
 	if !propertiesOnly {
 		tx.markNodePropertyFallback(nodeID)
@@ -4345,14 +4341,11 @@ func (tx *Tx) writableEdge(edgeID uint64, propertiesOnly bool) (*store.EdgeRecor
 			SourceID:   edge.SourceID,
 			TargetID:   edge.TargetID,
 			Type:       edge.Type,
-			Properties: maps.Clone(edge.Properties),
+			Properties: edge.Properties.Clone(),
 		}
 		tx.ensureEdgesWritable(edgeID)
 		tx.graph.Edges.Set(edgeID, edge)
 		tx.markUpsert(&tx.changes.upsertEdges, &tx.changes.deleteEdges, edgeID)
-	}
-	if edge.Properties == nil {
-		edge.Properties = map[string]any{}
 	}
 	if !propertiesOnly {
 		tx.markEdgePropertyFallback(edgeID)
@@ -4650,7 +4643,7 @@ func publicNode(node *store.NodeRecord) Node {
 	return Node{
 		ID:         node.ID,
 		Labels:     slices.Clone(node.Labels),
-		Properties: store.ClonePropertyMap(node.Properties),
+		Properties: node.Properties.CloneMap(),
 	}
 }
 
@@ -4660,6 +4653,6 @@ func publicEdge(edge *store.EdgeRecord) Edge {
 		SourceID:   edge.SourceID,
 		TargetID:   edge.TargetID,
 		Type:       edge.Type,
-		Properties: store.ClonePropertyMap(edge.Properties),
+		Properties: edge.Properties.CloneMap(),
 	}
 }

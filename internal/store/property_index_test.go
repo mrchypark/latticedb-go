@@ -189,14 +189,14 @@ func TestPropertyIndexesDefinitionsFor(t *testing.T) {
 		indexes.Create(definition)
 	}
 	var got []PropertyIndexDefinition
-	for definition := range indexes.DefinitionsFor([]string{"Item"}, map[string]any{"key": int64(1)}) {
+	for definition := range indexes.DefinitionsFor([]string{"Item"}, PropertiesFromMap(map[string]any{"key": int64(1)})) {
 		got = append(got, definition)
 	}
 	if !slices.Equal(got, []PropertyIndexDefinition{{Scope: "Item", Property: "key"}}) {
 		t.Fatalf("DefinitionsFor = %v", got)
 	}
 	got = nil
-	for definition := range indexes.DefinitionsFor([]string{"Item", "Other"}, map[string]any{"key": int64(1), "other": int64(2)}) {
+	for definition := range indexes.DefinitionsFor([]string{"Item", "Other"}, PropertiesFromMap(map[string]any{"key": int64(1), "other": int64(2)})) {
 		got = append(got, definition)
 	}
 	slices.SortFunc(got, func(left, right PropertyIndexDefinition) int {
@@ -220,7 +220,7 @@ func TestPropertyIndexesDefinitionsFor(t *testing.T) {
 		scopes = append(scopes, "Other"+strconv.Itoa(i))
 	}
 	got = nil
-	for definition := range indexes.DefinitionsFor(scopes, map[string]any{"key": int64(1)}) {
+	for definition := range indexes.DefinitionsFor(scopes, PropertiesFromMap(map[string]any{"key": int64(1)})) {
 		got = append(got, definition)
 	}
 	if !slices.Equal(got, []PropertyIndexDefinition{definition}) {
