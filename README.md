@@ -98,7 +98,7 @@ Important boundaries:
 - On mutation queries, `SKIP` and `LIMIT` restrict returned rows, not writes. With `RETURN DISTINCT`, every `ORDER BY` expression must also be projected.
 - An undirected match can return both orientations of an edge; a self-loop returns one. Use explicit `ORDER BY` when application behavior depends on result order.
 
-Query search predicates score candidate rows and sort matches before `LIMIT`; they do not use the direct HNSW or full-text indexes. For indexed search, use `VectorSearch` with HNSW enabled or `FTSSearch`. These APIs have different scopes: direct vector search uses the database's global vector space, and direct full-text search uses explicitly indexed node text rather than the named property in `@@`.
+Query search predicates score candidate rows and sort matches before `LIMIT`. Configured `FTSProperties` can accelerate eligible `@@` predicates; `ApproximateVector` opts eligible queries into HNSW candidates. See [query search candidates](docs/query-search-candidates.md) for exact defaults and fallback rules. Direct `VectorSearch` supports the global vector space and [configured namespaces](docs/vector-namespaces.md); direct `FTSSearch` uses explicitly indexed node text. HNSW state is a [validated, disposable cache](docs/vector-cache.md) that accelerates reopening a database.
 
 Use parameters for application values and explicit aliases for result columns. Queries default to 1,000,000 rows, 10,000,000 work units, and 64 MiB of live logical bytes. Use `QueryContext` with a deadline and explicit `QueryOptions` limits for your workload; logical byte budgets do not measure process RSS. Query text is limited to 32 KiB.
 

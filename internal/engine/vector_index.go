@@ -811,6 +811,10 @@ func vectorRebuildThreshold(graph *store.GraphState) int {
 }
 
 func validateVectorIndex(graph *store.GraphState) error {
+	return validateVectorIndexContext(context.Background(), graph)
+}
+
+func validateVectorIndexContext(ctx context.Context, graph *store.GraphState) error {
 	if graph.VectorIndex.Nodes.Len() == 0 {
 		if graph.VectorIndex.EntryID != 0 || graph.VectorIndex.MaxLevel != 0 {
 			return fmt.Errorf("empty vector index has entry %d at level %d", graph.VectorIndex.EntryID, graph.VectorIndex.MaxLevel)
@@ -822,6 +826,9 @@ func validateVectorIndex(graph *store.GraphState) error {
 	}
 	maxLevel := 0
 	for id, node := range graph.VectorIndex.Nodes.All() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if node == nil || node.Level < 0 || node.Level > vectorIndexMaxLevel || len(node.Neighbors) != node.Level+1 {
 			return fmt.Errorf("vector node %d has invalid level metadata", id)
 		}

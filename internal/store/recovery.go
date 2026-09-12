@@ -527,11 +527,16 @@ func loadWALBaseSnapshotFilesContextWithBaseAndRecoveryBudget(ctx context.Contex
 	return loadLatestWALV2ContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, base, budget)
 }
 
-var databaseTempKinds = []string{"state-payload", "snapshot-payload", "state", "wal-payload", "wal", "ids", "checkpoint"}
+var databaseTempKinds = []string{"state-payload", "snapshot-payload", "state", "wal-payload", "wal", "ids", "checkpoint", "vector-cache"}
 
 func databaseTempPattern(files DatabaseFiles, kind string) string {
 	token := sha256.Sum256([]byte(filepath.Base(files.State)))
 	return ".latticedb-" + hex.EncodeToString(token[:]) + "-" + kind + "-*.tmp"
+}
+
+// DatabaseTempPattern scopes a temporary file pattern to one database.
+func DatabaseTempPattern(files DatabaseFiles, kind string) string {
+	return databaseTempPattern(files, kind)
 }
 
 // DatabaseTempPrefixes returns the path prefixes reserved for checkpoint
