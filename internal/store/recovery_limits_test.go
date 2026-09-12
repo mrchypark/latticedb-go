@@ -93,8 +93,11 @@ func TestRecoveryDoesNotMarkMixedFormatWALAppendReady(t *testing.T) {
 	}
 	firstLength := binary.BigEndian.Uint64(wal[20:28])
 	second := walHeaderSize + int(firstLength)
-	copy(wal[second:second+8], legacyWALMagic[:])
-	binary.BigEndian.PutUint16(wal[second+8:second+10], legacyWALVersion)
+	snapshot, err := buildPersistedState(graph, 2, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal = append(wal[:second], jsonWALTestRecord(t, graph.DatabaseID, 1, walPayload{Kind: "snapshot", Snapshot: &snapshot}, legacyWALVersion)...)
 	if err := os.WriteFile(files.WAL, wal, 0o600); err != nil {
 		t.Fatal(err)
 	}

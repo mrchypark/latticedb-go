@@ -10,20 +10,42 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
 func mutateSerializedState(t *testing.T, data []byte, mutate func(map[string]any)) []byte {
 	t.Helper()
-	state := map[string]any{}
-	if err := json.Unmarshal(data[64:], &state); err != nil {
+
+	graph, nextNode, nextEdge, commit, err := store.DeserializeGraphState(data, ^uint64(0), ^uint64(0), ^uint64(0))
+	if err != nil {
 		t.Fatal(err)
 	}
+	// Build the legacy JSON semantic-corruption fixture from the decoded graph.
+	state := map[string]any{"database_id": graph.DatabaseID, "commit_id": commit, "next_node_id": nextNode, "next_edge_id": nextEdge}
+	nodes := []any{}
+	for id, node := range graph.Nodes.Ordered() {
+		if node.Properties.Len() != 0 {
+			t.Fatal("fixture expects property-free nodes")
+		}
+		nodes = append(nodes, map[string]any{"id": id, "labels": node.Labels, "properties": map[string]any{}})
+	}
+	edges := []any{}
+	for id, edge := range graph.Edges.Ordered() {
+		if edge.Properties.Len() != 0 {
+			t.Fatal("fixture expects property-free edges")
+		}
+		edges = append(edges, map[string]any{"id": id, "source_id": edge.SourceID, "target_id": edge.TargetID, "type": edge.Type, "properties": map[string]any{}})
+	}
+	state["nodes"], state["edges"] = nodes, edges
 	mutate(state)
 	payload, err := json.Marshal(state)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mutated := append([]byte(nil), data[:64]...)
+	copy(mutated[:8], "LDBSTAT4")
+	binary.BigEndian.PutUint16(mutated[8:10], 4)
 	binary.BigEndian.PutUint64(mutated[20:28], uint64(len(payload)))
 	binary.BigEndian.PutUint32(mutated[28:32], crc32.ChecksumIEEE(payload))
 	return append(mutated, payload...)

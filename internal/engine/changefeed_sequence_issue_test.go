@@ -39,10 +39,10 @@ func TestChangefeedSequencePreflightBoundaries(t *testing.T) {
 
 func persistedStreamAtSequenceForTest(t *testing.T, data []byte, next uint64) []byte {
 	t.Helper()
-	state := map[string]any{}
-	if err := json.Unmarshal(data[64:], &state); err != nil {
-		t.Fatal(err)
-	}
+
+	// The source is an empty database. Keep this a legacy JSON fixture so
+	// the sequence-overflow check also exercises migration on Open.
+	state := map[string]any{"database_id": string(data[32:64]), "commit_id": binary.BigEndian.Uint64(data[12:20]), "next_node_id": 1, "next_edge_id": 1, "nodes": []any{}, "edges": []any{}}
 	state["streams"] = map[string]any{
 		"streams": []any{map[string]any{"name": changeStreamName, "next": next}},
 	}
@@ -51,6 +51,8 @@ func persistedStreamAtSequenceForTest(t *testing.T, data []byte, next uint64) []
 		t.Fatal(err)
 	}
 	result := append([]byte(nil), data[:64]...)
+	copy(result[:8], "LDBSTAT4")
+	binary.BigEndian.PutUint16(result[8:10], 4)
 	binary.BigEndian.PutUint64(result[20:28], uint64(len(payload)))
 	binary.BigEndian.PutUint32(result[28:32], crc32.ChecksumIEEE(payload))
 	return append(result, payload...)

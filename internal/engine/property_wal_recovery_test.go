@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -83,7 +83,24 @@ func TestPropertyWALDeltaRecoversMixedDerivedStateAndChangefeed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(wal, []byte(`"kind":"property_delta"`)) {
+
+	foundPatch := false
+	for offset := 0; offset < len(wal); {
+		if len(wal)-offset < 64 {
+			t.Fatal("incomplete WAL header")
+		}
+		header := wal[offset : offset+64]
+		length := binary.BigEndian.Uint64(header[20:28])
+		if length > uint64(len(wal)-offset-64) {
+			t.Fatal("incomplete WAL payload")
+		}
+		// WAL v4 payload tag 3 identifies a property delta.
+		if string(header[:8]) == "LDBWAL4\x00" && length > 0 && wal[offset+64] == 3 {
+			foundPatch = true
+		}
+		offset += 64 + int(length)
+	}
+	if !foundPatch {
 		t.Fatal("property mutation used no patch WAL frame")
 	}
 	db.mu.Lock()
