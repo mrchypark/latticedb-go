@@ -1118,7 +1118,10 @@ func (db *DB) Close() error {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	defer db.writeMu.Unlock()
+	defer func() {
+		db.writeMu.Unlock()
+		db.requestBackgroundCheckpoint()
+	}()
 	return db.closeWithWriterHeld()
 }
 
@@ -1140,7 +1143,10 @@ func (db *DB) CloseContext(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
-	defer db.writeMu.Unlock()
+	defer func() {
+		db.writeMu.Unlock()
+		db.requestBackgroundCheckpoint()
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
