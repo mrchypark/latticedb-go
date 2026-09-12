@@ -1,9 +1,11 @@
 package store
 
 import (
+	"container/heap"
 	"iter"
 	"maps"
 	"math/bits"
+	"slices"
 )
 
 const (
@@ -13,6 +15,7 @@ const (
 	pagedMapClonedRoot     = uint8(1 << 0)
 	pagedMapClonedBucket   = uint8(1 << 1)
 	pagedMapClonedPage     = uint8(1 << 2)
+	pagedMapOrderedBatch   = 4096
 )
 
 type valuePage[V any] struct {
@@ -104,43 +107,134 @@ func (m *PagedMap[V]) All() iter.Seq2[uint64, V] {
 	}
 }
 
+// Ordered visits entries by ascending numeric ID. Dense root zero uses the
+// existing array traversal; sparse high roots use fixed-size root-key batches.
+// ponytail: 4096-key batches keep memory bounded; sparse maps pay
+// O(R*ceil(R/4096)) scans, with a persistent ordering structure as the upgrade.
+func (m *PagedMap[V]) Ordered() iter.Seq2[uint64, V] {
+	return func(yield func(uint64, V) bool) {
+		if m.smallActiveLen != pagedMapActiveOverflow {
+			var active [2]uint64
+			count := int(m.smallActiveLen)
+			copy(active[:], m.smallActive[:count])
+			if count == 2 && active[1] < active[0] {
+				active[0], active[1] = active[1], active[0]
+			}
+			for _, key := range active[:count] {
+				if !m.yieldPage(key, m.pageByKey(key), yield) {
+					return
+				}
+			}
+			return
+		}
+		if len(m.roots) == 0 {
+			m.yieldRoot(0, m.root0, yield)
+			return
+		}
+		if !m.yieldRoot(0, m.root0, yield) {
+			return
+		}
+		candidates := make([]uint64, 0, min(len(m.roots), pagedMapOrderedBatch))
+		var last uint64
+		haveLast := false
+		for {
+			candidates = candidates[:0]
+			for high := range m.roots {
+				if high == 0 || haveLast && high <= last {
+					continue
+				}
+				if len(candidates) < cap(candidates) {
+					candidates = append(candidates, high)
+					if len(candidates) == cap(candidates) {
+						heap.Init((*pagedMapRootHeap)(&candidates))
+					}
+					continue
+				}
+				if high < candidates[0] {
+					candidates[0] = high
+					heap.Fix((*pagedMapRootHeap)(&candidates), 0)
+				}
+			}
+			if len(candidates) == 0 {
+				return
+			}
+			slices.Sort(candidates)
+			if !m.yieldHighRoots(candidates, yield) {
+				return
+			}
+			last = candidates[len(candidates)-1]
+			haveLast = true
+		}
+	}
+}
+
 // orderedRoots visits root zero followed by caller-maintained ascending high
 // roots. Callers that already keep roots ordered avoid materializing a sorted
 // map-key list for each lookup.
 func (m *PagedMap[V]) orderedRoots(roots []uint64) iter.Seq2[uint64, V] {
 	return func(yield func(uint64, V) bool) {
-		yieldRoot := func(high uint64, root *pageRoot[V]) bool {
-			if root == nil {
-				return true
-			}
-			for bucketIndex, bucket := range root {
-				if bucket == nil {
-					continue
-				}
-				for shard, page := range bucket {
-					if page == nil {
-						continue
-					}
-					key := high<<14 | uint64(bucketIndex)<<7 | uint64(shard)
-					for occupied := page.occupied; occupied != 0; occupied &= occupied - 1 {
-						slot := uint(bits.TrailingZeros64(occupied))
-						if !yield(key<<6|uint64(slot), page.values[slot]) {
-							return false
-						}
-					}
-				}
-			}
-			return true
-		}
-		if !yieldRoot(0, m.root0) {
+		if !m.yieldRoot(0, m.root0, yield) {
 			return
 		}
-		for _, high := range roots {
-			if !yieldRoot(high, m.roots[high]) {
-				return
+		m.yieldHighRoots(roots, yield)
+	}
+}
+
+func (m *PagedMap[V]) yieldPage(key uint64, page *valuePage[V], yield func(uint64, V) bool) bool {
+	if page == nil {
+		return true
+	}
+	for occupied := page.occupied; occupied != 0; occupied &= occupied - 1 {
+		slot := uint(bits.TrailingZeros64(occupied))
+		if !yield(key<<6|uint64(slot), page.values[slot]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *PagedMap[V]) yieldRoot(high uint64, root *pageRoot[V], yield func(uint64, V) bool) bool {
+	if root == nil {
+		return true
+	}
+	for bucketIndex, bucket := range root {
+		if bucket == nil {
+			continue
+		}
+		for shard, page := range bucket {
+			if page == nil {
+				continue
+			}
+			key := high<<14 | uint64(bucketIndex)<<7 | uint64(shard)
+			if !m.yieldPage(key, page, yield) {
+				return false
 			}
 		}
 	}
+	return true
+}
+
+func (m *PagedMap[V]) yieldHighRoots(roots []uint64, yield func(uint64, V) bool) bool {
+	for _, high := range roots {
+		if !m.yieldRoot(high, m.roots[high], yield) {
+			return false
+		}
+	}
+	return true
+}
+
+type pagedMapRootHeap []uint64
+
+func (h pagedMapRootHeap) Len() int           { return len(h) }
+func (h pagedMapRootHeap) Less(i, j int) bool { return h[i] > h[j] }
+func (h pagedMapRootHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *pagedMapRootHeap) Push(value any)    { *h = append(*h, value.(uint64)) }
+func (h *pagedMapRootHeap) Pop() any {
+	old := *h
+	last := len(old) - 1
+	value := old[last]
+	*h = old[:last]
+	return value
 }
 
 func (m *PagedMap[V]) Set(id uint64, value V) {

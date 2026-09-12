@@ -209,18 +209,21 @@ func dumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.
 	if err := writeString(output, `{"nodes":[`); err != nil {
 		return err
 	}
-	for index, nodeID := range store.SortedNodeIDs(graph) {
+	first := true
+	index := 0
+	for _, node := range graph.Nodes.Ordered() {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		if index > 0 {
+		index++
+		if !first {
 			if err := writeString(output, ","); err != nil {
 				return err
 			}
 		}
-		node := graph.Nodes.Get(nodeID)
+		first = false
 		properties, err := exportPropertyMap(node.Properties)
 		if err != nil {
 			return err
@@ -236,18 +239,14 @@ func dumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.
 	if err := writeString(output, `],"edges":[`); err != nil {
 		return err
 	}
-	for index, edgeID := range sortedCanonicalEdgeIDs(graph) {
-		if index&255 == 0 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		}
-		if index > 0 {
+	first = true
+	if err := forEachCanonicalEdge(ctx, graph, func(edge *store.EdgeRecord) error {
+		if !first {
 			if err := writeString(output, ","); err != nil {
 				return err
 			}
 		}
-		edge := graph.Edges.Get(edgeID)
+		first = false
 		properties, err := exportPropertyMap(edge.Properties)
 		if err != nil {
 			return err
@@ -259,6 +258,9 @@ func dumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.
 		if err := writeBytes(output, data); err != nil {
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	return writeString(output, "]}")
 }
@@ -330,13 +332,14 @@ func exportJSONLContextWithOptions(ctx context.Context, graph *store.GraphState,
 
 func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output io.Writer) error {
 	output = contextOutputWriter{ctx: ctx, output: output}
-	for index, nodeID := range store.SortedNodeIDs(graph) {
+	index := 0
+	for _, node := range graph.Nodes.Ordered() {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		node := graph.Nodes.Get(nodeID)
+		index++
 		props, err := exportPropertyMap(node.Properties)
 		if err != nil {
 			return err
@@ -354,13 +357,14 @@ func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output i
 			return err
 		}
 	}
-	for index, edgeID := range store.SortedEdgeIDs(graph) {
+	index = 0
+	for _, edge := range graph.Edges.Ordered() {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		edge := graph.Edges.Get(edgeID)
+		index++
 		props, err := exportPropertyMap(edge.Properties)
 		if err != nil {
 			return err
@@ -476,13 +480,14 @@ func exportDOTContextTo(ctx context.Context, graph *store.GraphState, output io.
 	if err := writeString(output, "digraph G {\n"); err != nil {
 		return err
 	}
-	for index, nodeID := range store.SortedNodeIDs(graph) {
+	index := 0
+	for _, node := range graph.Nodes.Ordered() {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		node := graph.Nodes.Get(nodeID)
+		index++
 		label := strconv.FormatUint(node.ID, 10)
 		if len(node.Labels) > 0 {
 			label += " " + strings.Join(node.Labels, ",")
@@ -491,13 +496,14 @@ func exportDOTContextTo(ctx context.Context, graph *store.GraphState, output io.
 			return err
 		}
 	}
-	for index, edgeID := range store.SortedEdgeIDs(graph) {
+	index = 0
+	for _, edge := range graph.Edges.Ordered() {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		edge := graph.Edges.Get(edgeID)
+		index++
 		if _, err := fmt.Fprintf(output, "  n%d -> n%d [label=%q];\n", edge.SourceID, edge.TargetID, edge.Type); err != nil {
 			return err
 		}
@@ -572,36 +578,6 @@ func (writer contextOutputWriter) Write(value []byte) (int, error) {
 		err = writer.ctx.Err()
 	}
 	return written, err
-}
-
-func sortedCanonicalEdgeIDs(graph *store.GraphState) []uint64 {
-	edgeIDs := store.SortedEdgeIDs(graph)
-	slices.SortFunc(edgeIDs, func(leftID uint64, rightID uint64) int {
-		left := graph.Edges.Get(leftID)
-		right := graph.Edges.Get(rightID)
-
-		switch {
-		case left.SourceID < right.SourceID:
-			return -1
-		case left.SourceID > right.SourceID:
-			return 1
-		case left.TargetID < right.TargetID:
-			return -1
-		case left.TargetID > right.TargetID:
-			return 1
-		case left.Type < right.Type:
-			return -1
-		case left.Type > right.Type:
-			return 1
-		case left.ID < right.ID:
-			return -1
-		case left.ID > right.ID:
-			return 1
-		default:
-			return 0
-		}
-	})
-	return edgeIDs
 }
 
 func exportPropertyMap(in map[string]any) (map[string]exportedValue, error) {
@@ -693,13 +669,14 @@ func writeNodesCSVContextWithBudget(ctx context.Context, graph *store.GraphState
 	if err := writer.Write([]string{"id", "labels", "properties"}); err != nil {
 		return err
 	}
-	for index, nodeID := range store.SortedNodeIDs(graph) {
+	index := 0
+	for _, node := range graph.Nodes.Ordered() {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		node := graph.Nodes.Get(nodeID)
+		index++
 		props, err := exportPropertyMap(node.Properties)
 		if err != nil {
 			return err
@@ -740,13 +717,14 @@ func writeEdgesCSVContextWithBudget(ctx context.Context, graph *store.GraphState
 	if err := writer.Write([]string{"id", "source", "target", "type", "properties"}); err != nil {
 		return err
 	}
-	for index, edgeID := range store.SortedEdgeIDs(graph) {
+	index := 0
+	for _, edge := range graph.Edges.Ordered() {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		edge := graph.Edges.Get(edgeID)
+		index++
 		props, err := exportPropertyMap(edge.Properties)
 		if err != nil {
 			return err

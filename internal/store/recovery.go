@@ -1214,8 +1214,7 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 	if err := ValidateIDHighWater(nextEdgeID); err != nil {
 		return err
 	}
-	for _, nodeID := range SortedNodeIDs(graph) {
-		node := graph.Nodes.Get(nodeID)
+	for nodeID, node := range graph.Nodes.Ordered() {
 		if node == nil || node.ID != nodeID {
 			return fmt.Errorf("node key %d does not match record", nodeID)
 		}
@@ -1229,8 +1228,7 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 			return err
 		}
 	}
-	for _, edgeID := range SortedEdgeIDs(graph) {
-		edge := graph.Edges.Get(edgeID)
+	for edgeID, edge := range graph.Edges.Ordered() {
 		if edge == nil || edge.ID != edgeID {
 			return fmt.Errorf("edge key %d does not match record", edgeID)
 		}
@@ -1271,15 +1269,16 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 	if _, err := io.WriteString(output, `,"nodes":[`); err != nil {
 		return err
 	}
-	for index, nodeID := range SortedNodeIDs(graph) {
-		if index > 0 {
+	firstNode := true
+	for _, node := range graph.Nodes.Ordered() {
+		if !firstNode {
 			if _, err := io.WriteString(output, ","); err != nil {
 				return err
 			}
 		}
-		node := graph.Nodes.Get(nodeID)
+		firstNode = false
 		if err := ValidateCreateLabels(node.Labels); err != nil {
-			return fmt.Errorf("node %d labels: %w", nodeID, err)
+			return fmt.Errorf("node %d labels: %w", node.ID, err)
 		}
 		properties, err := encodePropertyMap(node.Properties)
 		if err != nil {
@@ -1296,13 +1295,14 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 	if _, err := io.WriteString(output, `],"edges":[`); err != nil {
 		return err
 	}
-	for index, edgeID := range SortedEdgeIDs(graph) {
-		if index > 0 {
+	firstEdge := true
+	for edgeID, edge := range graph.Edges.Ordered() {
+		if !firstEdge {
 			if _, err := io.WriteString(output, ","); err != nil {
 				return err
 			}
 		}
-		edge := graph.Edges.Get(edgeID)
+		firstEdge = false
 		if err := ValidateEdgeType(edge.Type); err != nil {
 			return fmt.Errorf("edge %d type: %w", edgeID, err)
 		}
@@ -1322,7 +1322,7 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 		return err
 	}
 	first := true
-	for _, nodeID := range SortedNodeIDs(graph) {
+	for nodeID := range graph.Nodes.Ordered() {
 		record := graph.FTS.Get(nodeID)
 		if record == nil {
 			continue
