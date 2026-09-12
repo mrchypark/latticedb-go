@@ -12,7 +12,7 @@ import (
 
 func TestPropertyDeltaRemovalOrderDoesNotMutateKeys(t *testing.T) {
 	keys := []string{"z", "present", "a"}
-	change, err := buildPersistedPropertyChange(1, keys, map[string]any{"present": int64(1)})
+	change, err := buildPersistedPropertyChange(1, keys, PropertiesFromMap(map[string]any{"present": int64(1)}))
 	if err != nil {
 		t.Fatal(err)
 	}

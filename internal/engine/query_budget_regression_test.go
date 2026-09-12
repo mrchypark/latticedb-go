@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
 func TestNormalizeQueryParamsReservesCopiesBeforeAllocation(t *testing.T) {
@@ -81,7 +83,7 @@ func TestQueryPatternPropertiesConsumeNestedComparisonWork(t *testing.T) {
 	required := map[string]any{"value": map[string]any{"items": []any{int64(1)}}}
 	for _, maxWork := range []uint64{2, 3} {
 		budget := newQueryBudget(context.Background(), QueryOptions{MaxWork: maxWork})
-		matched, err := queryPropertiesMatchWithBudget(properties, required, budget)
+		matched, err := queryPropertiesMatchWithBudget(store.PropertiesFromMap(properties), required, budget)
 		if maxWork == 2 && !errors.Is(err, ErrResourceLimit) {
 			t.Fatalf("below pattern-property boundary = %v", err)
 		}

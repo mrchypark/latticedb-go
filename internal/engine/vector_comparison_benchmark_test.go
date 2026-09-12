@@ -151,13 +151,13 @@ func zigHarnessGraph(tb testing.TB, count int) (*store.GraphState, [][]float32) 
 		}
 		zigHarnessNormalize(vector)
 		id := uint64(i + 1)
-		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: map[string]any{"embedding": vector}})
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"embedding": vector})})
 	}
 
 	queries := make([][]float32, 100)
 	for i := range queries {
 		baseID := rng.lessThan(uint64(count)) + 1
-		base := graph.Nodes.Get(baseID).Properties["embedding"].([]float32)
+		base := graph.Nodes.Get(baseID).Properties.Get("embedding").([]float32)
 		query := make([]float32, 128)
 		copy(query, base)
 		for dimension := range query {

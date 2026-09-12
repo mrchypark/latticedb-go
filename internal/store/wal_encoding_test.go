@@ -66,7 +66,7 @@ func TestAppendDeltaClearsReusableDeltaOnSuccessAndError(t *testing.T) {
 	newGraph := func() *GraphState {
 		graph := NewGraphState()
 		graph.DatabaseID = id
-		graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"value": "ok"}})
+		graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"value": "ok"})})
 		return graph
 	}
 	changes := GraphDelta{UpsertNodes: []uint64{1}}

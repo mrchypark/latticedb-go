@@ -477,7 +477,7 @@ type FTSRecord struct {
 type NodeRecord struct {
 	ID         uint64
 	Labels     []string
-	Properties map[string]any
+	Properties Properties
 }
 
 type EdgeRecord struct {
@@ -485,7 +485,7 @@ type EdgeRecord struct {
 	SourceID   uint64
 	TargetID   uint64
 	Type       string
-	Properties map[string]any
+	Properties Properties
 }
 
 type persistedState struct {
@@ -654,7 +654,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 		cloned.Nodes.Set(id, &NodeRecord{
 			ID:         node.ID,
 			Labels:     slices.Clone(node.Labels),
-			Properties: ClonePropertyMap(node.Properties),
+			Properties: node.Properties.CloneDeep(),
 		})
 		for _, label := range node.Labels {
 			cloned.Labels.Add(label, id)
@@ -666,7 +666,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 			SourceID:   edge.SourceID,
 			TargetID:   edge.TargetID,
 			Type:       edge.Type,
-			Properties: ClonePropertyMap(edge.Properties),
+			Properties: edge.Properties.CloneDeep(),
 		})
 		cloned.EdgeTypes.Add(edge.Type, id)
 	}
@@ -707,7 +707,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 		cloned.NodeProperties.Create(definition)
 		for id, node := range cloned.Nodes.All() {
 			if slices.Contains(node.Labels, definition.Scope) {
-				if value, ok := node.Properties[definition.Property]; ok {
+				if value, ok := node.Properties.Lookup(definition.Property); ok {
 					_ = cloned.NodeProperties.Add(definition, value, id)
 				}
 			}
@@ -717,7 +717,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 		cloned.EdgeProperties.Create(definition)
 		for id, edge := range cloned.Edges.All() {
 			if edge.Type == definition.Scope {
-				if value, ok := edge.Properties[definition.Property]; ok {
+				if value, ok := edge.Properties.Lookup(definition.Property); ok {
 					_ = cloned.EdgeProperties.Add(definition, value, id)
 				}
 			}

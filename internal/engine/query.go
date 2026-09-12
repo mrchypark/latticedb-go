@@ -2473,7 +2473,7 @@ func nodeMatchesIndexedProperty(node *store.NodeRecord, definition store.Propert
 	if node == nil || !slices.Contains(node.Labels, definition.Scope) {
 		return false, nil
 	}
-	stored, ok := node.Properties[definition.Property]
+	stored, ok := node.Properties.Lookup(definition.Property)
 	if !ok {
 		return false, nil
 	}
@@ -2484,7 +2484,7 @@ func edgeMatchesIndexedProperty(edge *store.EdgeRecord, definition store.Propert
 	if edge == nil || edge.Type != definition.Scope {
 		return false, nil
 	}
-	stored, ok := edge.Properties[definition.Property]
+	stored, ok := edge.Properties.Lookup(definition.Property)
 	if !ok {
 		return false, nil
 	}
@@ -4369,9 +4369,9 @@ func queryPropertiesMatch(properties, required map[string]any) bool {
 	return true
 }
 
-func queryPropertiesMatchWithBudget(properties, required map[string]any, budget *queryBudget) (bool, error) {
+func queryPropertiesMatchWithBudget(properties store.Properties, required map[string]any, budget *queryBudget) (bool, error) {
 	for key, expected := range required {
-		actual, ok := properties[key]
+		actual, ok := properties.Lookup(key)
 		if !ok {
 			return false, nil
 		}
@@ -4423,9 +4423,9 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 					return err
 				}
 				if normalized == nil {
-					delete(binding.Node.Properties, clause.Property)
+					binding.Node.Properties.Delete(clause.Property)
 				} else {
-					binding.Node.Properties[store.InternString(clause.Property)] = normalized
+					binding.Node.Properties.Set(clause.Property, normalized)
 				}
 				tx.trackNodeProperty(binding.Node.ID, clause.Property)
 			case binding.Edge != nil:
@@ -4434,9 +4434,9 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 					return err
 				}
 				if normalized == nil {
-					delete(binding.Edge.Properties, clause.Property)
+					binding.Edge.Properties.Delete(clause.Property)
 				} else {
-					binding.Edge.Properties[store.InternString(clause.Property)] = normalized
+					binding.Edge.Properties.Set(clause.Property, normalized)
 				}
 				tx.trackEdgeProperty(binding.Edge.ID, clause.Property)
 			default:
@@ -4447,19 +4447,26 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 			if err != nil {
 				return err
 			}
+			// Charge the new container while the normalized source map is still live.
+			containerBytes := uint64(len(props)) * 64
+			if err := budget.chargeTemporary(containerBytes); err != nil {
+				return err
+			}
+			temporaryBytes = saturatingAdd(temporaryBytes, containerBytes)
+			compact := store.PropertiesFromMap(props)
 			switch {
 			case binding.Node != nil:
 				binding.Node, err = tx.writableNode(binding.Node.ID, false)
 				if err != nil {
 					return err
 				}
-				binding.Node.Properties = props
+				binding.Node.Properties = compact
 			case binding.Edge != nil:
 				binding.Edge, err = tx.writableEdge(binding.Edge.ID, false)
 				if err != nil {
 					return err
 				}
-				binding.Edge.Properties = props
+				binding.Edge.Properties = compact
 			default:
 				return fmt.Errorf("binding %q is neither node nor edge", clause.Var)
 			}
@@ -4474,7 +4481,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 				if err != nil {
 					return err
 				}
-				if err := mergeMutationProperties(binding.Node.Properties, props, budget); err != nil {
+				if err := mergeMutationProperties(&binding.Node.Properties, props, budget); err != nil {
 					return err
 				}
 				for key := range props {
@@ -4485,7 +4492,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 				if err != nil {
 					return err
 				}
-				if err := mergeMutationProperties(binding.Edge.Properties, props, budget); err != nil {
+				if err := mergeMutationProperties(&binding.Edge.Properties, props, budget); err != nil {
 					return err
 				}
 				for key := range props {
@@ -4597,7 +4604,7 @@ func (clause *removeClause) apply(tx *Tx, rows []queryRow, budget *queryBudget) 
 					if err != nil {
 						return err
 					}
-					delete(binding.Node.Properties, item.Property)
+					binding.Node.Properties.Delete(item.Property)
 					tx.trackNodeProperty(binding.Node.ID, item.Property)
 				case binding.Edge != nil:
 					var err error
@@ -4605,7 +4612,7 @@ func (clause *removeClause) apply(tx *Tx, rows []queryRow, budget *queryBudget) 
 					if err != nil {
 						return err
 					}
-					delete(binding.Edge.Properties, item.Property)
+					binding.Edge.Properties.Delete(item.Property)
 					tx.trackEdgeProperty(binding.Edge.ID, item.Property)
 				default:
 					return fmt.Errorf("binding %q is neither node nor edge", item.Var)
@@ -4814,12 +4821,12 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 				}
 				switch {
 				case binding.Node != nil:
-					if err := budget.chargeResult(queryPropertyBytes(binding.Node.Properties)); err != nil {
+					if err := budget.chargeResult(queryStoredPropertyBytes(binding.Node.Properties)); err != nil {
 						return QueryResult{}, err
 					}
 					resultRow[projection.Alias] = publicNode(binding.Node)
 				case binding.Edge != nil:
-					if err := budget.chargeResult(queryPropertyBytes(binding.Edge.Properties)); err != nil {
+					if err := budget.chargeResult(queryStoredPropertyBytes(binding.Edge.Properties)); err != nil {
 						return QueryResult{}, err
 					}
 					resultRow[projection.Alias] = publicEdge(binding.Edge)
@@ -4892,12 +4899,12 @@ func (clause *returnClause) renderRow(row queryRow, budget *queryBudget) (map[st
 			case !bound:
 				resultRow[projection.Alias] = nil
 			case binding.Node != nil:
-				if err := budget.chargeResult(queryPropertyBytes(binding.Node.Properties)); err != nil {
+				if err := budget.chargeResult(queryStoredPropertyBytes(binding.Node.Properties)); err != nil {
 					return nil, err
 				}
 				resultRow[projection.Alias] = publicNode(binding.Node)
 			case binding.Edge != nil:
-				if err := budget.chargeResult(queryPropertyBytes(binding.Edge.Properties)); err != nil {
+				if err := budget.chargeResult(queryStoredPropertyBytes(binding.Edge.Properties)); err != nil {
 					return nil, err
 				}
 				resultRow[projection.Alias] = publicEdge(binding.Edge)
@@ -4914,6 +4921,14 @@ func (clause *returnClause) renderRow(row queryRow, budget *queryBudget) (map[st
 		}
 	}
 	return resultRow, nil
+}
+
+func queryStoredPropertyBytes(properties store.Properties) uint64 {
+	bytes := uint64(properties.Len()) * 32
+	for key, value := range properties.All() {
+		bytes += uint64(len(key)) + queryValueBytes(value)
+	}
+	return bytes
 }
 
 func queryPropertyBytes(properties map[string]any) uint64 {
@@ -5928,10 +5943,10 @@ func bindingMatchesNode(row queryRow, name string, node *store.NodeRecord) bool 
 func propertyFromBinding(binding boundValue, property string) (any, bool) {
 	switch {
 	case binding.Node != nil:
-		value, ok := binding.Node.Properties[property]
+		value, ok := binding.Node.Properties.Lookup(property)
 		return value, ok
 	case binding.Edge != nil:
-		value, ok := binding.Edge.Properties[property]
+		value, ok := binding.Edge.Properties.Lookup(property)
 		return value, ok
 	case binding.HasValue:
 		value, ok := binding.Value.(map[string]any)
@@ -6030,16 +6045,16 @@ func mergePropertyMap(value any) (map[string]any, error) {
 	return props, nil
 }
 
-func mergeMutationProperties(dst map[string]any, src map[string]any, budget *queryBudget) error {
+func mergeMutationProperties(dst *store.Properties, src map[string]any, budget *queryBudget) error {
 	for key, value := range src {
 		if err := budget.check(1, 0); err != nil {
 			return err
 		}
 		if value == nil {
-			delete(dst, key)
+			dst.Delete(key)
 			continue
 		}
-		dst[key] = value
+		dst.Set(key, value)
 	}
 	return nil
 }

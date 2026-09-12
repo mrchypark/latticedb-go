@@ -103,8 +103,8 @@ func TestCleanupDatabaseTempFilesScopesFlatDatabases(t *testing.T) {
 func TestCreateCheckpointGraphStateFilesPublishesOnce(t *testing.T) {
 	files := FlatDatabaseFiles(filepath.Join(t.TempDir(), "backup.ltdb"))
 	first, second := NewGraphState(), NewGraphState()
-	first.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"source": "first"}})
-	second.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"source": "second"}})
+	first.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"source": "first"})})
+	second.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"source": "second"})})
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	for index, graph := range []*GraphState{first, second} {
@@ -156,9 +156,9 @@ func TestPreparedCheckpointPublishFaultMatrix(t *testing.T) {
 					}
 					first := NewGraphState()
 					first.DatabaseID = "00000000000000000000000000000001"
-					first.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"revision": int64(1)}})
+					first.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"revision": int64(1)})})
 					second := CloneGraphState(first)
-					second.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"revision": int64(2)}})
+					second.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"revision": int64(2)})})
 					if err := CheckpointGraphStateAndCompactWALFiles(files, first, 2, 1, 1, 1); err != nil {
 						t.Fatal(err)
 					}
@@ -190,7 +190,7 @@ func TestPreparedCheckpointPublishFaultMatrix(t *testing.T) {
 					if commitID != expectedCommit {
 						t.Fatalf("recovered commit ID = %d, want %d", commitID, expectedCommit)
 					}
-					if got := graph.Nodes.Get(1).Properties["revision"]; got != int64(expectedCommit) {
+					if got := graph.Nodes.Get(1).Properties.Get("revision"); got != int64(expectedCommit) {
 						t.Fatalf("recovered revision = %v, want %d", got, expectedCommit)
 					}
 				})
@@ -226,7 +226,7 @@ func TestLoadGraphStateRecoversLatestCommitFromWAL(t *testing.T) {
 	committed.Nodes.Set(1, &NodeRecord{
 		ID:         1,
 		Labels:     []string{"Person"},
-		Properties: map[string]any{"name": "Alice"},
+		Properties: PropertiesFromMap(map[string]any{"name": "Alice"}),
 	})
 	if err := AppendWALCommit(dbPath, committed, 2, 1, 1); err != nil {
 		t.Fatalf("append wal commit: %v", err)
@@ -250,7 +250,7 @@ func TestLoadGraphStateRecoversLatestCommitFromWAL(t *testing.T) {
 	if node == nil {
 		t.Fatalf("expected recovered node 1")
 	}
-	if got := node.Properties["name"]; got != "Alice" {
+	if got := node.Properties.Get("name"); got != "Alice" {
 		t.Fatalf("unexpected recovered property %#v", got)
 	}
 }
@@ -501,16 +501,16 @@ func TestSnapshotEstimatorIsConservativeForStreamedPayload(t *testing.T) {
 		graph.Nodes.Set(id, &NodeRecord{
 			ID:     id,
 			Labels: []string{"문서", "item"},
-			Properties: map[string]any{
+			Properties: PropertiesFromMap(map[string]any{
 				"bytes":  []byte{0, 1, 2, byte(id)},
 				"nested": map[string]any{"list": []any{int64(id), "quoted\nvalue", true}},
 				"vector": []float32{float32(id), float32(id) / 3},
-			},
+			}),
 		})
 		graph.FTS.Set(id, &FTSRecord{Text: "한글 quoted text", Tokens: []string{"한글", "quoted", "text"}})
 	}
 	for id := uint64(1); id < 100; id++ {
-		graph.Edges.Set(id, &EdgeRecord{ID: id, SourceID: id, TargetID: id + 1, Type: "연결", Properties: map[string]any{"weight": float64(id) / 7}})
+		graph.Edges.Set(id, &EdgeRecord{ID: id, SourceID: id, TargetID: id + 1, Type: "연결", Properties: PropertiesFromMap(map[string]any{"weight": float64(id) / 7})})
 	}
 	estimated, err := EstimateSnapshotBytes(graph)
 	if err != nil {
@@ -527,7 +527,7 @@ func TestSnapshotEstimatorIsConservativeForStreamedPayload(t *testing.T) {
 	updated := CloneGraphStateShallow(graph)
 	node := updated.Nodes.Get(100)
 	updated.Nodes.CloneShardOnce(100)
-	updated.Nodes.Set(100, &NodeRecord{ID: node.ID, Labels: node.Labels, Properties: map[string]any{"short": "x"}})
+	updated.Nodes.Set(100, &NodeRecord{ID: node.ID, Labels: node.Labels, Properties: PropertiesFromMap(map[string]any{"short": "x"})})
 	updatedSize, err := ApplyDeltaSnapshotBytes(graph, updated, GraphDelta{UpsertNodes: []uint64{100}})
 	if err != nil {
 		t.Fatal(err)
@@ -557,7 +557,7 @@ func TestSnapshotEstimatorRandomizedDeltasNeverUndercount(t *testing.T) {
 		switch random.Intn(6) {
 		case 0, 1:
 			next.Nodes.CloneShardOnce(id)
-			next.Nodes.Set(id, &NodeRecord{ID: id, Labels: []string{"문서", fmt.Sprintf("l%d", step)}, Properties: map[string]any{"text": fmt.Sprintf("quoted\\\"\n%d한글", random.Uint64()), "nested": map[string]any{"items": []any{int64(step), true, []byte{0, byte(step)}}}, "vector": []float32{float32(step), float32(step) / 3}}})
+			next.Nodes.Set(id, &NodeRecord{ID: id, Labels: []string{"문서", fmt.Sprintf("l%d", step)}, Properties: PropertiesFromMap(map[string]any{"text": fmt.Sprintf("quoted\\\"\n%d한글", random.Uint64()), "nested": map[string]any{"items": []any{int64(step), true, []byte{0, byte(step)}}}, "vector": []float32{float32(step), float32(step) / 3}})})
 			delta.UpsertNodes = []uint64{id}
 		case 2:
 			next.Nodes.CloneShardOnce(id)
@@ -573,7 +573,7 @@ func TestSnapshotEstimatorRandomizedDeltasNeverUndercount(t *testing.T) {
 			delta.DeleteFTS = []uint64{id}
 		case 5:
 			next.Edges.CloneShardOnce(id)
-			next.Edges.Set(id, &EdgeRecord{ID: id, SourceID: id, TargetID: id + 1, Type: "연결", Properties: map[string]any{"n": int64(step)}})
+			next.Edges.Set(id, &EdgeRecord{ID: id, SourceID: id, TargetID: id + 1, Type: "연결", Properties: PropertiesFromMap(map[string]any{"n": int64(step)})})
 			delta.UpsertEdges = []uint64{id}
 		}
 		updated, err := ApplyDeltaSnapshotBytes(graph, next, delta)
@@ -595,7 +595,7 @@ func TestSnapshotEstimatorRandomizedDeltasNeverUndercount(t *testing.T) {
 func TestLoadGraphStateUsesWALWhenCheckpointIsCorrupt(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "corrupt-checkpoint.ltdb")
 	graph := NewGraphState()
-	graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{"Person"}, Properties: map[string]any{}})
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{"Person"}, Properties: PropertiesFromMap(map[string]any{})})
 	if err := AppendWALCommit(dbPath, graph, 2, 1, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -615,7 +615,7 @@ func TestLoadGraphStateUsesWALWhenCheckpointIsCorrupt(t *testing.T) {
 func TestLoadGraphStateRepairsStaleIDCounters(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "stale-ids.ltdb")
 	graph := NewGraphState()
-	graph.Nodes.Set(9, &NodeRecord{ID: 9, Labels: []string{"Person"}, Properties: map[string]any{}})
+	graph.Nodes.Set(9, &NodeRecord{ID: 9, Labels: []string{"Person"}, Properties: PropertiesFromMap(map[string]any{})})
 	if err := CheckpointGraphState(dbPath, graph, 0, 0, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +632,7 @@ func TestLoadGraphStateRepairsStaleIDCounters(t *testing.T) {
 func TestLoadGraphStateRejectsDanglingEdge(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "dangling-edge.ltdb")
 	graph := NewGraphState()
-	graph.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 2, Type: "KNOWS", Properties: map[string]any{}})
+	graph.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 2, Type: "KNOWS", Properties: PropertiesFromMap(map[string]any{})})
 	if err := CheckpointGraphState(dbPath, graph, 1, 2, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +645,7 @@ func TestLoadGraphStateRejectsDanglingEdge(t *testing.T) {
 func TestLoadGraphStateIgnoresIncompleteWALTail(t *testing.T) {
 	dbPath := t.TempDir()
 	graph := NewGraphState()
-	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{}})
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{})})
 	if err := AppendWALCommit(dbPath, graph, 2, 1, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +680,7 @@ func TestLoadGraphStateRejectsInteriorWALCorruption(t *testing.T) {
 
 func TestWALV2TruncationAndCorruption(t *testing.T) {
 	graph := NewGraphState()
-	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{}})
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{})})
 	snapshot, err := buildPersistedState(graph, 2, 1, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -911,11 +911,11 @@ func TestWALV2ReplaysDeltasWithoutCheckpoint(t *testing.T) {
 	if err := AppendWALCommit(dbPath, graph, 1, 1, 0); err != nil {
 		t.Fatal(err)
 	}
-	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"value": int64(1)}})
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"value": int64(1)})})
 	if err := AppendWALDelta(dbPath, graph, 2, 1, 1, GraphDelta{UpsertNodes: []uint64{1}}); err != nil {
 		t.Fatal(err)
 	}
-	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"value": int64(2)}})
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"value": int64(2)})})
 	if err := AppendWALDelta(dbPath, graph, 2, 1, 2, GraphDelta{UpsertNodes: []uint64{1}}); err != nil {
 		t.Fatal(err)
 	}
@@ -926,7 +926,7 @@ func TestWALV2ReplaysDeltasWithoutCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if commitID != 2 || nextNodeID != 2 || loaded.Nodes.Get(1).Properties["value"] != int64(2) {
+	if commitID != 2 || nextNodeID != 2 || loaded.Nodes.Get(1).Properties.Get("value") != int64(2) {
 		t.Fatalf("recovered commit=%d next=%d graph=%#v", commitID, nextNodeID, loaded)
 	}
 }
@@ -961,9 +961,9 @@ func TestWALV2RejectsCommitGap(t *testing.T) {
 
 func TestWALV2RejectsSemanticallyInvalidDelta(t *testing.T) {
 	base := NewGraphState()
-	base.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{}})
-	base.Nodes.Set(2, &NodeRecord{ID: 2, Properties: map[string]any{}})
-	base.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 2, Type: "edge", Properties: map[string]any{}})
+	base.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{})})
+	base.Nodes.Set(2, &NodeRecord{ID: 2, Properties: PropertiesFromMap(map[string]any{})})
+	base.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 2, Type: "edge", Properties: PropertiesFromMap(map[string]any{})})
 	base.FTS.Set(1, &FTSRecord{Text: "one"})
 	snapshot, err := buildPersistedState(base, 3, 2, 1)
 	if err != nil {
@@ -1064,20 +1064,20 @@ func TestPersistenceWritersRejectInvalidSemantics(t *testing.T) {
 		"empty label": func() *GraphState {
 			graph := NewGraphState()
 			graph.DatabaseID = databaseID
-			graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{""}, Properties: map[string]any{}})
+			graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{""}, Properties: PropertiesFromMap(map[string]any{})})
 			return graph
 		}(),
 		"duplicate label": func() *GraphState {
 			graph := NewGraphState()
 			graph.DatabaseID = databaseID
-			graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{"tag", "tag"}, Properties: map[string]any{}})
+			graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{"tag", "tag"}, Properties: PropertiesFromMap(map[string]any{})})
 			return graph
 		}(),
 		"empty edge type": func() *GraphState {
 			graph := NewGraphState()
 			graph.DatabaseID = databaseID
-			graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{}})
-			graph.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 1, Properties: map[string]any{}})
+			graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{})})
+			graph.Edges.Set(1, &EdgeRecord{ID: 1, SourceID: 1, TargetID: 1, Properties: PropertiesFromMap(map[string]any{})})
 			return graph
 		}(),
 		"deep property": func() *GraphState {
@@ -1087,7 +1087,7 @@ func TestPersistenceWritersRejectInvalidSemantics(t *testing.T) {
 			for range maxValueDepth + 1 {
 				value = map[string]any{"next": value}
 			}
-			graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"deep": value}})
+			graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"deep": value})})
 			return graph
 		}(),
 	} {
@@ -1099,7 +1099,7 @@ func TestPersistenceWritersRejectInvalidSemantics(t *testing.T) {
 	}
 	graph := NewGraphState()
 	graph.DatabaseID = databaseID
-	graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{""}, Properties: map[string]any{}})
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Labels: []string{""}, Properties: PropertiesFromMap(map[string]any{})})
 	if _, err := buildPersistedDelta(graph, 2, 1, 1, GraphDelta{UpsertNodes: []uint64{1}}); err == nil {
 		t.Fatal("invalid graph was encoded in a WAL delta")
 	}
@@ -1110,7 +1110,7 @@ func TestPersistedFTSRejectsInvalidUTF8(t *testing.T) {
 	invalid := string([]byte{0xff})
 	graph := NewGraphState()
 	graph.DatabaseID = databaseID
-	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{}})
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{})})
 	graph.FTS.Set(1, &FTSRecord{Text: invalid})
 	if _, err := SerializeGraphState(graph, 2, 1, 1); err == nil {
 		t.Fatal("invalid FTS text was serialized")
@@ -1192,7 +1192,7 @@ func TestWALDeltaRejectsInvalidPersistedSemantics(t *testing.T) {
 func TestCompactionCrashMatrixPreservesAcknowledgedCommit(t *testing.T) {
 	buildPath := t.TempDir()
 	oldGraph := NewGraphState()
-	oldGraph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"version": int64(1)}})
+	oldGraph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"version": int64(1)})})
 	if err := CheckpointGraphState(buildPath, oldGraph, 2, 1, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -1200,7 +1200,7 @@ func TestCompactionCrashMatrixPreservesAcknowledgedCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	newGraph := CloneGraphState(oldGraph)
-	newGraph.Nodes.Get(1).Properties["version"] = int64(2)
+	newGraph.Nodes.Get(1).Properties.Set("version", int64(2))
 	if err := AppendWALDelta(buildPath, newGraph, 2, 1, 2, GraphDelta{UpsertNodes: []uint64{1}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1262,7 +1262,7 @@ func TestCompactionCrashMatrixPreservesAcknowledgedCommit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if commitID != 2 || graph.Nodes.Get(1).Properties["version"] != int64(2) {
+			if commitID != 2 || graph.Nodes.Get(1).Properties.Get("version") != int64(2) {
 				t.Fatalf("recovered commit %d graph %#v", commitID, graph)
 			}
 		})

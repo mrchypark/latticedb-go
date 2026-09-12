@@ -13,7 +13,7 @@ import (
 func propertyTestGraph() *GraphState {
 	graph := NewGraphState()
 	graph.DatabaseID = "00000000000000000000000000000001"
-	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"keep": int64(1), "change": "old"}})
+	graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"keep": int64(1), "change": "old"})})
 	return graph
 }
 
@@ -40,20 +40,20 @@ func TestBuildPersistedPropertyChangeRejectsCombinedAggregateLimit(t *testing.T)
 	if _, err := encodePropertyMap(map[string]any{"changed": "valid"}); err != nil {
 		t.Fatalf("individual changed property was rejected: %v", err)
 	}
-	if _, err := buildPersistedPropertyChange(1, []string{"changed"}, properties); !errors.Is(err, ErrValueLimit) {
+	if _, err := buildPersistedPropertyChange(1, []string{"changed"}, PropertiesFromMap(properties)); !errors.Is(err, ErrValueLimit) {
 		t.Fatalf("combined property map error = %v, want ErrValueLimit", err)
 	}
 }
 
 func TestBuildPersistedPropertyChangeAggregateBytesBoundary(t *testing.T) {
 	large := strings.Repeat("x", maxValueBytes-1)
-	if _, err := buildPersistedPropertyChange(1, []string{"x"}, map[string]any{"x": large}); err != nil {
+	if _, err := buildPersistedPropertyChange(1, []string{"x"}, PropertiesFromMap(map[string]any{"x": large})); err != nil {
 		t.Fatalf("exact aggregate byte boundary rejected: %v", err)
 	}
 	if _, err := encodePropertyMap(map[string]any{"y": "valid"}); err != nil {
 		t.Fatalf("individual changed property was rejected: %v", err)
 	}
-	if _, err := buildPersistedPropertyChange(1, []string{"y"}, map[string]any{"x": large, "y": "valid"}); !errors.Is(err, ErrValueLimit) {
+	if _, err := buildPersistedPropertyChange(1, []string{"y"}, PropertiesFromMap(map[string]any{"x": large, "y": "valid"})); !errors.Is(err, ErrValueLimit) {
 		t.Fatalf("combined property map error = %v, want ErrValueLimit", err)
 	}
 }
@@ -133,7 +133,7 @@ func TestPropertyDeltaRoundTripsThroughRecovery(t *testing.T) {
 	if err := AppendWALCommit(path, graph, 2, 1, 0); err != nil {
 		t.Fatal(err)
 	}
-	graph.Nodes.Get(1).Properties["change"] = "new"
+	graph.Nodes.Get(1).Properties.Set("change", "new")
 	if err := AppendWALDelta(path, graph, 2, 1, 1, GraphDelta{UpsertNodes: []uint64{1}, NodePropertyKeys: map[uint64][]string{1: {"change"}}}); err != nil {
 		t.Fatal(err)
 	}

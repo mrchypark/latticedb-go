@@ -21,8 +21,8 @@ func TestTrackedPropertyChangefeedMatchesFullDiff(t *testing.T) {
 					changes.edgePropertyKeys = map[uint64][]string{1: tracked}
 				}
 				tx := &Tx{db: &DB{changefeedMaxBytes: 1 << 20}, graph: store.NewGraphState(), changes: changes}
-				count := tx.countPropertyChanges(before, after, tracked)
-				tx.appendPropertyChanges(entity, 1, before, after)
+				count := tx.countPropertyChanges(store.PropertiesFromMap(before), store.PropertiesFromMap(after), tracked)
+				tx.appendPropertyChanges(entity, 1, store.PropertiesFromMap(before), store.PropertiesFromMap(after))
 				return tx.graph.Streams.Read(changeStreamName, 0, 100), count
 			}
 			want, wantCount := emit(nil)

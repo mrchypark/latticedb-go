@@ -1295,7 +1295,7 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 		if err := ValidateCreateLabels(node.Labels); err != nil {
 			return fmt.Errorf("node %d labels: %w", node.ID, err)
 		}
-		properties, err := encodePropertyMap(node.Properties)
+		properties, err := encodePropertyStorage(node.Properties)
 		if err != nil {
 			return err
 		}
@@ -1321,7 +1321,7 @@ func writePersistedStateJSON(output io.Writer, graph *GraphState, nextNodeID uin
 		if err := ValidateEdgeType(edge.Type); err != nil {
 			return fmt.Errorf("edge %d type: %w", edgeID, err)
 		}
-		properties, err := encodePropertyMap(edge.Properties)
+		properties, err := encodePropertyStorage(edge.Properties)
 		if err != nil {
 			return err
 		}
@@ -2840,7 +2840,7 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		if err := ValidateCreateLabels(node.Labels); err != nil {
 			return persistedState{}, fmt.Errorf("encode node %d labels: %w", nodeID, err)
 		}
-		props, err := encodePropertyMap(node.Properties)
+		props, err := encodePropertyStorage(node.Properties)
 		if err != nil {
 			return persistedState{}, fmt.Errorf("encode node %d properties: %w", nodeID, err)
 		}
@@ -2867,7 +2867,7 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		if err := ValidateEdgeType(edge.Type); err != nil {
 			return persistedState{}, fmt.Errorf("encode edge %d type: %w", edgeID, err)
 		}
-		props, err := encodePropertyMap(edge.Properties)
+		props, err := encodePropertyStorage(edge.Properties)
 		if err != nil {
 			return persistedState{}, fmt.Errorf("encode edge %d properties: %w", edgeID, err)
 		}
@@ -3070,7 +3070,7 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 			delta.NodePropertyChanges = append(delta.NodePropertyChanges, change)
 			continue
 		}
-		props, err := encodePropertyMap(node.Properties)
+		props, err := encodePropertyStorage(node.Properties)
 		if err != nil {
 			return persistedDelta{}, fmt.Errorf("encode node %d properties: %w", nodeID, err)
 		}
@@ -3104,7 +3104,7 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 			delta.EdgePropertyChanges = append(delta.EdgePropertyChanges, change)
 			continue
 		}
-		props, err := encodePropertyMap(edge.Properties)
+		props, err := encodePropertyStorage(edge.Properties)
 		if err != nil {
 			return persistedDelta{}, fmt.Errorf("encode edge %d properties: %w", edgeID, err)
 		}
@@ -3314,7 +3314,7 @@ func propertyIndexSnapshotBytes(definition PropertyIndexDefinition) uint64 {
 }
 
 func nodeSnapshotBytes(node *NodeRecord) (uint64, error) {
-	size := snapshotAdd(128, estimatePropertyMapBytes(node.Properties))
+	size := snapshotAdd(128, estimatePropertyStorageBytes(node.Properties))
 	for _, label := range node.Labels {
 		size = snapshotAdd(size, snapshotAdd(snapshotMul(uint64(len(label)), 6), 8))
 	}
@@ -3322,7 +3322,15 @@ func nodeSnapshotBytes(node *NodeRecord) (uint64, error) {
 }
 
 func edgeSnapshotBytes(edge *EdgeRecord) (uint64, error) {
-	return snapshotAdd(snapshotAdd(192, snapshotMul(uint64(len(edge.Type)), 6)), estimatePropertyMapBytes(edge.Properties)), nil
+	return snapshotAdd(snapshotAdd(192, snapshotMul(uint64(len(edge.Type)), 6)), estimatePropertyStorageBytes(edge.Properties)), nil
+}
+
+func estimatePropertyStorageBytes(properties Properties) uint64 {
+	size := uint64(64)
+	for key, value := range properties.All() {
+		size = snapshotAdd(size, snapshotAdd(snapshotAdd(snapshotMul(uint64(len(key)), 6), 64), estimateValueBytes(value)))
+	}
+	return size
 }
 
 func estimatePropertyMapBytes(properties map[string]any) uint64 {
@@ -3437,7 +3445,7 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 		if graph.Nodes.Get(storedNode.ID) != nil {
 			return nil, 0, 0, 0, fmt.Errorf("duplicate stored node id %d", storedNode.ID)
 		}
-		props, err := decodePropertyMap(storedNode.Properties)
+		props, err := decodePropertyStorage(storedNode.Properties)
 		if err != nil {
 			return nil, 0, 0, 0, fmt.Errorf("decode node %d properties: %w", storedNode.ID, err)
 		}
@@ -3484,7 +3492,7 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 		if graph.Nodes.Get(storedEdge.SourceID) == nil || graph.Nodes.Get(storedEdge.TargetID) == nil {
 			return nil, 0, 0, 0, fmt.Errorf("stored edge %d references missing node", storedEdge.ID)
 		}
-		props, err := decodePropertyMap(storedEdge.Properties)
+		props, err := decodePropertyStorage(storedEdge.Properties)
 		if err != nil {
 			return nil, 0, 0, 0, fmt.Errorf("decode edge %d properties: %w", storedEdge.ID, err)
 		}
@@ -3519,7 +3527,7 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 				return nil, 0, 0, 0, err
 			}
 			node := graph.Nodes.Get(nodeID)
-			value, ok := node.Properties[definition.Property]
+			value, ok := node.Properties.Lookup(definition.Property)
 			if !ok {
 				continue
 			}
@@ -3548,7 +3556,7 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 				return nil, 0, 0, 0, err
 			}
 			edge := graph.Edges.Get(edgeID)
-			value, ok := edge.Properties[definition.Property]
+			value, ok := edge.Properties.Lookup(definition.Property)
 			if !ok {
 				continue
 			}
@@ -3635,7 +3643,7 @@ func propertyIndexBudget(graph *GraphState) (uint64, uint64) {
 		work, bytes = addSaturated(work, 1), addSaturated(bytes, uint64(len(def.Scope)+len(def.Property))+192)
 		for id := range graph.Labels.All(def.Scope) {
 			work = addSaturated(work, 1)
-			if value, ok := graph.Nodes.Get(id).Properties[def.Property]; ok {
+			if value, ok := graph.Nodes.Get(id).Properties.Lookup(def.Property); ok {
 				v := estimateValueBytes(value)
 				work = addSaturated(work, max(uint64(1), v))
 				bytes = addSaturated(bytes, v+192)
@@ -3646,7 +3654,7 @@ func propertyIndexBudget(graph *GraphState) (uint64, uint64) {
 		work, bytes = addSaturated(work, 1), addSaturated(bytes, uint64(len(def.Scope)+len(def.Property))+192)
 		for id := range graph.EdgeTypes.All(def.Scope) {
 			work = addSaturated(work, 1)
-			if value, ok := graph.Edges.Get(id).Properties[def.Property]; ok {
+			if value, ok := graph.Edges.Get(id).Properties.Lookup(def.Property); ok {
 				v := estimateValueBytes(value)
 				work = addSaturated(work, max(uint64(1), v))
 				bytes = addSaturated(bytes, v+192)

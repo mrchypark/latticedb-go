@@ -11,7 +11,7 @@ func TestOrderedSnapshotPreservesExistingBytes(t *testing.T) {
 	graph := NewGraphState()
 	graph.DatabaseID = "0123456789abcdef0123456789abcdef"
 	for _, id := range []uint64{3 << 20, 128, 1 << 20, 1, 64} {
-		graph.Nodes.Set(id, &NodeRecord{ID: id, Labels: []string{"Item"}, Properties: map[string]any{"name": "한글"}})
+		graph.Nodes.Set(id, &NodeRecord{ID: id, Labels: []string{"Item"}, Properties: PropertiesFromMap(map[string]any{"name": "한글"})})
 		graph.Edges.Set(id, &EdgeRecord{ID: id, SourceID: id, TargetID: 1, Type: "LINK"})
 		graph.FTS.Set(id, &FTSRecord{Text: "text"})
 	}

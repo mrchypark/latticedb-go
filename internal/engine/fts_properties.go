@@ -96,7 +96,7 @@ func ftsPropertyValue(node *store.NodeRecord, property string) (string, bool) {
 	if node == nil {
 		return "", false
 	}
-	value, ok := node.Properties[property].(string)
+	value, ok := node.Properties.Get(property).(string)
 	return value, ok
 }
 
