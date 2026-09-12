@@ -6,8 +6,20 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"slices"
 	"testing"
 )
+
+func TestPropertyDeltaRemovalOrderDoesNotMutateKeys(t *testing.T) {
+	keys := []string{"z", "present", "a"}
+	change, err := buildPersistedPropertyChange(1, keys, map[string]any{"present": int64(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(change.Remove, []string{"a", "z"}) || !slices.Equal(keys, []string{"z", "present", "a"}) {
+		t.Fatalf("remove=%v, caller keys=%v", change.Remove, keys)
+	}
+}
 
 func TestPropertyDeltaChargesNewScalarKeys(t *testing.T) {
 	set := make(map[string]persistedValue, 100)

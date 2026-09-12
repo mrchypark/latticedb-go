@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"unicode/utf8"
 )
@@ -453,15 +454,28 @@ func validateNormalizedPropertyValueLimits(value any, depth int, walk *valueWalk
 		return fmt.Errorf("%w: nesting exceeds %d", ErrValueLimit, maxValueDepth)
 	}
 	switch value := value.(type) {
-	case nil, bool, int64, float64:
+	case nil, bool, int64:
+		return nil
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return errors.New("non-finite float64")
+		}
 		return nil
 	case string:
+		if !utf8.ValidString(value) {
+			return errors.New("string contains invalid UTF-8")
+		}
 		return walk.addBytes(len(value))
 	case []byte:
 		return walk.addBytes(len(value))
 	case []float32:
 		if len(value) > maxValueBytes/4 {
 			return fmt.Errorf("%w: byte count exceeds %d", ErrValueLimit, maxValueBytes)
+		}
+		for _, item := range value {
+			if math.IsNaN(float64(item)) || math.IsInf(float64(item), 0) {
+				return errors.New("non-finite float32")
+			}
 		}
 		return walk.addBytes(len(value) * 4)
 	case []any:
@@ -502,8 +516,6 @@ func buildPersistedPropertyChange(id uint64, keys []string, properties map[strin
 	if err := validateNormalizedPropertyMapLimits(properties); err != nil {
 		return persistedPropertyChange{}, err
 	}
-	keys = slices.Clone(keys)
-	slices.Sort(keys)
 	change := persistedPropertyChange{ID: id, Set: make(map[string]persistedValue)}
 	seen := make(map[string]struct{}, len(keys))
 	for _, key := range keys {
@@ -519,12 +531,13 @@ func buildPersistedPropertyChange(id uint64, keys []string, properties map[strin
 			change.Remove = append(change.Remove, key)
 			continue
 		}
-		encoded, err := encodePropertyMap(map[string]any{key: value})
+		encoded, err := encodeValue(value)
 		if err != nil {
 			return persistedPropertyChange{}, fmt.Errorf("property %q: %w", key, err)
 		}
-		change.Set[key] = encoded[key]
+		change.Set[key] = encoded
 	}
+	slices.Sort(change.Remove)
 	return change, nil
 }
 

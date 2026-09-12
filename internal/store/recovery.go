@@ -119,6 +119,7 @@ var legacyStateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '3'}
 
 type WALWriter struct {
 	encodeValue   walPayload
+	encodeDelta   persistedDelta
 	encodeBuffer  bytes.Buffer
 	file          *os.File
 	tailSize      atomic.Int64
@@ -171,11 +172,16 @@ func (writer *WALWriter) AppendDelta(graph *GraphState, nextNodeID uint64, nextE
 	if err != nil {
 		return err
 	}
+	if writer == nil || writer.file == nil {
+		return errors.New("WAL writer is closed")
+	}
+	writer.encodeDelta = delta
+	defer func() { writer.encodeDelta = persistedDelta{} }()
 	kind := "delta"
 	if hasPropertyDelta(delta) {
 		kind = "property_delta"
 	}
-	return writer.appendJSON(delta.DatabaseID, delta.CommitID, walPayload{Kind: kind, Delta: &delta})
+	return writer.appendJSON(delta.DatabaseID, delta.CommitID, walPayload{Kind: kind, Delta: &writer.encodeDelta})
 }
 
 // The engine serializes WAL writes. Reuse small payload storage without
@@ -2125,6 +2131,7 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 	var accumulator *walAccumulator
 	currentFormat := true
 	var header [walHeaderSize]byte
+	var wrapper walPayload
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
@@ -2192,7 +2199,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
 			return nil, false, errors.New("WAL checksum mismatch")
 		}
-		var wrapper walPayload
+		// The accumulator copies snapshot and delta data it retains. Reuse the
+		// wrapper allocation, but clear pointers before decoding each frame so
+		// omitted JSON fields cannot carry over from the previous frame.
+		wrapper = walPayload{}
 		if err := unmarshalContext(ctx, payload, &wrapper); err != nil {
 			return nil, false, fmt.Errorf("decode WAL payload: %w", err)
 		}

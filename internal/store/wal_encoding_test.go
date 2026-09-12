@@ -60,3 +60,49 @@ func TestWALPayloadBufferPreservesFramesAndReleasesLargeValues(t *testing.T) {
 		t.Fatalf("writer failed after encoding error: %v", err)
 	}
 }
+
+func TestAppendDeltaClearsReusableDeltaOnSuccessAndError(t *testing.T) {
+	const id = "00000000000000000000000000000001"
+	newGraph := func() *GraphState {
+		graph := NewGraphState()
+		graph.DatabaseID = id
+		graph.Nodes.Set(1, &NodeRecord{ID: 1, Properties: map[string]any{"value": "ok"}})
+		return graph
+	}
+	changes := GraphDelta{UpsertNodes: []uint64{1}}
+
+	successFile, err := os.CreateTemp(t.TempDir(), "wal-success")
+	if err != nil {
+		t.Fatal(err)
+	}
+	successWriter := &WALWriter{file: successFile, fullSync: true}
+	if err := successWriter.AppendDelta(newGraph(), 2, 1, 1, changes); err != nil {
+		t.Fatal(err)
+	}
+	if successWriter.encodeDelta.DatabaseID != "" || successWriter.encodeDelta.UpsertNodes != nil {
+		t.Fatal("successful AppendDelta retained its reusable delta")
+	}
+	if err := successWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	errorFile, err := os.CreateTemp(t.TempDir(), "wal-error")
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorWriter := &WALWriter{
+		file: errorFile,
+		writeFn: func(*os.File, []byte) (int, error) {
+			return 0, os.ErrPermission
+		},
+	}
+	if err := errorWriter.AppendDelta(newGraph(), 2, 1, 1, changes); err == nil {
+		t.Fatal("failing AppendDelta unexpectedly succeeded")
+	}
+	if errorWriter.encodeDelta.DatabaseID != "" || errorWriter.encodeDelta.UpsertNodes != nil {
+		t.Fatal("failing AppendDelta retained its reusable delta")
+	}
+	if err := errorWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

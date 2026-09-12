@@ -10,15 +10,15 @@ import (
 func TestTrackedPropertyChangefeedMatchesFullDiff(t *testing.T) {
 	before := map[string]any{"keep": []any{int64(1), "nested"}, "remove": int64(3), "revert": "same", "set": int64(1)}
 	after := map[string]any{"keep": before["keep"], "revert": "same", "set": int64(2), "null": nil}
-	keys := map[string]struct{}{"remove": {}, "revert": {}, "set": {}, "null": {}, "missing": {}}
+	keys := []string{"remove", "revert", "set", "null", "missing"}
 	for _, entity := range []string{"node", "edge"} {
 		t.Run(entity, func(t *testing.T) {
-			emit := func(tracked map[string]struct{}) ([]store.StreamRecord, uint64) {
+			emit := func(tracked []string) ([]store.StreamRecord, uint64) {
 				changes := newTxChanges(0)
 				if entity == "node" {
-					changes.nodePropertyKeys = map[uint64]map[string]struct{}{1: tracked}
+					changes.nodePropertyKeys = map[uint64][]string{1: tracked}
 				} else {
-					changes.edgePropertyKeys = map[uint64]map[string]struct{}{1: tracked}
+					changes.edgePropertyKeys = map[uint64][]string{1: tracked}
 				}
 				tx := &Tx{db: &DB{changefeedMaxBytes: 1 << 20}, graph: store.NewGraphState(), changes: changes}
 				count := tx.countPropertyChanges(before, after, tracked)

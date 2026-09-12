@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -70,13 +71,11 @@ func TestPropertyMutationTrackingDirectQueryAndRollback(t *testing.T) {
 		t.Fatal("missing node mutation succeeded")
 	}
 
-	wantNodes := map[uint64]map[string]struct{}{
-		node.ID: {
-			"direct": {}, "merge": {}, "missing": {}, "query": {}, "revert": {}, "uncommitted": {},
-		},
-		other.ID: {"uncommitted": {}},
+	wantNodes := map[uint64][]string{
+		node.ID:  {"direct", "revert", "query", "merge", "missing", "uncommitted"},
+		other.ID: {"uncommitted"},
 	}
-	wantEdges := map[uint64]map[string]struct{}{edge.ID: {"edgeDirect": {}, "old": {}, "query": {}, "queryMissing": {}}}
+	wantEdges := map[uint64][]string{edge.ID: {"edgeDirect", "old", "query", "queryMissing"}}
 	if got := tx.changes.nodePropertyKeys; !reflect.DeepEqual(got, wantNodes) {
 		t.Fatalf("node property keys = %#v, want %#v", got, wantNodes)
 	}
@@ -137,13 +136,13 @@ func TestPropertyMutationTrackingFullFallbackPersists(t *testing.T) {
 	if _, err := tx.Query(`MATCH (n) SET n.failed = 1, n.bad = missing.name`, nil); err == nil {
 		t.Fatal("failed query succeeded")
 	}
-	if got := tx.changes.nodePropertyKeys[node.ID]; !reflect.DeepEqual(got, map[string]struct{}{"kept": {}}) {
+	if got := tx.changes.nodePropertyKeys[node.ID]; !reflect.DeepEqual(got, []string{"kept"}) {
 		t.Fatalf("failed query changed parent tracker = %#v", got)
 	}
 	if _, err := tx.Query(`MATCH (n) WHERE id(n) = $id SET n.afterFailure = 1`, map[string]any{"id": int64(node.ID)}); err != nil {
 		t.Fatal(err)
 	}
-	if got := tx.changes.nodePropertyKeys[node.ID]; !reflect.DeepEqual(got, map[string]struct{}{"afterFailure": {}, "kept": {}}) {
+	if got := tx.changes.nodePropertyKeys[node.ID]; !reflect.DeepEqual(got, []string{"kept", "afterFailure"}) {
 		t.Fatalf("post-failure tracker = %#v", got)
 	}
 }
@@ -196,8 +195,67 @@ func TestSetVectorTracksPropertyKey(t *testing.T) {
 	if err := tx.SetVector(node.ID, "embedding", []float32{1, 2}); err != nil {
 		t.Fatal(err)
 	}
-	if got := tx.changes.nodePropertyKeys[node.ID]; !reflect.DeepEqual(got, map[string]struct{}{"embedding": {}}) {
+	if got := tx.changes.nodePropertyKeys[node.ID]; !reflect.DeepEqual(got, []string{"embedding"}) {
 		t.Fatalf("vector property keys = %#v", got)
+	}
+}
+
+func TestWidePropertyUpdateFallsBackToFullRecordAndRecovers(t *testing.T) {
+	db, node, _, _ := openPropertyMutationDB(t)
+	path := db.path
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxTrackedPropertyKeys-1; i++ {
+		if err := tx.SetProperty(node.ID, "wide"+strconv.Itoa(i), int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := maxTrackedPropertyKeys - 1; i <= maxTrackedPropertyKeys; i++ {
+		if _, err := tx.Query(`MATCH (n) WHERE id(n) = $id SET n.wide`+strconv.Itoa(i)+` = $value`, map[string]any{
+			"id":    int64(node.ID),
+			"value": int64(i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if keys, exists := tx.changes.nodePropertyKeys[node.ID]; !exists || keys != nil {
+		t.Fatalf("wide property tracker = %#v, exists=%v; want nil full-record sentinel", keys, exists)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := reopened.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := reopened.View(func(tx *Tx) error {
+		got, ok, err := tx.GetNodeValue(node.ID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			t.Fatalf("recovered node %d is missing", node.ID)
+		}
+		for i := 0; i <= maxTrackedPropertyKeys; i++ {
+			key := "wide" + strconv.Itoa(i)
+			if value := got.Properties[key]; value != int64(i) {
+				t.Fatalf("recovered property %s = %v, want %d", key, value, i)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

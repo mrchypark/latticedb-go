@@ -42,20 +42,20 @@ Candidate medians on darwin/arm64, Apple M3:
 
 | Entity | Shape | Width | Time baseline → candidate | Heap B/op baseline → candidate | Allocs/op baseline → candidate | WAL bytes/op baseline → candidate |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| node | flat | 10 | 147,172 → 97,105 ns (-34.0%) | 16,639 → 13,905 (-16.4%) | 105 → 83 (-21.0%) | 2,211 → 637.7 (-71.2%) |
-| node | nested | 10 | 306,591 → 207,444 ns (-32.3%) | 40,660 → 13,917 (-65.8%) | 375 → 83 (-77.9%) | 2,778 → 637.7 (-77.0%) |
-| edge | flat | 10 | 148,600 → 118,044 ns (-20.6%) | 16,747 → 13,971 (-16.6%) | 105 → 84 (-20.0%) | 2,240 → 642.5 (-71.3%) |
-| edge | nested | 10 | 254,252 → 121,465 ns (-52.2%) | 40,871 → 14,091 (-65.5%) | 373 → 82 (-78.0%) | 2,802 → 637.9 (-77.2%) |
-| node | flat | 1,000 | 3,052,792 → 1,061,861 ns (-65.2%) | 846,029 → 95,989 (-88.7%) | 3,100 → 85 (-97.3%) | 174,466 → 633.3 (-99.6%) |
-| node | nested | 1,000 | 8,744,361 → 544,264 ns (-93.8%) | 4,755,826 → 96,834 (-98.0%) | 33,109 → 90 (-99.7%) | 237,403 → 633.3 (-99.7%) |
+| node | flat | 10 | 147,172 → 166,106 ns (+12.9%) | 16,639 → 12,241 (-26.4%) | 105 → 68 (-35.2%) | 2,211 → 637.7 (-71.2%) |
+| node | nested | 10 | 306,591 → 158,004 ns (-48.5%) | 40,660 → 12,241 (-69.9%) | 375 → 68 (-81.9%) | 2,778 → 637.7 (-77.0%) |
+| edge | flat | 10 | 148,600 → 197,896 ns (+33.2%) | 16,747 → 12,296 (-26.6%) | 105 → 68 (-35.2%) | 2,240 → 642.5 (-71.3%) |
+| edge | nested | 10 | 254,252 → 137,383 ns (-46.0%) | 40,871 → 12,427 (-69.6%) | 373 → 67 (-82.0%) | 2,802 → 637.9 (-77.2%) |
+| node | flat | 1,000 | 3,052,792 → 1,081,083 ns (-64.6%) | 846,029 → 95,173 (-88.8%) | 3,100 → 75 (-97.6%) | 174,466 → 633.3 (-99.6%) |
+| node | nested | 1,000 | 8,744,361 → 1,357,361 ns (-84.5%) | 4,755,826 → 94,328 (-98.0%) | 33,109 → 70 (-99.8%) | 237,403 → 633.3 (-99.7%) |
 
 The candidate WAL size is effectively independent of unchanged property width:
 the width-10 and width-1000 node updates append about 638 and 633 bytes per
 operation. The outer property map is still copied in `O(width)` time and
 space; unchanged nested values are reused. The benchmark shows substantial
 allocation reduction without claiming zero allocation. The small edge-flat row
-is from the sequential 1000x/count3 run. Its wall-clock time decreased, while
-its WAL and heap metrics also decreased.
+is from the sequential 1000x/count3 run. Its wall-clock time increased, while
+its WAL and heap metrics decreased.
 
 The new WAL property-delta kind requires a current reader; an old reader is
 expected to reject that new kind. Existing old-format WAL remains readable by
@@ -66,7 +66,12 @@ still allocate.
 
 Before writing a patch, aggregate limit validation still walks the final property
 structure without copying it, so commit work is not independent of nested
-element count. Unchanged strings and byte payloads are counted by length.
+element count. String contents are validated as UTF-8 and vector values are
+checked for finiteness without allocating normalized copies.
+
+At most 64 distinct property keys per entity are tracked in one transaction.
+Larger sets use the full-record path, bounding duplicate-key tracking work
+while preserving the resulting values and changefeed events.
 
 Recovery computes lazy aggregate totals: unchanged nested values are scanned
 once per entity between full replacements, while each property patch clones
@@ -78,7 +83,7 @@ Raw measurement outputs:
 
 - `/tmp/latticedb-issue67-baseline-small.txt`
 - `/tmp/latticedb-issue67-baseline-wide.txt`
-- `/tmp/latticedb-issue67-candidate-final-small.txt`
-- `/tmp/latticedb-issue67-candidate-final-wide.txt`
+- `/tmp/latticedb-issue67-candidate-sealed-small.txt`
+- `/tmp/latticedb-issue67-candidate-sealed-wide.txt`
 - `/tmp/latticedb-issue67-edgeflat-baseline-1000x.txt`
-- `/tmp/latticedb-issue67-edgeflat-candidate-final-1000x.txt`
+- `/tmp/latticedb-issue67-candidate-sealed-edgeflat-1000x.txt`

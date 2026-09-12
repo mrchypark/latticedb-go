@@ -349,7 +349,7 @@ func (tx *Tx) countLabelChanges(before, after *store.NodeRecord) uint64 {
 	return count
 }
 
-func (tx *Tx) trackedPropertyKeys(entity string, id uint64) map[string]struct{} {
+func (tx *Tx) trackedPropertyKeys(entity string, id uint64) []string {
 	if tx.changes == nil {
 		return nil
 	}
@@ -359,10 +359,10 @@ func (tx *Tx) trackedPropertyKeys(entity string, id uint64) map[string]struct{} 
 	return tx.changes.edgePropertyKeys[id]
 }
 
-func (tx *Tx) countPropertyChanges(before, after map[string]any, keys map[string]struct{}) uint64 {
+func (tx *Tx) countPropertyChanges(before, after map[string]any, keys []string) uint64 {
 	var count uint64
 	if keys != nil {
-		for key := range keys {
+		for _, key := range keys {
 			oldValue, oldOK := before[key]
 			newValue, newOK := after[key]
 			if oldOK != newOK || oldOK && !reflect.DeepEqual(oldValue, newValue) {
@@ -506,15 +506,19 @@ func (tx *Tx) appendLabelChanges(nodeID uint64, before, after *store.NodeRecord)
 func (tx *Tx) appendPropertyChanges(entity string, id uint64, before, after map[string]any) {
 	keys := tx.trackedPropertyKeys(entity, id)
 	if keys == nil {
-		keys = map[string]struct{}{}
+		keys = make([]string, 0, len(before)+len(after))
 		for key := range before {
-			keys[key] = struct{}{}
+			keys = append(keys, key)
 		}
 		for key := range after {
-			keys[key] = struct{}{}
+			keys = append(keys, key)
 		}
+		slices.Sort(keys)
+		keys = slices.Compact(keys)
+	} else {
+		slices.Sort(keys)
 	}
-	for _, key := range sortedStringSet(keys) {
+	for _, key := range keys {
 		oldValue, oldOK := before[key]
 		newValue, newOK := after[key]
 		if oldOK == newOK && (!oldOK || reflect.DeepEqual(oldValue, newValue)) {

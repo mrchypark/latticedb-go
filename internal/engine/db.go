@@ -69,6 +69,10 @@ const defaultVectorBuildMaxLogicalBytes = 16 << 30
 const defaultDerivedBuildMaxWork = 100_000_000_000
 const defaultDerivedBuildMaxLogicalBytes = 16 << 30
 
+// ponytail: cap per-entity property patch tracking at 64; raise or replace this
+// fixed cap only with allocation and CPU evidence from wider updates.
+const maxTrackedPropertyKeys = 64
+
 type OpenOptions struct {
 	Create                            bool
 	ReadOnly                          bool
@@ -397,8 +401,8 @@ type txChanges struct {
 	deleteNodes       map[uint64]struct{}
 	upsertEdges       map[uint64]struct{}
 	deleteEdges       map[uint64]struct{}
-	nodePropertyKeys  map[uint64]map[string]struct{}
-	edgePropertyKeys  map[uint64]map[string]struct{}
+	nodePropertyKeys  map[uint64][]string
+	edgePropertyKeys  map[uint64][]string
 	upsertFTS         map[uint64]struct{}
 	deleteFTS         map[uint64]struct{}
 	appMetadata       map[string]appMetadataChange
@@ -4366,25 +4370,24 @@ func mapKeys(values map[uint64]struct{}) []uint64 {
 	return keys
 }
 
-func propertyKeyDeltas(upserts map[uint64]struct{}, tracked map[uint64]map[string]struct{}) map[uint64][]string {
+func propertyKeyDeltas(upserts map[uint64]struct{}, tracked map[uint64][]string) map[uint64][]string {
 	if len(upserts) == 0 || len(tracked) == 0 {
 		return nil
 	}
-	var deltas map[uint64][]string
-	for id := range upserts {
-		keys := tracked[id]
+	for id, keys := range tracked {
 		if len(keys) == 0 {
 			continue
 		}
-		if deltas == nil {
-			deltas = make(map[uint64][]string)
+		if _, ok := upserts[id]; !ok {
+			delete(tracked, id)
+			continue
 		}
-		deltas[id] = slices.Sorted(maps.Keys(keys))
+		slices.Sort(keys)
 	}
-	if len(deltas) == 0 {
+	if len(tracked) == 0 {
 		return nil
 	}
-	return deltas
+	return tracked
 }
 
 func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struct{}, node bool) {
@@ -4395,8 +4398,8 @@ func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struc
 		if !idExists(tx.base, id, node) {
 			continue
 		}
-		var child map[uint64]map[string]struct{}
-		var parent *map[uint64]map[string]struct{}
+		var child map[uint64][]string
+		var parent *map[uint64][]string
 		if node {
 			child = changes.nodePropertyKeys
 			parent = &tx.changes.nodePropertyKeys
@@ -4407,24 +4410,34 @@ func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struc
 		keys, exists := child[id]
 		if !exists || keys == nil {
 			if *parent == nil {
-				*parent = make(map[uint64]map[string]struct{})
+				*parent = make(map[uint64][]string)
 			}
 			(*parent)[id] = nil
 			continue
 		}
 		if *parent == nil {
-			*parent = make(map[uint64]map[string]struct{})
+			*parent = make(map[uint64][]string)
 		}
 		current, alreadyTracked := (*parent)[id]
 		if alreadyTracked && current == nil {
 			continue
 		}
 		if !alreadyTracked {
-			current = make(map[string]struct{}, len(keys))
-			(*parent)[id] = current
+			(*parent)[id] = keys
+			continue
 		}
-		for key := range keys {
-			current[key] = struct{}{}
+		for _, key := range keys {
+			if !slices.Contains(current, key) {
+				if len(current) >= maxTrackedPropertyKeys {
+					(*parent)[id] = nil
+					current = nil
+					break
+				}
+				current = append(current, key)
+			}
+		}
+		if current != nil {
+			(*parent)[id] = current
 		}
 	}
 }
@@ -4434,15 +4447,19 @@ func (tx *Tx) trackNodeProperty(id uint64, key string) {
 		return
 	}
 	if tx.changes.nodePropertyKeys == nil {
-		tx.changes.nodePropertyKeys = make(map[uint64]map[string]struct{})
+		tx.changes.nodePropertyKeys = make(map[uint64][]string)
 	}
 	keys, exists := tx.changes.nodePropertyKeys[id]
 	if !exists {
-		keys = make(map[string]struct{})
+		keys = make([]string, 0, 1)
 		tx.changes.nodePropertyKeys[id] = keys
 	}
-	if keys != nil {
-		keys[key] = struct{}{}
+	if keys != nil && !slices.Contains(keys, key) {
+		if len(keys) >= maxTrackedPropertyKeys {
+			tx.changes.nodePropertyKeys[id] = nil
+			return
+		}
+		tx.changes.nodePropertyKeys[id] = append(keys, key)
 	}
 }
 
@@ -4451,15 +4468,19 @@ func (tx *Tx) trackEdgeProperty(id uint64, key string) {
 		return
 	}
 	if tx.changes.edgePropertyKeys == nil {
-		tx.changes.edgePropertyKeys = make(map[uint64]map[string]struct{})
+		tx.changes.edgePropertyKeys = make(map[uint64][]string)
 	}
 	keys, exists := tx.changes.edgePropertyKeys[id]
 	if !exists {
-		keys = make(map[string]struct{})
+		keys = make([]string, 0, 1)
 		tx.changes.edgePropertyKeys[id] = keys
 	}
-	if keys != nil {
-		keys[key] = struct{}{}
+	if keys != nil && !slices.Contains(keys, key) {
+		if len(keys) >= maxTrackedPropertyKeys {
+			tx.changes.edgePropertyKeys[id] = nil
+			return
+		}
+		tx.changes.edgePropertyKeys[id] = append(keys, key)
 	}
 }
 
@@ -4468,7 +4489,7 @@ func (tx *Tx) markNodePropertyFallback(id uint64) {
 		return
 	}
 	if tx.changes.nodePropertyKeys == nil {
-		tx.changes.nodePropertyKeys = make(map[uint64]map[string]struct{})
+		tx.changes.nodePropertyKeys = make(map[uint64][]string)
 	}
 	tx.changes.nodePropertyKeys[id] = nil
 }
@@ -4478,7 +4499,7 @@ func (tx *Tx) markEdgePropertyFallback(id uint64) {
 		return
 	}
 	if tx.changes.edgePropertyKeys == nil {
-		tx.changes.edgePropertyKeys = make(map[uint64]map[string]struct{})
+		tx.changes.edgePropertyKeys = make(map[uint64][]string)
 	}
 	tx.changes.edgePropertyKeys[id] = nil
 }
