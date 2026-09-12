@@ -93,6 +93,17 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 		exactFallbackUsed = true
 		results = results[:0]
 	}
+	if err := budget.reserveBytes(capacity * 16); err != nil {
+		return nil, false, err
+	}
+	defer budget.releaseBytes(capacity * 16)
+	var stack [64]vectorCandidate
+	candidateStorage := stack[:0]
+	if capacity > uint64(len(stack)) {
+		candidateStorage = make([]vectorCandidate, 0, int(capacity))
+	}
+	exact := vectorCandidateHeap{items: candidateStorage, max: true, exact: true}
+	cutoff := math.Inf(1)
 	for _, node := range graph.Nodes.All() {
 		vectorValue, ok := selectedVector(graph, node)
 		if !ok {
@@ -104,21 +115,42 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 		if err := budget.add(uint64(len(queryVector))); err != nil {
 			return nil, false, err
 		}
-		var distance float32
+		var distance float64
 		var err error
 		if len(queryVector) < 256 {
-			distance, err = search.VectorDistance(vectorValue, queryVector)
+			distance, err = search.SquaredVectorDistance(vectorValue, queryVector)
 		} else {
-			distance, err = search.VectorDistanceContext(budget.ctx, vectorValue, queryVector)
+			distance, err = search.SquaredVectorDistanceContext(budget.ctx, vectorValue, queryVector)
 		}
 		if err != nil {
 			return nil, false, err
 		}
-		results = pushVectorResult(results, VectorSearchResult{NodeID: node.ID, Distance: distance}, int(capacity))
+		if distance > cutoff || capacity == 0 {
+			continue
+		}
+		candidate := vectorCandidate{id: node.ID, distance: distance}
+		if len(exact.items) == int(capacity) {
+			if compareExactVectorCandidate(candidate, exact.items[0]) >= 0 {
+				continue
+			}
+			exact.pop()
+		}
+		exact.items = pushVectorCandidateHeap(exact, candidate)
+		if len(exact.items) == int(capacity) {
+			cutoff = exact.items[0].distance * (1 + exactSquaredRoundingMargin)
+			// With nonzero squared sums >= 2^-298, a subnormal L2 bin
+			// spans less than a factor of four in squared distance.
+			if exact.items[0].distance < smallestNormalL2Squared {
+				cutoff = exact.items[0].distance * 4
+			}
+		}
 	}
 	if err := budget.check(); err != nil {
 		return nil, false, err
 	}
-	slices.SortFunc(results, compareVectorResult)
+	slices.SortFunc(exact.items, compareExactVectorCandidate)
+	for _, candidate := range exact.items {
+		results = append(results, VectorSearchResult{NodeID: candidate.id, Distance: float32(math.Sqrt(candidate.distance))})
+	}
 	return results, exactFallbackUsed, nil
 }

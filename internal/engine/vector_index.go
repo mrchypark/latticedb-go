@@ -29,12 +29,16 @@ type vectorCandidate struct {
 type vectorCandidateHeap struct {
 	items []vectorCandidate
 	max   bool
+	exact bool
 }
 
 func (h vectorCandidateHeap) Len() int { return len(h.items) }
 
 func (h vectorCandidateHeap) before(left, right vectorCandidate) bool {
 	order := compareVectorCandidate(left, right)
+	if h.exact {
+		order = compareExactVectorCandidate(left, right)
+	}
 	if h.max {
 		return order > 0
 	}
@@ -42,6 +46,11 @@ func (h vectorCandidateHeap) before(left, right vectorCandidate) bool {
 }
 
 func (h *vectorCandidateHeap) push(item vectorCandidate) {
+	h.items = pushVectorCandidateHeap(*h, item)
+}
+
+// Passing the slice by value lets exact-search scratch remain on the stack.
+func pushVectorCandidateHeap(h vectorCandidateHeap, item vectorCandidate) []vectorCandidate {
 	h.items = append(h.items, item)
 	for index := len(h.items) - 1; index > 0; {
 		parent := (index - 1) / 2
@@ -51,6 +60,7 @@ func (h *vectorCandidateHeap) push(item vectorCandidate) {
 		h.items[index], h.items[parent] = h.items[parent], h.items[index]
 		index = parent
 	}
+	return h.items
 }
 
 func (h *vectorCandidateHeap) pop() vectorCandidate {
