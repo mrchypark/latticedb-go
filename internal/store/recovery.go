@@ -3441,9 +3441,14 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 		if err != nil {
 			return nil, 0, 0, 0, fmt.Errorf("decode node %d properties: %w", storedNode.ID, err)
 		}
+		labels := InternStrings(storedNode.Labels)
+		// Preserve recovery's empty-label convention.
+		if len(labels) == 0 {
+			labels = nil
+		}
 		graph.Nodes.Set(storedNode.ID, &NodeRecord{
 			ID:         storedNode.ID,
-			Labels:     CloneStrings(storedNode.Labels),
+			Labels:     labels,
 			Properties: props,
 		})
 		for _, label := range storedNode.Labels {
@@ -3487,7 +3492,7 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 			ID:         storedEdge.ID,
 			SourceID:   storedEdge.SourceID,
 			TargetID:   storedEdge.TargetID,
-			Type:       storedEdge.Type,
+			Type:       InternString(storedEdge.Type),
 			Properties: props,
 		})
 		if err := budget.add(3, uint64(len(storedEdge.Type))+160); err != nil {

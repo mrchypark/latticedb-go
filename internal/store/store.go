@@ -978,7 +978,12 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 		if err := walk.addBytes(len(v)); err != nil {
 			return nil, err
 		}
-		return v, nil
+		if len(v) > 0 && len(v) <= maxInternedStringBytes {
+			if err := walk.reserveBytes(uint64(len(v))); err != nil {
+				return nil, err
+			}
+		}
+		return InternString(v), nil
 	case []byte:
 		if err := walk.addBytes(len(v)); err != nil {
 			return nil, err
@@ -1045,7 +1050,12 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			out[key] = normalized
+			if len(key) > 0 && len(key) <= maxInternedStringBytes {
+				if err := walk.reserveBytes(uint64(len(key))); err != nil {
+					return nil, err
+				}
+			}
+			out[InternString(key)] = normalized
 		}
 		return out, nil
 	}
@@ -1100,7 +1110,12 @@ func normalizeValue(value any, depth int, walk *valueWalk) (any, error) {
 			if err != nil {
 				return nil, err
 			}
-			out[key] = normalized
+			if len(key) > 0 && len(key) <= maxInternedStringBytes {
+				if err := walk.reserveBytes(uint64(len(key))); err != nil {
+					return nil, err
+				}
+			}
+			out[InternString(key)] = normalized
 		}
 		return out, nil
 	default:
@@ -1182,7 +1197,7 @@ func NormalizeProperties(in map[string]any) (map[string]any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("property %q: %w", key, err)
 		}
-		out[key] = normalized
+		out[InternString(key)] = normalized
 	}
 	return out, nil
 }
