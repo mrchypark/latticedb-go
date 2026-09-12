@@ -49,8 +49,8 @@ func TestReportUsesMediansAndComparesMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	var report bytes.Buffer
-	writeReport(&report, current, previous, "head", "base", nil, "")
-	for _, want := range []string{"`BenchmarkLookup`", "| 110 | 100 | +10.0% | 8 | 16 | -50.0% | 1 | 2 | -50.0% |", "ns/op is informational because shared-runner latency is noisy"} {
+	writeReport(&report, current, previous, "head", "base", nil, "", false)
+	for _, want := range []string{"`BenchmarkLookup`", "| `BenchmarkLookup` | 3 / 1 | 110 | 100 | +10.0% | 8 | 16 | -50.0% | 1 | 2 | -50.0% |", "sample counts are current / previous", "ns/op is informational because shared-runner latency is noisy"} {
 		if !strings.Contains(report.String(), want) {
 			t.Fatalf("report does not contain %q:\n%s", want, report.String())
 		}
@@ -67,13 +67,43 @@ func TestReportComparesPureGoWithZig100K(t *testing.T) {
 		t.Fatal(err)
 	}
 	var report bytes.Buffer
-	writeReport(&report, current, result{}, "head", "base", zig, "upstream@abc")
+	writeReport(&report, current, result{}, "head", "base", zig, "upstream@abc", true)
 	for _, want := range []string{
 		"## pure-Go vs Zig reference (100K)",
 		"| Index build / insert (ms) | 1234 | 1000 | +23.4% |",
 		"| Mean search (ns) | 800000 | 500000 | +60.0% |",
 		"| Recall@10 | 99.0% | 98.0% | +1.0 pp |",
 		"Zig reports 42.0 MB",
+		"Both are measured in the same CI run",
+	} {
+		if !strings.Contains(report.String(), want) {
+			t.Fatalf("report does not contain %q:\n%s", want, report.String())
+		}
+	}
+
+	report.Reset()
+	writeReport(&report, current, result{}, "head", "base", zig, "upstream@abc", false)
+	if !strings.Contains(report.String(), "The Zig result was not measured in this CI run") {
+		t.Fatalf("reused Zig report omitted provenance:\n%s", report.String())
+	}
+}
+
+func TestReportShowsRowSamplesAndZigProvenance(t *testing.T) {
+	current, err := parse(strings.NewReader("BenchmarkVectorSearchClustered128D/1K-8 1 100 ns/op\nBenchmarkVectorSearchClustered128D/10K-8 1 200 ns/op\nBenchmarkVectorSearchClustered128D/100K-8 1 300 ns/op\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous, err := parse(strings.NewReader("BenchmarkVectorSearchClustered128D/1K-8 1 90 ns/op\nBenchmarkVectorSearchClustered128D/10K-8 1 190 ns/op\nBenchmarkVectorSearchClustered128D/100K-8 1 290 ns/op\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report bytes.Buffer
+	writeReport(&report, current, previous, "head", "base", nil, "", false)
+	for _, want := range []string{
+		"| `BenchmarkVectorSearchClustered128D/1K` | 1 / 1 |",
+		"| `BenchmarkVectorSearchClustered128D/10K` | 1 / 1 |",
+		"| `BenchmarkVectorSearchClustered128D/100K` | 1 / 1 |",
+		"Values are medians of the samples shown in each row",
 	} {
 		if !strings.Contains(report.String(), want) {
 			t.Fatalf("report does not contain %q:\n%s", want, report.String())

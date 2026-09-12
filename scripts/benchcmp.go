@@ -150,6 +150,10 @@ func display(metrics map[string][]float64, unit string) string {
 	return fmt.Sprintf("%.0f", v)
 }
 
+func sampleCount(metrics map[string][]float64) int {
+	return len(metrics["ns/op"])
+}
+
 func delta(current, previous map[string][]float64, unit string) string {
 	c, cok := value(current, unit)
 	p, pok := value(previous, unit)
@@ -216,7 +220,7 @@ func otherMetrics(current, previous map[string][]float64) string {
 	return strings.Join(parts, ", ")
 }
 
-func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel string) {
+func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel string, zigFresh bool) {
 	goMetrics := current["BenchmarkVectorSearchClustered128D/100K"]
 	if goMetrics == nil {
 		return
@@ -244,10 +248,14 @@ func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel st
 	if goRecall, ok := value(goMetrics, "recall@10"); ok {
 		fmt.Fprintf(w, "| Recall@10 | %.1f%% | %.1f%% | %+.1f pp |\n", goRecall, zig.recall, goRecall-zig.recall)
 	}
-	fmt.Fprintf(w, "\nPositive latency/build Δ means pure-Go is slower. Zig reports %.1f MB of index memory; it is not compared with Go B/op because they measure different things. Both run on the same CI runner with the same 128-D clustered workload and HNSW parameters, but the Zig benchmark includes its storage layer.\n", zig.memoryMB)
+	if zigFresh {
+		fmt.Fprintf(w, "\nPositive latency/build Δ means pure-Go is slower. Zig reports %.1f MB of index memory; it is not compared with Go B/op because they measure different things. Both are measured in the same CI run with the same 128-D clustered workload and HNSW parameters, but the Zig benchmark includes its storage layer.\n", zig.memoryMB)
+	} else {
+		fmt.Fprintf(w, "\nPositive latency/build Δ means pure-Go is slower. Zig reports %.1f MB of index memory; it is not compared with Go B/op because they measure different things. The Zig result was not measured in this CI run; both use the same 128-D clustered workload and HNSW parameters, but the Zig benchmark includes its storage layer.\n", zig.memoryMB)
+	}
 }
 
-func writeReport(w io.Writer, current, previous result, currentLabel, previousLabel string, zig *zigResult, zigLabel string) {
+func writeReport(w io.Writer, current, previous result, currentLabel, previousLabel string, zig *zigResult, zigLabel string, zigFresh bool) {
 	names := make([]string, 0, len(current))
 	for name := range current {
 		names = append(names, name)
@@ -256,17 +264,17 @@ func writeReport(w io.Writer, current, previous result, currentLabel, previousLa
 
 	fmt.Fprintln(w, "# Performance benchmark report")
 	fmt.Fprintf(w, "\nCurrent: `%s`  \nPrevious: `%s`\n", currentLabel, previousLabel)
-	fmt.Fprintln(w, "\nValues are medians of three runs except the 100K clustered-vector workload, which runs once. Δ is current versus previous; ns/op is informational because shared-runner latency is noisy, while graph-core B/op and allocs/op remain enforced (including multi-hop). WAL recovery latency is informational; its allocation and byte metrics remain gated.")
+	fmt.Fprintln(w, "\nValues are medians of the samples shown in each row; sample counts are current / previous. Δ is current versus previous; ns/op is informational because shared-runner latency is noisy, while graph-core B/op and allocs/op remain enforced (including multi-hop). WAL recovery latency is informational; its allocation and byte metrics remain gated.")
 	if zig != nil {
-		writeZigComparison(w, current, zig, zigLabel)
+		writeZigComparison(w, current, zig, zigLabel, zigFresh)
 	}
-	fmt.Fprintln(w, "\n| Benchmark | ns/op current | previous | Δ | B/op current | previous | Δ | allocs/op current | previous | Δ | Other current / previous (Δ) |")
-	fmt.Fprintln(w, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+	fmt.Fprintln(w, "\n| Benchmark | n cur/prev | ns/op current | previous | Δ | B/op current | previous | Δ | allocs/op current | previous | Δ | Other current / previous (Δ) |")
+	fmt.Fprintln(w, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 	for _, name := range names {
 		cur := current[name]
 		prev := previous[name]
-		fmt.Fprintf(w, "| `%s` | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
-			name,
+		fmt.Fprintf(w, "| `%s` | %d / %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			name, sampleCount(cur), sampleCount(prev),
 			display(cur, "ns/op"), display(prev, "ns/op"), delta(cur, prev, "ns/op"),
 			display(cur, "B/op"), display(prev, "B/op"), delta(cur, prev, "B/op"),
 			display(cur, "allocs/op"), display(prev, "allocs/op"), delta(cur, prev, "allocs/op"),
@@ -317,6 +325,7 @@ func main() {
 	validateGoPath := flag.String("validate-go", "", "validate Go benchmark output")
 	validateZigPath := flag.String("validate-zig", "", "validate Zig vector benchmark output")
 	checkPath := flag.Bool("check", false, "enforce stable performance gates")
+	zigFresh := flag.Bool("zig-fresh", false, "whether Zig reference was freshly measured in this run")
 	flag.Parse()
 	if *validateGoPath != "" {
 		benchmarks, err := read(*validateGoPath)
@@ -392,5 +401,5 @@ func main() {
 		os.Exit(1)
 	}
 	defer output.Close()
-	writeReport(output, current, previous, *currentLabel, *previousLabel, zig, *zigLabel)
+	writeReport(output, current, previous, *currentLabel, *previousLabel, zig, *zigLabel, *zigFresh)
 }

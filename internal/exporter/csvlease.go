@@ -296,7 +296,17 @@ func regularCSVGenerationFile(path string) (os.FileInfo, error) {
 	return info, nil
 }
 
+type csvLeaseCleanupHooks struct {
+	beforeLstat  func(path string) // called after ReadDir, before each Lstat
+	beforeOpen   func(path string) // called after Lstat+active check, before each OpenFile
+	beforeRemove func(path string) // called after lock check+close, before each Remove
+}
+
 func cleanupCSVLeases(generationPath string) (bool, error) {
+	return cleanupCSVLeasesWithHooks(generationPath, nil)
+}
+
+func cleanupCSVLeasesWithHooks(generationPath string, hooks *csvLeaseCleanupHooks) (bool, error) {
 	csvGenerationLeases.Lock()
 	defer csvGenerationLeases.Unlock()
 	entries, err := os.ReadDir(generationPath)
@@ -308,7 +318,13 @@ func cleanupCSVLeases(generationPath string) (bool, error) {
 			continue
 		}
 		path := filepath.Join(generationPath, entry.Name())
+		if hooks != nil && hooks.beforeLstat != nil {
+			hooks.beforeLstat(path)
+		}
 		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			return false, fmt.Errorf("%w: lease file", ErrInvalidCSVGeneration)
 		}
@@ -322,7 +338,13 @@ func cleanupCSVLeases(generationPath string) (bool, error) {
 		if activeHere {
 			return true, nil
 		}
+		if hooks != nil && hooks.beforeOpen != nil {
+			hooks.beforeOpen(path)
+		}
 		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return false, err
 		}
@@ -339,7 +361,10 @@ func cleanupCSVLeases(generationPath string) (bool, error) {
 		if err := file.Close(); err != nil {
 			return false, err
 		}
-		if err := os.Remove(path); err != nil {
+		if hooks != nil && hooks.beforeRemove != nil {
+			hooks.beforeRemove(path)
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return false, err
 		}
 	}

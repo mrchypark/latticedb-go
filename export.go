@@ -100,10 +100,12 @@ func Dump(dbPath string) ([]byte, error) {
 	return DumpContext(context.Background(), dbPath)
 }
 
+// DumpContext treats a nil context as context.Background().
 func DumpContext(ctx context.Context, dbPath string) ([]byte, error) {
 	return DumpContextWithOptions(ctx, dbPath, ExportOptions{})
 }
 
+// DumpContextWithOptions treats a nil context as context.Background().
 func DumpContextWithOptions(ctx context.Context, dbPath string, opts ExportOptions) ([]byte, error) {
 	db, err := OpenContext(ctx, dbPath, OpenOptions{ReadOnly: true})
 	if err != nil {
@@ -166,10 +168,12 @@ func (db *DB) Dump() ([]byte, error) {
 	return db.DumpContext(context.Background())
 }
 
+// DumpContext treats a nil context as context.Background().
 func (db *DB) DumpContext(ctx context.Context) ([]byte, error) {
 	return db.DumpContextWithOptions(ctx, ExportOptions{})
 }
 
+// DumpContextWithOptions treats a nil context as context.Background().
 func (db *DB) DumpContextWithOptions(ctx context.Context, opts ExportOptions) ([]byte, error) {
 	inner, err := db.requireOpen()
 	if err != nil {
@@ -190,6 +194,7 @@ func (db *DB) DumpTo(output io.Writer) error {
 
 // DumpToContext observes cancellation between writes. It cannot interrupt an
 // output writer that is itself blocked in Write.
+// A nil context is treated as context.Background(), as in file-path exports.
 func (db *DB) DumpToContext(ctx context.Context, output io.Writer) error {
 	return db.DumpToContextWithOptions(ctx, output, ExportOptions{})
 }
@@ -197,6 +202,7 @@ func (db *DB) DumpToContext(ctx context.Context, output io.Writer) error {
 // DumpToContextWithOptions can leave already-written bytes in output when a
 // limit, cancellation, or writer error occurs; arbitrary writers cannot roll
 // those bytes back.
+// A nil context is treated as context.Background().
 func (db *DB) DumpToContextWithOptions(ctx context.Context, output io.Writer, opts ExportOptions) error {
 	inner, err := db.requireOpen()
 	if err != nil {
@@ -216,6 +222,7 @@ func (db *DB) ExportTo(format ExportFormat, output io.Writer) error {
 
 // ExportToContext observes cancellation between writes. It cannot interrupt an
 // output writer that is itself blocked in Write.
+// A nil context is treated as context.Background(), as in file-path exports.
 func (db *DB) ExportToContext(ctx context.Context, format ExportFormat, output io.Writer) error {
 	return db.ExportToContextWithOptions(ctx, format, output, ExportOptions{})
 }
@@ -223,6 +230,7 @@ func (db *DB) ExportToContext(ctx context.Context, format ExportFormat, output i
 // ExportToContextWithOptions can leave already-written bytes in output when a
 // limit, cancellation, or writer error occurs; arbitrary writers cannot roll
 // those bytes back.
+// A nil context is treated as context.Background().
 func (db *DB) ExportToContextWithOptions(ctx context.Context, format ExportFormat, output io.Writer, opts ExportOptions) error {
 	inner, err := db.requireOpen()
 	if err != nil {

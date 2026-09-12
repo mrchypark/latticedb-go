@@ -118,6 +118,8 @@ var stateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '4'}
 var legacyStateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '3'}
 
 type WALWriter struct {
+	encodeValue   walPayload
+	encodeBuffer  bytes.Buffer
 	file          *os.File
 	tailSize      atomic.Int64
 	fullSync      bool
@@ -161,11 +163,7 @@ func (writer *WALWriter) AppendSnapshot(graph *GraphState, nextNodeID uint64, ne
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(walPayload{Kind: "snapshot", Snapshot: &snapshot})
-	if err != nil {
-		return fmt.Errorf("encode WAL snapshot: %w", err)
-	}
-	return writer.append(snapshot.DatabaseID, snapshot.CommitID, payload)
+	return writer.appendJSON(snapshot.DatabaseID, snapshot.CommitID, walPayload{Kind: "snapshot", Snapshot: &snapshot})
 }
 
 func (writer *WALWriter) AppendDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, changes GraphDelta) error {
@@ -173,11 +171,29 @@ func (writer *WALWriter) AppendDelta(graph *GraphState, nextNodeID uint64, nextE
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(walPayload{Kind: "delta", Delta: &delta})
-	if err != nil {
-		return fmt.Errorf("encode WAL delta: %w", err)
+	return writer.appendJSON(delta.DatabaseID, delta.CommitID, walPayload{Kind: "delta", Delta: &delta})
+}
+
+// The engine serializes WAL writes. Reuse small payload storage without
+// retaining an unusually large transaction or snapshot for the writer lifetime.
+func (writer *WALWriter) appendJSON(databaseID string, commitID uint64, value walPayload) error {
+	if writer == nil || writer.file == nil {
+		return errors.New("WAL writer is closed")
 	}
-	return writer.append(delta.DatabaseID, delta.CommitID, payload)
+	writer.encodeBuffer.Reset()
+	writer.encodeValue = value
+	defer func() {
+		writer.encodeValue = walPayload{}
+		if writer.encodeBuffer.Cap() > 64<<10 {
+			writer.encodeBuffer = bytes.Buffer{}
+		}
+	}()
+	if err := json.NewEncoder(&writer.encodeBuffer).Encode(&writer.encodeValue); err != nil {
+		return fmt.Errorf("encode WAL %s: %w", value.Kind, err)
+	}
+	// Encoder adds a newline; preserve the existing Marshal payload bytes.
+	payload := writer.encodeBuffer.Bytes()
+	return writer.append(databaseID, commitID, payload[:len(payload)-1])
 }
 
 func (writer *WALWriter) append(databaseID string, commitID uint64, payload []byte) error {
@@ -2113,7 +2129,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 				if accumulator == nil {
 					return nil, false, os.ErrNotExist
 				}
-				state := accumulator.persistedState()
+				state, stateErr := accumulator.persistedState()
+				if stateErr != nil {
+					return nil, false, fmt.Errorf("serialize WAL state: %w", stateErr)
+				}
 				return &state, false, nil
 			}
 			return nil, false, fmt.Errorf("read wal header: %w", err)
@@ -2136,7 +2155,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 			if accumulator == nil {
 				return nil, false, os.ErrNotExist
 			}
-			state := accumulator.persistedState()
+			state, stateErr := accumulator.persistedState()
+			if stateErr != nil {
+				return nil, false, fmt.Errorf("serialize WAL state: %w", stateErr)
+			}
 			return &state, false, nil
 		}
 		if err := budget.frame(); err != nil {
@@ -2151,7 +2173,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 				if accumulator == nil {
 					return nil, false, os.ErrNotExist
 				}
-				state := accumulator.persistedState()
+				state, stateErr := accumulator.persistedState()
+				if stateErr != nil {
+					return nil, false, fmt.Errorf("serialize WAL state: %w", stateErr)
+				}
 				return &state, false, nil
 			}
 			return nil, false, fmt.Errorf("read wal payload: %w", err)
@@ -2232,7 +2257,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 	if accumulator == nil {
 		return nil, false, os.ErrNotExist
 	}
-	state := accumulator.persistedState()
+	state, err := accumulator.persistedState()
+	if err != nil {
+		return nil, false, fmt.Errorf("serialize WAL state: %w", err)
+	}
 	return &state, currentFormat, nil
 }
 
@@ -2552,7 +2580,11 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 		}
 	}
 	if delta.Streams != nil {
-		accumulator.streams, _ = decodePersistedStreams(*delta.Streams)
+		var decodeErr error
+		accumulator.streams, decodeErr = decodePersistedStreams(*delta.Streams)
+		if decodeErr != nil {
+			return fmt.Errorf("decode persisted streams: %w", decodeErr)
+		}
 	} else if len(delta.StreamOperations) != 0 {
 		accumulator.streams = streams
 	}
@@ -2635,7 +2667,7 @@ func validateUniqueDeltaIDs[T any](deletes []uint64, upserts []T, id func(T) uin
 	return nil
 }
 
-func (accumulator *walAccumulator) persistedState() persistedState {
+func (accumulator *walAccumulator) persistedState() (persistedState, error) {
 	state := accumulator.state
 	state.AppMetadata = make([]persistedAppMetadata, 0, len(accumulator.metadata))
 	metadataKeys := make([]string, 0, len(accumulator.metadata))
@@ -2647,7 +2679,11 @@ func (accumulator *walAccumulator) persistedState() persistedState {
 		entry := accumulator.metadata[key]
 		state.AppMetadata = append(state.AppMetadata, persistedAppMetadata{Key: slices.Clone(entry.Key), Value: slices.Clone(entry.Value)})
 	}
-	state.Streams, _ = buildPersistedStreams(accumulator.streams)
+	var err error
+	state.Streams, err = buildPersistedStreams(accumulator.streams)
+	if err != nil {
+		return persistedState{}, fmt.Errorf("encode streams: %w", err)
+	}
 	state.Nodes = state.Nodes[:0]
 	state.Edges = state.Edges[:0]
 	state.FTS = state.FTS[:0]
@@ -2660,7 +2696,7 @@ func (accumulator *walAccumulator) persistedState() persistedState {
 	for _, id := range sortedMapKeys(accumulator.fts) {
 		state.FTS = append(state.FTS, accumulator.fts[id])
 	}
-	return state
+	return state, nil
 }
 
 func sortedMapKeys[T any](values map[uint64]T) []uint64 {
@@ -3409,11 +3445,8 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 			}
 			return nil, 0, 0, 0, err
 		}
-		var tokenBytes uint64
-		for _, token := range tokens {
-			tokenBytes = addSaturated(tokenBytes, uint64(len(token))+128)
-		}
-		if err := budget.add(uint64(len(storedFTS.Text))+uint64(len(tokens)), addSaturated(tokenBytes, multiplySaturated(uint64(len(tokens)), 16))); err != nil {
+		work, logicalBytes := FTSDerivedCost(storedFTS.Text, tokens)
+		if err := budget.add(work, logicalBytes); err != nil {
 			return nil, 0, 0, 0, err
 		}
 		graph.FTS.Set(storedFTS.NodeID, &FTSRecord{Text: storedFTS.Text, Tokens: tokens})

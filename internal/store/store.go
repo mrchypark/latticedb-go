@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -769,6 +770,21 @@ func ClonePropertyMap(in map[string]any) map[string]any {
 	return out
 }
 
+func clonePropertyMapContext(ctx context.Context, in map[string]any) (map[string]any, error) {
+	if len(in) == 0 {
+		return map[string]any{}, nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		c, err := CloneValueContext(ctx, value)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = c
+	}
+	return out, nil
+}
+
 func CloneValue(value any) any {
 	switch v := value.(type) {
 	case nil:
@@ -808,6 +824,83 @@ func CloneValue(value any) any {
 			return value
 		}
 	}
+}
+
+// CloneValueContext is like CloneValue but checks ctx.Err() before each
+// recursive allocation and between chunks of large slice copies. Returns (cloned, nil) on success, (zero, err) if
+// ctx is cancelled mid-clone. A nil ctx is treated as context.Background.
+func CloneValueContext(ctx context.Context, value any) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch v := value.(type) {
+	case nil:
+		return nil, nil
+	case []byte:
+		return cloneValueSliceContext(ctx, v)
+	case []float32:
+		return cloneValueSliceContext(ctx, v)
+	case []any:
+		cloned := make([]any, len(v))
+		for i, item := range v {
+			c, err := CloneValueContext(ctx, item)
+			if err != nil {
+				return nil, err
+			}
+			cloned[i] = c
+		}
+		return cloned, nil
+	case map[string]any:
+		return clonePropertyMapContext(ctx, v)
+	default:
+		rv := reflect.ValueOf(value)
+		switch rv.Kind() {
+		case reflect.Slice, reflect.Array:
+			list := make([]any, rv.Len())
+			for i := 0; i < rv.Len(); i++ {
+				c, err := CloneValueContext(ctx, rv.Index(i).Interface())
+				if err != nil {
+					return nil, err
+				}
+				list[i] = c
+			}
+			return list, nil
+		case reflect.Map:
+			if rv.Type().Key().Kind() != reflect.String {
+				return value, nil
+			}
+			out := make(map[string]any, rv.Len())
+			iter := rv.MapRange()
+			for iter.Next() {
+				c, err := CloneValueContext(ctx, iter.Value().Interface())
+				if err != nil {
+					return nil, err
+				}
+				out[iter.Key().String()] = c
+			}
+			return out, nil
+		default:
+			return value, nil
+		}
+	}
+}
+
+func cloneValueSliceContext[T byte | float32](ctx context.Context, value []T) ([]T, error) {
+	if len(value) == 0 {
+		return nil, nil
+	}
+	cloned := make([]T, len(value))
+	for start := 0; start < len(value); start += 4096 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := min(start+4096, len(value))
+		copy(cloned[start:end], value[start:end])
+	}
+	return cloned, ctx.Err()
 }
 
 func NormalizeValue(value any) (any, error) {

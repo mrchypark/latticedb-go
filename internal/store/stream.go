@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"slices"
@@ -52,7 +53,8 @@ type streamChunk struct {
 }
 
 // StreamStore keeps system streams separate from graph data. Fork shares its
-// immutable state; the first writer copies only the changed stream or offset.
+// immutable state; the first stream write copies the outer streams and next
+// maps. Offset writes copy the outer offsets map and selected consumer map.
 type StreamStore struct {
 	streams       map[string]streamLog
 	next          map[string]uint64
@@ -142,12 +144,29 @@ func (store StreamStore) Read(name string, after uint64, limit uint) []StreamRec
 // ReadBounded returns at most limit records without cloning a record that
 // would exceed maxBytes. A zero maxBytes disables the byte limit.
 func (store StreamStore) ReadBounded(name string, after uint64, limit uint, maxBytes uint64) StreamReadResult {
+	result, _ := store.readBoundedTraverse(context.Background(), name, after, limit, maxBytes)
+	return result
+}
+
+// ReadBoundedContext is like ReadBounded but propagates ctx cancellation
+// during traversal and cloning. Callers must discard partial records on error.
+func (store StreamStore) ReadBoundedContext(ctx context.Context, name string, after uint64, limit uint, maxBytes uint64) (StreamReadResult, error) {
+	return store.readBoundedTraverse(ctx, name, after, limit, maxBytes)
+}
+
+func (store StreamStore) readBoundedTraverse(ctx context.Context, name string, after uint64, limit uint, maxBytes uint64) (StreamReadResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return StreamReadResult{}, err
+	}
 	log := store.streams[name]
 	if limit == 0 || log.count == 0 {
-		return StreamReadResult{Records: []StreamRecord{}}
+		return StreamReadResult{Records: []StreamRecord{}}, nil
 	}
 	if after >= log.first+log.count-1 {
-		return StreamReadResult{Records: []StreamRecord{}}
+		return StreamReadResult{Records: []StreamRecord{}}, nil
 	}
 	sequence := after + 1
 	if sequence < log.first {
@@ -164,43 +183,62 @@ func (store StreamStore) ReadBounded(name string, after uint64, limit uint, maxB
 	end := sequence + take - 1
 	endChunk := log.chunk(end)
 	if endChunk == nil {
-		return StreamReadResult{Records: []StreamRecord{}}
+		return StreamReadResult{Records: []StreamRecord{}}, nil
 	}
 	result := StreamReadResult{Records: make([]StreamRecord, 0, take)}
 	if sequence >= endChunk.records[0].Sequence {
 		start := int(sequence - endChunk.records[0].Sequence)
 		for _, record := range endChunk.records[start : start+int(take)] {
-			if !result.append(record, maxBytes) {
-				return result
+			if err := result.appendCtx(ctx, record, maxBytes); err != nil {
+				return result, err
+			}
+			if result.ByteLimited {
+				return result, ctx.Err()
 			}
 		}
-		return result
+		return result, ctx.Err()
 	}
 	chunks := make([]*streamChunk, 0, (take+streamChunkSize-1)/streamChunkSize+1)
 	for chunk := endChunk; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= sequence; chunk = chunk.previous {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		chunks = append(chunks, chunk)
 	}
 	slices.Reverse(chunks)
 	for _, chunk := range chunks {
 		for _, record := range chunk.records {
-			if record.Sequence >= sequence && record.Sequence <= end && !result.append(record, maxBytes) {
-				return result
+			if record.Sequence >= sequence && record.Sequence <= end {
+				if err := result.appendCtx(ctx, record, maxBytes); err != nil {
+					return result, err
+				}
+				if result.ByteLimited {
+					return result, ctx.Err()
+				}
 			}
 		}
 	}
-	return result
+	return result, ctx.Err()
 }
 
-func (result *StreamReadResult) append(record StreamRecord, maxBytes uint64) bool {
-	bytes := streamRecordBytes(record)
+func (result *StreamReadResult) appendCtx(ctx context.Context, record StreamRecord, maxBytes uint64) error {
+	valueBytes, err := estimateValueBytesContext(ctx, record.Payload)
+	if err != nil {
+		return err
+	}
+	bytes := snapshotAdd(uint64(len(record.Kind))+48, valueBytes)
 	if maxBytes != 0 && (bytes > maxBytes || result.bytes > maxBytes-bytes) {
 		result.ByteLimited = true
-		return false
+		return nil
 	}
-	result.Records = append(result.Records, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: CloneValue(record.Payload)})
+	cloned, err := CloneValueContext(ctx, record.Payload)
+	if err != nil {
+		return err
+	}
+	result.Records = append(result.Records, StreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: cloned})
 	result.LastSequence = record.Sequence
 	result.bytes = snapshotAdd(result.bytes, bytes)
-	return true
+	return nil
 }
 
 func (store StreamStore) StreamBytes(name string) uint64 { return store.streams[name].bytes }
@@ -435,7 +473,7 @@ func ApplyPersistedStreamOperations(store StreamStore, operations []persistedStr
 			if err := ValidateStreamKind(operation.Kind); err != nil {
 				return StreamStore{}, err
 			}
-			payload, err := decodeValue(operation.Payload)
+			payload, err := decodeStreamValue(operation.Stream, operation.Payload)
 			if err != nil {
 				return StreamStore{}, err
 			}
@@ -564,7 +602,7 @@ func decodePersistedStreams(state persistedStreams) (StreamStore, error) {
 			if err := ValidateStreamKind(record.Kind); err != nil {
 				return StreamStore{}, err
 			}
-			payload, err := decodeValue(record.Payload)
+			payload, err := decodeStreamValue(stream.Name, record.Payload)
 			if err != nil {
 				return StreamStore{}, err
 			}

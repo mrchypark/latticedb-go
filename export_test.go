@@ -14,6 +14,63 @@ import (
 
 type shortWriter struct{}
 
+func TestExportNilContext(t *testing.T) {
+	db := openExportLimitDB(t)
+	want, err := db.Dump()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, withOptions := range []bool{false, true} {
+		var got []byte
+		if withOptions {
+			got, err = db.DumpContextWithOptions(nil, ExportOptions{})
+		} else {
+			got, err = db.DumpContext(nil)
+		}
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("dump options=%v: %s, %v", withOptions, got, err)
+		}
+		var output bytes.Buffer
+		if withOptions {
+			err = db.DumpToContextWithOptions(nil, &output, ExportOptions{})
+		} else {
+			err = db.DumpToContext(nil, &output)
+		}
+		if err != nil || !bytes.Equal(output.Bytes(), want) {
+			t.Fatalf("dump writer options=%v: %s, %v", withOptions, output.Bytes(), err)
+		}
+		for _, format := range []ExportFormat{ExportFormatJSON, ExportFormatJSONL, ExportFormatDOT} {
+			var expected bytes.Buffer
+			if err := db.ExportTo(format, &expected); err != nil {
+				t.Fatal(err)
+			}
+			output.Reset()
+			if withOptions {
+				err = db.ExportToContextWithOptions(nil, format, &output, ExportOptions{})
+			} else {
+				err = db.ExportToContext(nil, format, &output)
+			}
+			if err != nil || !bytes.Equal(output.Bytes(), expected.Bytes()) {
+				t.Fatalf("export %s options=%v: %s, %v", format, withOptions, output.Bytes(), err)
+			}
+		}
+	}
+	if err := db.DumpToContextWithOptions(nil, io.Discard, ExportOptions{MaxBytes: 1}); !errors.Is(err, ErrExportOutputLimit) {
+		t.Fatalf("nil context byte limit: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := db.DumpToContext(ctx, io.Discard); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled dump: %v", err)
+	}
+	if err := db.ExportToContext(ctx, ExportFormatJSONL, io.Discard); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled export: %v", err)
+	}
+	if _, err := db.ReadStreamContext(nil, "events", 0, StreamReadOptions{Limit: 1}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("nil stream context: %v", err)
+	}
+}
+
 func (shortWriter) Write(data []byte) (int, error) { return len(data) / 2, nil }
 
 type recordingWriter struct{ writes int }

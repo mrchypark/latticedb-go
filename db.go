@@ -465,6 +465,8 @@ func (db *DB) ReadStream(stream string, afterSequence uint64, limit uint, timeou
 
 // ReadStreamContext reads stream records until a record is available, the byte
 // budget is reached, or ctx is canceled. A zero MaxBytes disables the byte limit.
+// Unlike export and dump methods, it rejects a nil context with ErrInvalidArgument:
+// a blocking read requires an explicit context.
 func (db *DB) ReadStreamContext(ctx context.Context, stream string, afterSequence uint64, opts StreamReadOptions) (StreamReadResult, error) {
 	inner, err := db.requireOpen()
 	if err != nil {
