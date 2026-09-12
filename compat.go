@@ -40,7 +40,14 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, params map[string]
 	if tx == nil || tx.inner == nil {
 		return QueryResult{}, ErrInactiveTx
 	}
-	result, err := tx.inner.QueryContext(ctx, query, params, engine.QueryOptions{MaxRows: opts.MaxRows, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes, VectorNamespace: opts.VectorNamespace})
+	result, err := tx.inner.QueryContext(ctx, query, params, engine.QueryOptions{
+		MaxRows:           opts.MaxRows,
+		MaxWork:           opts.MaxWork,
+		MaxBytes:          opts.MaxBytes,
+		VectorNamespace:   opts.VectorNamespace,
+		ApproximateVector: opts.ApproximateVector,
+		VectorEfSearch:    opts.VectorEfSearch,
+	})
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}

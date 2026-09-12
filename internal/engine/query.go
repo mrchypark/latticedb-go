@@ -47,13 +47,15 @@ type matchPattern interface {
 // returned results, materialized query rows, and scoped scratch; it is not an
 // estimate of process RSS.
 type queryBudget struct {
-	ctx             context.Context
-	maxRows         uint32
-	maxWork         uint32
-	maxBytes        uint32
-	work            uint32
-	bytes           uint32
-	vectorNamespace *store.VectorNamespace
+	ctx               context.Context
+	maxRows           uint32
+	maxWork           uint32
+	maxBytes          uint32
+	work              uint32
+	bytes             uint32
+	vectorNamespace   *store.VectorNamespace
+	approximateVector bool
+	vectorEfSearch    uint16
 }
 
 const queryRowBytes = 128
@@ -80,11 +82,13 @@ func newQueryBudget(ctx context.Context, opts QueryOptions) *queryBudget {
 		namespace = &copy
 	}
 	*budget = queryBudget{
-		ctx:             ctx,
-		maxRows:         uint32(min(opts.MaxRows, uint64(^uint32(0)))),
-		maxWork:         uint32(min(opts.MaxWork, uint64(^uint32(0)))),
-		maxBytes:        uint32(min(opts.MaxBytes, uint64(^uint32(0)))),
-		vectorNamespace: namespace,
+		ctx:               ctx,
+		maxRows:           uint32(min(opts.MaxRows, uint64(^uint32(0)))),
+		maxWork:           uint32(min(opts.MaxWork, uint64(^uint32(0)))),
+		maxBytes:          uint32(min(opts.MaxBytes, uint64(^uint32(0)))),
+		vectorNamespace:   namespace,
+		approximateVector: opts.ApproximateVector,
+		vectorEfSearch:    opts.VectorEfSearch,
 	}
 	return budget
 }
@@ -386,11 +390,16 @@ type patternQueryIterator struct {
 	budget  *queryBudget
 	pending []queryRow
 	emitted int
+	search  *querySearchCandidate
 }
 
 func (it *patternQueryIterator) Close() {
 	it.budget.releaseRows(len(it.pending))
 	it.pending = nil
+	if it.search != nil {
+		it.budget.releaseTemporary(it.search.bytes)
+		it.search = nil
+	}
 	it.input.Close()
 }
 
@@ -435,10 +444,10 @@ func (it *patternQueryIterator) Next() (queryRow, bool, error) {
 	for {
 		if len(it.pending) != 0 {
 			row := it.pending[0]
-			it.pending = it.pending[1:]
 			if err := it.budget.checkRows(it.emitted + 1); err != nil {
 				return queryRow{}, false, err
 			}
+			it.pending = it.pending[1:]
 			it.emitted++
 			return row, true, nil
 		}
@@ -470,6 +479,30 @@ func (it *patternQueryIterator) apply(row queryRow) ([]queryRow, error) {
 			return nil, err
 		} else if found {
 			return node.applyID(it.tx, []queryRow{row}, nodeID, nil, it.budget)
+		}
+		if it.search != nil {
+			search := it.search
+			it.search = nil
+			defer it.budget.releaseTemporary(search.bytes)
+			var rows []queryRow
+			if len(search.vectorResults) != 0 {
+				for _, result := range search.vectorResults {
+					var err error
+					rows, err = node.applyID(it.tx, []queryRow{row}, result.NodeID, rows, it.budget)
+					if err != nil {
+						return nil, err
+					}
+				}
+			} else {
+				for _, nodeID := range search.nodeIDs {
+					var err error
+					rows, err = node.applyID(it.tx, []queryRow{row}, nodeID, rows, it.budget)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+			return rows, nil
 		}
 		if nodeIDs, found, err := it.plan.indexedNodeIDs(it.tx, node, it.params, it.limit, it.budget); err != nil {
 			return nil, err
@@ -1159,12 +1192,24 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	if err != nil {
 		return QueryResult{}, err
 	}
+	searchCandidate, err := plan.searchCandidate(tx, patterns, params, limit, skip, budget)
+	if err != nil {
+		return QueryResult{}, err
+	}
 	for _, pattern := range patterns {
 		lookupLimit := uint(0)
 		if node, ok := pattern.(nodePattern); ok {
 			lookupLimit = plan.indexedNodeLookupLimit(node, limit, skip)
 		}
-		match = &patternQueryIterator{plan: plan, tx: tx, input: match, pattern: pattern, params: params, limit: lookupLimit, budget: budget}
+		var candidate *querySearchCandidate
+		if searchCandidate != nil {
+			if node, ok := pattern.(nodePattern); ok && node.Var == searchCandidate.variable {
+				candidate = searchCandidate
+				searchCandidate = nil
+				lookupLimit = ^uint(0)
+			}
+		}
+		match = &patternQueryIterator{plan: plan, tx: tx, input: match, pattern: pattern, params: params, limit: lookupLimit, budget: budget, search: candidate}
 	}
 	stream = match
 	if len(plan.whereClauses) > 0 {

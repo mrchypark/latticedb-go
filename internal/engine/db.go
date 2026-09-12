@@ -83,6 +83,7 @@ type OpenOptions struct {
 	VectorIndexMode                   VectorIndexMode
 	VectorDimensions                  uint16
 	VectorNamespaces                  []VectorNamespace
+	FTSProperties                     []string
 	Durability                        DurabilityMode
 	WALCheckpointThresholdBytes       uint64
 	ChangefeedMaxBytes                uint64
@@ -157,10 +158,12 @@ type QueryResult struct {
 }
 
 type QueryOptions struct {
-	MaxRows         uint64
-	MaxWork         uint64
-	MaxBytes        uint64
-	VectorNamespace *VectorNamespace
+	MaxRows           uint64
+	MaxWork           uint64
+	MaxBytes          uint64
+	VectorNamespace   *VectorNamespace
+	ApproximateVector bool
+	VectorEfSearch    uint16
 }
 
 type VectorSearchOptions struct {
@@ -613,6 +616,26 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 				_ = lock.close()
 				return nil, err
 			}
+		}
+	}
+	ftsProperties, err := normalizeFTSProperties(opts.FTSProperties)
+	if err != nil {
+		_ = lock.close()
+		return nil, err
+	}
+	graph.FTSProperties = nil
+	if len(ftsProperties) != 0 {
+		postings, work, logicalBytes, err := buildFTSPropertyPostings(ctx, graph, ftsProperties, &DB{derivedIndexBuildMaxWork: opts.DerivedIndexBuildMaxWork, derivedIndexBuildMaxLogicalBytes: opts.DerivedIndexBuildMaxLogicalBytes})
+		if err != nil {
+			_ = lock.close()
+			return nil, err
+		}
+		graph.FTSProperties = postings
+		graph.DerivedIndexWork = saturatingAdd(graph.DerivedIndexWork, work)
+		graph.DerivedIndexLogicalBytes = saturatingAdd(graph.DerivedIndexLogicalBytes, logicalBytes)
+		if graph.DerivedIndexWork > opts.DerivedIndexBuildMaxWork || graph.DerivedIndexLogicalBytes > opts.DerivedIndexBuildMaxLogicalBytes {
+			_ = lock.close()
+			return nil, fmt.Errorf("%w: FTS property index build exceeds derived-index budget", ErrResourceLimit)
 		}
 	}
 	reservedNodeID, reservedEdgeID, err := store.LoadIDReservationFiles(files, graph.DatabaseID)
@@ -1945,7 +1968,7 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 	if err != nil {
 		return nil, err
 	}
-	if db.vectorDimensions > 0 && len(vector) != int(db.vectorDimensions) {
+	if len(vector) != int(db.vectorDimensions) {
 		return nil, fmt.Errorf("vector length %d does not match configured dimensions %d", len(vector), db.vectorDimensions)
 	}
 	for _, value := range vector {
@@ -1953,103 +1976,26 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 			return nil, errors.New("vector contains non-finite value")
 		}
 	}
-	queryVector := vector
 	var results []VectorSearchResult
-
 	err = db.View(func(tx *Tx) error {
 		graph := tx.graph
-		resolvedNamespace, err := resolveVectorNamespace(graph, opts.Namespace)
+		resolved, err := resolveVectorNamespace(graph, opts.Namespace)
 		if err != nil {
 			return err
 		}
-		if resolvedNamespace != nil {
-			graph = vectorNamespaceFacade(graph, *resolvedNamespace)
+		if resolved != nil {
+			graph = vectorNamespaceFacade(graph, *resolved)
 		}
-		capacity := limit
-		if !opts.Exact && !db.disableVectorIndex && graph.VectorIndex.Nodes.Len() > 0 {
-			capacity = min(limit, graph.VectorLiveCount)
-		} else if nodeCount := uint64(graph.Nodes.Len()); capacity > nodeCount {
-			capacity = nodeCount
-		}
-		results = make([]VectorSearchResult, 0, int(capacity))
-		if !opts.Exact && !db.disableVectorIndex && graph.VectorIndex.Nodes.Len() > 0 {
-			entry := graph.VectorIndex.EntryID
-			for level := graph.VectorIndex.MaxLevel; level > 0; level-- {
-				var err error
-				entry, err = vectorGreedyBudget(graph, queryVector, entry, level, budget)
-				if err != nil {
-					return err
-				}
-			}
-			ef := int(opts.EfSearch)
-			if ef == 0 {
-				ef = vectorIndexSearchEF
-			}
-			ef = max(ef, int(capacity))
-			maxVisited := uint64(graph.VectorIndex.Nodes.Len())
-			if byWork := budget.maxWork/uint64(max(1, len(queryVector))) + 1; maxVisited > byWork {
-				maxVisited = byWork
-			}
-			// Visited entries are charged as they are discovered so small-Ef searches are
-			// not rejected solely because the index is large.
-			scratchBytes := saturatingAdd(256, saturatingMul(uint64(ef), 32))
-			if err := budget.reserveBytes(scratchBytes); err != nil {
-				return err
-			}
-			budget.annVisitedLimit = (budget.maxBytes - budget.bytes) / 80
-			if budget.annVisitedLimit == 0 {
-				return fmt.Errorf("%w: search memory exceeds budget", ErrResourceLimit)
-			}
-			annBytesBefore := budget.bytes
-			scratch := acquireVectorSearchScratch(int(maxVisited), int(maxVisited), ef*2)
-			candidates, searchErr := vectorSearchLayerBudget(graph, queryVector, entry, 0, ef, 0, scratch, budget)
-			if searchErr != nil {
-				releaseVectorSearchScratch(scratch)
-				return searchErr
-			}
-			budget.bytes += uint64(len(scratch.visited)) * 80
-			for _, candidate := range candidates {
-				results = pushVectorResult(results, VectorSearchResult{NodeID: candidate.id, Distance: float32(math.Sqrt(candidate.distance))}, int(capacity))
-			}
-			releaseVectorSearchScratch(scratch)
-			if len(results) == int(capacity) {
-				return budget.check()
-			}
-			budget.releaseBytes(budget.bytes - annBytesBefore + scratchBytes)
-			// ponytail: disconnected or degenerate ANN graphs fall back to exact search to honor K.
+		var fallback bool
+		results, fallback, err = searchVectorGraph(graph, vector, opts, budget, db.disableVectorIndex)
+		if fallback {
 			db.vectorExactFallbacks.Add(1)
-			results = results[:0]
 		}
-		for _, node := range graph.Nodes.All() {
-			vectorValue, ok := selectedVector(graph, node)
-			if !ok {
-				if err := budget.add(1); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := budget.add(uint64(len(queryVector))); err != nil {
-				return err
-			}
-			var distance float32
-			var err error
-			if len(queryVector) < 256 {
-				distance, err = search.VectorDistance(vectorValue, queryVector)
-			} else {
-				distance, err = search.VectorDistanceContext(budget.ctx, vectorValue, queryVector)
-			}
-			if err != nil {
-				return err
-			}
-			results = pushVectorResult(results, VectorSearchResult{NodeID: node.ID, Distance: distance}, int(capacity))
-		}
-		return nil
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	slices.SortFunc(results, compareVectorResult)
 	return results, nil
 }
 
@@ -3342,7 +3288,7 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		}
 	}
 	if !tx.propertyIndexesApplied {
-		if err := tx.applyPropertyIndexChanges(); err != nil {
+		if err := tx.applyPropertyIndexChanges(ctx); err != nil {
 			return err
 		}
 		tx.propertyIndexesApplied = true
@@ -3463,9 +3409,12 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	return nil
 }
 
-func (tx *Tx) applyPropertyIndexChanges() error {
+func (tx *Tx) applyPropertyIndexChanges(ctx context.Context) error {
 	if tx.base == nil || tx.changes == nil {
 		return nil
+	}
+	if err := tx.applyFTSPropertyChanges(ctx); err != nil {
+		return err
 	}
 	for id := range tx.changes.deleteNodes {
 		adjustNodeDerivedCost(tx.graph, tx.base, id, false)
