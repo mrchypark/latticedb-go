@@ -523,23 +523,25 @@ type walPayload struct {
 }
 
 type persistedDelta struct {
-	DatabaseID        string                             `json:"database_id"`
-	CommitID          uint64                             `json:"commit_id"`
-	NextNodeID        uint64                             `json:"next_node_id"`
-	NextEdgeID        uint64                             `json:"next_edge_id"`
-	UpsertNodes       []persistedNode                    `json:"upsert_nodes,omitempty"`
-	DeleteNodes       []uint64                           `json:"delete_nodes,omitempty"`
-	UpsertEdges       []persistedEdge                    `json:"upsert_edges,omitempty"`
-	DeleteEdges       []uint64                           `json:"delete_edges,omitempty"`
-	UpsertFTS         []persistedFTS                     `json:"upsert_fts,omitempty"`
-	DeleteFTS         []uint64                           `json:"delete_fts,omitempty"`
-	AppMetadata       []persistedAppMetadataChange       `json:"app_metadata,omitempty"`
-	Streams           *persistedStreams                  `json:"streams,omitempty"`
-	StreamOperations  []persistedStreamOperation         `json:"stream_operations,omitempty"`
-	CreateNodeIndexes []persistedPropertyIndexDefinition `json:"create_node_indexes,omitempty"`
-	DropNodeIndexes   []persistedPropertyIndexDefinition `json:"drop_node_indexes,omitempty"`
-	CreateEdgeIndexes []persistedPropertyIndexDefinition `json:"create_edge_indexes,omitempty"`
-	DropEdgeIndexes   []persistedPropertyIndexDefinition `json:"drop_edge_indexes,omitempty"`
+	DatabaseID          string                             `json:"database_id"`
+	CommitID            uint64                             `json:"commit_id"`
+	NextNodeID          uint64                             `json:"next_node_id"`
+	NextEdgeID          uint64                             `json:"next_edge_id"`
+	UpsertNodes         []persistedNode                    `json:"upsert_nodes,omitempty"`
+	DeleteNodes         []uint64                           `json:"delete_nodes,omitempty"`
+	UpsertEdges         []persistedEdge                    `json:"upsert_edges,omitempty"`
+	DeleteEdges         []uint64                           `json:"delete_edges,omitempty"`
+	UpsertFTS           []persistedFTS                     `json:"upsert_fts,omitempty"`
+	DeleteFTS           []uint64                           `json:"delete_fts,omitempty"`
+	AppMetadata         []persistedAppMetadataChange       `json:"app_metadata,omitempty"`
+	Streams             *persistedStreams                  `json:"streams,omitempty"`
+	StreamOperations    []persistedStreamOperation         `json:"stream_operations,omitempty"`
+	CreateNodeIndexes   []persistedPropertyIndexDefinition `json:"create_node_indexes,omitempty"`
+	DropNodeIndexes     []persistedPropertyIndexDefinition `json:"drop_node_indexes,omitempty"`
+	CreateEdgeIndexes   []persistedPropertyIndexDefinition `json:"create_edge_indexes,omitempty"`
+	DropEdgeIndexes     []persistedPropertyIndexDefinition `json:"drop_edge_indexes,omitempty"`
+	NodePropertyChanges []persistedPropertyChange          `json:"node_property_changes,omitempty"`
+	EdgePropertyChanges []persistedPropertyChange          `json:"edge_property_changes,omitempty"`
 }
 
 type GraphDelta struct {
@@ -556,6 +558,10 @@ type GraphDelta struct {
 	DropNodeIndexes   []PropertyIndexDefinition
 	CreateEdgeIndexes []PropertyIndexDefinition
 	DropEdgeIndexes   []PropertyIndexDefinition
+	// Nonempty keys select a property patch for an existing Upsert ID; absent
+	// or empty keys retain the full-record encoding.
+	NodePropertyKeys map[uint64][]string
+	EdgePropertyKeys map[uint64][]string
 }
 
 type AppMetadataChange struct {
