@@ -9,13 +9,17 @@ import (
 
 func TestPropertyMutationTrackingDirectQueryAndRollback(t *testing.T) {
 	db, node, other, edge := openPropertyMutationDB(t)
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	tx, err := db.Begin(false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = tx.Rollback() })
+	defer tx.Rollback()
 	if err := tx.SetProperty(node.ID, "direct", int64(1)); err != nil {
 		t.Fatal(err)
 	}
@@ -85,17 +89,21 @@ func TestPropertyMutationTrackingDirectQueryAndRollback(t *testing.T) {
 	if got := propertyKeyDeltas(tx.changes.upsertNodes, tx.changes.nodePropertyKeys)[node.ID]; !reflect.DeepEqual(got, []string{"direct", "merge", "missing", "query", "revert", "uncommitted"}) {
 		t.Fatalf("sorted node property keys = %v", got)
 	}
-	_ = other
 }
 
 func TestPropertyMutationTrackingFullFallbackPersists(t *testing.T) {
 	db, node, _, _ := openPropertyMutationDB(t)
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	tx, err := db.Begin(false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	if err := tx.SetProperty(node.ID, "before", int64(1)); err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +130,7 @@ func TestPropertyMutationTrackingFullFallbackPersists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = tx.Rollback() })
+	defer tx.Rollback()
 	if err := tx.SetProperty(node.ID, "kept", int64(1)); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +150,11 @@ func TestPropertyMutationTrackingFullFallbackPersists(t *testing.T) {
 
 func TestPropertyMutationInputAndOutputNestedValuesAreIsolated(t *testing.T) {
 	db, node, _, _ := openPropertyMutationDB(t)
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	input := map[string]any{"nested": map[string]any{"value": int64(1)}}
 	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(node.ID, "input", input) }); err != nil {
@@ -163,7 +175,11 @@ func TestSetVectorTracksPropertyKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	var node Node
 	if err := db.Update(func(tx *Tx) error {
 		var err error
