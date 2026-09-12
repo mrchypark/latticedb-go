@@ -2113,7 +2113,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 				if accumulator == nil {
 					return nil, false, os.ErrNotExist
 				}
-				state := accumulator.persistedState()
+				state, stateErr := accumulator.persistedState()
+				if stateErr != nil {
+					return nil, false, fmt.Errorf("serialize WAL state: %w", stateErr)
+				}
 				return &state, false, nil
 			}
 			return nil, false, fmt.Errorf("read wal header: %w", err)
@@ -2136,7 +2139,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 			if accumulator == nil {
 				return nil, false, os.ErrNotExist
 			}
-			state := accumulator.persistedState()
+			state, stateErr := accumulator.persistedState()
+			if stateErr != nil {
+				return nil, false, fmt.Errorf("serialize WAL state: %w", stateErr)
+			}
 			return &state, false, nil
 		}
 		if err := budget.frame(); err != nil {
@@ -2151,7 +2157,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 				if accumulator == nil {
 					return nil, false, os.ErrNotExist
 				}
-				state := accumulator.persistedState()
+				state, stateErr := accumulator.persistedState()
+				if stateErr != nil {
+					return nil, false, fmt.Errorf("serialize WAL state: %w", stateErr)
+				}
 				return &state, false, nil
 			}
 			return nil, false, fmt.Errorf("read wal payload: %w", err)
@@ -2232,7 +2241,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 	if accumulator == nil {
 		return nil, false, os.ErrNotExist
 	}
-	state := accumulator.persistedState()
+	state, err := accumulator.persistedState()
+	if err != nil {
+		return nil, false, fmt.Errorf("serialize WAL state: %w", err)
+	}
 	return &state, currentFormat, nil
 }
 
@@ -2552,7 +2564,11 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 		}
 	}
 	if delta.Streams != nil {
-		accumulator.streams, _ = decodePersistedStreams(*delta.Streams)
+		var decodeErr error
+		accumulator.streams, decodeErr = decodePersistedStreams(*delta.Streams)
+		if decodeErr != nil {
+			return fmt.Errorf("decode persisted streams: %w", decodeErr)
+		}
 	} else if len(delta.StreamOperations) != 0 {
 		accumulator.streams = streams
 	}
@@ -2635,7 +2651,7 @@ func validateUniqueDeltaIDs[T any](deletes []uint64, upserts []T, id func(T) uin
 	return nil
 }
 
-func (accumulator *walAccumulator) persistedState() persistedState {
+func (accumulator *walAccumulator) persistedState() (persistedState, error) {
 	state := accumulator.state
 	state.AppMetadata = make([]persistedAppMetadata, 0, len(accumulator.metadata))
 	metadataKeys := make([]string, 0, len(accumulator.metadata))
@@ -2647,7 +2663,11 @@ func (accumulator *walAccumulator) persistedState() persistedState {
 		entry := accumulator.metadata[key]
 		state.AppMetadata = append(state.AppMetadata, persistedAppMetadata{Key: slices.Clone(entry.Key), Value: slices.Clone(entry.Value)})
 	}
-	state.Streams, _ = buildPersistedStreams(accumulator.streams)
+	var err error
+	state.Streams, err = buildPersistedStreams(accumulator.streams)
+	if err != nil {
+		return persistedState{}, fmt.Errorf("encode streams: %w", err)
+	}
 	state.Nodes = state.Nodes[:0]
 	state.Edges = state.Edges[:0]
 	state.FTS = state.FTS[:0]
@@ -2660,7 +2680,7 @@ func (accumulator *walAccumulator) persistedState() persistedState {
 	for _, id := range sortedMapKeys(accumulator.fts) {
 		state.FTS = append(state.FTS, accumulator.fts[id])
 	}
-	return state
+	return state, nil
 }
 
 func sortedMapKeys[T any](values map[uint64]T) []uint64 {
@@ -3409,11 +3429,8 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
 			}
 			return nil, 0, 0, 0, err
 		}
-		var tokenBytes uint64
-		for _, token := range tokens {
-			tokenBytes = addSaturated(tokenBytes, uint64(len(token))+128)
-		}
-		if err := budget.add(uint64(len(storedFTS.Text))+uint64(len(tokens)), addSaturated(tokenBytes, multiplySaturated(uint64(len(tokens)), 16))); err != nil {
+		work, logicalBytes := FTSDerivedCost(storedFTS.Text, tokens)
+		if err := budget.add(work, logicalBytes); err != nil {
 			return nil, 0, 0, 0, err
 		}
 		graph.FTS.Set(storedFTS.NodeID, &FTSRecord{Text: storedFTS.Text, Tokens: tokens})

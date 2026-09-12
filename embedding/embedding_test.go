@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -61,6 +64,61 @@ func TestHashSupportsUnicodeWords(t *testing.T) {
 	}
 	if reflect.DeepEqual(left, make([]float32, 32)) || reflect.DeepEqual(left, right) {
 		t.Fatalf("unicode hashes are not distinct: %v / %v", left, right)
+	}
+}
+
+func TestHashUnicodeLongTokenPolicy(t *testing.T) {
+	// 22 Korean chars = 66 UTF-8 bytes > maxTokenBytes (64).
+	long := strings.Repeat("가", 22)
+	vector, err := Hash(long, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range vector {
+		if v != 0 {
+			t.Fatalf("long Unicode token (%d bytes) should be dropped, got non-zero at [%d]: %v", len([]byte(long)), i, v)
+		}
+	}
+
+	// 21 Korean chars = 63 UTF-8 bytes <= maxTokenBytes.
+	short := strings.Repeat("가", 21)
+	vector2, err := Hash(short, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasNonZero := false
+	for _, v := range vector2 {
+		if v != 0 {
+			hasNonZero = true
+			break
+		}
+	}
+	if !hasNonZero {
+		t.Fatalf("short Unicode token (%d bytes) should produce non-zero vector", len([]byte(short)))
+	}
+}
+
+func TestHashASCIITokenLengthBoundary(t *testing.T) {
+	base, err := Hash("bb", 128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int{64, 65} {
+		token := strings.Repeat("a", size)
+		ascii, err := Hash(token+" bb", 128)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unicode, err := Hash(token+"、bb", 128)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(ascii, unicode) {
+			t.Fatalf("%d-byte token differs with Unicode separator", size)
+		}
+		if dropped := reflect.DeepEqual(ascii, base); dropped != (size > 64) {
+			t.Fatalf("%d-byte token dropped=%v", size, dropped)
+		}
 	}
 }
 
@@ -239,5 +297,47 @@ func TestClientRejectsNullEmbeddingComponents(t *testing.T) {
 				t.Fatalf("null component accepted as %#v", vector)
 			}
 		})
+	}
+}
+
+func TestCloseDoesNotTearDownSharedTransport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+	independent := &http.Client{}
+	get := func() bool {
+		var reused bool
+		ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := independent.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, readErr := io.Copy(io.Discard, resp.Body)
+		closeErr := resp.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("response: %v, %v", readErr, closeErr)
+		}
+		return reused
+	}
+	get()
+	if !get() {
+		t.Fatal("independent client did not establish an idle reusable connection")
+	}
+	client, err := NewClient(Config{Endpoint: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !get() {
+		t.Fatal("embedding Close removed another client's idle connection")
 	}
 }

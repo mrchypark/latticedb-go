@@ -196,6 +196,9 @@ func DumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.
 }
 
 func DumpGraphContextToWithOptions(ctx context.Context, graph *store.GraphState, output io.Writer, opts ExportOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := opts.checkRecords(graph); err != nil {
 		return err
 	}
@@ -269,6 +272,9 @@ func ExportGraphContextTo(ctx context.Context, graph *store.GraphState, format E
 }
 
 func ExportGraphContextToWithOptions(ctx context.Context, graph *store.GraphState, format ExportFormat, output io.Writer, opts ExportOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := opts.checkRecords(graph); err != nil {
 		return err
 	}

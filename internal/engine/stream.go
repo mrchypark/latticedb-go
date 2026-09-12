@@ -75,7 +75,10 @@ func (db *DB) readStream(ctx context.Context, stream string, afterSequence uint6
 		streams := db.graph.Streams
 		notify := db.streamNotify
 		db.mu.RUnlock()
-		read := streams.ReadBounded(stream, afterSequence, opts.Limit, opts.MaxBytes)
+		read, readErr := streams.ReadBoundedContext(ctx, stream, afterSequence, opts.Limit, opts.MaxBytes)
+		if readErr != nil {
+			return StreamReadResult{}, readErr
+		}
 		result := StreamReadResult{Records: read.Records, LastSequence: read.LastSequence, ByteLimited: read.ByteLimited}
 		if len(result.Records) != 0 || result.ByteLimited || ctx == nil && timeout == 0 {
 			return result, nil
@@ -203,6 +206,106 @@ func validateStreamKind(kind string) error {
 
 func validateConsumer(consumer string) error { return validateStreamName(consumer, true) }
 
+// countChangefeedEvents returns the number of events appendChangefeed would
+// emit without touching stream state. Used for sequence-exhaustion preflight.
+func (tx *Tx) countChangefeedEvents() uint64 {
+	if tx.changes == nil {
+		return 0
+	}
+	var count uint64
+	for id := range tx.changes.deleteEdges {
+		if tx.base != nil {
+			if edge := tx.base.Edges.Get(id); edge != nil {
+				count++
+			}
+		}
+	}
+	count += uint64(len(tx.changes.deleteNodes))
+	for id := range tx.changes.upsertNodes {
+		count += tx.countNodeChanges(tx.base.Nodes.Get(id), tx.graph.Nodes.Get(id))
+	}
+	for id := range tx.changes.upsertEdges {
+		count += tx.countEdgeChanges(tx.base.Edges.Get(id), tx.graph.Edges.Get(id))
+	}
+	return count
+}
+
+func (tx *Tx) countNodeChanges(before, after *store.NodeRecord) uint64 {
+	if after == nil {
+		return 0
+	}
+	var count uint64
+	if before == nil {
+		count++
+	}
+	count += tx.countLabelChanges(before, after)
+	count += tx.countPropertyChanges(beforeProperties(before), after.Properties)
+	return count
+}
+
+func (tx *Tx) countEdgeChanges(before, after *store.EdgeRecord) uint64 {
+	if after == nil {
+		return 0
+	}
+	var count uint64
+	if before == nil {
+		count++
+	}
+	count += tx.countPropertyChanges(beforePropertiesEdge(before), after.Properties)
+	return count
+}
+
+func (tx *Tx) countLabelChanges(before, after *store.NodeRecord) uint64 {
+	oldLabels := map[string]struct{}{}
+	if before != nil {
+		for _, label := range before.Labels {
+			oldLabels[label] = struct{}{}
+		}
+	}
+	newLabels := map[string]struct{}{}
+	for _, label := range after.Labels {
+		newLabels[label] = struct{}{}
+	}
+	var count uint64
+	for label := range newLabels {
+		if _, exists := oldLabels[label]; !exists {
+			count++
+		}
+	}
+	for label := range oldLabels {
+		if _, exists := newLabels[label]; !exists {
+			count++
+		}
+	}
+	return count
+}
+
+func (tx *Tx) countPropertyChanges(before, after map[string]any) uint64 {
+	var count uint64
+	for key := range before {
+		oldValue, oldOK := before[key]
+		newValue, newOK := after[key]
+		if oldOK && newOK && reflect.DeepEqual(oldValue, newValue) {
+			continue
+		}
+		count++
+	}
+	for key := range after {
+		if _, oldOK := before[key]; oldOK {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func preflightChangefeedSequence(next, pending uint64) error {
+	if pending != 0 && (next == ^uint64(0) || pending > ^uint64(0)-next) {
+		return fmt.Errorf("%w: change stream sequence space exhausted", ErrResourceLimit)
+	}
+	return nil
+}
+
 func (tx *Tx) appendChangefeed() error {
 	if tx.changes == nil || (!hasIDs(tx.changes.upsertNodes) && !hasIDs(tx.changes.deleteNodes) && !hasIDs(tx.changes.upsertEdges) && !hasIDs(tx.changes.deleteEdges)) {
 		return nil
@@ -234,6 +337,12 @@ func (tx *Tx) appendChangefeed() error {
 		if err := store.ValidateEntityID(id); err != nil {
 			return err
 		}
+	}
+
+	// Preflight: reject if changefeed events would exhaust the sequence space.
+	pending := tx.countChangefeedEvents()
+	if err := preflightChangefeedSequence(tx.graph.Streams.NextSequence(changeStreamName), pending); err != nil {
+		return err
 	}
 	for _, id := range mapKeys(tx.changes.deleteEdges) {
 		if edge := tx.base.Edges.Get(id); edge != nil {
@@ -326,29 +435,35 @@ func (tx *Tx) appendPropertyChanges(entity string, id uint64, before, after map[
 			payload["edge_id"] = int64(id)
 		}
 		if newOK {
-			payload["new_value"] = tx.changefeedValue(newValue)
+			nv, nomit := tx.changefeedValue(newValue)
+			payload["new_value"] = nv
+			payload["new_value_omitted"] = nomit
 			if oldOK {
-				payload["old_value"] = tx.changefeedValue(oldValue)
+				ov, oomit := tx.changefeedValue(oldValue)
+				payload["old_value"] = ov
+				payload["old_value_omitted"] = oomit
 			}
 			tx.appendChange(entity+".property_set", payload)
 			continue
 		}
-		payload["old_value"] = tx.changefeedValue(oldValue)
+		ov, oomit := tx.changefeedValue(oldValue)
+		payload["old_value"] = ov
+		payload["old_value_omitted"] = oomit
 		tx.appendChange(entity+".property_remove", payload)
 	}
 }
 
-func (tx *Tx) changefeedValue(value any) any {
+func (tx *Tx) changefeedValue(value any) (any, bool) {
 	encodedBytes := store.EstimatePropertyIndexValueBytes(value)
 	inlineLimit := min(uint64(changefeedInlineValueBytes), tx.db.changefeedMaxBytes/4)
 	if encodedBytes <= inlineLimit {
-		return store.CloneValue(value)
+		return store.CloneValue(value), false
 	}
 	return map[string]any{
 		"__lattice_value_omitted": true,
 		"type":                    changefeedValueType(value),
 		"encoded_bytes":           int64(min(encodedBytes, uint64(^uint64(0)>>1))),
-	}
+	}, true
 }
 
 func changefeedValueType(value any) string {

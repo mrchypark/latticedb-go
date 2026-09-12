@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"math"
 	"path/filepath"
 	"reflect"
@@ -147,5 +148,77 @@ func TestStreamByteRetentionRemovesOversizedNewestRecord(t *testing.T) {
 	through, trimmed := store.TrimToBytes("events", 1_000)
 	if !trimmed || through != 1 || store.StreamBytes("events") != 0 || len(store.Read("events", 0, 1)) != 0 {
 		t.Fatalf("oversized trim = through %d, trimmed %v, bytes %d", through, trimmed, store.StreamBytes("events"))
+	}
+}
+
+type streamCancelChecks struct {
+	context.Context
+	calls, cancelAt int
+}
+
+func (c *streamCancelChecks) Err() error {
+	c.calls++
+	if c.calls >= c.cancelAt {
+		return context.Canceled
+	}
+	return nil
+}
+func TestStreamReadCancellationDuringWork(t *testing.T) {
+	t.Run("chunk traversal", func(t *testing.T) {
+		s := NewStreamStore()
+		for range 130 {
+			s.Publish("events", "event", "x")
+		}
+		ctx := &streamCancelChecks{Context: context.Background(), cancelAt: 2}
+		_, err := s.ReadBoundedContext(ctx, "events", 0, 130, 0)
+		if err != context.Canceled {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("payload estimation", func(t *testing.T) {
+		s := NewStreamStore()
+		s.Publish("events", "event", []any{"a", "b", "c", "d"})
+		ctx := &streamCancelChecks{Context: context.Background(), cancelAt: 4}
+		result, err := s.ReadBoundedContext(ctx, "events", 0, 1, 0)
+		if err != context.Canceled || len(result.Records) != 0 {
+			t.Fatalf("result=%v err=%v", result, err)
+		}
+	})
+	for _, value := range []any{make([]byte, 16384), make([]float32, 16384)} {
+		ctx := &streamCancelChecks{Context: context.Background(), cancelAt: 4}
+		if _, err := CloneValueContext(ctx, value); err != context.Canceled {
+			t.Fatalf("clone %T: %v", value, err)
+		}
+	}
+}
+func TestReadBoundedByteLimitPreservesOrder(t *testing.T) {
+	s := NewStreamStore()
+	s.Publish("events", "event", "first")
+	s.Publish("events", "event", strings.Repeat("big", 512))
+	s.Publish("events", "event", "third")
+	maxBytes := streamRecordBytes(s.streams["events"].tail.records[0])
+	a := s.ReadBounded("events", 0, 3, maxBytes)
+	b, err := s.ReadBoundedContext(nil, "events", 0, 3, maxBytes)
+	if err != nil || !reflect.DeepEqual(a, b) || !a.ByteLimited || len(a.Records) != 1 || a.LastSequence != 1 {
+		t.Fatalf("plain=%v context=%v err=%v", a, b, err)
+	}
+}
+
+func TestContextStreamClonePreservesValuesAndSize(t *testing.T) {
+	value := map[string]any{"items": []any{[]byte{1, 2}, []float32{3, 4}, "text", int64(5)}}
+	bytes, err := estimateValueBytesContext(context.Background(), value)
+	if err != nil || bytes != estimateValueBytes(value) {
+		t.Fatalf("bytes=%d want=%d err=%v", bytes, estimateValueBytes(value), err)
+	}
+	cloned, err := CloneValueContext(context.Background(), value)
+	if err != nil || !reflect.DeepEqual(cloned, CloneValue(value)) {
+		t.Fatalf("clone=%v err=%v", cloned, err)
+	}
+	items := cloned.(map[string]any)["items"].([]any)
+	items[0].([]byte)[0] = 9
+	items[1].([]float32)[0] = 9
+	original := value["items"].([]any)
+	if original[0].([]byte)[0] != 1 || original[1].([]float32)[0] != 3 {
+		t.Fatal("clone aliases stored payload")
 	}
 }

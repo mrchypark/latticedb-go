@@ -128,12 +128,14 @@ func TokenizeContext(ctx context.Context, text string) ([]string, error) {
 	}
 	tokens := make([]string, 0)
 	var token strings.Builder
-	for offset, value := range text {
-		if offset&255 == 0 {
+	var runeCount int
+	for _, value := range text {
+		if runeCount&63 == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
+		runeCount++
 		if unicode.IsLetter(value) || unicode.IsDigit(value) {
 			token.WriteRune(unicode.ToLower(value))
 			continue
@@ -168,12 +170,14 @@ func tokenizationLogicalBytes(ctx context.Context, text string) (uint64, error) 
 	}
 	var tokens, lowercaseBytes uint64
 	inToken := false
-	for offset, value := range text {
-		if offset&255 == 0 {
+	var runeCount int
+	for _, value := range text {
+		if runeCount&63 == 0 {
 			if err := ctx.Err(); err != nil {
 				return 0, err
 			}
 		}
+		runeCount++
 		if unicode.IsLetter(value) || unicode.IsDigit(value) {
 			if !inToken {
 				tokens++

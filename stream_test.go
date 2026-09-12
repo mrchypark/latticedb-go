@@ -72,7 +72,9 @@ func TestLargePropertyChangefeedUsesBoundedSummaries(t *testing.T) {
 
 func TestAutomaticChangefeedRetentionPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "retained-changefeed.ltdb")
-	db, err := Open(path, OpenOptions{Create: true, ChangefeedMaxBytes: 1 << 10})
+	// Explicit omission markers add metadata to each property event; keep the
+	// retention budget large enough to retain a suffix while still trimming.
+	db, err := Open(path, OpenOptions{Create: true, ChangefeedMaxBytes: 2 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}

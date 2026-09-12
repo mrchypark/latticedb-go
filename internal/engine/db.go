@@ -2111,10 +2111,18 @@ func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearch
 		}
 		results = make([]FTSSearchResult, 0, int(capacity))
 		if opts.MaxDistance == 0 {
+			if err := budget.reserveBytes(saturatingMul(uint64(len(terms)), 64)); err != nil {
+				return err
+			}
+			seenTerms := make(map[string]struct{}, len(terms))
 			for termIndex, term := range terms {
-				if slices.Contains(terms[:termIndex], term) {
+				if err := budget.add(uint64(max(1, len(term)))); err != nil {
+					return err
+				}
+				if _, dup := seenTerms[term]; dup {
 					continue
 				}
+				seenTerms[term] = struct{}{}
 				for nodeID := range tx.graph.FTSTokens.All(term) {
 					if err := budget.add(1); err != nil {
 						return err
@@ -2123,8 +2131,8 @@ func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearch
 					if record == nil {
 						continue
 					}
-					score, seen, work := ftsExactScore(record.Tokens, terms, termIndex)
-					if err := budget.add(work); err != nil {
+					score, seen, err := ftsExactScore(budget, record.Tokens, terms, termIndex)
+					if err != nil {
 						return err
 					}
 					if seen {
@@ -2133,7 +2141,7 @@ func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearch
 					results = pushFTSResult(results, FTSSearchResult{NodeID: nodeID, Score: score}, int(capacity))
 				}
 			}
-			return nil
+			return budget.check()
 		}
 		for token := range tx.graph.FTSTokens.Keys() {
 			if err := budget.add(1); err != nil {
@@ -2414,20 +2422,21 @@ func ftsScoreWork(tokens, terms []string, maxDistance uint32) uint64 {
 	return work
 }
 
-func ftsExactScore(tokens, terms []string, priorTerms int) (float32, bool, uint64) {
+func ftsExactScore(budget *directSearchBudget, tokens, terms []string, priorTerms int) (float32, bool, error) {
 	var score int
 	var seen bool
-	var work uint64
 	for _, token := range tokens {
 		for termIndex, term := range terms {
-			work = saturatingAdd(work, uint64(max(1, min(len(token), len(term)))))
+			if err := budget.add(uint64(max(1, min(len(token), len(term))))); err != nil {
+				return 0, false, err
+			}
 			if token == term {
 				score++
 				seen = seen || termIndex < priorTerms
 			}
 		}
 	}
-	return float32(score), seen, work
+	return float32(score), seen, budget.check()
 }
 
 func compareFTSResult(a FTSSearchResult, b FTSSearchResult) int {
@@ -2840,12 +2849,8 @@ func adjustFTSDerivedCost(graph, source *store.GraphState, id uint64, add bool) 
 	if f == nil {
 		return
 	}
-	var bytes uint64
-	for _, token := range f.Tokens {
-		bytes = saturatingAdd(bytes, uint64(len(token))+128)
-	}
-	bytes = saturatingAdd(bytes, uint64(len(f.Tokens))*16)
-	adjustDerivedCost(graph, saturatingAdd(uint64(len(f.Text))*2, uint64(len(f.Text))+uint64(len(f.Tokens))), bytes, add)
+	work, bytes := store.FTSDerivedCost(f.Text, f.Tokens)
+	adjustDerivedCost(graph, work, bytes, add)
 }
 
 func adjustNodePropertyBudget(graph, source *store.GraphState, defs store.PropertyIndexes, id uint64, add bool) {

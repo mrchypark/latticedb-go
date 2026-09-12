@@ -44,6 +44,48 @@ func BenchmarkStreamScaling(b *testing.B) {
 	}
 }
 
+// Keep retained records fixed while varying the maps copied on the first write.
+func BenchmarkStreamFirstWriteCardinality(b *testing.B) {
+	for _, size := range []int{1, 100, 10_000} {
+		b.Run(fmt.Sprintf("streams_%d", size), func(b *testing.B) {
+			base := NewStreamStore()
+			for index := range size {
+				name := fmt.Sprintf("stream-%d", index)
+				base.Publish(name, "event", nil)
+				base.Trim(name, 1)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				fork := base.Fork()
+				fork.Publish("stream-0", "event", nil)
+			}
+		})
+		for _, outer := range []bool{false, true} {
+			kind := "consumers"
+			if outer {
+				kind = "offset_streams"
+			}
+			b.Run(fmt.Sprintf("%s_%d", kind, size), func(b *testing.B) {
+				base := NewStreamStore()
+				for index := range size {
+					stream, consumer := "stream-0", fmt.Sprintf("consumer-%d", index)
+					if outer {
+						stream, consumer = fmt.Sprintf("stream-%d", index), "consumer-0"
+					}
+					base.SetOffset(stream, consumer, 1)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					fork := base.Fork()
+					fork.SetOffset("stream-0", "consumer-0", 2)
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkStreamSnapshotAccountingScaling(b *testing.B) {
 	for _, size := range []int{1_000, 10_000} {
 		base := NewGraphState()

@@ -25,6 +25,7 @@ const (
 	defaultModel      = "nomic-embed-text"
 	defaultTimeoutMS  = 30_000
 	maxResponseBytes  = 10 << 20
+	maxTokenBytes     = 64
 )
 
 // APIFormat selects the request and response JSON shapes.
@@ -57,6 +58,11 @@ type Client struct {
 }
 
 // Hash returns the deterministic upstream LatticeDB hash embedding.
+//
+// Tokens with fewer than two runes or more than 64 lowercase UTF-8 bytes
+// are skipped. The vector is L2-normalized. Earlier versions accepted long
+// tokens on the Unicode path; embeddings containing those tokens must be
+// regenerated when upgrading. Existing ASCII embeddings are unchanged.
 func Hash(text string, dimensions uint16) ([]float32, error) {
 	if text == "" {
 		return nil, errors.New("embedding text is empty")
@@ -69,7 +75,7 @@ func Hash(text string, dimensions uint16) ([]float32, error) {
 	}
 
 	vector := make([]float32, dimensions)
-	var lower [64]byte
+	var lower [maxTokenBytes]byte
 	unicodeText := false
 
 asciiTokens:
@@ -86,7 +92,7 @@ asciiTokens:
 			offset++
 		}
 		length := offset - start
-		if length < 2 || length > len(lower) {
+		if length < 2 || length > maxTokenBytes {
 			continue
 		}
 		for index := range length {
@@ -136,7 +142,11 @@ func addUnicodeHashToken(vector []float32, token string) {
 	if utf8.RuneCountInString(token) < 2 {
 		return
 	}
-	addHashToken(vector, []byte(strings.ToLower(token)))
+	lowered := []byte(strings.ToLower(token))
+	if len(lowered) > maxTokenBytes {
+		return
+	}
+	addHashToken(vector, lowered)
 }
 
 func addHashToken(vector []float32, token []byte) {
@@ -175,7 +185,8 @@ func NewClient(config Config) (*Client, error) {
 // NewEmbeddingClient is a compatibility alias for NewClient.
 func NewEmbeddingClient(config Config) (*Client, error) { return NewClient(config) }
 
-// Close releases this client. It is safe to call more than once.
+// Close disables this client. It is safe to call more than once.
+// The shared default HTTP transport and its connections remain available.
 func (client *Client) Close() error {
 	if client == nil {
 		return nil
@@ -183,7 +194,6 @@ func (client *Client) Close() error {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	client.closed = true
-	client.client.CloseIdleConnections()
 	return nil
 }
 

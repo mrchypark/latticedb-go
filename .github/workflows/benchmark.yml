@@ -227,8 +227,11 @@ jobs:
       - name: Create comparison report
         run: |
           zig_status='freshly measured in this run'
+          zig_fresh=false
           if [[ "$ZIG_REUSED" == true ]]; then
             zig_status='reused from a compatible successful benchmark artifact; not measured in this run'
+          else
+            zig_fresh=true
           fi
           go run ./scripts/benchcmp.go \
             -current results/current.txt \
@@ -237,6 +240,7 @@ jobs:
             -previous-label "$(cat previous/revision.txt)" \
             -zig results/zig.txt \
             -zig-label "mrchypark/latticedb@$(cat results/zig-revision.txt) (Zig $(cat results/zig-version.txt), ReleaseFast; $zig_status)" \
+            -zig-fresh="$zig_fresh" \
             -output results/report.md
           printf 'Zig reference: %s (Zig %s, ref %s).\n\n' "$zig_status" "$(cat results/zig-version.txt)" "$(cat results/zig-ref.txt)" >> "$GITHUB_STEP_SUMMARY"
           cat results/report.md >> "$GITHUB_STEP_SUMMARY"
