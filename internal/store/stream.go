@@ -46,10 +46,13 @@ type streamLog struct {
 	snapshotBytes uint64
 }
 
+// Byte totals include preceding chunks, including any logically trimmed prefix.
 type streamChunk struct {
-	previous *streamChunk
-	skips    []*streamChunk
-	records  []StreamRecord
+	previous      *streamChunk
+	skips         []*streamChunk
+	records       []StreamRecord
+	bytes         uint64
+	snapshotBytes uint64
 }
 
 // StreamStore keeps system streams separate from graph data. Fork shares its
@@ -251,8 +254,11 @@ func (store *StreamStore) TrimToBytes(name string, maxBytes uint64) (uint64, boo
 	target := maxBytes / 2
 	var retained uint64
 	through := log.first - 1
-	for chunk := log.tail; chunk != nil; chunk = chunk.previous {
+	for chunk := log.tail; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= log.first; chunk = chunk.previous {
 		for index := len(chunk.records) - 1; index >= 0; index-- {
+			if chunk.records[index].Sequence < log.first {
+				continue
+			}
 			recordBytes := streamRecordBytes(chunk.records[index])
 			if snapshotAdd(retained, recordBytes) > target {
 				store.Trim(name, chunk.records[index].Sequence)
@@ -299,7 +305,13 @@ func (store *StreamStore) Publish(name, kind string, payload any) uint64 {
 		records := make([]StreamRecord, len(log.tail.records)+1)
 		copy(records, log.tail.records)
 		records[len(log.tail.records)] = record
-		log.tail = &streamChunk{previous: log.tail.previous, skips: log.tail.skips, records: records}
+		log.tail = &streamChunk{
+			previous:      log.tail.previous,
+			skips:         log.tail.skips,
+			records:       records,
+			bytes:         snapshotAdd(log.tail.bytes, recordBytes),
+			snapshotBytes: snapshotAdd(log.tail.snapshotBytes, recordSnapshotBytes),
+		}
 	}
 	if log.count == 0 {
 		log.first = sequence
@@ -346,52 +358,67 @@ func (store *StreamStore) Trim(name string, through uint64) {
 	}
 	last := log.first + log.count - 1
 	trimmedThrough := min(through, last)
-	chunks := make([]*streamChunk, 0, (log.count+streamChunkSize-1)/streamChunkSize)
-	for chunk := log.tail; chunk != nil && chunk.records[len(chunk.records)-1].Sequence > trimmedThrough; chunk = chunk.previous {
-		chunks = append(chunks, chunk)
-	}
-	var tail *streamChunk
-	var retainedBytes uint64
-	var retainedSnapshotBytes uint64
-	for index := len(chunks) - 1; index >= 0; index-- {
-		records := chunks[index].records
-		start := 0
-		for start < len(records) && records[start].Sequence <= trimmedThrough {
-			start++
-		}
-		if start < len(records) {
-			retained := slices.Clone(records[start:])
-			tail = newStreamChunk(tail, retained)
-			for _, record := range retained {
-				retainedBytes = snapshotAdd(retainedBytes, streamRecordBytes(record))
-				retainedSnapshotBytes = snapshotAdd(retainedSnapshotBytes, streamRecordSnapshotBytes(record))
-			}
-		}
-	}
+	startChunk := log.chunk(log.first)
+	endChunk := log.chunk(trimmedThrough)
+	startBytes, startSnapshotBytes := streamChunkBytesThrough(startChunk, log.first-1)
+	endBytes, endSnapshotBytes := streamChunkBytesThrough(endChunk, trimmedThrough)
+	removedBytes := endBytes - startBytes
+	removedSnapshotBytes := endSnapshotBytes - startSnapshotBytes
+	saturated := log.tail.bytes == ^uint64(0) || log.tail.snapshotBytes == ^uint64(0) || startBytes == ^uint64(0) || endBytes == ^uint64(0) || startSnapshotBytes == ^uint64(0) || endSnapshotBytes == ^uint64(0) || log.bytes == ^uint64(0) || log.snapshotBytes == ^uint64(0) || removedBytes > log.bytes || removedSnapshotBytes > log.snapshotBytes || store.logicalBytes == ^uint64(0) || store.snapshotBytes == ^uint64(0) || removedBytes > store.logicalBytes || removedSnapshotBytes > store.snapshotBytes
 	removed := trimmedThrough - log.first + 1
 	log.count -= removed
 	log.first = trimmedThrough + 1
 	if log.count == 0 {
 		log.first = 0
+		log.tail = nil
+		log.bytes = 0
+		log.snapshotBytes = 0
+	} else if !saturated {
+		log.bytes -= removedBytes
+		log.snapshotBytes -= removedSnapshotBytes
 	}
-	log.tail = tail
-	if store.logicalBytes == ^uint64(0) || log.bytes > store.logicalBytes || store.snapshotBytes == ^uint64(0) || log.snapshotBytes > store.snapshotBytes {
-		log.bytes = retainedBytes
-		log.snapshotBytes = retainedSnapshotBytes
-		store.streams[name] = log
+	if !saturated {
+		store.logicalBytes -= removedBytes
+		store.snapshotBytes -= removedSnapshotBytes
+	}
+	// Compact once hidden bytes reach visible bytes, amortizing repeated head trims.
+	if log.count != 0 && (saturated || log.tail.bytes-log.bytes >= log.bytes) {
+		chunks := make([]*streamChunk, 0, (log.count+streamChunkSize-1)/streamChunkSize)
+		for chunk := log.tail; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= log.first; chunk = chunk.previous {
+			chunks = append(chunks, chunk)
+		}
+		var tail *streamChunk
+		for index := len(chunks) - 1; index >= 0; index-- {
+			records := chunks[index].records
+			start := 0
+			for start < len(records) && records[start].Sequence < log.first {
+				start++
+			}
+			if start < len(records) {
+				tail = newStreamChunk(tail, slices.Clone(records[start:]))
+			}
+		}
+		log.tail = tail
+		log.bytes = tail.bytes
+		log.snapshotBytes = tail.snapshotBytes
+	}
+	store.streams[name] = log
+	if saturated {
 		store.logicalBytes = calculateStreamStoreBytes(*store)
 		store.snapshotBytes = calculateStreamStoreSnapshotBytes(*store)
-		return
 	}
-	store.logicalBytes = snapshotAdd(store.logicalBytes-log.bytes, retainedBytes)
-	store.snapshotBytes = snapshotAdd(store.snapshotBytes-log.snapshotBytes, retainedSnapshotBytes)
-	log.bytes = retainedBytes
-	log.snapshotBytes = retainedSnapshotBytes
-	store.streams[name] = log
 }
 
 func newStreamChunk(previous *streamChunk, records []StreamRecord) *streamChunk {
 	chunk := &streamChunk{previous: previous, records: records}
+	if previous != nil {
+		chunk.bytes = previous.bytes
+		chunk.snapshotBytes = previous.snapshotBytes
+	}
+	for _, record := range records {
+		chunk.bytes = snapshotAdd(chunk.bytes, streamRecordBytes(record))
+		chunk.snapshotBytes = snapshotAdd(chunk.snapshotBytes, streamRecordSnapshotBytes(record))
+	}
 	if previous == nil {
 		return chunk
 	}
@@ -406,9 +433,29 @@ func newStreamChunk(previous *streamChunk, records []StreamRecord) *streamChunk 
 	return chunk
 }
 
+func streamChunkBytesThrough(chunk *streamChunk, sequence uint64) (uint64, uint64) {
+	if chunk == nil {
+		return 0, 0
+	}
+	bytes := uint64(0)
+	snapshotBytes := uint64(0)
+	if chunk.previous != nil {
+		bytes = chunk.previous.bytes
+		snapshotBytes = chunk.previous.snapshotBytes
+	}
+	for _, record := range chunk.records {
+		if record.Sequence > sequence {
+			break
+		}
+		bytes = snapshotAdd(bytes, streamRecordBytes(record))
+		snapshotBytes = snapshotAdd(snapshotBytes, streamRecordSnapshotBytes(record))
+	}
+	return bytes, snapshotBytes
+}
+
 func (log streamLog) chunk(sequence uint64) *streamChunk {
 	chunk := log.tail
-	if chunk == nil || sequence > chunk.records[len(chunk.records)-1].Sequence {
+	if chunk == nil || log.count == 0 || sequence < log.first || sequence > chunk.records[len(chunk.records)-1].Sequence {
 		return nil
 	}
 	for level := len(chunk.skips) - 1; level >= 0; level-- {
@@ -541,11 +588,14 @@ func buildPersistedStreams(store StreamStore) (persistedStreams, error) {
 		stream := persistedStream{Name: name, Next: store.next[name], Records: make([]persistedStreamRecord, 0, log.count)}
 		var previous uint64
 		chunks := make([]*streamChunk, 0, (log.count+streamChunkSize-1)/streamChunkSize)
-		for chunk := log.tail; chunk != nil; chunk = chunk.previous {
+		for chunk := log.tail; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= log.first; chunk = chunk.previous {
 			chunks = append(chunks, chunk)
 		}
 		for index := len(chunks) - 1; index >= 0; index-- {
 			for _, record := range chunks[index].records {
+				if record.Sequence < log.first {
+					continue
+				}
 				if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next || previous != 0 && record.Sequence != previous+1 {
 					return persistedStreams{}, fmt.Errorf("invalid stream sequence")
 				}
@@ -668,8 +718,11 @@ func calculateStreamStoreSnapshotBytes(store StreamStore) uint64 {
 	for name := range store.next {
 		log := store.streams[name]
 		size = snapshotAdd(size, streamSnapshotBytes(name))
-		for chunk := log.tail; chunk != nil; chunk = chunk.previous {
+		for chunk := log.tail; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= log.first; chunk = chunk.previous {
 			for _, record := range chunk.records {
+				if record.Sequence < log.first {
+					continue
+				}
 				size = snapshotAdd(size, streamRecordSnapshotBytes(record))
 			}
 		}
@@ -696,10 +749,14 @@ func streamRecordSnapshotBytes(record StreamRecord) uint64 {
 
 func calculateStreamStoreBytes(store StreamStore) uint64 {
 	var size uint64
-	for name, log := range store.streams {
+	for name := range store.next {
+		log := store.streams[name]
 		size = snapshotAdd(size, uint64(len(name))+64)
-		for chunk := log.tail; chunk != nil; chunk = chunk.previous {
+		for chunk := log.tail; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= log.first; chunk = chunk.previous {
 			for _, record := range chunk.records {
+				if record.Sequence < log.first {
+					continue
+				}
 				size = snapshotAdd(size, snapshotAdd(uint64(len(record.Kind))+48, estimateValueBytes(record.Payload)))
 			}
 		}
