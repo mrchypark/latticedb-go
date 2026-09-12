@@ -28,6 +28,11 @@ type StreamReadResult struct {
 	ByteLimited  bool
 }
 
+type streamSubscription struct {
+	notify  chan struct{}
+	waiters uint
+}
+
 func (db *DB) ReadStream(stream string, afterSequence uint64, limit uint, timeoutMS uint32) ([]StreamRecord, error) {
 	result, err := db.readStream(nil, stream, afterSequence, StreamReadOptions{Limit: limit}, time.Duration(timeoutMS)*time.Millisecond)
 	return result.Records, err
@@ -50,6 +55,9 @@ func (db *DB) readStream(ctx context.Context, stream string, afterSequence uint6
 		return StreamReadResult{}, fmt.Errorf("%w: stream read limit must be positive", ErrInvalidArgument)
 	}
 	var deadline *time.Timer
+	if ctx == nil && timeout > 0 {
+		deadline = time.NewTimer(timeout)
+	}
 	defer func() {
 		if deadline != nil {
 			deadline.Stop()
@@ -61,6 +69,13 @@ func (db *DB) readStream(ctx context.Context, stream string, afterSequence uint6
 				return StreamReadResult{}, err
 			}
 		}
+		if deadline != nil {
+			select {
+			case <-deadline.C:
+				return StreamReadResult{Records: []StreamRecord{}}, nil
+			default:
+			}
+		}
 		db.mu.RLock()
 		if db.closed {
 			db.mu.RUnlock()
@@ -70,10 +85,12 @@ func (db *DB) readStream(ctx context.Context, stream string, afterSequence uint6
 			db.mu.RUnlock()
 			return StreamReadResult{}, ErrRecoveryRequired
 		}
-		// Keep the immutable stream generation and its wakeup together. Writers
-		// fork the store, so payload copying does not need to hold the DB lock.
-		streams := db.graph.Streams
-		notify := db.streamNotify
+		// Keep the immutable stream generation with the lock boundary used to
+		// subscribe below. Writers fork the store, so payload copying does not
+		// need to hold the DB lock.
+		generation := db.graph
+		streams := generation.Streams
+		nextSequence := streams.NextSequence(stream)
 		db.mu.RUnlock()
 		read, readErr := streams.ReadBoundedContext(ctx, stream, afterSequence, opts.Limit, opts.MaxBytes)
 		if readErr != nil {
@@ -83,20 +100,36 @@ func (db *DB) readStream(ctx context.Context, stream string, afterSequence uint6
 		if len(result.Records) != 0 || result.ByteLimited || ctx == nil && timeout == 0 {
 			return result, nil
 		}
+		db.mu.Lock()
+		if db.closed {
+			db.mu.Unlock()
+			return StreamReadResult{}, ErrDatabaseClosed
+		}
+		if db.recoveryRequired {
+			db.mu.Unlock()
+			return StreamReadResult{}, ErrRecoveryRequired
+		}
+		if db.graph.Streams.NextSequence(stream) != nextSequence {
+			db.mu.Unlock()
+			continue
+		}
+		subscription := db.subscribeStreamLocked(stream)
+		db.mu.Unlock()
 		if ctx != nil {
 			select {
-			case <-notify:
+			case <-subscription.notify:
+				db.unsubscribeStream(stream, subscription)
 			case <-ctx.Done():
+				db.unsubscribeStream(stream, subscription)
 				return StreamReadResult{}, ctx.Err()
 			}
 			continue
 		}
-		if deadline == nil {
-			deadline = time.NewTimer(timeout)
-		}
 		select {
-		case <-notify:
+		case <-subscription.notify:
+			db.unsubscribeStream(stream, subscription)
 		case <-deadline.C:
+			db.unsubscribeStream(stream, subscription)
 			return result, nil
 		}
 	}
@@ -183,11 +216,47 @@ func (tx *Tx) TrimStream(stream string, beforeSequence uint64) error {
 	return nil
 }
 
-func (db *DB) notifyStreamsLocked() {
-	if db.streamNotify != nil {
-		close(db.streamNotify)
+func (db *DB) subscribeStreamLocked(stream string) *streamSubscription {
+	if db.streamNotify == nil {
+		db.streamNotify = map[string]*streamSubscription{}
 	}
-	db.streamNotify = make(chan struct{})
+	subscription := db.streamNotify[stream]
+	if subscription == nil {
+		subscription = &streamSubscription{notify: make(chan struct{})}
+		db.streamNotify[stream] = subscription
+	}
+	subscription.waiters++
+	return subscription
+}
+
+func (db *DB) unsubscribeStream(stream string, subscription *streamSubscription) {
+	db.mu.Lock()
+	if subscription.waiters != 0 {
+		subscription.waiters--
+	}
+	if subscription.waiters == 0 && db.streamNotify[stream] == subscription {
+		delete(db.streamNotify, stream)
+	}
+	db.mu.Unlock()
+}
+
+func (db *DB) notifyStreamsLocked(operations []store.StreamOperation) {
+	for _, operation := range operations {
+		if operation.Type != "publish" && operation.Type != "trim" {
+			continue
+		}
+		if subscription := db.streamNotify[operation.Stream]; subscription != nil {
+			delete(db.streamNotify, operation.Stream)
+			close(subscription.notify)
+		}
+	}
+}
+
+func (db *DB) notifyAllStreamsLocked() {
+	for stream, subscription := range db.streamNotify {
+		delete(db.streamNotify, stream)
+		close(subscription.notify)
+	}
 }
 
 func validateStreamName(name string, allowReserved bool) error {

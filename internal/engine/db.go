@@ -294,7 +294,7 @@ type DB struct {
 	pathLock                          *pathLock
 	wal                               *store.WALWriter
 	temporary                         bool
-	streamNotify                      chan struct{}
+	streamNotify                      map[string]*streamSubscription
 	vectorRebuild                     *vectorRebuildState
 	vectorRebuildBeforeBuild          func()
 }
@@ -674,7 +674,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		checkpoint:                        opts.checkpoint,
 		pathLock:                          lock,
 		wal:                               wal,
-		streamNotify:                      make(chan struct{}),
+		streamNotify:                      map[string]*streamSubscription{},
 	}
 	db.checkpointAttemptCond.L = &db.checkpointWorkerMu
 	if !db.readOnly {
@@ -1162,7 +1162,7 @@ func (db *DB) closeWithWriterHeld() error {
 		db.vectorRebuild.cancel()
 	}
 	db.closed = true
-	db.notifyStreamsLocked()
+	db.notifyAllStreamsLocked()
 	db.mu.Unlock()
 
 	db.stopCheckpointWorker()
@@ -3347,7 +3347,7 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	if size, sizeErr := wal.TailSize(); sizeErr == nil && size >= 0 && uint64(size) >= tx.db.walCheckpointThresholdBytes {
 		tx.db.checkpointNeeded.Store(true)
 	}
-	tx.db.notifyStreamsLocked()
+	tx.db.notifyStreamsLocked(delta.StreamOperations)
 	tx.db.mu.Unlock()
 	return nil
 }
