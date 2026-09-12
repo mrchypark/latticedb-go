@@ -4425,7 +4425,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 				if normalized == nil {
 					delete(binding.Node.Properties, clause.Property)
 				} else {
-					binding.Node.Properties[clause.Property] = normalized
+					binding.Node.Properties[store.InternString(clause.Property)] = normalized
 				}
 				tx.trackNodeProperty(binding.Node.ID, clause.Property)
 			case binding.Edge != nil:
@@ -4436,7 +4436,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 				if normalized == nil {
 					delete(binding.Edge.Properties, clause.Property)
 				} else {
-					binding.Edge.Properties[clause.Property] = normalized
+					binding.Edge.Properties[store.InternString(clause.Property)] = normalized
 				}
 				tx.trackEdgeProperty(binding.Edge.ID, clause.Property)
 			default:
@@ -4503,7 +4503,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 				return err
 			}
 			if !slices.Contains(binding.Node.Labels, clause.Label) {
-				binding.Node.Labels = append(binding.Node.Labels, clause.Label)
+				binding.Node.Labels = append(binding.Node.Labels, store.InternString(clause.Label))
 				tx.graph.Labels.Add(clause.Label, binding.Node.ID)
 			}
 		default:

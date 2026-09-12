@@ -3595,7 +3595,7 @@ func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 	}
 	record := &store.NodeRecord{
 		ID:         id,
-		Labels:     slices.Clone(opts.Labels),
+		Labels:     store.InternStrings(opts.Labels),
 		Properties: props,
 	}
 	tx.ensureNodesWritable(id)
@@ -3719,7 +3719,7 @@ func (tx *Tx) SetProperty(nodeID uint64, key string, value any) error {
 			return err
 		}
 	}
-	node.Properties[key] = normalized
+	node.Properties[store.InternString(key)] = normalized
 	tx.trackNodeProperty(nodeID, key)
 	return nil
 }
@@ -3828,7 +3828,7 @@ func (tx *Tx) SetVector(nodeID uint64, key string, vector []float32) error {
 	if err := validateVectorPropertyUpdate(node, key, normalized); err != nil {
 		return err
 	}
-	node.Properties[key] = normalized
+	node.Properties[store.InternString(key)] = normalized
 	tx.trackNodeProperty(nodeID, key)
 	return nil
 }
@@ -3954,7 +3954,7 @@ func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts
 		ID:         id,
 		SourceID:   sourceID,
 		TargetID:   targetID,
-		Type:       edgeType,
+		Type:       store.InternString(edgeType),
 		Properties: props,
 	}
 	tx.ensureEdgesWritable(id)
@@ -4080,7 +4080,7 @@ func (tx *Tx) SetEdgeProperty(edgeID uint64, key string, value any) error {
 	if err != nil {
 		return err
 	}
-	edge.Properties[key] = normalized
+	edge.Properties[store.InternString(key)] = normalized
 	tx.trackEdgeProperty(edgeID, key)
 	return nil
 }
