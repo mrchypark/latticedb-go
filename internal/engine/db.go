@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"math"
 	"os"
 	"slices"
@@ -67,6 +68,10 @@ const defaultVectorBuildMaxWork = 100_000_000_000
 const defaultVectorBuildMaxLogicalBytes = 16 << 30
 const defaultDerivedBuildMaxWork = 100_000_000_000
 const defaultDerivedBuildMaxLogicalBytes = 16 << 30
+
+// ponytail: cap per-entity property patch tracking at 64; raise or replace this
+// fixed cap only with allocation and CPU evidence from wider updates.
+const maxTrackedPropertyKeys = 64
 
 type OpenOptions struct {
 	Create                            bool
@@ -396,6 +401,8 @@ type txChanges struct {
 	deleteNodes       map[uint64]struct{}
 	upsertEdges       map[uint64]struct{}
 	deleteEdges       map[uint64]struct{}
+	nodePropertyKeys  map[uint64][]string
+	edgePropertyKeys  map[uint64][]string
 	upsertFTS         map[uint64]struct{}
 	deleteFTS         map[uint64]struct{}
 	appMetadata       map[string]appMetadataChange
@@ -1115,7 +1122,10 @@ func (db *DB) Close() error {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	defer db.writeMu.Unlock()
+	defer func() {
+		db.writeMu.Unlock()
+		db.requestBackgroundCheckpoint()
+	}()
 	return db.closeWithWriterHeld()
 }
 
@@ -1137,7 +1147,10 @@ func (db *DB) CloseContext(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
-	defer db.writeMu.Unlock()
+	defer func() {
+		db.writeMu.Unlock()
+		db.requestBackgroundCheckpoint()
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -3303,6 +3316,8 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		DropNodeIndexes:   propertyIndexKeys(tx.changes.dropNodeIndexes),
 		CreateEdgeIndexes: propertyIndexKeys(tx.changes.createEdgeIndexes),
 		DropEdgeIndexes:   propertyIndexKeys(tx.changes.dropEdgeIndexes),
+		NodePropertyKeys:  propertyKeyDeltas(tx.changes.upsertNodes, tx.changes.nodePropertyKeys),
+		EdgePropertyKeys:  propertyKeyDeltas(tx.changes.upsertEdges, tx.changes.edgePropertyKeys),
 		StreamsChanged:    tx.changes.streamsChanged,
 		StreamOperations:  slices.Clone(tx.changes.streamOperations),
 	}
@@ -3634,7 +3649,7 @@ func (tx *Tx) SetProperty(nodeID uint64, key string, value any) error {
 	if err := store.ValidatePropertyKey(key); err != nil {
 		return err
 	}
-	node, err := tx.writableNode(nodeID)
+	node, err := tx.writableNode(nodeID, true)
 	if err != nil {
 		return err
 	}
@@ -3651,6 +3666,7 @@ func (tx *Tx) SetProperty(nodeID uint64, key string, value any) error {
 		}
 	}
 	node.Properties[key] = normalized
+	tx.trackNodeProperty(nodeID, key)
 	return nil
 }
 
@@ -3747,7 +3763,7 @@ func (tx *Tx) SetVector(nodeID uint64, key string, vector []float32) error {
 	if tx.db.vectorDimensions > 0 && len(vector) != int(tx.db.vectorDimensions) {
 		return fmt.Errorf("vector length %d does not match configured dimensions %d", len(vector), tx.db.vectorDimensions)
 	}
-	node, err := tx.writableNode(nodeID)
+	node, err := tx.writableNode(nodeID, true)
 	if err != nil {
 		return err
 	}
@@ -3759,6 +3775,7 @@ func (tx *Tx) SetVector(nodeID uint64, key string, vector []float32) error {
 		return err
 	}
 	node.Properties[key] = normalized
+	tx.trackNodeProperty(nodeID, key)
 	return nil
 }
 
@@ -4001,7 +4018,7 @@ func (tx *Tx) SetEdgeProperty(edgeID uint64, key string, value any) error {
 	if err := store.ValidatePropertyKey(key); err != nil {
 		return err
 	}
-	edge, err := tx.writableEdge(edgeID)
+	edge, err := tx.writableEdge(edgeID, true)
 	if err != nil {
 		return err
 	}
@@ -4010,6 +4027,7 @@ func (tx *Tx) SetEdgeProperty(edgeID uint64, key string, value any) error {
 		return err
 	}
 	edge.Properties[key] = normalized
+	tx.trackEdgeProperty(edgeID, key)
 	return nil
 }
 
@@ -4020,11 +4038,12 @@ func (tx *Tx) RemoveEdgeProperty(edgeID uint64, key string) error {
 	if err := store.ValidatePropertyKey(key); err != nil {
 		return err
 	}
-	edge, err := tx.writableEdge(edgeID)
+	edge, err := tx.writableEdge(edgeID, true)
 	if err != nil {
 		return err
 	}
 	delete(edge.Properties, key)
+	tx.trackEdgeProperty(edgeID, key)
 	return nil
 }
 
@@ -4237,7 +4256,7 @@ func validateEntityID(id uint64) error {
 	return nil
 }
 
-func (tx *Tx) writableNode(nodeID uint64) (*store.NodeRecord, error) {
+func (tx *Tx) writableNode(nodeID uint64, propertiesOnly bool) (*store.NodeRecord, error) {
 	node, err := tx.requireNode(nodeID)
 	if err != nil {
 		return nil, err
@@ -4246,16 +4265,22 @@ func (tx *Tx) writableNode(nodeID uint64) (*store.NodeRecord, error) {
 		node = &store.NodeRecord{
 			ID:         node.ID,
 			Labels:     slices.Clone(node.Labels),
-			Properties: store.ClonePropertyMap(node.Properties),
+			Properties: maps.Clone(node.Properties),
 		}
 		tx.ensureNodesWritable(nodeID)
 		tx.graph.Nodes.Set(nodeID, node)
 		tx.markUpsert(&tx.changes.upsertNodes, &tx.changes.deleteNodes, nodeID)
 	}
+	if node.Properties == nil {
+		node.Properties = map[string]any{}
+	}
+	if !propertiesOnly {
+		tx.markNodePropertyFallback(nodeID)
+	}
 	return node, nil
 }
 
-func (tx *Tx) writableEdge(edgeID uint64) (*store.EdgeRecord, error) {
+func (tx *Tx) writableEdge(edgeID uint64, propertiesOnly bool) (*store.EdgeRecord, error) {
 	edge, err := tx.requireEdge(edgeID)
 	if err != nil {
 		return nil, err
@@ -4266,11 +4291,17 @@ func (tx *Tx) writableEdge(edgeID uint64) (*store.EdgeRecord, error) {
 			SourceID:   edge.SourceID,
 			TargetID:   edge.TargetID,
 			Type:       edge.Type,
-			Properties: store.ClonePropertyMap(edge.Properties),
+			Properties: maps.Clone(edge.Properties),
 		}
 		tx.ensureEdgesWritable(edgeID)
 		tx.graph.Edges.Set(edgeID, edge)
 		tx.markUpsert(&tx.changes.upsertEdges, &tx.changes.deleteEdges, edgeID)
+	}
+	if edge.Properties == nil {
+		edge.Properties = map[string]any{}
+	}
+	if !propertiesOnly {
+		tx.markEdgePropertyFallback(edgeID)
 	}
 	return edge, nil
 }
@@ -4337,6 +4368,140 @@ func mapKeys(values map[uint64]struct{}) []uint64 {
 	}
 	slices.Sort(keys)
 	return keys
+}
+
+func propertyKeyDeltas(upserts map[uint64]struct{}, tracked map[uint64][]string) map[uint64][]string {
+	if len(upserts) == 0 || len(tracked) == 0 {
+		return nil
+	}
+	for id, keys := range tracked {
+		if len(keys) == 0 {
+			continue
+		}
+		if _, ok := upserts[id]; !ok {
+			delete(tracked, id)
+			continue
+		}
+		slices.Sort(keys)
+	}
+	if len(tracked) == 0 {
+		return nil
+	}
+	return tracked
+}
+
+func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struct{}, node bool) {
+	if tx.changes == nil || changes == nil {
+		return
+	}
+	for id := range upserts {
+		if !idExists(tx.base, id, node) {
+			continue
+		}
+		var child map[uint64][]string
+		var parent *map[uint64][]string
+		if node {
+			child = changes.nodePropertyKeys
+			parent = &tx.changes.nodePropertyKeys
+		} else {
+			child = changes.edgePropertyKeys
+			parent = &tx.changes.edgePropertyKeys
+		}
+		keys, exists := child[id]
+		if !exists || keys == nil {
+			if *parent == nil {
+				*parent = make(map[uint64][]string)
+			}
+			(*parent)[id] = nil
+			continue
+		}
+		if *parent == nil {
+			*parent = make(map[uint64][]string)
+		}
+		current, alreadyTracked := (*parent)[id]
+		if alreadyTracked && current == nil {
+			continue
+		}
+		if !alreadyTracked {
+			(*parent)[id] = keys
+			continue
+		}
+		for _, key := range keys {
+			if !slices.Contains(current, key) {
+				if len(current) >= maxTrackedPropertyKeys {
+					(*parent)[id] = nil
+					current = nil
+					break
+				}
+				current = append(current, key)
+			}
+		}
+		if current != nil {
+			(*parent)[id] = current
+		}
+	}
+}
+
+func (tx *Tx) trackNodeProperty(id uint64, key string) {
+	if tx.changes == nil || !idExists(tx.base, id, true) {
+		return
+	}
+	if tx.changes.nodePropertyKeys == nil {
+		tx.changes.nodePropertyKeys = make(map[uint64][]string)
+	}
+	keys, exists := tx.changes.nodePropertyKeys[id]
+	if !exists {
+		keys = make([]string, 0, 1)
+		tx.changes.nodePropertyKeys[id] = keys
+	}
+	if keys != nil && !slices.Contains(keys, key) {
+		if len(keys) >= maxTrackedPropertyKeys {
+			tx.changes.nodePropertyKeys[id] = nil
+			return
+		}
+		tx.changes.nodePropertyKeys[id] = append(keys, key)
+	}
+}
+
+func (tx *Tx) trackEdgeProperty(id uint64, key string) {
+	if tx.changes == nil || !idExists(tx.base, id, false) {
+		return
+	}
+	if tx.changes.edgePropertyKeys == nil {
+		tx.changes.edgePropertyKeys = make(map[uint64][]string)
+	}
+	keys, exists := tx.changes.edgePropertyKeys[id]
+	if !exists {
+		keys = make([]string, 0, 1)
+		tx.changes.edgePropertyKeys[id] = keys
+	}
+	if keys != nil && !slices.Contains(keys, key) {
+		if len(keys) >= maxTrackedPropertyKeys {
+			tx.changes.edgePropertyKeys[id] = nil
+			return
+		}
+		tx.changes.edgePropertyKeys[id] = append(keys, key)
+	}
+}
+
+func (tx *Tx) markNodePropertyFallback(id uint64) {
+	if tx.changes == nil || !idExists(tx.base, id, true) {
+		return
+	}
+	if tx.changes.nodePropertyKeys == nil {
+		tx.changes.nodePropertyKeys = make(map[uint64][]string)
+	}
+	tx.changes.nodePropertyKeys[id] = nil
+}
+
+func (tx *Tx) markEdgePropertyFallback(id uint64) {
+	if tx.changes == nil || !idExists(tx.base, id, false) {
+		return
+	}
+	if tx.changes.edgePropertyKeys == nil {
+		tx.changes.edgePropertyKeys = make(map[uint64][]string)
+	}
+	tx.changes.edgePropertyKeys[id] = nil
 }
 
 func propertyIndexKeys(values map[store.PropertyIndexDefinition]struct{}) []store.PropertyIndexDefinition {

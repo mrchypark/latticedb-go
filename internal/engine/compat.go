@@ -122,4 +122,6 @@ func mergeStatementChanges(tx *Tx, changes *txChanges) {
 		func(id uint64) bool { return tx.graph.Edges.Get(id) != nil }, func(id uint64) bool { return tx.base.Edges.Get(id) != nil })
 	merge(changes.upsertFTS, changes.deleteFTS, &tx.changes.upsertFTS, &tx.changes.deleteFTS,
 		func(id uint64) bool { return tx.graph.FTS.Get(id) != nil }, func(id uint64) bool { return tx.base.FTS.Get(id) != nil })
+	tx.mergePropertyTracking(changes, changes.upsertNodes, true)
+	tx.mergePropertyTracking(changes, changes.upsertEdges, false)
 }

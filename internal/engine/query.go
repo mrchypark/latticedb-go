@@ -4319,7 +4319,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 		case setProperty:
 			switch {
 			case binding.Node != nil:
-				binding.Node, err = tx.writableNode(binding.Node.ID)
+				binding.Node, err = tx.writableNode(binding.Node.ID, true)
 				if err != nil {
 					return err
 				}
@@ -4328,8 +4328,9 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 				} else {
 					binding.Node.Properties[clause.Property] = normalized
 				}
+				tx.trackNodeProperty(binding.Node.ID, clause.Property)
 			case binding.Edge != nil:
-				binding.Edge, err = tx.writableEdge(binding.Edge.ID)
+				binding.Edge, err = tx.writableEdge(binding.Edge.ID, true)
 				if err != nil {
 					return err
 				}
@@ -4338,6 +4339,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 				} else {
 					binding.Edge.Properties[clause.Property] = normalized
 				}
+				tx.trackEdgeProperty(binding.Edge.ID, clause.Property)
 			default:
 				return fmt.Errorf("binding %q is neither node nor edge", clause.Var)
 			}
@@ -4348,13 +4350,13 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 			}
 			switch {
 			case binding.Node != nil:
-				binding.Node, err = tx.writableNode(binding.Node.ID)
+				binding.Node, err = tx.writableNode(binding.Node.ID, false)
 				if err != nil {
 					return err
 				}
 				binding.Node.Properties = props
 			case binding.Edge != nil:
-				binding.Edge, err = tx.writableEdge(binding.Edge.ID)
+				binding.Edge, err = tx.writableEdge(binding.Edge.ID, false)
 				if err != nil {
 					return err
 				}
@@ -4369,20 +4371,26 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 			}
 			switch {
 			case binding.Node != nil:
-				binding.Node, err = tx.writableNode(binding.Node.ID)
+				binding.Node, err = tx.writableNode(binding.Node.ID, true)
 				if err != nil {
 					return err
 				}
 				if err := mergeMutationProperties(binding.Node.Properties, props, budget); err != nil {
 					return err
 				}
+				for key := range props {
+					tx.trackNodeProperty(binding.Node.ID, key)
+				}
 			case binding.Edge != nil:
-				binding.Edge, err = tx.writableEdge(binding.Edge.ID)
+				binding.Edge, err = tx.writableEdge(binding.Edge.ID, true)
 				if err != nil {
 					return err
 				}
 				if err := mergeMutationProperties(binding.Edge.Properties, props, budget); err != nil {
 					return err
+				}
+				for key := range props {
+					tx.trackEdgeProperty(binding.Edge.ID, key)
 				}
 			default:
 				return fmt.Errorf("binding %q is neither node nor edge", clause.Var)
@@ -4391,7 +4399,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 			if binding.Node == nil {
 				return fmt.Errorf("binding %q is not a node", clause.Var)
 			}
-			binding.Node, err = tx.writableNode(binding.Node.ID)
+			binding.Node, err = tx.writableNode(binding.Node.ID, false)
 			if err != nil {
 				return err
 			}
@@ -4486,18 +4494,20 @@ func (clause *removeClause) apply(tx *Tx, rows []queryRow, budget *queryBudget) 
 				switch {
 				case binding.Node != nil:
 					var err error
-					binding.Node, err = tx.writableNode(binding.Node.ID)
+					binding.Node, err = tx.writableNode(binding.Node.ID, true)
 					if err != nil {
 						return err
 					}
 					delete(binding.Node.Properties, item.Property)
+					tx.trackNodeProperty(binding.Node.ID, item.Property)
 				case binding.Edge != nil:
 					var err error
-					binding.Edge, err = tx.writableEdge(binding.Edge.ID)
+					binding.Edge, err = tx.writableEdge(binding.Edge.ID, true)
 					if err != nil {
 						return err
 					}
 					delete(binding.Edge.Properties, item.Property)
+					tx.trackEdgeProperty(binding.Edge.ID, item.Property)
 				default:
 					return fmt.Errorf("binding %q is neither node nor edge", item.Var)
 				}
@@ -4506,7 +4516,7 @@ func (clause *removeClause) apply(tx *Tx, rows []queryRow, budget *queryBudget) 
 					return fmt.Errorf("binding %q is not a node", item.Var)
 				}
 				var err error
-				binding.Node, err = tx.writableNode(binding.Node.ID)
+				binding.Node, err = tx.writableNode(binding.Node.ID, false)
 				if err != nil {
 					return err
 				}

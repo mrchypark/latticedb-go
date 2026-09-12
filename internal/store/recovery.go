@@ -119,6 +119,7 @@ var legacyStateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '3'}
 
 type WALWriter struct {
 	encodeValue   walPayload
+	encodeDelta   persistedDelta
 	encodeBuffer  bytes.Buffer
 	file          *os.File
 	tailSize      atomic.Int64
@@ -171,7 +172,16 @@ func (writer *WALWriter) AppendDelta(graph *GraphState, nextNodeID uint64, nextE
 	if err != nil {
 		return err
 	}
-	return writer.appendJSON(delta.DatabaseID, delta.CommitID, walPayload{Kind: "delta", Delta: &delta})
+	if writer == nil || writer.file == nil {
+		return errors.New("WAL writer is closed")
+	}
+	writer.encodeDelta = delta
+	defer func() { writer.encodeDelta = persistedDelta{} }()
+	kind := "delta"
+	if hasPropertyDelta(delta) {
+		kind = "property_delta"
+	}
+	return writer.appendJSON(delta.DatabaseID, delta.CommitID, walPayload{Kind: kind, Delta: &writer.encodeDelta})
 }
 
 // The engine serializes WAL writes. Reuse small payload storage without
@@ -1470,7 +1480,11 @@ func AppendWALDeltaFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(walPayload{Kind: "delta", Delta: &delta})
+	kind := "delta"
+	if hasPropertyDelta(delta) {
+		kind = "property_delta"
+	}
+	payload, err := json.Marshal(walPayload{Kind: kind, Delta: &delta})
 	if err != nil {
 		return fmt.Errorf("encode WAL delta: %w", err)
 	}
@@ -2117,6 +2131,7 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 	var accumulator *walAccumulator
 	currentFormat := true
 	var header [walHeaderSize]byte
+	var wrapper walPayload
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
@@ -2184,7 +2199,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
 			return nil, false, errors.New("WAL checksum mismatch")
 		}
-		var wrapper walPayload
+		// The accumulator copies snapshot and delta data it retains. Reuse the
+		// wrapper allocation, but clear pointers before decoding each frame so
+		// omitted JSON fields cannot carry over from the previous frame.
+		wrapper = walPayload{}
 		if err := unmarshalContext(ctx, payload, &wrapper); err != nil {
 			return nil, false, fmt.Errorf("decode WAL payload: %w", err)
 		}
@@ -2217,6 +2235,9 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 			if wrapper.Delta == nil || wrapper.Delta.CommitID != commitID || wrapper.Delta.DatabaseID != databaseID {
 				return nil, false, errors.New("WAL delta metadata mismatch")
 			}
+			if hasPropertyDelta(*wrapper.Delta) {
+				return nil, false, errors.New("WAL delta contains property changes")
+			}
 			if accumulator == nil {
 				return nil, false, errors.New("WAL delta has no base snapshot")
 			}
@@ -2228,6 +2249,55 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 			}
 			if err := accumulator.apply(*wrapper.Delta); err != nil {
 				return nil, false, fmt.Errorf("invalid WAL delta: %w", err)
+			}
+		case "property_delta":
+			if wrapper.Delta == nil || wrapper.Delta.CommitID != commitID || wrapper.Delta.DatabaseID != databaseID {
+				return nil, false, errors.New("WAL property delta metadata mismatch")
+			}
+			if !hasPropertyDelta(*wrapper.Delta) {
+				return nil, false, errEmptyPropertyDelta
+			}
+			if accumulator == nil {
+				return nil, false, errors.New("WAL property delta has no base snapshot")
+			}
+			if databaseID != accumulator.state.DatabaseID || accumulator.state.CommitID == ^uint64(0) || commitID != accumulator.state.CommitID+1 {
+				return nil, false, errors.New("WAL property delta history regression")
+			}
+			work, err := propertyDeltaWork(ctx, accumulator, *wrapper.Delta)
+			if err != nil {
+				return nil, false, err
+			}
+			if err := budget.replayWork(work); err != nil {
+				return nil, false, err
+			}
+			prepared, err := preparePropertyDelta(ctx, accumulator, *wrapper.Delta)
+			if err != nil {
+				return nil, false, fmt.Errorf("invalid WAL property delta: %w", err)
+			}
+			propertyDelta := *wrapper.Delta
+			propertyDelta.NodePropertyChanges = nil
+			propertyDelta.EdgePropertyChanges = nil
+			if err := accumulator.apply(propertyDelta); err != nil {
+				return nil, false, fmt.Errorf("invalid WAL property delta: %w", err)
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, false, err
+			}
+			for _, change := range prepared {
+				if change.nodeID != 0 {
+					node := accumulator.nodes[change.nodeID]
+					node.Properties = change.properties
+					accumulator.nodes[change.nodeID] = node
+					accumulator.nodePropertyTotals[change.nodeID] = change.totals
+				} else {
+					edge := accumulator.edges[change.edgeID]
+					edge.Properties = change.properties
+					accumulator.edges[change.edgeID] = edge
+					accumulator.edgePropertyTotals[change.edgeID] = change.totals
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, false, err
+				}
 			}
 		case "checkpoint":
 			if accumulator != nil {
@@ -2265,13 +2335,15 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 }
 
 type walAccumulator struct {
-	state    persistedState
-	streams  StreamStore
-	metadata map[string]persistedAppMetadata
-	nodes    map[uint64]persistedNode
-	edges    map[uint64]persistedEdge
-	fts      map[uint64]persistedFTS
-	incident map[uint64]uint64
+	state              persistedState
+	streams            StreamStore
+	metadata           map[string]persistedAppMetadata
+	nodes              map[uint64]persistedNode
+	edges              map[uint64]persistedEdge
+	fts                map[uint64]persistedFTS
+	incident           map[uint64]uint64
+	nodePropertyTotals map[uint64]propertyTotals
+	edgePropertyTotals map[uint64]propertyTotals
 }
 
 func newWALAccumulator(ctx context.Context, state persistedState) (*walAccumulator, error) {
@@ -2534,8 +2606,10 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 		accumulator.incident[edge.SourceID]--
 		accumulator.incident[edge.TargetID]--
 		delete(accumulator.edges, id)
+		delete(accumulator.edgePropertyTotals, id)
 	}
 	for _, node := range delta.UpsertNodes {
+		delete(accumulator.nodePropertyTotals, node.ID)
 		accumulator.nodes[node.ID] = node
 	}
 	for _, edge := range delta.UpsertEdges {
@@ -2547,6 +2621,7 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 			return fmt.Errorf("edge %d references missing node", edge.ID)
 		}
 		accumulator.edges[edge.ID] = edge
+		delete(accumulator.edgePropertyTotals, edge.ID)
 		accumulator.incident[edge.SourceID]++
 		accumulator.incident[edge.TargetID]++
 	}
@@ -2558,6 +2633,7 @@ func (accumulator *walAccumulator) apply(delta persistedDelta) error {
 			return fmt.Errorf("delete node %d with incident edges", id)
 		}
 		delete(accumulator.nodes, id)
+		delete(accumulator.nodePropertyTotals, id)
 	}
 	for _, id := range delta.DeleteFTS {
 		if _, ok := accumulator.fts[id]; !ok {
@@ -2888,6 +2964,50 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		DeleteEdges: slices.Clone(changes.DeleteEdges),
 		DeleteFTS:   slices.Clone(changes.DeleteFTS),
 	}
+	if hasPropertyKeys(changes.NodePropertyKeys) || hasPropertyKeys(changes.EdgePropertyKeys) {
+		if err := validateUniqueDeltaIDs(changes.DeleteNodes, changes.UpsertNodes, func(id uint64) uint64 { return id }); err != nil {
+			return persistedDelta{}, fmt.Errorf("node operations: %w", err)
+		}
+		if err := validateUniqueDeltaIDs(changes.DeleteEdges, changes.UpsertEdges, func(id uint64) uint64 { return id }); err != nil {
+			return persistedDelta{}, fmt.Errorf("edge operations: %w", err)
+		}
+		nodeUpserts := make(map[uint64]struct{}, len(changes.UpsertNodes))
+		for _, id := range changes.UpsertNodes {
+			nodeUpserts[id] = struct{}{}
+		}
+		nodeDeletes := make(map[uint64]struct{}, len(changes.DeleteNodes))
+		for _, id := range changes.DeleteNodes {
+			nodeDeletes[id] = struct{}{}
+		}
+		edgeUpserts := make(map[uint64]struct{}, len(changes.UpsertEdges))
+		for _, id := range changes.UpsertEdges {
+			edgeUpserts[id] = struct{}{}
+		}
+		edgeDeletes := make(map[uint64]struct{}, len(changes.DeleteEdges))
+		for _, id := range changes.DeleteEdges {
+			edgeDeletes[id] = struct{}{}
+		}
+		for id, keys := range changes.NodePropertyKeys {
+			if len(keys) != 0 {
+				if _, ok := nodeUpserts[id]; !ok {
+					return persistedDelta{}, fmt.Errorf("node property patch %d is not an upsert", id)
+				}
+				if _, ok := nodeDeletes[id]; ok {
+					return persistedDelta{}, fmt.Errorf("node property patch %d is also deleted", id)
+				}
+			}
+		}
+		for id, keys := range changes.EdgePropertyKeys {
+			if len(keys) != 0 {
+				if _, ok := edgeUpserts[id]; !ok {
+					return persistedDelta{}, fmt.Errorf("edge property patch %d is not an upsert", id)
+				}
+				if _, ok := edgeDeletes[id]; ok {
+					return persistedDelta{}, fmt.Errorf("edge property patch %d is also deleted", id)
+				}
+			}
+		}
+	}
 	seenMetadata := make(map[string]struct{}, len(changes.AppMetadata))
 	for _, change := range changes.AppMetadata {
 		if len(change.Key) == 0 || len(change.Key) > maxAppMetadataKeyBytes {
@@ -2937,6 +3057,14 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		if err := ValidateCreateLabels(node.Labels); err != nil {
 			return persistedDelta{}, fmt.Errorf("encode node %d labels: %w", nodeID, err)
 		}
+		if keys, patch := changes.NodePropertyKeys[nodeID]; patch && len(keys) != 0 {
+			change, err := buildPersistedPropertyChange(node.ID, keys, node.Properties)
+			if err != nil {
+				return persistedDelta{}, fmt.Errorf("encode node %d property patch: %w", nodeID, err)
+			}
+			delta.NodePropertyChanges = append(delta.NodePropertyChanges, change)
+			continue
+		}
 		props, err := encodePropertyMap(node.Properties)
 		if err != nil {
 			return persistedDelta{}, fmt.Errorf("encode node %d properties: %w", nodeID, err)
@@ -2962,6 +3090,14 @@ func buildPersistedDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 		}
 		if err := ValidateEdgeType(edge.Type); err != nil {
 			return persistedDelta{}, fmt.Errorf("encode edge %d type: %w", edgeID, err)
+		}
+		if keys, patch := changes.EdgePropertyKeys[edgeID]; patch && len(keys) != 0 {
+			change, err := buildPersistedPropertyChange(edge.ID, keys, edge.Properties)
+			if err != nil {
+				return persistedDelta{}, fmt.Errorf("encode edge %d property patch: %w", edgeID, err)
+			}
+			delta.EdgePropertyChanges = append(delta.EdgePropertyChanges, change)
+			continue
 		}
 		props, err := encodePropertyMap(edge.Properties)
 		if err != nil {

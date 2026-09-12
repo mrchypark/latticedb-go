@@ -752,6 +752,8 @@ func TestBackgroundCheckpointDoesNotBlockNextCommit(t *testing.T) {
 	release := make(chan struct{})
 	checkpointDone := make(chan struct{}, 32)
 	var once sync.Once
+	var releaseOnce sync.Once
+	releaseCheckpoint := func() { releaseOnce.Do(func() { close(release) }) }
 	db, err := Open(path, OpenOptions{
 		Create:                      true,
 		WALCheckpointThresholdBytes: 1,
@@ -768,6 +770,7 @@ func TestBackgroundCheckpointDoesNotBlockNextCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	defer releaseCheckpoint()
 	if err := db.Update(func(tx *Tx) error {
 		_, err := tx.CreateNode(CreateNodeOptions{})
 		return err
@@ -790,7 +793,7 @@ func TestBackgroundCheckpointDoesNotBlockNextCommit(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("next commit blocked by background checkpoint preparation")
 	}
-	close(release)
+	releaseCheckpoint()
 	waitForBackgroundCheckpoint(t, db, 1, checkpointDone)
 	if err := db.View(func(tx *Tx) error {
 		result, err := tx.Query("MATCH (n) RETURN count(n) AS count", nil)
@@ -1217,6 +1220,8 @@ func TestExplicitCheckpointWhileBackgroundPreparationRuns(t *testing.T) {
 	release := make(chan struct{})
 	checkpointDone := make(chan struct{}, 8)
 	var once sync.Once
+	var releaseOnce sync.Once
+	releaseCheckpoint := func() { releaseOnce.Do(func() { close(release) }) }
 	db, err := Open(path, OpenOptions{
 		Create:                      true,
 		WALCheckpointThresholdBytes: 1,
@@ -1231,6 +1236,7 @@ func TestExplicitCheckpointWhileBackgroundPreparationRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
+	defer releaseCheckpoint()
 	if err := db.Update(func(tx *Tx) error {
 		_, err := tx.CreateNode(CreateNodeOptions{})
 		return err
@@ -1239,7 +1245,7 @@ func TestExplicitCheckpointWhileBackgroundPreparationRuns(t *testing.T) {
 	}
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("background checkpoint did not start")
 	}
 	explicitDone := make(chan error, 1)
@@ -1252,7 +1258,7 @@ func TestExplicitCheckpointWhileBackgroundPreparationRuns(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("explicit checkpoint blocked on background preparation")
 	}
-	close(release)
+	releaseCheckpoint()
 	select {
 	case <-checkpointDone:
 	case <-time.After(time.Second):

@@ -308,7 +308,7 @@ func (tx *Tx) countNodeChanges(before, after *store.NodeRecord) uint64 {
 		count++
 	}
 	count += tx.countLabelChanges(before, after)
-	count += tx.countPropertyChanges(beforeProperties(before), after.Properties)
+	count += tx.countPropertyChanges(beforeProperties(before), after.Properties, tx.trackedPropertyKeys("node", after.ID))
 	return count
 }
 
@@ -320,7 +320,7 @@ func (tx *Tx) countEdgeChanges(before, after *store.EdgeRecord) uint64 {
 	if before == nil {
 		count++
 	}
-	count += tx.countPropertyChanges(beforePropertiesEdge(before), after.Properties)
+	count += tx.countPropertyChanges(beforePropertiesEdge(before), after.Properties, tx.trackedPropertyKeys("edge", after.ID))
 	return count
 }
 
@@ -349,8 +349,28 @@ func (tx *Tx) countLabelChanges(before, after *store.NodeRecord) uint64 {
 	return count
 }
 
-func (tx *Tx) countPropertyChanges(before, after map[string]any) uint64 {
+func (tx *Tx) trackedPropertyKeys(entity string, id uint64) []string {
+	if tx.changes == nil {
+		return nil
+	}
+	if entity == "node" {
+		return tx.changes.nodePropertyKeys[id]
+	}
+	return tx.changes.edgePropertyKeys[id]
+}
+
+func (tx *Tx) countPropertyChanges(before, after map[string]any, keys []string) uint64 {
 	var count uint64
+	if keys != nil {
+		for _, key := range keys {
+			oldValue, oldOK := before[key]
+			newValue, newOK := after[key]
+			if oldOK != newOK || oldOK && !reflect.DeepEqual(oldValue, newValue) {
+				count++
+			}
+		}
+		return count
+	}
 	for key := range before {
 		oldValue, oldOK := before[key]
 		newValue, newOK := after[key]
@@ -484,17 +504,24 @@ func (tx *Tx) appendLabelChanges(nodeID uint64, before, after *store.NodeRecord)
 }
 
 func (tx *Tx) appendPropertyChanges(entity string, id uint64, before, after map[string]any) {
-	keys := map[string]struct{}{}
-	for key := range before {
-		keys[key] = struct{}{}
+	keys := tx.trackedPropertyKeys(entity, id)
+	if keys == nil {
+		keys = make([]string, 0, len(before)+len(after))
+		for key := range before {
+			keys = append(keys, key)
+		}
+		for key := range after {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		keys = slices.Compact(keys)
+	} else {
+		slices.Sort(keys)
 	}
-	for key := range after {
-		keys[key] = struct{}{}
-	}
-	for _, key := range sortedStringSet(keys) {
+	for _, key := range keys {
 		oldValue, oldOK := before[key]
 		newValue, newOK := after[key]
-		if oldOK && newOK && reflect.DeepEqual(oldValue, newValue) {
+		if oldOK == newOK && (!oldOK || reflect.DeepEqual(oldValue, newValue)) {
 			continue
 		}
 		payload := map[string]any{"key": key}
