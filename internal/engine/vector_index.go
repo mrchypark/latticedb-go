@@ -123,6 +123,17 @@ func refreshVectorLiveCount(graph *store.GraphState) {
 		}
 	}
 	graph.VectorLiveCount = live
+	for _, namespace := range sortedVectorNamespaces(graph.VectorNamespaces) {
+		view := vectorNamespaceFacade(graph, namespace)
+		var live uint64
+		for _, node := range graph.Nodes.All() {
+			if _, ok := selectedVector(view, node); ok {
+				live++
+			}
+		}
+		view.VectorLiveCount = live
+		writeVectorNamespaceFacade(graph, namespace, view)
+	}
 }
 
 func rebuildVectorIndexContext(ctx context.Context, graph *store.GraphState) error {
@@ -131,6 +142,21 @@ func rebuildVectorIndexContext(ctx context.Context, graph *store.GraphState) err
 
 func rebuildVectorIndexBudget(ctx context.Context, graph *store.GraphState, maxWork, maxBytes uint64) error {
 	return rebuildVectorIndexWithBudget(ctx, graph, &directSearchBudget{ctx: ctx, maxWork: maxWork, maxBytes: maxBytes, annVisitedLimit: ^uint64(0)})
+}
+
+func rebuildAllVectorIndexesBudget(ctx context.Context, graph *store.GraphState, maxWork, maxBytes uint64) error {
+	budget := &directSearchBudget{ctx: ctx, maxWork: maxWork, maxBytes: maxBytes, annVisitedLimit: ^uint64(0)}
+	if err := rebuildVectorIndexWithBudget(ctx, graph, budget); err != nil {
+		return err
+	}
+	for _, namespace := range sortedVectorNamespaces(graph.VectorNamespaces) {
+		view := vectorNamespaceFacade(graph, namespace)
+		if err := rebuildVectorIndexWithBudget(ctx, view, budget); err != nil {
+			return err
+		}
+		writeVectorNamespaceFacade(graph, namespace, view)
+	}
+	return nil
 }
 
 func rebuildVectorIndexWithBudget(ctx context.Context, graph *store.GraphState, budget *directSearchBudget) error {
@@ -144,7 +170,7 @@ func rebuildVectorIndexWithBudget(ctx context.Context, graph *store.GraphState, 
 		}
 	}
 	estimatedBytes := estimateVectorBuildLogicalBytes(graph, live)
-	if estimatedBytes > budget.maxBytes {
+	if budget.bytes > budget.maxBytes || estimatedBytes > budget.maxBytes-budget.bytes {
 		return fmt.Errorf("%w: vector index build requires approximately %d bytes, limit is %d", ErrResourceLimit, estimatedBytes, budget.maxBytes)
 	}
 	target := store.CloneGraphStateShallow(graph)
@@ -157,8 +183,8 @@ func rebuildVectorIndexWithBudget(ctx context.Context, graph *store.GraphState, 
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
-	budget.bytes = estimatedBytes
-	if budget.bytes < vectorBuildScratchBytes || budget.maxBytes-budget.bytes+vectorBuildScratchBytes < 80 {
+	budget.bytes += estimatedBytes
+	if budget.bytes > budget.maxBytes || budget.maxBytes-budget.bytes+vectorBuildScratchBytes < 80 {
 		return fmt.Errorf("%w: vector index build scratch exceeds budget", ErrResourceLimit)
 	}
 	budget.annVisitedLimit = (budget.maxBytes - (budget.bytes - vectorBuildScratchBytes)) / 80
@@ -539,10 +565,9 @@ func vectorForSearchCandidate(graph *store.GraphState, id uint64) ([]float32, bo
 	}
 	node := graph.Nodes.Get(id)
 	if node != nil {
-		vector, ok := search.FirstVectorProperty(node.Properties)
+		vector, ok := selectedVector(graph, node)
 		if ok {
-			valid := graph.VectorDimensions == 0 || len(vector) == int(graph.VectorDimensions)
-			return vector, valid, valid
+			return vector, true, true
 		}
 	}
 	return nil, false, false
@@ -551,6 +576,9 @@ func vectorForSearchCandidate(graph *store.GraphState, id uint64) ([]float32, bo
 func selectedVector(graph *store.GraphState, node *store.NodeRecord) ([]float32, bool) {
 	if graph == nil || node == nil {
 		return nil, false
+	}
+	if graph.VectorNamespace != nil {
+		return selectedNamespaceVector(graph, node)
 	}
 	vector, ok := search.FirstVectorProperty(node.Properties)
 	return vector, ok && (graph.VectorDimensions == 0 || len(vector) == int(graph.VectorDimensions))
@@ -662,11 +690,59 @@ func (tx *Tx) applyVectorIndexChanges() error {
 			tombstoneVectorIndex(tx.graph, id, vector)
 		}
 	}
+	if err := tx.applyVectorNamespaceIndexChanges(); err != nil {
+		return err
+	}
 	threshold := vectorRebuildThreshold(tx.graph)
 	tombstoneBytes := saturatingMul(uint64(tx.graph.VectorTombstones.Len()), uint64(tx.graph.VectorDimensions)*4)
 	debt := uint64(tx.graph.VectorTombstones.Len()) + tx.graph.VectorMutations
 	if changed && (debt > uint64(threshold) || tombstoneBytes > 64<<20) {
 		return ErrVectorIndexMaintenanceRequired
+	}
+	return nil
+}
+
+func (tx *Tx) applyVectorNamespaceIndexChanges() error {
+	if len(tx.graph.VectorNamespaces) == 0 {
+		return nil
+	}
+	for _, namespace := range sortedVectorNamespaces(tx.graph.VectorNamespaces) {
+		baseView := vectorNamespaceFacade(tx.base, namespace)
+		afterView := vectorNamespaceFacade(tx.graph, namespace)
+		changed := false
+		for _, id := range mapKeys(tx.changes.upsertNodes) {
+			beforeVector, beforeOK := selectedVector(baseView, tx.base.Nodes.Get(id))
+			afterVector, afterOK := selectedVector(afterView, tx.graph.Nodes.Get(id))
+			if beforeOK == afterOK && slices.Equal(beforeVector, afterVector) {
+				continue
+			}
+			changed = true
+			if afterOK {
+				if err := insertVectorIndex(afterView, id); err != nil {
+					return err
+				}
+				if beforeOK {
+					afterView.VectorMutations++
+				}
+			} else if beforeOK {
+				tombstoneVectorIndex(afterView, id, beforeVector)
+			}
+		}
+		for _, id := range mapKeys(tx.changes.deleteNodes) {
+			if vector, ok := selectedVector(baseView, tx.base.Nodes.Get(id)); ok {
+				changed = true
+				tombstoneVectorIndex(afterView, id, vector)
+			}
+		}
+		if changed {
+			threshold := vectorRebuildThreshold(afterView)
+			tombstoneBytes := saturatingMul(uint64(afterView.VectorTombstones.Len()), uint64(afterView.VectorDimensions)*4)
+			debt := uint64(afterView.VectorTombstones.Len()) + afterView.VectorMutations
+			if debt > uint64(threshold) || tombstoneBytes > 64<<20 {
+				return ErrVectorIndexMaintenanceRequired
+			}
+			writeVectorNamespaceFacade(tx.graph, namespace, afterView)
+		}
 	}
 	return nil
 }
@@ -690,6 +766,29 @@ func (tx *Tx) applyVectorLiveCountChanges() {
 				tx.graph.VectorLiveCount--
 			}
 		}
+	}
+	if len(tx.graph.VectorNamespaces) == 0 {
+		return
+	}
+	for _, namespace := range sortedVectorNamespaces(tx.graph.VectorNamespaces) {
+		baseView := vectorNamespaceFacade(tx.base, namespace)
+		view := vectorNamespaceFacade(tx.graph, namespace)
+		for _, id := range mapKeys(tx.changes.upsertNodes) {
+			_, beforeOK := selectedVector(baseView, tx.base.Nodes.Get(id))
+			_, afterOK := selectedVector(view, tx.graph.Nodes.Get(id))
+			if !beforeOK && afterOK {
+				view.VectorLiveCount++
+			}
+			if beforeOK && !afterOK && view.VectorLiveCount > 0 {
+				view.VectorLiveCount--
+			}
+		}
+		for _, id := range mapKeys(tx.changes.deleteNodes) {
+			if _, ok := selectedVector(baseView, tx.base.Nodes.Get(id)); ok && view.VectorLiveCount > 0 {
+				view.VectorLiveCount--
+			}
+		}
+		writeVectorNamespaceFacade(tx.graph, namespace, view)
 	}
 }
 

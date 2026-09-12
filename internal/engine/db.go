@@ -82,6 +82,7 @@ type OpenOptions struct {
 	EnableVector                      bool
 	VectorIndexMode                   VectorIndexMode
 	VectorDimensions                  uint16
+	VectorNamespaces                  []VectorNamespace
 	Durability                        DurabilityMode
 	WALCheckpointThresholdBytes       uint64
 	ChangefeedMaxBytes                uint64
@@ -156,17 +157,19 @@ type QueryResult struct {
 }
 
 type QueryOptions struct {
-	MaxRows  uint64
-	MaxWork  uint64
-	MaxBytes uint64
+	MaxRows         uint64
+	MaxWork         uint64
+	MaxBytes        uint64
+	VectorNamespace *VectorNamespace
 }
 
 type VectorSearchOptions struct {
-	K        uint32
-	EfSearch uint16
-	Exact    bool
-	MaxWork  uint64
-	MaxBytes uint64
+	K         uint32
+	EfSearch  uint16
+	Exact     bool
+	MaxWork   uint64
+	MaxBytes  uint64
+	Namespace *VectorNamespace
 }
 
 type FTSSearchOptions struct {
@@ -362,8 +365,10 @@ type vectorRebuildDelta struct {
 
 type vectorRebuildState struct {
 	graph             *store.GraphState
+	namespace         *VectorNamespace
 	dimensions        uint16
 	maxWork, maxBytes uint64
+	retainedBytes     uint64
 	buildBytes        uint64
 	deltas            []vectorRebuildDelta
 	logWork, logBytes uint64
@@ -585,14 +590,26 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 			graph.VectorDimensions = 128
 		}
 	}
-	if opts.EnableVector || graph.VectorDimensions != 0 {
+	effectiveEnableVector := opts.EnableVector || graph.VectorDimensions != 0
+	if len(opts.VectorNamespaces) != 0 && !effectiveEnableVector {
+		_ = lock.close()
+		return nil, fmt.Errorf("%w: vector namespaces require vector support", ErrUnsupportedOption)
+	}
+	namespaces, err := normalizeVectorNamespaces(opts.VectorNamespaces, graph.VectorDimensions)
+	if err != nil {
+		_ = lock.close()
+		return nil, err
+	}
+	graph.VectorNamespaces = emptyVectorNamespaceStates(namespaces)
+	graph.VectorNamespace = nil
+	if effectiveEnableVector {
 		if err := validateGraphVectorsContext(ctx, graph); err != nil {
 			_ = lock.close()
 			return nil, err
 		}
 		refreshVectorLiveCount(graph)
 		if opts.VectorIndexMode == VectorIndexHNSWSynchronous {
-			if err := rebuildVectorIndexBudget(ctx, graph, opts.VectorIndexBuildMaxWork, opts.VectorIndexBuildMaxLogicalBytes); err != nil {
+			if err := rebuildAllVectorIndexesBudget(ctx, graph, opts.VectorIndexBuildMaxWork, opts.VectorIndexBuildMaxLogicalBytes); err != nil {
 				_ = lock.close()
 				return nil, err
 			}
@@ -649,7 +666,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		reservedEdgeID:                    reservedEdgeID,
 		commitID:                          commitID,
 		readOnly:                          opts.ReadOnly,
-		enableVector:                      opts.EnableVector || graph.VectorDimensions != 0,
+		enableVector:                      effectiveEnableVector,
 		disableVectorIndex:                opts.VectorIndexMode == VectorIndexExactOnly,
 		vectorDimensions:                  graph.VectorDimensions,
 		queryCache:                        map[string]*queryPlan{},
@@ -1940,18 +1957,26 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 	var results []VectorSearchResult
 
 	err = db.View(func(tx *Tx) error {
+		graph := tx.graph
+		resolvedNamespace, err := resolveVectorNamespace(graph, opts.Namespace)
+		if err != nil {
+			return err
+		}
+		if resolvedNamespace != nil {
+			graph = vectorNamespaceFacade(graph, *resolvedNamespace)
+		}
 		capacity := limit
-		if !opts.Exact && !db.disableVectorIndex && tx.graph.VectorIndex.Nodes.Len() > 0 {
-			capacity = min(limit, tx.graph.VectorLiveCount)
-		} else if nodeCount := uint64(tx.graph.Nodes.Len()); capacity > nodeCount {
+		if !opts.Exact && !db.disableVectorIndex && graph.VectorIndex.Nodes.Len() > 0 {
+			capacity = min(limit, graph.VectorLiveCount)
+		} else if nodeCount := uint64(graph.Nodes.Len()); capacity > nodeCount {
 			capacity = nodeCount
 		}
 		results = make([]VectorSearchResult, 0, int(capacity))
-		if !opts.Exact && !db.disableVectorIndex && tx.graph.VectorIndex.Nodes.Len() > 0 {
-			entry := tx.graph.VectorIndex.EntryID
-			for level := tx.graph.VectorIndex.MaxLevel; level > 0; level-- {
+		if !opts.Exact && !db.disableVectorIndex && graph.VectorIndex.Nodes.Len() > 0 {
+			entry := graph.VectorIndex.EntryID
+			for level := graph.VectorIndex.MaxLevel; level > 0; level-- {
 				var err error
-				entry, err = vectorGreedyBudget(tx.graph, queryVector, entry, level, budget)
+				entry, err = vectorGreedyBudget(graph, queryVector, entry, level, budget)
 				if err != nil {
 					return err
 				}
@@ -1961,7 +1986,7 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 				ef = vectorIndexSearchEF
 			}
 			ef = max(ef, int(capacity))
-			maxVisited := uint64(tx.graph.VectorIndex.Nodes.Len())
+			maxVisited := uint64(graph.VectorIndex.Nodes.Len())
 			if byWork := budget.maxWork/uint64(max(1, len(queryVector))) + 1; maxVisited > byWork {
 				maxVisited = byWork
 			}
@@ -1977,7 +2002,7 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 			}
 			annBytesBefore := budget.bytes
 			scratch := acquireVectorSearchScratch(int(maxVisited), int(maxVisited), ef*2)
-			candidates, searchErr := vectorSearchLayerBudget(tx.graph, queryVector, entry, 0, ef, 0, scratch, budget)
+			candidates, searchErr := vectorSearchLayerBudget(graph, queryVector, entry, 0, ef, 0, scratch, budget)
 			if searchErr != nil {
 				releaseVectorSearchScratch(scratch)
 				return searchErr
@@ -1995,8 +2020,8 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 			db.vectorExactFallbacks.Add(1)
 			results = results[:0]
 		}
-		for _, node := range tx.graph.Nodes.All() {
-			vectorValue, ok := search.FirstVectorProperty(node.Properties)
+		for _, node := range graph.Nodes.All() {
+			vectorValue, ok := selectedVector(graph, node)
 			if !ok {
 				if err := budget.add(1); err != nil {
 					return err
@@ -2898,96 +2923,142 @@ func (db *DB) VectorIndexStats() (VectorIndexStats, error) {
 	if db.closed {
 		return VectorIndexStats{}, ErrDatabaseClosed
 	}
-	live := db.graph.VectorLiveCount
-	threshold := uint64(vectorRebuildThreshold(db.graph))
-	debt := uint64(db.graph.VectorTombstones.Len()) + db.graph.VectorMutations
-	remaining := uint64(0)
-	triggerDebt := saturatingAdd(threshold, 1)
-	if debt < triggerDebt {
-		remaining = triggerDebt - debt
+	return vectorIndexStats(db.graph, db.vectorExactFallbacks.Load(), db.vectorRebuilds.Load(), db.vectorRebuildNanos.Load()), nil
+}
+
+func (db *DB) VectorIndexNamespaceStats(namespace VectorNamespace) (VectorIndexStats, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return VectorIndexStats{}, ErrDatabaseClosed
 	}
-	tombstoneBytes := saturatingMul(uint64(db.graph.VectorTombstones.Len()), uint64(db.graph.VectorDimensions)*4)
+	resolved, err := resolveVectorNamespace(db.graph, &namespace)
+	if err != nil {
+		return VectorIndexStats{}, err
+	}
+	return vectorIndexStats(vectorNamespaceFacade(db.graph, *resolved), db.vectorExactFallbacks.Load(), db.vectorRebuilds.Load(), db.vectorRebuildNanos.Load()), nil
+}
+
+func vectorIndexStats(graph *store.GraphState, fallbacks, rebuilds, nanos uint64) VectorIndexStats {
+	live := graph.VectorLiveCount
+	threshold := uint64(vectorRebuildThreshold(graph))
+	debt := uint64(graph.VectorTombstones.Len()) + graph.VectorMutations
+	remaining := uint64(0)
+	if debt < saturatingAdd(threshold, 1) {
+		remaining = saturatingAdd(threshold, 1) - debt
+	}
+	tombstoneBytes := saturatingMul(uint64(graph.VectorTombstones.Len()), uint64(graph.VectorDimensions)*4)
 	tombstoneRemaining := uint64(0)
 	if tombstoneBytes <= 64<<20 {
 		tombstoneRemaining = (64 << 20) + 1 - tombstoneBytes
 	}
-	return VectorIndexStats{
-		LiveEntries:                live,
-		IndexEntries:               uint64(db.graph.VectorIndex.Nodes.Len()),
-		Tombstones:                 uint64(db.graph.VectorTombstones.Len()),
-		TombstoneBytes:             tombstoneBytes,
-		TombstoneBytesUntilRebuild: tombstoneRemaining,
-		MutationDebt:               db.graph.VectorMutations,
-		RebuildThreshold:           threshold,
-		DebtUntilRebuild:           remaining,
-		EstimatedBuildLogicalBytes: estimateVectorBuildLogicalBytes(db.graph, live),
-		ExactFallbacks:             db.vectorExactFallbacks.Load(),
-		Rebuilds:                   db.vectorRebuilds.Load(),
-		RebuildNanoseconds:         db.vectorRebuildNanos.Load(),
-	}, nil
+	return VectorIndexStats{LiveEntries: live, IndexEntries: uint64(graph.VectorIndex.Nodes.Len()), Tombstones: uint64(graph.VectorTombstones.Len()), TombstoneBytes: tombstoneBytes, TombstoneBytesUntilRebuild: tombstoneRemaining, MutationDebt: graph.VectorMutations, RebuildThreshold: threshold, DebtUntilRebuild: remaining, EstimatedBuildLogicalBytes: estimateVectorBuildLogicalBytes(graph, live), ExactFallbacks: fallbacks, Rebuilds: rebuilds, RebuildNanoseconds: nanos}
 }
 
 func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
+	return db.rebuildVectorIndexTargetContext(ctx, nil)
+}
+
+func (db *DB) RebuildVectorIndexNamespaceContext(ctx context.Context, namespace VectorNamespace) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	db.mu.Lock()
-	if db.closed {
-		db.mu.Unlock()
-		return ErrDatabaseClosed
+	db.mu.RLock()
+	resolved, err := resolveVectorNamespace(db.graph, &namespace)
+	db.mu.RUnlock()
+	if err != nil {
+		return err
 	}
-	if !db.enableVector || db.disableVectorIndex {
-		db.mu.Unlock()
-		return fmt.Errorf("%w: synchronous HNSW mode is not enabled", ErrUnsupportedOption)
+	return db.rebuildVectorIndexTargetContext(ctx, resolved)
+}
+
+func (db *DB) rebuildVectorIndexTargetContext(ctx context.Context, namespace *VectorNamespace) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if state := db.vectorRebuild; state != nil {
-		done := state.done
-		db.mu.Unlock()
-		select {
-		case <-done:
-			return state.err
-		case <-ctx.Done():
-			return ctx.Err()
+	for {
+		db.mu.Lock()
+		if db.closed {
+			db.mu.Unlock()
+			return ErrDatabaseClosed
 		}
+		if !db.enableVector || db.disableVectorIndex {
+			db.mu.Unlock()
+			return fmt.Errorf("%w: synchronous HNSW mode is not enabled", ErrUnsupportedOption)
+		}
+		if active := db.vectorRebuild; active != nil {
+			done := active.done
+			same := sameVectorNamespace(active.namespace, namespace)
+			db.mu.Unlock()
+			select {
+			case <-done:
+				if same {
+					return active.err
+				}
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		buildCtx, cancel := context.WithCancel(ctx)
+		graph := store.CloneGraphStateShallow(db.graph)
+		buildBytes := retainedVectorIndexBytes(graph, namespace)
+		if namespace == nil {
+			buildBytes = saturatingAdd(buildBytes, estimateVectorBuildLogicalBytes(graph, graph.VectorLiveCount))
+		} else {
+			view := vectorNamespaceFacade(graph, *namespace)
+			buildBytes = saturatingAdd(buildBytes, estimateVectorBuildLogicalBytes(view, view.VectorLiveCount))
+		}
+		state := &vectorRebuildState{graph: graph, namespace: cloneVectorNamespace(namespace), dimensions: db.vectorDimensions, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes, retainedBytes: retainedVectorIndexBytes(graph, namespace), buildBytes: buildBytes, tombstoneBytes: map[uint64]uint64{}, done: make(chan struct{}), cancel: cancel}
+		db.vectorRebuild = state
+		hook := db.vectorRebuildBeforeBuild
+		db.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+		started := time.Now()
+		err := db.runVectorRebuild(buildCtx, state)
+		cancel()
+		db.mu.Lock()
+		if state.err != nil {
+			err = state.err
+		}
+		if db.closed && errors.Is(err, context.Canceled) {
+			err = ErrDatabaseClosed
+		}
+		if db.vectorRebuild == state {
+			db.vectorRebuild = nil
+		}
+		state.err = err
+		close(state.done)
+		db.mu.Unlock()
+		if err == nil {
+			db.vectorRebuilds.Add(1)
+			db.vectorRebuildNanos.Add(uint64(time.Since(started)))
+			db.requestBackgroundCheckpoint()
+		}
+		return err
 	}
-	// The initiating context owns the shared attempt; coalesced callers can stop waiting without canceling it.
-	buildCtx, cancel := context.WithCancel(ctx)
-	graph := store.CloneGraphStateShallow(db.graph)
-	state := &vectorRebuildState{graph: graph, dimensions: db.vectorDimensions, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes, buildBytes: estimateVectorBuildLogicalBytes(graph, graph.VectorLiveCount), tombstoneBytes: map[uint64]uint64{}, done: make(chan struct{}), cancel: cancel}
-	db.vectorRebuild = state
-	hook := db.vectorRebuildBeforeBuild
-	db.mu.Unlock()
-	if hook != nil {
-		hook()
-	}
-	started := time.Now()
-	err := db.runVectorRebuild(buildCtx, state)
-	cancel()
-	db.mu.Lock()
-	if state.err != nil {
-		err = state.err
-	}
-	if db.closed && errors.Is(err, context.Canceled) {
-		err = ErrDatabaseClosed
-	}
-	if db.vectorRebuild == state {
-		db.vectorRebuild = nil
-	}
-	state.err = err
-	close(state.done)
-	db.mu.Unlock()
-	if err == nil {
-		db.vectorRebuilds.Add(1)
-		db.vectorRebuildNanos.Add(uint64(time.Since(started)))
-		db.requestBackgroundCheckpoint()
-	}
-	return err
 }
 
 func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) error {
 	budget := &directSearchBudget{ctx: ctx, maxWork: state.maxWork, maxBytes: state.maxBytes, annVisitedLimit: ^uint64(0)}
-	if err := rebuildVectorIndexWithBudget(ctx, state.graph, budget); err != nil {
-		return err
+	budget.bytes = retainedVectorIndexBytes(state.graph, state.namespace)
+	if state.namespace == nil {
+		if err := rebuildVectorIndexWithBudget(ctx, state.graph, budget); err != nil {
+			return err
+		}
+	} else {
+		view := vectorNamespaceFacade(state.graph, *state.namespace)
+		if err := rebuildVectorIndexWithBudget(ctx, view, budget); err != nil {
+			return err
+		}
+		writeVectorNamespaceFacade(state.graph, *state.namespace, view)
+		state.graph.VectorNamespace = cloneVectorNamespace(state.namespace)
+		state.graph.VectorIndex = view.VectorIndex
+		state.graph.VectorTombstones = view.VectorTombstones
+		state.graph.VectorLiveCount = view.VectorLiveCount
+		state.graph.VectorMutations = view.VectorMutations
 	}
 	for {
 		db.mu.Lock()
@@ -3070,11 +3141,31 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 			db.writeMu.Unlock()
 			continue
 		}
+		currentRetained := retainedVectorIndexBytes(db.graph, state.namespace)
+		if currentRetained > state.retainedBytes {
+			if err := budget.reserveBytes(currentRetained - state.retainedBytes); err != nil {
+				db.mu.Unlock()
+				db.writeMu.Unlock()
+				return err
+			}
+		}
 		published := store.CloneGraphStateShallow(db.graph)
-		published.VectorIndex = state.graph.VectorIndex
-		published.VectorTombstones = state.graph.VectorTombstones
-		published.VectorLiveCount = state.graph.VectorLiveCount
-		published.VectorMutations = 0
+		if state.namespace == nil {
+			published.VectorIndex = state.graph.VectorIndex
+			published.VectorTombstones = state.graph.VectorTombstones
+			published.VectorLiveCount = state.graph.VectorLiveCount
+			published.VectorMutations = 0
+		} else {
+			stateValue := published.VectorNamespaces[*state.namespace]
+			stateValue.Index = state.graph.VectorIndex
+			stateValue.Tombstones = state.graph.VectorTombstones
+			stateValue.LiveCount = state.graph.VectorLiveCount
+			stateValue.Mutations = 0
+			if published.VectorNamespaces == nil {
+				published.VectorNamespaces = make(map[VectorNamespace]VectorNamespaceState)
+			}
+			published.VectorNamespaces[*state.namespace] = stateValue
+		}
 		db.graph = published
 		db.mu.Unlock()
 		db.writeMu.Unlock()
@@ -3137,9 +3228,14 @@ func (db *DB) appendVectorRebuildTxLocked(tx *Tx) {
 		state.deltas = append(state.deltas, delta)
 		return true
 	}
+	baseGraph, afterGraph := tx.base, tx.graph
+	if state.namespace != nil {
+		baseGraph = vectorNamespaceFacade(tx.base, *state.namespace)
+		afterGraph = vectorNamespaceFacade(tx.graph, *state.namespace)
+	}
 	for id := range tx.changes.upsertNodes {
-		before, beforeOK := selectedVector(tx.base, tx.base.Nodes.Get(id))
-		after, afterOK := selectedVector(tx.graph, tx.graph.Nodes.Get(id))
+		before, beforeOK := selectedVector(baseGraph, baseGraph.Nodes.Get(id))
+		after, afterOK := selectedVector(afterGraph, afterGraph.Nodes.Get(id))
 		if beforeOK == afterOK && slices.Equal(before, after) {
 			continue
 		}
@@ -3148,7 +3244,7 @@ func (db *DB) appendVectorRebuildTxLocked(tx *Tx) {
 		}
 	}
 	for id := range tx.changes.deleteNodes {
-		if before, ok := selectedVector(tx.base, tx.base.Nodes.Get(id)); ok && !appendDelta(id, before, nil) {
+		if before, ok := selectedVector(baseGraph, baseGraph.Nodes.Get(id)); ok && !appendDelta(id, before, nil) {
 			return
 		}
 	}

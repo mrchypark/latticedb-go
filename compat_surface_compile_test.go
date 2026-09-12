@@ -23,7 +23,11 @@ var _ = OpenOptions{
 	EnableVector:         true,
 	DisableLock:          false,
 	VectorDimensions:     128,
+	VectorNamespaces:     []VectorNamespace{{Property: "embedding", Dimensions: 128, Metric: VectorMetricL2}},
 }
+
+var _ = QueryOptions{VectorNamespace: &VectorNamespace{Property: "embedding", Dimensions: 128, Metric: VectorMetricL2}}
+var _ = VectorSearchOptions{Namespace: &VectorNamespace{Property: "embedding", Dimensions: 128, Metric: VectorMetricL2}}
 
 var (
 	_ ErrorCode       = ErrorOK
@@ -41,6 +45,7 @@ var compatUpstreamMethods = []any{
 	(*DB).CreateNodePropertyIndex, (*DB).CreateNodePropertyIndexContext, (*DB).DropNodePropertyIndex,
 	(*DB).CreateEdgePropertyIndex, (*DB).CreateEdgePropertyIndexContext, (*DB).DropEdgePropertyIndex,
 	(*DB).GetNodesByLabel, (*DB).VectorSearch, (*DB).FTSSearch,
+	(*DB).RebuildVectorIndexNamespaceContext, (*DB).VectorIndexNamespaceStats,
 	(*DB).FTSSearchFuzzy, (*DB).ReadStream, (*DB).ReadStreamContext, (*DB).GetStreamOffset, (*DB).Changes, (*DB).ChangesContext,
 	(*Tx).IsReadOnly, (*Tx).IsActive, (*Tx).Commit, (*Tx).Rollback,
 	(*Tx).CreateNode, (*Tx).DeleteNode, (*Tx).NodeExists, (*Tx).GetNode,

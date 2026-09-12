@@ -433,6 +433,10 @@ type GraphState struct {
 	EdgeProperties   PropertyIndexes
 	VectorIndex      VectorIndex
 	VectorTombstones PagedMap[[]float32]
+	VectorNamespaces map[VectorNamespace]VectorNamespaceState
+	// VectorNamespace is a transient selector supplied by the caller and is
+	// retained across shallow clones while the namespace map is copied.
+	VectorNamespace *VectorNamespace
 	// VectorLiveCount is derived from node properties and rebuilt on load/rebuild.
 	VectorLiveCount uint64
 	VectorMutations uint64
@@ -718,16 +722,10 @@ func CloneGraphState(graph *GraphState) *GraphState {
 			}
 		}
 	}
-	for id, node := range graph.VectorIndex.Nodes.All() {
-		copyNode := &VectorIndexNode{Level: node.Level, Neighbors: make([][]uint64, len(node.Neighbors)), Vector: slices.Clone(node.Vector)}
-		for level := range node.Neighbors {
-			copyNode.Neighbors[level] = slices.Clone(node.Neighbors[level])
-		}
-		cloned.VectorIndex.Nodes.Set(id, copyNode)
-	}
-	for id, vector := range graph.VectorTombstones.All() {
-		cloned.VectorTombstones.Set(id, slices.Clone(vector))
-	}
+	cloned.VectorIndex = cloneVectorIndexDeep(graph.VectorIndex)
+	cloned.VectorTombstones = cloneVectorTombstonesDeep(graph.VectorTombstones)
+	cloned.VectorNamespaces = cloneVectorNamespacesDeep(graph.VectorNamespaces)
+	cloned.VectorNamespace = graph.VectorNamespace
 	return cloned
 }
 
@@ -749,6 +747,8 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 		EdgeProperties:           graph.EdgeProperties.Fork(),
 		VectorIndex:              graph.VectorIndex.Fork(),
 		VectorTombstones:         graph.VectorTombstones.Fork(),
+		VectorNamespaces:         cloneVectorNamespacesShallow(graph.VectorNamespaces),
+		VectorNamespace:          graph.VectorNamespace,
 		VectorLiveCount:          graph.VectorLiveCount,
 		VectorMutations:          graph.VectorMutations,
 		DerivedIndexWork:         graph.DerivedIndexWork,
