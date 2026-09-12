@@ -611,7 +611,11 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 			return nil, err
 		}
 		refreshVectorLiveCount(graph)
-		if opts.VectorIndexMode == VectorIndexHNSWSynchronous {
+		if opts.VectorIndexMode == VectorIndexHNSWSynchronous && !loadVectorCache(ctx, files, graph, commitID, opts.VectorIndexBuildMaxWork, opts.VectorIndexBuildMaxLogicalBytes) {
+			if err := ctx.Err(); err != nil {
+				_ = lock.close()
+				return nil, err
+			}
 			if err := rebuildAllVectorIndexesBudget(ctx, graph, opts.VectorIndexBuildMaxWork, opts.VectorIndexBuildMaxLogicalBytes); err != nil {
 				_ = lock.close()
 				return nil, err
@@ -1240,6 +1244,9 @@ func (db *DB) closeWithWriterHeld() error {
 			reserve = true
 		}
 	}
+	if closeErr == nil && !db.recoveryRequired {
+		db.saveVectorCache(context.Background(), db.graph, db.commitID)
+	}
 	db.mu.Unlock()
 	if reserve {
 		if err := db.reserveIDsToDisk(reserveDatabaseID, reserveNodeID, reserveEdgeID); err != nil {
@@ -1478,6 +1485,7 @@ func (db *DB) CheckpointContext(ctx context.Context) error {
 	db.checkpointNeeded.Store(false)
 	db.checkpointCount++
 	db.mu.Unlock()
+	db.saveVectorCache(ctx, graph, commitID)
 	return nil
 }
 
@@ -1531,6 +1539,7 @@ func (db *DB) checkpointWithWriterHeld(ctx context.Context) error {
 	db.dirty = false
 	db.checkpointNeeded.Store(false)
 	db.checkpointCount++
+	db.saveVectorCache(context.Background(), graph, commitID)
 	return nil
 }
 
