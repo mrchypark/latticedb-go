@@ -214,6 +214,10 @@ type FTSSearchResult struct {
 }
 
 type DB struct {
+	batchMu                           sync.Mutex
+	batchPending                      []*batchRequest
+	batchRunning                      bool
+	batchTimer                        *time.Timer
 	mu                                sync.RWMutex
 	writeMu                           sync.Mutex
 	cacheMu                           sync.RWMutex

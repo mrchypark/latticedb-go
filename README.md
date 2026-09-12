@@ -109,6 +109,7 @@ See the [query semantics and full grammar](docs/engine_conformance.md#query-sema
 ### Opening and sizing
 
 - The database uses one active writer. `BeginWriteContext` waits for the writer slot until cancellation; `Begin(false)` and `Update` can return `ErrWriteTxActive` on contention.
+- Opt-in `Batch`/`BatchContext` groups concurrent callbacks into one durable transaction. Peer failure rolls back the group; see the [group commit contract](docs/group-commit.md).
 - `MaxDatabaseSnapshotBytes` defaults to 512 MiB of canonical snapshot data. Set it explicitly for larger databases; exceeding it rejects a commit with `ErrResourceLimit`. This is not an RSS limit or an on-disk paging cache.
 
 - Entity IDs (nodes, edges, and edge endpoints) are uint64 values in `1..MaxInt64`.
