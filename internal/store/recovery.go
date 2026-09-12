@@ -118,6 +118,8 @@ var stateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '4'}
 var legacyStateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '3'}
 
 type WALWriter struct {
+	encodeValue   walPayload
+	encodeBuffer  bytes.Buffer
 	file          *os.File
 	tailSize      atomic.Int64
 	fullSync      bool
@@ -161,11 +163,7 @@ func (writer *WALWriter) AppendSnapshot(graph *GraphState, nextNodeID uint64, ne
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(walPayload{Kind: "snapshot", Snapshot: &snapshot})
-	if err != nil {
-		return fmt.Errorf("encode WAL snapshot: %w", err)
-	}
-	return writer.append(snapshot.DatabaseID, snapshot.CommitID, payload)
+	return writer.appendJSON(snapshot.DatabaseID, snapshot.CommitID, walPayload{Kind: "snapshot", Snapshot: &snapshot})
 }
 
 func (writer *WALWriter) AppendDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, changes GraphDelta) error {
@@ -173,11 +171,29 @@ func (writer *WALWriter) AppendDelta(graph *GraphState, nextNodeID uint64, nextE
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(walPayload{Kind: "delta", Delta: &delta})
-	if err != nil {
-		return fmt.Errorf("encode WAL delta: %w", err)
+	return writer.appendJSON(delta.DatabaseID, delta.CommitID, walPayload{Kind: "delta", Delta: &delta})
+}
+
+// The engine serializes WAL writes. Reuse small payload storage without
+// retaining an unusually large transaction or snapshot for the writer lifetime.
+func (writer *WALWriter) appendJSON(databaseID string, commitID uint64, value walPayload) error {
+	if writer == nil || writer.file == nil {
+		return errors.New("WAL writer is closed")
 	}
-	return writer.append(delta.DatabaseID, delta.CommitID, payload)
+	writer.encodeBuffer.Reset()
+	writer.encodeValue = value
+	defer func() {
+		writer.encodeValue = walPayload{}
+		if writer.encodeBuffer.Cap() > 64<<10 {
+			writer.encodeBuffer = bytes.Buffer{}
+		}
+	}()
+	if err := json.NewEncoder(&writer.encodeBuffer).Encode(&writer.encodeValue); err != nil {
+		return fmt.Errorf("encode WAL %s: %w", value.Kind, err)
+	}
+	// Encoder adds a newline; preserve the existing Marshal payload bytes.
+	payload := writer.encodeBuffer.Bytes()
+	return writer.append(databaseID, commitID, payload[:len(payload)-1])
 }
 
 func (writer *WALWriter) append(databaseID string, commitID uint64, payload []byte) error {
