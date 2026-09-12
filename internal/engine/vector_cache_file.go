@@ -25,6 +25,11 @@ func openVectorCacheFile(files store.DatabaseFiles, maxBytes uint64) (*os.File, 
 	if uint64(info.Size()) > maxBytes {
 		return nil, fmt.Errorf("vector cache sidecar exceeds size limit: %d > %d", info.Size(), maxBytes)
 	}
+	// Windows may resolve a path-based FileInfo's identity lazily. Freeze it
+	// before opening, rather than resolving both paths after a replacement.
+	if !os.SameFile(info, info) {
+		return nil, errors.New("cannot capture vector cache file identity")
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -67,6 +72,12 @@ func publishVectorCacheFile(ctx context.Context, files store.DatabaseFiles, maxB
 		if err != nil {
 			return err
 		}
+		// Descriptor Stat captures identity now, including on Windows.
+		destInfo, err = previous.Stat()
+		if err != nil {
+			previous.Close()
+			return err
+		}
 		var prefix [7]byte
 		_, readErr := io.ReadFull(previous, prefix[:])
 		closeErr := previous.Close()
@@ -89,7 +100,7 @@ func publishVectorCacheFile(ctx context.Context, files store.DatabaseFiles, maxB
 	defer os.Remove(tmpPath)
 	defer tmp.Close()
 
-	tmpInfo, err := os.Lstat(tmpPath)
+	tmpInfo, err := tmp.Stat()
 	if err != nil {
 		return fmt.Errorf("stat vector cache temp: %w", err)
 	}
