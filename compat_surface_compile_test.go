@@ -1,16 +1,20 @@
 package latticedb
 
+import "context"
+
 // Keep the public names and method signatures used by the upstream Go
 // binding compile-checked without importing its cgo implementation.
 var (
-	_ func(*DB) (*Tx, error)                                         = (*DB).BeginRead
-	_ func(*DB) (*Tx, error)                                         = (*DB).BeginWrite
-	_ func(*DB, string) ([]NodeID, error)                            = (*DB).GetNodesByLabel
-	_ func(*DB, string, FTSSearchOptions) ([]FTSSearchResult, error) = (*DB).FTSSearchFuzzy
-	_ func(*Tx) bool                                                 = (*Tx).IsReadOnly
-	_ func(*Tx) bool                                                 = (*Tx).IsActive
-	_ func(*Tx, NodeID, NodeID, string) error                        = (*Tx).DeleteEdge
-	_ func(*Tx, string, map[string]Value) (QueryResult, error)       = (*Tx).Query
+	_ func(*DB) (*Tx, error)                                                                  = (*DB).BeginRead
+	_ func(*DB) (*Tx, error)                                                                  = (*DB).BeginWrite
+	_ func(*DB, string) ([]NodeID, error)                                                     = (*DB).GetNodesByLabel
+	_ func(*DB, string, FTSSearchOptions) ([]FTSSearchResult, error)                          = (*DB).FTSSearchFuzzy
+	_ func(*Tx) bool                                                                          = (*Tx).IsReadOnly
+	_ func(*Tx) bool                                                                          = (*Tx).IsActive
+	_ func(*Tx, NodeID, NodeID, string) error                                                 = (*Tx).DeleteEdge
+	_ func(*Tx, string, map[string]Value) (QueryResult, error)                                = (*Tx).Query
+	_ func(*DB, context.Context, string, map[string]Value, QueryOptions) (QueryResult, error) = (*DB).QueryContext
+	_ func(*Tx, context.Context, string, map[string]Value, QueryOptions) (QueryResult, error) = (*Tx).QueryContext
 )
 
 var _ = OpenOptions{
@@ -24,9 +28,14 @@ var _ = OpenOptions{
 	DisableLock:          false,
 	VectorDimensions:     128,
 	VectorNamespaces:     []VectorNamespace{{Property: "embedding", Dimensions: 128, Metric: VectorMetricL2}},
+	FTSProperties:        []string{"body"},
 }
 
-var _ = QueryOptions{VectorNamespace: &VectorNamespace{Property: "embedding", Dimensions: 128, Metric: VectorMetricL2}}
+var _ = QueryOptions{
+	VectorNamespace:   &VectorNamespace{Property: "embedding", Dimensions: 128, Metric: VectorMetricL2},
+	ApproximateVector: true,
+	VectorEfSearch:    64,
+}
 var _ = VectorSearchOptions{Namespace: &VectorNamespace{Property: "embedding", Dimensions: 128, Metric: VectorMetricL2}}
 
 var (

@@ -429,6 +429,7 @@ type GraphState struct {
 	Labels           StringPostings
 	EdgeTypes        StringPostings
 	FTSTokens        StringPostings
+	FTSProperties    map[string]StringPostings
 	NodeProperties   PropertyIndexes
 	EdgeProperties   PropertyIndexes
 	VectorIndex      VectorIndex
@@ -722,6 +723,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 			}
 		}
 	}
+	cloned.FTSProperties = cloneFTSPropertiesDeep(graph.FTSProperties)
 	cloned.VectorIndex = cloneVectorIndexDeep(graph.VectorIndex)
 	cloned.VectorTombstones = cloneVectorTombstonesDeep(graph.VectorTombstones)
 	cloned.VectorNamespaces = cloneVectorNamespacesDeep(graph.VectorNamespaces)
@@ -743,6 +745,7 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 		Labels:                   graph.Labels.Fork(),
 		EdgeTypes:                graph.EdgeTypes.Fork(),
 		FTSTokens:                graph.FTSTokens.Fork(),
+		FTSProperties:            cloneFTSPropertiesShallow(graph.FTSProperties),
 		NodeProperties:           graph.NodeProperties.Fork(),
 		EdgeProperties:           graph.EdgeProperties.Fork(),
 		VectorIndex:              graph.VectorIndex.Fork(),

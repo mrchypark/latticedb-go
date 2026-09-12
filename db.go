@@ -94,6 +94,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		VectorIndexMode:                   engine.VectorIndexMode(opts.VectorIndexMode),
 		VectorDimensions:                  opts.VectorDimensions,
 		VectorNamespaces:                  slices.Clone(opts.VectorNamespaces),
+		FTSProperties:                     slices.Clone(opts.FTSProperties),
 		Durability:                        engine.DurabilityMode(opts.Durability),
 		WALCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
 		ChangefeedMaxBytes:                opts.ChangefeedMaxBytes,
@@ -127,6 +128,7 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 		VectorIndexMode:                   engine.VectorIndexMode(opts.VectorIndexMode),
 		VectorDimensions:                  opts.VectorDimensions,
 		VectorNamespaces:                  slices.Clone(opts.VectorNamespaces),
+		FTSProperties:                     slices.Clone(opts.FTSProperties),
 		Durability:                        engine.DurabilityMode(opts.Durability),
 		WALCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
 		ChangefeedMaxBytes:                opts.ChangefeedMaxBytes,
@@ -390,7 +392,14 @@ func (db *DB) QueryContext(ctx context.Context, query string, params map[string]
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}
-	result, err := inner.QueryContext(ctx, query, params, engine.QueryOptions{MaxRows: opts.MaxRows, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes, VectorNamespace: opts.VectorNamespace})
+	result, err := inner.QueryContext(ctx, query, params, engine.QueryOptions{
+		MaxRows:           opts.MaxRows,
+		MaxWork:           opts.MaxWork,
+		MaxBytes:          opts.MaxBytes,
+		VectorNamespace:   opts.VectorNamespace,
+		ApproximateVector: opts.ApproximateVector,
+		VectorEfSearch:    opts.VectorEfSearch,
+	})
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}

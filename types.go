@@ -62,13 +62,16 @@ type OpenOptions struct {
 	// DisableWAL requests an unsupported mode because WAL is always enabled. Leave false (the default).
 	DisableWAL bool
 	// EnableAdjacencyCache is reserved for compatibility; true is unsupported. Leave false (the default).
-	EnableAdjacencyCache        bool
-	EnableVectors               bool
-	EnableVector                bool
-	DisableLock                 bool
-	VectorIndexMode             VectorIndexMode
-	VectorDimensions            uint16
-	VectorNamespaces            []VectorNamespace
+	EnableAdjacencyCache bool
+	EnableVectors        bool
+	EnableVector         bool
+	DisableLock          bool
+	VectorIndexMode      VectorIndexMode
+	VectorDimensions     uint16
+	VectorNamespaces     []VectorNamespace
+	// FTSProperties configures complete top-level node-string property postings
+	// for this open. It is separate from manual FTS indexing.
+	FTSProperties               []string
 	Durability                  DurabilityMode
 	WALCheckpointThresholdBytes uint64
 	// ChangefeedMaxBytes bounds retained automatic change records. Zero uses the
@@ -144,6 +147,11 @@ type QueryOptions struct {
 	// VectorNamespace selects the namespace for every vector comparison in the
 	// query. Nil preserves the legacy global vector behavior.
 	VectorNamespace *VectorNamespace
+	// ApproximateVector opts into the narrow ANN query candidate path. False
+	// preserves exact vector query behavior.
+	ApproximateVector bool
+	// VectorEfSearch controls ANN search breadth when ApproximateVector is true.
+	VectorEfSearch uint16
 }
 
 type VectorSearchOptions struct {
