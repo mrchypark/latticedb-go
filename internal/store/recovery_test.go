@@ -794,31 +794,25 @@ func TestAppMetadataWALDeltaIsIncremental(t *testing.T) {
 
 func TestLegacyStateAndWALHeadersRemainReadable(t *testing.T) {
 	graph := NewGraphState()
-	serialized, err := SerializeGraphState(graph, 1, 1, 0)
+	for _, version := range []uint16{legacyStateVersion, jsonStateVersion} {
+		serialized := jsonStateTestBytes(t, graph, 1, 1, 0, version)
+		if _, _, _, _, err := DeserializeGraphState(serialized, maxStateFileBytes, ^uint64(0), ^uint64(0)); err != nil {
+			t.Fatalf("state v%d: %v", version, err)
+		}
+	}
+	snapshot, err := buildPersistedState(graph, 1, 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	copy(serialized[:8], legacyStateBinaryMagic[:])
-	binary.BigEndian.PutUint16(serialized[8:10], legacyStateVersion)
-	if _, _, _, _, err := DeserializeGraphState(serialized, maxStateFileBytes, ^uint64(0), ^uint64(0)); err != nil {
-		t.Fatalf("legacy state header: %v", err)
-	}
-
-	path := t.TempDir()
-	if err := AppendWALCommit(path, graph, 1, 1, 0); err != nil {
-		t.Fatal(err)
-	}
-	wal, err := os.ReadFile(walFilePath(path))
-	if err != nil {
-		t.Fatal(err)
-	}
-	copy(wal[:8], legacyWALMagic[:])
-	binary.BigEndian.PutUint16(wal[8:10], legacyWALVersion)
-	if err := os.WriteFile(walFilePath(path), wal, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, _, err := LoadGraphState(path); err != nil {
-		t.Fatalf("legacy WAL header: %v", err)
+	for _, version := range []uint16{legacyWALVersion, jsonWALVersion} {
+		path := t.TempDir()
+		wal := jsonWALTestRecord(t, graph.DatabaseID, 0, walPayload{Kind: "snapshot", Snapshot: &snapshot}, version)
+		if err := os.WriteFile(walFilePath(path), wal, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, _, err := LoadGraphState(path); err != nil {
+			t.Fatalf("WAL v%d: %v", version, err)
+		}
 	}
 }
 
@@ -1140,16 +1134,7 @@ func TestPersistedFTSRejectsInvalidUTF8(t *testing.T) {
 }
 
 func persistedWALTestRecord(t *testing.T, databaseID string, commitID uint64, payload walPayload) []byte {
-	t.Helper()
-	data, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	header, err := encodeWALHeader(databaseID, commitID, data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return append(header[:], data...)
+	return jsonWALTestRecord(t, databaseID, commitID, payload, jsonWALVersion)
 }
 
 func TestWALDeltaRejectsInvalidPersistedSemantics(t *testing.T) {

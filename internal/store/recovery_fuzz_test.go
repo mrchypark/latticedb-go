@@ -61,7 +61,7 @@ func FuzzLoadLatestWALFrames(f *testing.F) {
 	if err != nil {
 		f.Fatal(err)
 	}
-	payload, err := json.Marshal(walPayload{Kind: "snapshot", Snapshot: &snapshot})
+	payload, err := encodeBinaryWALPayload(walPayload{Kind: "snapshot", Snapshot: &snapshot})
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -70,7 +70,14 @@ func FuzzLoadLatestWALFrames(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(record)
-	legacyRecord := append([]byte(nil), record...)
+	legacyPayload, err := json.Marshal(walPayload{Kind: "snapshot", Snapshot: &snapshot})
+	if err != nil {
+		f.Fatal(err)
+	}
+	legacyRecord, err := encodeWALRecord(snapshot, legacyPayload)
+	if err != nil {
+		f.Fatal(err)
+	}
 	copy(legacyRecord[:8], legacyWALMagic[:])
 	binary.BigEndian.PutUint16(legacyRecord[8:10], legacyWALVersion)
 	f.Add(legacyRecord)

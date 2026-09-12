@@ -236,6 +236,7 @@ func BenchmarkDeserialize(b *testing.B) {
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
+			b.ReportMetric(float64(len(data)), "serialized_B")
 			for range b.N {
 				copyDB, err := Deserialize(data, OpenOptions{})
 				if err != nil {

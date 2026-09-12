@@ -26,6 +26,7 @@ import (
 
 var ErrCommitOutcomeUnknown = errors.New("commit outcome is unknown")
 var ErrLoadResourceLimit = errors.New("database load resource limit exceeded")
+var errUnsupportedStorageFormat = errors.New("unsupported database storage format")
 var ErrDerivedIndexResourceLimit = errors.New("derived index resource limit exceeded")
 
 // RecoveryLimits bounds the total work needed to load a checkpoint and WAL.
@@ -105,16 +106,20 @@ const (
 	maxStateFileBytes      = 1 << 30
 	maxIDsFileBytes        = 64 << 10
 	stateHeaderSize        = 64
-	stateVersion           = 4
+	stateVersion           = 5
+	jsonStateVersion       = 4
 	legacyStateVersion     = 3
-	walVersion             = 3
+	walVersion             = 4
+	jsonWALVersion         = 3
 	legacyWALVersion       = 2
 	maxAppMetadataKeyBytes = 1<<16 - 1
 )
 
-var walMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '3', 0}
+var walMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '4', 0}
+var jsonWALMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '3', 0}
 var legacyWALMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '2', 0}
-var stateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '4'}
+var stateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '5'}
+var jsonStateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '4'}
 var legacyStateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '3'}
 
 type WALWriter struct {
@@ -164,7 +169,7 @@ func (writer *WALWriter) AppendSnapshot(graph *GraphState, nextNodeID uint64, ne
 	if err != nil {
 		return err
 	}
-	return writer.appendJSON(snapshot.DatabaseID, snapshot.CommitID, walPayload{Kind: "snapshot", Snapshot: &snapshot})
+	return writer.appendBinary(snapshot.DatabaseID, snapshot.CommitID, walPayload{Kind: "snapshot", Snapshot: &snapshot})
 }
 
 func (writer *WALWriter) AppendDelta(graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, changes GraphDelta) error {
@@ -181,12 +186,12 @@ func (writer *WALWriter) AppendDelta(graph *GraphState, nextNodeID uint64, nextE
 	if hasPropertyDelta(delta) {
 		kind = "property_delta"
 	}
-	return writer.appendJSON(delta.DatabaseID, delta.CommitID, walPayload{Kind: kind, Delta: &writer.encodeDelta})
+	return writer.appendBinary(delta.DatabaseID, delta.CommitID, walPayload{Kind: kind, Delta: &writer.encodeDelta})
 }
 
 // The engine serializes WAL writes. Reuse small payload storage without
 // retaining an unusually large transaction or snapshot for the writer lifetime.
-func (writer *WALWriter) appendJSON(databaseID string, commitID uint64, value walPayload) error {
+func (writer *WALWriter) appendBinary(databaseID string, commitID uint64, value walPayload) error {
 	if writer == nil || writer.file == nil {
 		return errors.New("WAL writer is closed")
 	}
@@ -198,12 +203,10 @@ func (writer *WALWriter) appendJSON(databaseID string, commitID uint64, value wa
 			writer.encodeBuffer = bytes.Buffer{}
 		}
 	}()
-	if err := json.NewEncoder(&writer.encodeBuffer).Encode(&writer.encodeValue); err != nil {
+	if err := writeBinaryWALPayload(&writer.encodeBuffer, writer.encodeValue); err != nil {
 		return fmt.Errorf("encode WAL %s: %w", value.Kind, err)
 	}
-	// Encoder adds a newline; preserve the existing Marshal payload bytes.
-	payload := writer.encodeBuffer.Bytes()
-	return writer.append(databaseID, commitID, payload[:len(payload)-1])
+	return writer.append(databaseID, commitID, writer.encodeBuffer.Bytes())
 }
 
 func (writer *WALWriter) append(databaseID string, commitID uint64, payload []byte) error {
@@ -338,7 +341,7 @@ func SerializeGraphState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
 	}
 	var payload bytes.Buffer
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateJSON(io.MultiWriter(&payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateBinary(io.MultiWriter(&payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return nil, err
 	}
 	header, err := encodeStateHeader(graph.DatabaseID, commitID, uint64(payload.Len()), checksum.Sum32())
@@ -377,8 +380,15 @@ func DeserializeGraphStateWithRecoveryLimits(data []byte, maxCanonicalBytes, max
 	if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
 		return nil, 0, 0, 0, errors.New("state checksum mismatch")
 	}
+
 	var snapshot persistedState
-	if err := json.Unmarshal(payload, &snapshot); err != nil {
+	if binary.BigEndian.Uint16(header[8:10]) == stateVersion {
+		decoded, err := decodeBinaryStatePayload(bytes.NewReader(payload), payloadLength, maxCanonicalBytes)
+		if err != nil {
+			return nil, 0, 0, 0, fmt.Errorf("decode binary state payload: %w", err)
+		}
+		snapshot = *decoded
+	} else if err := json.Unmarshal(payload, &snapshot); err != nil {
 		return nil, 0, 0, 0, fmt.Errorf("decode state payload: %w", err)
 	}
 	if snapshot.DatabaseID != string(header[32:64]) || snapshot.CommitID != binary.BigEndian.Uint64(header[12:20]) {
@@ -413,7 +423,7 @@ func LoadGraphStateFilesContextWithRecoveryLimitsAndWALAppendReady(ctx context.C
 	}
 	budget := &recoveryBudget{limits: limits}
 	snapshot, snapshotErr := loadCheckpointSnapshotFilesContextWithRecoveryBudget(ctx, files, maxCanonicalBytes, budget)
-	if errors.Is(snapshotErr, ErrLoadResourceLimit) {
+	if errors.Is(snapshotErr, ErrLoadResourceLimit) || errors.Is(snapshotErr, errUnsupportedStorageFormat) {
 		return nil, 0, 0, 0, false, snapshotErr
 	}
 	base := snapshot
@@ -627,7 +637,7 @@ func checkpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeI
 	defer os.Remove(payloadPath)
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateJSON(io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateBinary(io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	if _, err := payload.Seek(0, io.SeekStart); err != nil {
@@ -856,7 +866,7 @@ func WALFilesHaveCheckpointMarker(files DatabaseFiles) (bool, error) {
 	if _, err := io.ReadFull(file, header[:]); err != nil {
 		return false, err
 	}
-	if !validCurrentWALHeader(header[:]) {
+	if !validWALHeader(header[:]) {
 		return false, errors.New("invalid WAL header")
 	}
 	payloadLength := binary.BigEndian.Uint64(header[20:28])
@@ -871,7 +881,7 @@ func WALFilesHaveCheckpointMarker(files DatabaseFiles) (bool, error) {
 		return false, errors.New("WAL checksum mismatch")
 	}
 	var wrapper walPayload
-	if err := json.Unmarshal(payload, &wrapper); err != nil {
+	if err := decodeWALPayloadBytes(context.Background(), header[:], payload, maxWALFrameBytes, &wrapper); err != nil {
 		return false, err
 	}
 	return wrapper.Kind == "checkpoint", nil
@@ -986,7 +996,7 @@ func checkpointGraphStateAndWALFilesContext(ctx context.Context, files DatabaseF
 	defer os.Remove(payloadPath)
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateJSON(contextWriter{ctx: ctx, Writer: io.MultiWriter(payload, checksum)}, graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateBinary(contextWriter{ctx: ctx, Writer: io.MultiWriter(payload, checksum)}, graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -1104,20 +1114,17 @@ func rewriteWALStatePayload(files DatabaseFiles, statePayload *os.File, database
 	checksum := crc32.NewIEEE()
 	output := io.MultiWriter(payload, checksum)
 	if statePayload == nil {
-		if _, err := io.WriteString(output, `{"kind":"checkpoint"}`); err != nil {
+		if _, err := output.Write([]byte{binaryWALCheckpoint}); err != nil {
 			return err
 		}
 	} else {
 		if _, err := statePayload.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
-		if _, err := io.WriteString(output, `{"kind":"snapshot","snapshot":`); err != nil {
+		if _, err := output.Write([]byte{binaryWALSnapshot}); err != nil {
 			return err
 		}
 		if _, err := io.Copy(output, statePayload); err != nil {
-			return err
-		}
-		if _, err := io.WriteString(output, "}"); err != nil {
 			return err
 		}
 	}
@@ -1406,7 +1413,7 @@ func AppendWALCommitFiles(files DatabaseFiles, graph *GraphState, nextNodeID uin
 	if err != nil {
 		return err
 	}
-	payload, err := json.Marshal(walPayload{Kind: "snapshot", Snapshot: &snapshot})
+	payload, err := encodeBinaryWALPayload(walPayload{Kind: "snapshot", Snapshot: &snapshot})
 	if err != nil {
 		return fmt.Errorf("encode wal entry: %w", err)
 	}
@@ -1430,13 +1437,10 @@ func RewriteWALSnapshotFiles(files DatabaseFiles, graph *GraphState, nextNodeID 
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
 	output := io.MultiWriter(payload, checksum)
-	if _, err := io.WriteString(output, `{"kind":"snapshot","snapshot":`); err != nil {
+	if _, err := output.Write([]byte{binaryWALSnapshot}); err != nil {
 		return err
 	}
-	if err := writePersistedStateJSON(output, graph, nextNodeID, nextEdgeID, commitID); err != nil {
-		return err
-	}
-	if _, err := io.WriteString(output, "}"); err != nil {
+	if err := writePersistedStateBinary(output, graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	info, err := payload.Stat()
@@ -1481,6 +1485,25 @@ func AppendWALDelta(dbPath string, graph *GraphState, nextNodeID uint64, nextEdg
 }
 
 func AppendWALDeltaFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, changes GraphDelta) error {
+	// A delta cannot replace an older-format base: migrate using the complete
+	// caller snapshot before writing any current-format history.
+	if file, err := os.Open(files.WAL); err == nil {
+		var header [walHeaderSize]byte
+		_, readErr := io.ReadFull(file, header[:])
+		closeErr := file.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if !validCurrentWALHeader(header[:]) {
+			return AppendWALCommitFiles(files, graph, nextNodeID, nextEdgeID, commitID)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
 	delta, err := buildPersistedDelta(graph, nextNodeID, nextEdgeID, commitID, changes)
 	if err != nil {
 		return err
@@ -1489,7 +1512,7 @@ func AppendWALDeltaFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint
 	if hasPropertyDelta(delta) {
 		kind = "property_delta"
 	}
-	payload, err := json.Marshal(walPayload{Kind: kind, Delta: &delta})
+	payload, err := encodeBinaryWALPayload(walPayload{Kind: kind, Delta: &delta})
 	if err != nil {
 		return fmt.Errorf("encode WAL delta: %w", err)
 	}
@@ -1525,6 +1548,12 @@ func appendWALRecord(files DatabaseFiles, databaseID string, commitID uint64, pa
 		}
 		if !validCurrentWALHeader(existingHeader[:]) {
 			_ = file.Close()
+			if !validWALHeader(existingHeader[:]) && !bytes.HasPrefix(bytes.TrimSpace(existingHeader[:]), []byte("{")) {
+				return fmt.Errorf("%w: existing WAL header", errUnsupportedStorageFormat)
+			}
+			if len(payload) == 0 || payload[0] != binaryWALSnapshot {
+				return errors.New("WAL migration requires a complete snapshot")
+			}
 			record := append(header[:], payload...)
 			return rewriteWAL(files, record)
 		}
@@ -1808,11 +1837,14 @@ func loadCheckpointSnapshotFilesContextWithRecoveryBudget(ctx context.Context, f
 	if _, err := io.ReadFull(file, magic[:]); err != nil {
 		return nil, err
 	}
-	if magic == stateBinaryMagic || magic == legacyStateBinaryMagic {
+	if magic == stateBinaryMagic || magic == jsonStateBinaryMagic || magic == legacyStateBinaryMagic {
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			return nil, err
 		}
 		return loadBinaryCheckpointContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, budget)
+	}
+	if strings.HasPrefix(string(magic[:]), "LDBSTAT") {
+		return nil, fmt.Errorf("%w: state magic %q", errUnsupportedStorageFormat, magic)
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
@@ -1869,6 +1901,9 @@ func loadBinaryCheckpointContextWithRecoveryBudget(ctx context.Context, file *os
 	if _, err := io.ReadFull(file, header[:]); err != nil {
 		return nil, err
 	}
+	if binary.BigEndian.Uint16(header[8:10]) > stateVersion {
+		return nil, fmt.Errorf("%w: state version %d", errUnsupportedStorageFormat, binary.BigEndian.Uint16(header[8:10]))
+	}
 	if !validStateHeader(header[:]) {
 		return nil, errors.New("invalid state header")
 	}
@@ -1886,14 +1921,31 @@ func loadBinaryCheckpointContextWithRecoveryBudget(ctx context.Context, file *os
 	if err := budget.decodedBytes(payloadLength); err != nil {
 		return nil, err
 	}
+
 	checksum := crc32.NewIEEE()
-	decoder := json.NewDecoder(io.TeeReader(&contextReader{ctx: ctx, reader: io.LimitReader(file, int64(payloadLength))}, checksum))
+	input := io.TeeReader(&contextReader{ctx: ctx, reader: io.LimitReader(file, int64(payloadLength))}, checksum)
 	var snapshot persistedState
-	if err := decoder.Decode(&snapshot); err != nil {
-		return nil, fmt.Errorf("decode state payload: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, errors.New("state payload has trailing data")
+	if binary.BigEndian.Uint16(header[8:10]) == stateVersion {
+		decoded, err := decodeBinaryStatePayload(bufio.NewReaderSize(input, 64<<10), payloadLength, maxCanonicalBytes)
+		if err != nil {
+			// Buffered bytes have already reached the checksum through input.
+			if _, drainErr := io.Copy(io.Discard, input); drainErr != nil {
+				return nil, drainErr
+			}
+			if checksum.Sum32() != binary.BigEndian.Uint32(header[28:32]) {
+				return nil, errors.New("state checksum mismatch")
+			}
+			return nil, fmt.Errorf("decode binary state payload: %w", err)
+		}
+		snapshot = *decoded
+	} else {
+		decoder := json.NewDecoder(input)
+		if err := decoder.Decode(&snapshot); err != nil {
+			return nil, fmt.Errorf("decode state payload: %w", err)
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			return nil, errors.New("state payload has trailing data")
+		}
 	}
 	if checksum.Sum32() != binary.BigEndian.Uint32(header[28:32]) {
 		return nil, errors.New("state checksum mismatch")
@@ -1930,7 +1982,7 @@ func validStateHeader(header []byte) bool {
 	}
 	magic := string(header[:8])
 	version := binary.BigEndian.Uint16(header[8:10])
-	return magic == string(stateBinaryMagic[:]) && version == stateVersion || magic == string(legacyStateBinaryMagic[:]) && version == legacyStateVersion
+	return magic == string(stateBinaryMagic[:]) && version == stateVersion || magic == string(jsonStateBinaryMagic[:]) && version == jsonStateVersion || magic == string(legacyStateBinaryMagic[:]) && version == legacyStateVersion
 }
 
 func loadLatestWALSnapshot(dbPath string) (*persistedState, error) {
@@ -1975,9 +2027,12 @@ func loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudgetAndAppendReady(ct
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, false, fmt.Errorf("rewind wal: %w", err)
 	}
-	if magic == walMagic || magic == legacyWALMagic {
+	if magic == walMagic || magic == jsonWALMagic || magic == legacyWALMagic {
 		state, ready, err := loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx, file, maxCanonicalBytes, base, budget)
 		return state, ready && magic == walMagic, err
+	}
+	if strings.HasPrefix(string(magic[:]), "LDBWAL") {
+		return nil, false, fmt.Errorf("%w: WAL magic %q", errUnsupportedStorageFormat, magic)
 	}
 	state, err := loadLatestLegacyWALContextWithRecoveryBudget(ctx, file, maxCanonicalBytes, budget)
 	return state, false, err
@@ -2009,7 +2064,7 @@ func WALFilesReadyForAppend(files DatabaseFiles) bool {
 		return false
 	}
 	var wrapper walPayload
-	if json.Unmarshal(payload, &wrapper) == nil && wrapper.Kind == "checkpoint" {
+	if decodeWALPayloadBytes(context.Background(), header[:], payload, maxWALFrameBytes, &wrapper) == nil && wrapper.Kind == "checkpoint" {
 		return true
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
@@ -2137,6 +2192,7 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 	currentFormat := true
 	var header [walHeaderSize]byte
 	var wrapper walPayload
+	payloadReader := bufio.NewReaderSize(nil, 4096)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
@@ -2187,29 +2243,63 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 		if err := budget.decodedBytes(payloadLength); err != nil {
 			return nil, false, err
 		}
-		payload := make([]byte, int(payloadLength))
-		if _, err := io.ReadFull(&contextReader{ctx: ctx, reader: file}, payload); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				if accumulator == nil {
-					return nil, false, os.ErrNotExist
-				}
-				state, stateErr := accumulator.persistedState()
-				if stateErr != nil {
-					return nil, false, fmt.Errorf("serialize WAL state: %w", stateErr)
-				}
-				return &state, false, nil
-			}
-			return nil, false, fmt.Errorf("read wal payload: %w", err)
-		}
-		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
-			return nil, false, errors.New("WAL checksum mismatch")
-		}
-		// The accumulator copies snapshot and delta data it retains. Reuse the
-		// wrapper allocation, but clear pointers before decoding each frame so
-		// omitted JSON fields cannot carry over from the previous frame.
+
 		wrapper = walPayload{}
-		if err := unmarshalContext(ctx, payload, &wrapper); err != nil {
-			return nil, false, fmt.Errorf("decode WAL payload: %w", err)
+		var payload []byte
+		if binary.BigEndian.Uint16(header[8:10]) == walVersion {
+			limited := &io.LimitedReader{R: &contextReader{ctx: ctx, reader: file}, N: int64(payloadLength)}
+			checksum := crc32.NewIEEE()
+			payloadReader.Reset(io.TeeReader(limited, checksum))
+			wrapper, err = decodeBinaryWALPayload(payloadReader, payloadLength, maxCanonicalBytes)
+			if err != nil {
+				// A decoder EOF can mean an invalid logical length, not a torn file.
+				// Hash only unread underlying bytes; buffered bytes are already hashed.
+				if _, drainErr := io.Copy(io.Discard, io.TeeReader(limited, checksum)); drainErr != nil {
+					return nil, false, drainErr
+				}
+				if limited.N > 0 {
+					if accumulator == nil {
+						return nil, false, os.ErrNotExist
+					}
+					state, stateErr := accumulator.persistedState()
+					if stateErr != nil {
+						return nil, false, stateErr
+					}
+					return &state, false, nil
+				}
+				if checksum.Sum32() != binary.BigEndian.Uint32(header[28:32]) {
+					return nil, false, errors.New("WAL checksum mismatch")
+				}
+				return nil, false, fmt.Errorf("decode binary WAL payload: %w", err)
+			}
+			if checksum.Sum32() != binary.BigEndian.Uint32(header[28:32]) {
+				return nil, false, errors.New("WAL checksum mismatch")
+			}
+		} else {
+			payload = make([]byte, int(payloadLength))
+			if _, err := io.ReadFull(&contextReader{ctx: ctx, reader: file}, payload); err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					if accumulator == nil {
+						return nil, false, os.ErrNotExist
+					}
+					state, stateErr := accumulator.persistedState()
+					if stateErr != nil {
+						return nil, false, fmt.Errorf("serialize WAL state: %w", stateErr)
+					}
+					return &state, false, nil
+				}
+				return nil, false, fmt.Errorf("read wal payload: %w", err)
+			}
+			if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(header[28:32]) {
+				return nil, false, errors.New("WAL checksum mismatch")
+			}
+			// The accumulator copies snapshot and delta data it retains. Reuse the
+			// wrapper allocation, but clear pointers before decoding each frame so
+			// omitted JSON fields cannot carry over from the previous frame.
+			wrapper = walPayload{}
+			if err := unmarshalContext(ctx, payload, &wrapper); err != nil {
+				return nil, false, fmt.Errorf("decode WAL payload: %w", err)
+			}
 		}
 		if wrapper.Kind == "" {
 			var snapshot persistedState
@@ -3790,7 +3880,7 @@ func validWALHeader(header []byte) bool {
 	}
 	magic := string(header[:8])
 	version := binary.BigEndian.Uint16(header[8:10])
-	return magic == string(walMagic[:]) && version == walVersion || magic == string(legacyWALMagic[:]) && version == legacyWALVersion
+	return magic == string(walMagic[:]) && version == walVersion || magic == string(jsonWALMagic[:]) && version == jsonWALVersion || magic == string(legacyWALMagic[:]) && version == legacyWALVersion
 }
 
 func validateWALPayloadSize(size int) error {

@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"strconv"
 	"testing"
@@ -42,7 +41,7 @@ func benchmarkWALV2File(b *testing.B, frames uint64) *os.File {
 		} else {
 			payloadValue = walPayload{Kind: "delta", Delta: &persistedDelta{DatabaseID: databaseID, CommitID: commitID, NextNodeID: 2, NextEdgeID: 1, UpsertNodes: []persistedNode{{ID: 1, Properties: map[string]persistedValue{"version": {Kind: "int", Int: int64(commitID)}}}}}}
 		}
-		payload, err := json.Marshal(payloadValue)
+		payload, err := encodeBinaryWALPayload(payloadValue)
 		if err != nil {
 			b.Fatal(err)
 		}
