@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"slices"
 
 	"github.com/mrchypark/latticedb-go/internal/engine"
 )
@@ -92,6 +93,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		EnableVector:                      opts.EnableVector || opts.EnableVectors,
 		VectorIndexMode:                   engine.VectorIndexMode(opts.VectorIndexMode),
 		VectorDimensions:                  opts.VectorDimensions,
+		VectorNamespaces:                  slices.Clone(opts.VectorNamespaces),
 		Durability:                        engine.DurabilityMode(opts.Durability),
 		WALCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
 		ChangefeedMaxBytes:                opts.ChangefeedMaxBytes,
@@ -124,6 +126,7 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 		EnableVector:                      opts.EnableVector || opts.EnableVectors,
 		VectorIndexMode:                   engine.VectorIndexMode(opts.VectorIndexMode),
 		VectorDimensions:                  opts.VectorDimensions,
+		VectorNamespaces:                  slices.Clone(opts.VectorNamespaces),
 		Durability:                        engine.DurabilityMode(opts.Durability),
 		WALCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
 		ChangefeedMaxBytes:                opts.ChangefeedMaxBytes,
@@ -387,7 +390,7 @@ func (db *DB) QueryContext(ctx context.Context, query string, params map[string]
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}
-	result, err := inner.QueryContext(ctx, query, params, engine.QueryOptions{MaxRows: opts.MaxRows, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	result, err := inner.QueryContext(ctx, query, params, engine.QueryOptions{MaxRows: opts.MaxRows, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes, VectorNamespace: opts.VectorNamespace})
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}
@@ -400,11 +403,12 @@ func (db *DB) VectorSearch(vector []float32, opts VectorSearchOptions) ([]Vector
 		return nil, wrapError(err)
 	}
 	results, err := inner.VectorSearch(vector, engine.VectorSearchOptions{
-		K:        opts.K,
-		EfSearch: opts.EfSearch,
-		Exact:    opts.Exact,
-		MaxWork:  opts.MaxWork,
-		MaxBytes: opts.MaxBytes,
+		K:         opts.K,
+		EfSearch:  opts.EfSearch,
+		Exact:     opts.Exact,
+		MaxWork:   opts.MaxWork,
+		MaxBytes:  opts.MaxBytes,
+		Namespace: opts.Namespace,
 	})
 	if err != nil {
 		return nil, wrapError(err)
@@ -417,7 +421,7 @@ func (db *DB) VectorSearchContext(ctx context.Context, vector []float32, opts Ve
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	results, err := inner.VectorSearchContext(ctx, vector, engine.VectorSearchOptions{K: opts.K, EfSearch: opts.EfSearch, Exact: opts.Exact, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	results, err := inner.VectorSearchContext(ctx, vector, engine.VectorSearchOptions{K: opts.K, EfSearch: opts.EfSearch, Exact: opts.Exact, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes, Namespace: opts.Namespace})
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -607,6 +611,39 @@ func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
 		return wrapError(err)
 	}
 	return wrapError(inner.RebuildVectorIndexContext(ctx))
+}
+
+func (db *DB) RebuildVectorIndexNamespaceContext(ctx context.Context, namespace VectorNamespace) error {
+	inner, err := db.requireOpen()
+	if err != nil {
+		return wrapError(err)
+	}
+	return wrapError(inner.RebuildVectorIndexNamespaceContext(ctx, namespace))
+}
+
+func (db *DB) VectorIndexNamespaceStats(namespace VectorNamespace) (VectorIndexStats, error) {
+	inner, err := db.requireOpen()
+	if err != nil {
+		return VectorIndexStats{}, wrapError(err)
+	}
+	stats, err := inner.VectorIndexNamespaceStats(namespace)
+	if err != nil {
+		return VectorIndexStats{}, wrapError(err)
+	}
+	return VectorIndexStats{
+		LiveEntries:                stats.LiveEntries,
+		IndexEntries:               stats.IndexEntries,
+		Tombstones:                 stats.Tombstones,
+		TombstoneBytes:             stats.TombstoneBytes,
+		TombstoneBytesUntilRebuild: stats.TombstoneBytesUntilRebuild,
+		MutationDebt:               stats.MutationDebt,
+		RebuildThreshold:           stats.RebuildThreshold,
+		DebtUntilRebuild:           stats.DebtUntilRebuild,
+		EstimatedBuildLogicalBytes: stats.EstimatedBuildLogicalBytes,
+		ExactFallbacks:             stats.ExactFallbacks,
+		Rebuilds:                   stats.Rebuilds,
+		RebuildNanoseconds:         stats.RebuildNanoseconds,
+	}, nil
 }
 
 // Commit makes the transaction inactive, whether it succeeds or fails.

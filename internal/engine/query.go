@@ -47,12 +47,13 @@ type matchPattern interface {
 // returned results, materialized query rows, and scoped scratch; it is not an
 // estimate of process RSS.
 type queryBudget struct {
-	ctx      context.Context
-	maxRows  uint32
-	maxWork  uint32
-	maxBytes uint32
-	work     uint32
-	bytes    uint32
+	ctx             context.Context
+	maxRows         uint32
+	maxWork         uint32
+	maxBytes        uint32
+	work            uint32
+	bytes           uint32
+	vectorNamespace *store.VectorNamespace
 }
 
 const queryRowBytes = 128
@@ -73,11 +74,17 @@ func newQueryBudget(ctx context.Context, opts QueryOptions) *queryBudget {
 		opts.MaxBytes = 64 << 20
 	}
 	budget := queryBudgetPool.Get().(*queryBudget)
+	var namespace *store.VectorNamespace
+	if opts.VectorNamespace != nil {
+		copy := *opts.VectorNamespace
+		namespace = &copy
+	}
 	*budget = queryBudget{
-		ctx:      ctx,
-		maxRows:  uint32(min(opts.MaxRows, uint64(^uint32(0)))),
-		maxWork:  uint32(min(opts.MaxWork, uint64(^uint32(0)))),
-		maxBytes: uint32(min(opts.MaxBytes, uint64(^uint32(0)))),
+		ctx:             ctx,
+		maxRows:         uint32(min(opts.MaxRows, uint64(^uint32(0)))),
+		maxWork:         uint32(min(opts.MaxWork, uint64(^uint32(0)))),
+		maxBytes:        uint32(min(opts.MaxBytes, uint64(^uint32(0)))),
+		vectorNamespace: namespace,
 	}
 	return budget
 }
@@ -1107,6 +1114,16 @@ func parsePlanReturn(plan *queryPlan, text string) error {
 }
 
 func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudget) (QueryResult, error) {
+	if budget.vectorNamespace != nil {
+		namespace, err := resolveVectorNamespace(tx.graph, budget.vectorNamespace)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		budget.vectorNamespace = namespace
+		if err := plan.validateQueryVectorNamespace(*namespace); err != nil {
+			return QueryResult{}, err
+		}
+	}
 	params, paramBytes, err := normalizeQueryParamsWithBudget(params, budget)
 	if err != nil {
 		return QueryResult{}, err
@@ -1269,6 +1286,35 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		result.Rows = result.Rows[:limit]
 	}
 	return result, nil
+}
+
+func (plan *queryPlan) validateQueryVectorNamespace(namespace store.VectorNamespace) error {
+	validate := func(clause *whereClause) error {
+		if clause == nil || clause.Kind != whereVector {
+			return nil
+		}
+		if clause.Property != namespace.Property {
+			return fmt.Errorf("%w: vector property %q does not match namespace property %q", ErrInvalidArgument, clause.Property, namespace.Property)
+		}
+		for _, pattern := range plan.matchPatterns {
+			edge, ok := pattern.(edgePattern)
+			if ok && edge.EdgeVar == clause.Var {
+				return fmt.Errorf("%w: vector namespace cannot be used with edge binding %q", ErrInvalidArgument, clause.Var)
+			}
+		}
+		return nil
+	}
+	for _, clause := range plan.whereClauses {
+		if err := validate(clause); err != nil {
+			return err
+		}
+	}
+	for _, clause := range wherePredicateClauses(plan.wherePredicate) {
+		if err := validate(clause); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // orderedMatchPatterns keeps each connected path in source order and only
@@ -3782,6 +3828,14 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 		value, exists := propertyFromBinding(binding, clause.Property)
 		switch clause.Kind {
 		case whereVector:
+			if budget.vectorNamespace != nil && budget.vectorNamespace.Scope != "" {
+				if binding.Node == nil || !slices.Contains(binding.Node.Labels, budget.vectorNamespace.Scope) {
+					if err := budget.check(1, len(filtered)); err != nil {
+						return nil, err
+					}
+					continue
+				}
+			}
 			if !exists {
 				if err := budget.check(1, len(filtered)); err != nil {
 					return nil, err

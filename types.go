@@ -11,6 +11,17 @@ type Value = any
 type DurabilityMode uint8
 type VectorIndexMode uint8
 
+// VectorMetric identifies the distance metric used by a vector namespace.
+// L2 is currently the only supported metric.
+type VectorMetric = engine.VectorMetric
+
+const VectorMetricL2 VectorMetric = engine.VectorMetricL2
+
+// VectorNamespace identifies one derived vector index and its eligible nodes.
+// Namespace definitions are supplied when opening a database and are not
+// persisted with the database snapshot.
+type VectorNamespace = engine.VectorNamespace
+
 // PersistenceCapabilities reports the persistence primitives implemented by
 // this build target. A true value means LatticeDB uses that primitive; it does
 // not guarantee physical-media or power-loss durability from the filesystem or
@@ -57,6 +68,7 @@ type OpenOptions struct {
 	DisableLock                 bool
 	VectorIndexMode             VectorIndexMode
 	VectorDimensions            uint16
+	VectorNamespaces            []VectorNamespace
 	Durability                  DurabilityMode
 	WALCheckpointThresholdBytes uint64
 	// ChangefeedMaxBytes bounds retained automatic change records. Zero uses the
@@ -129,6 +141,9 @@ type QueryOptions struct {
 	// MaxBytes limits owned query working storage and results, including normalized
 	// parameter copies. It does not bound process RSS or committed database size.
 	MaxBytes uint64
+	// VectorNamespace selects the namespace for every vector comparison in the
+	// query. Nil preserves the legacy global vector behavior.
+	VectorNamespace *VectorNamespace
 }
 
 type VectorSearchOptions struct {
@@ -139,6 +154,9 @@ type VectorSearchOptions struct {
 	// MaxWork and MaxBytes bound one direct search request's scalar work and logical scratch/result bytes, not process RSS. Zero MaxWork means no caller-requested work limit; zero MaxBytes uses a 64 MiB logical scratch limit.
 	MaxWork  uint64
 	MaxBytes uint64
+	// Namespace selects an explicitly configured vector namespace. Nil preserves
+	// the legacy global vector behavior.
+	Namespace *VectorNamespace
 }
 
 type FTSSearchOptions struct {
