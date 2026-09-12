@@ -59,7 +59,7 @@ func validateChangefeedEnvelope(envelope map[string]persistedValue) error {
 	}
 	propertyEvent := keyOK && keyIsString && len(propertyValues) != 0
 	if !propertyEvent {
-		return validateStreamValue(persistedValue{Kind: "map", Map: envelope}, -1, &valueWalk{})
+		return validateStreamValue(persistedValue{Kind: "map", Map: envelope}, 0, &valueWalk{})
 	}
 	if !utf8.ValidString(propertyKeyText) {
 		return fmt.Errorf("property key contains invalid UTF-8")

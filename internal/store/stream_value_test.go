@@ -155,3 +155,14 @@ func TestChangefeedRecoveryRejectsInvalidPropertyKeyUTF8(t *testing.T) {
 		t.Fatal("invalid property key accepted")
 	}
 }
+
+func TestNonPropertyChangefeedEnvelopeUsesOrdinaryDepth(t *testing.T) {
+	value := persistedValue{Kind: "null"}
+	for range maxValueDepth {
+		value = persistedValue{Kind: "list", List: []persistedValue{value}}
+	}
+	envelope := persistedValue{Kind: "map", Map: map[string]persistedValue{"unexpected": value}}
+	if _, err := decodeStreamValue("__lattice_changes", envelope); !errors.Is(err, ErrValueLimit) {
+		t.Fatalf("non-property envelope depth error = %v", err)
+	}
+}

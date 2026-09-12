@@ -6,8 +6,9 @@ Snapshot and WAL stream payloads now use the same per-value limits as live
 as four bytes per element. Invalid UTF-8 and non-finite numbers are rejected.
 The persisted value tree is checked before allocating its decoded copy.
 
-The reserved automatic changefeed uses the graph-property depth convention:
-its event map is an envelope, and each contained value starts at depth zero.
+Reserved automatic property-change events use the graph-property depth
+convention: each old/new property value starts at depth zero. Other envelopes
+use ordinary stream depth limits.
 This preserves existing events containing a maximum-depth graph property;
 ordinary streams count their root value at depth zero. Aggregate limits still
 apply to envelope metadata independently. Property change events validate each
