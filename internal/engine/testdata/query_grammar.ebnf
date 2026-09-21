@@ -46,13 +46,14 @@ return-tail    = [DISTINCT] (count-return | projection {"," projection})
                  [ORDER BY order {"," order}]
                  [SKIP pagination] [LIMIT pagination]
 count-return   = "count(" ("*" | binding) ")" [AS alias]
-projection     = (binding | property-access | id-access) [AS alias]
+projection     = (binding | property-access | id-access | function-call) [AS alias]
 order          = (binding | property-access | id-access | alias) [ASC | DESC]
 pagination     = non-negative-integer | parameter
 
 value          = null | true | false | integer | float | string | parameter | map
 map            = "{" [property ":" expression {"," property ":" expression}] "}"
-expression     = value | binding | property-access
+expression     = value | binding | property-access | function-call
+function-call  = identifier "(" [expression {"," expression}] ")"
 
 identifier     = unquoted-identifier | quoted-identifier
 unquoted-identifier

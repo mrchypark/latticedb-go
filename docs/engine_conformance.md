@@ -277,13 +277,14 @@ return-tail    = [DISTINCT] (count-return | projection {"," projection})
                  [ORDER BY order {"," order}]
                  [SKIP pagination] [LIMIT pagination]
 count-return   = "count(" ("*" | binding) ")" [AS alias]
-projection     = (binding | property-access | id-access) [AS alias]
+projection     = (binding | property-access | id-access | function-call) [AS alias]
 order          = (binding | property-access | id-access | alias) [ASC | DESC]
 pagination     = non-negative-integer | parameter
 
 value          = null | true | false | integer | float | string | parameter | map
 map            = "{" [property ":" expression {"," property ":" expression}] "}"
-expression     = value | binding | property-access
+expression     = value | binding | property-access | function-call
+function-call  = identifier "(" [expression {"," expression}] ")"
 
 identifier     = unquoted-identifier | quoted-identifier
 unquoted-identifier
@@ -303,6 +304,8 @@ parameter      = "$" identifier
 <!-- END supported-cypher-grammar -->
 
 Fixed-length `MATCH` paths may be incoming, outgoing, or undirected; relationship creation remains directed. Variable-length paths remain unsupported. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, and list literals remain unsupported. Values unsupported by the literal grammar, including lists, bytes, and vectors, remain available through parameters.
+
+Function calls are limited to the built-in helpers `id`, `labels`, `type`, `properties`, `size`, `head`, `last`, `tail`, `range`, `split`, `replace`, `substring`, `trim`, `toLower`, `toUpper`, `toInteger`, `toFloat`, `toString`, `abs`, and `coalesce`. Unknown names and wrong argument counts are rejected while the query is parsed. Calls may appear wherever a value expression is accepted, including `RETURN` projections, `SET` assignments, `CREATE` property maps, and the right side of a `WHERE` comparison. The left side of a comparison remains a property access, and `ORDER BY` on a computed projection is not supported.
 
 An undirected relationship produces one row per matching orientation. A non-self edge can therefore produce two rows when both endpoints are unbound; a self-loop produces one.
 
