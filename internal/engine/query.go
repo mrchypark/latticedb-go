@@ -310,6 +310,9 @@ type projection struct {
 	// ExplicitAlias records whether the item carried an AS alias, which decides
 	// whether its name crosses a WITH boundary.
 	ExplicitAlias bool
+	// QuotedVar records a backtick-quoted binding item, whose decoded name is a
+	// legitimate export even though it is not shaped like an unquoted identifier.
+	QuotedVar bool
 }
 
 type orderClause struct {
@@ -934,13 +937,27 @@ func withOutputNames(clause *returnClause) []string {
 		switch {
 		case projection.ExplicitAlias && projection.Alias != "":
 			names = append(names, projection.Alias)
-		case projection.Kind == projectionValue && projection.Var != "":
+		case projection.Kind == projectionValue && (projection.QuotedVar || isUnquotedIdentifierShape(projection.Var)):
 			// A plain binding keeps its decoded name; a derived display alias such
 			// as n.p never crosses the boundary.
 			names = append(names, projection.Var)
 		}
 	}
 	return names
+}
+
+// isUnquotedIdentifierShape reports whether value can be written as an unquoted
+// identifier, which keeps derived display labels such as n.p out of scope.
+func isUnquotedIdentifierShape(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if !isQueryIdentifierChar(value[index]) {
+			return false
+		}
+	}
+	return !(value[0] >= '0' && value[0] <= '9')
 }
 
 func (plan *queryPlan) newRow() queryRow {
@@ -3770,6 +3787,7 @@ func parseReturnClause(text string) (*returnClause, error) {
 				Var:           name,
 				Alias:         alias,
 				ExplicitAlias: explicitAlias,
+				QuotedVar:     strings.HasPrefix(exprText, "`"),
 			})
 		}
 	}
