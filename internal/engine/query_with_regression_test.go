@@ -133,3 +133,15 @@ func TestWithMaterializationRespectsByteBudget(t *testing.T) {
 		}
 	}
 }
+
+func TestWithExportedNamesAreDecodedAndScoped(t *testing.T) {
+	db := openWithDB(t)
+	quote := string(rune(96))
+	result, err := db.Query("MATCH ("+quote+"a b"+quote+":Person) WITH "+quote+"a b"+quote+" RETURN count("+quote+"a b"+quote+") AS c", nil)
+	if err != nil {
+		t.Fatalf("quoted binding through WITH: %v", err)
+	}
+	if got := fmt.Sprint(result.Rows[0]["c"]); got != "3" {
+		t.Fatalf("quoted binding count = %q, want 3", got)
+	}
+}

@@ -871,11 +871,23 @@ func withProjectionNames(clause *returnClause) []string {
 	}
 	names := make([]string, 0, len(clause.Projections))
 	for _, projection := range clause.Projections {
-		if projection.Alias != "" {
-			names = append(names, projection.Alias)
+		if name := projectionSlotName(projection); name != "" {
+			names = append(names, name)
 		}
 	}
 	return names
+}
+
+// projectionSlotName is the slot a WITH projection writes into: the exported
+// name when the item exports one, otherwise its display alias for internal use.
+func projectionSlotName(projection projection) string {
+	if projection.ExplicitAlias && projection.Alias != "" {
+		return projection.Alias
+	}
+	if projection.Kind == projectionValue && (projection.QuotedVar || isUnquotedIdentifierShape(projection.Var)) {
+		return projection.Var
+	}
+	return projection.Alias
 }
 
 // findWithToken finds the top-level WITH clause keyword, skipping the STARTS
@@ -1028,6 +1040,10 @@ func (plan *queryPlan) validateBindings() error {
 	for _, name := range plan.inherited {
 		inherited[name] = struct{}{}
 	}
+	internalSlots := make(map[string]struct{}, len(plan.inheritedSlots))
+	for _, name := range plan.inheritedSlots {
+		internalSlots[name] = struct{}{}
+	}
 	plan.slots = make(map[string]int)
 	for _, name := range plan.inherited {
 		if name == "" || (name[0] != 0 && !isQueryIdentifier(name)) {
@@ -1120,6 +1136,10 @@ func (plan *queryPlan) validateBindings() error {
 				plan.slots[name] = len(plan.slots)
 			}
 			return nil
+		}
+		if _, ok := internalSlots[name]; ok {
+			// The value crossed the WITH boundary for internal use only.
+			return fmt.Errorf("unknown binding %q", name)
 		}
 		role, ok := bindings[name]
 		if !ok {
@@ -5612,7 +5632,7 @@ func (clause *returnClause) withRows(rows []queryRow, next *queryPlan, params ma
 				if err != nil {
 					return nil, err
 				}
-				nextRow.set(projection.Alias, binding)
+				nextRow.set(projectionSlotName(projection), binding)
 			}
 			projected = append(projected, nextRow)
 		}
@@ -5780,10 +5800,10 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 			if projection.Kind == projectionAggregate {
 				value := group.aggregates[aggregateIndex].result()
 				aggregateIndex++
-				nextRow.set(projection.Alias, boundValue{Value: value, HasValue: true})
+				nextRow.set(projectionSlotName(projection), boundValue{Value: value, HasValue: true})
 				continue
 			}
-			nextRow.set(projection.Alias, group.values[keyIndex])
+			nextRow.set(projectionSlotName(projection), group.values[keyIndex])
 			keyIndex++
 		}
 		projected = append(projected, nextRow)
@@ -5798,7 +5818,7 @@ func (clause *returnClause) distinctWithRows(rows []queryRow, budget *queryBudge
 	for _, row := range rows {
 		var keyBuilder strings.Builder
 		for _, projection := range clause.Projections {
-			binding, ok := row.get(projection.Alias)
+			binding, ok := row.get(projectionSlotName(projection))
 			var value any
 			if ok {
 				value = publicProjectionValue(binding)
