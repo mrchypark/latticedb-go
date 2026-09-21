@@ -783,7 +783,11 @@ func attachWithPart(plan *queryPlan, text string) error {
 		return errors.New("WITH must be followed by another clause")
 	}
 	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " UNWIND ", " RETURN ")
-	if withIndex := findWithToken(text); withIndex >= 0 && (keyword == "" || withIndex < strings.Index(text, keyword)) {
+	keywordIndex := -1
+	if keyword != "" {
+		keywordIndex = findTopLevelToken(text, keyword)
+	}
+	if withIndex := findWithToken(text); withIndex >= 0 && (keyword == "" || keywordIndex < 0 || withIndex < keywordIndex) {
 		itemsText = strings.TrimSpace(text[:withIndex])
 		keyword = " WITH "
 		tail = strings.TrimSpace(text[withIndex+len(" WITH "):])
@@ -1224,12 +1228,11 @@ func (plan *queryPlan) validateBindings() error {
 					return err
 				}
 			}
-			if plan.next != nil {
-				plan.next.inheritedRoles = map[string]bindingRole{clause.CountAlias: bindingValue}
-			}
-			return nil
 		}
 		roles := make(map[string]bindingRole, len(clause.Projections))
+		if clause.CountAlias != "" {
+			roles[clause.CountAlias] = bindingValue
+		}
 		for _, projection := range clause.Projections {
 			switch projection.Kind {
 			case projectionValue, projectionProperty:
@@ -1254,6 +1257,8 @@ func (plan *queryPlan) validateBindings() error {
 			if projection.Kind == projectionValue {
 				if source, ok := bindings[projection.Var]; ok {
 					role = source
+				} else if source, ok := plan.inheritedRoles[projection.Var]; ok {
+					role = source
 				}
 			}
 			roles[projection.Alias] = role
@@ -1266,6 +1271,11 @@ func (plan *queryPlan) validateBindings() error {
 			if _, ok := projected[item.Var]; !ok {
 				return fmt.Errorf("unknown binding %q", item.Var)
 			}
+			for _, name := range valueExprBindings(item.Expr) {
+				if _, ok := projected[name]; !ok {
+					return fmt.Errorf("unknown binding %q", name)
+				}
+			}
 		}
 		for _, order := range plan.withOrder {
 			if order.Var == "" {
@@ -1273,6 +1283,11 @@ func (plan *queryPlan) validateBindings() error {
 			}
 			if _, ok := projected[order.Var]; !ok {
 				return fmt.Errorf("unknown binding %q", order.Var)
+			}
+			for _, projection := range clause.Projections {
+				if projection.Alias == order.Var && projection.Kind == projectionExpr {
+					return errors.New("ORDER BY on a computed projection is not supported")
+				}
 			}
 		}
 		if plan.next != nil {

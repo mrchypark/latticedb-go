@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "b36db2c714931cdd4cae814a7cc3d5c95e0901076465c34463190dd53459c6c4"
+const auditedCypherParserDigest = "74b57ade021b519965d689af6520386649e598c8182dc61411d5bc2b79558f10"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
