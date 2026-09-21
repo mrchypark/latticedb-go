@@ -70,7 +70,7 @@ func TestCountRenderAccountsForLiveRowsAtBoundary(t *testing.T) {
 		if err := budget.chargeRows(1); err != nil {
 			t.Fatal(err)
 		}
-		_, err := clause.render([]queryRow{row}, budget)
+		_, err := clause.render([]queryRow{row}, nil, budget)
 		budget.releaseRows(1)
 		if maxBytes == queryRowBytes+64+32-1 {
 			if !errors.Is(err, ErrResourceLimit) {

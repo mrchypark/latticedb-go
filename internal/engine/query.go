@@ -295,6 +295,7 @@ type projection struct {
 	Var      string
 	Property string
 	Alias    string
+	Expr     valueExpr
 }
 
 type orderClause struct {
@@ -310,6 +311,7 @@ const (
 	projectionProperty  projectionKind = "property"
 	projectionBindingID projectionKind = "binding_id"
 	projectionValue     projectionKind = "value"
+	projectionExpr      projectionKind = "expr"
 )
 
 type queryRow struct {
@@ -934,6 +936,14 @@ func (plan *queryPlan) validateBindings() error {
 			}
 		}
 		for _, projection := range plan.returnClause.Projections {
+			if projection.Kind == projectionExpr {
+				for _, name := range valueExprBindings(projection.Expr) {
+					if err := require(name, bindingNode, bindingEdge, bindingValue); err != nil {
+						return err
+					}
+				}
+				continue
+			}
 			roles := []bindingRole{bindingNode, bindingEdge}
 			if projection.Kind == projectionValue || projection.Kind == projectionProperty {
 				roles = []bindingRole{bindingNode, bindingEdge, bindingValue}
@@ -963,6 +973,12 @@ func valueExprBindings(expr valueExpr) []string {
 		var names []string
 		for _, entry := range expr.Entries {
 			names = append(names, valueExprBindings(entry)...)
+		}
+		return names
+	case callExpr:
+		var names []string
+		for _, arg := range expr.Args {
+			names = append(names, valueExprBindings(arg)...)
 		}
 		return names
 	default:
@@ -1132,6 +1148,11 @@ func parsePlanReturn(plan *queryPlan, text string) error {
 	}
 	plan.returnClause = returnClause
 	plan.orderClauses = resolveOrderAliases(returnClause, orderClauses)
+	for _, order := range plan.orderClauses {
+		if order.Kind == projectionExpr {
+			return errors.New("ORDER BY on a computed projection is not supported")
+		}
+	}
 	if returnClause.Distinct {
 		for _, order := range plan.orderClauses {
 			if !slices.ContainsFunc(returnClause.Projections, func(projection projection) bool {
@@ -1247,7 +1268,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		if plan.limitExpr == nil {
 			iteratorLimit = -1
 		}
-		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit, budget: budget}, budget)
+		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit, budget: budget}, params, budget)
 	}
 	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit {
 		rows, err := plan.collectTopKRows(stream, skip, limit, budget)
@@ -1255,7 +1276,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 			return QueryResult{}, err
 		}
 		defer budget.releaseRows(len(rows))
-		result, err := plan.returnClause.render(rows, budget)
+		result, err := plan.returnClause.render(rows, params, budget)
 		if err != nil {
 			return QueryResult{}, err
 		}
@@ -1313,7 +1334,7 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	if len(plan.orderClauses) != 0 {
 		slices.SortStableFunc(rows, plan.compareOrderedRows)
 	}
-	result, err := plan.returnClause.render(rows, budget)
+	result, err := plan.returnClause.render(rows, params, budget)
 	if err != nil {
 		return QueryResult{}, err
 	}
@@ -3318,7 +3339,19 @@ func parseReturnClause(text string) (*returnClause, error) {
 			continue
 		}
 		if name, err := parseQueryIdentifier(exprText); err != nil {
-			return nil, fmt.Errorf("invalid RETURN projection %q", exprText)
+			expr, exprErr := parseValueExpr(exprText)
+			if exprErr != nil {
+				return nil, fmt.Errorf("invalid RETURN projection %q: %w", exprText, exprErr)
+			}
+			call, ok := expr.(callExpr)
+			if !ok {
+				return nil, fmt.Errorf("invalid RETURN projection %q", exprText)
+			}
+			projections = append(projections, projection{
+				Kind:  projectionExpr,
+				Expr:  call,
+				Alias: alias,
+			})
 		} else {
 			projections = append(projections, projection{
 				Kind:  projectionValue,
@@ -4747,7 +4780,7 @@ func (clause *deleteClause) apply(tx *Tx, rows []queryRow, budget *queryBudget) 
 	return nil
 }
 
-func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryResult, error) {
+func (clause *returnClause) render(rows []queryRow, params map[string]any, budget *queryBudget) (QueryResult, error) {
 	if clause.CountAlias != "" {
 		if err := budget.chargeResult(64 + 32); err != nil {
 			return QueryResult{}, err
@@ -4838,6 +4871,16 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 				default:
 					resultRow[projection.Alias] = nil
 				}
+			case projectionExpr:
+				value, err := projection.Expr.eval(row, params)
+				if err != nil {
+					return QueryResult{}, err
+				}
+				public := publicProjectionValue(value)
+				if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+					return QueryResult{}, err
+				}
+				resultRow[projection.Alias] = public
 			default:
 				return QueryResult{}, fmt.Errorf("unsupported projection kind %q", projection.Kind)
 			}
@@ -4847,7 +4890,7 @@ func (clause *returnClause) render(rows []queryRow, budget *queryBudget) (QueryR
 	return result, nil
 }
 
-func (clause *returnClause) renderIterator(it queryIterator, budget *queryBudget) (QueryResult, error) {
+func (clause *returnClause) renderIterator(it queryIterator, params map[string]any, budget *queryBudget) (QueryResult, error) {
 	defer it.Close()
 	result := QueryResult{Columns: make([]string, 0, len(clause.Projections))}
 	for _, projection := range clause.Projections {
@@ -4861,7 +4904,7 @@ func (clause *returnClause) renderIterator(it queryIterator, budget *queryBudget
 		if !ok {
 			return result, nil
 		}
-		resultRow, err := clause.renderRow(row, budget)
+		resultRow, err := clause.renderRow(row, params, budget)
 		budget.releaseRows(1)
 		if err != nil {
 			return QueryResult{}, err
@@ -4870,7 +4913,7 @@ func (clause *returnClause) renderIterator(it queryIterator, budget *queryBudget
 	}
 }
 
-func (clause *returnClause) renderRow(row queryRow, budget *queryBudget) (map[string]any, error) {
+func (clause *returnClause) renderRow(row queryRow, params map[string]any, budget *queryBudget) (map[string]any, error) {
 	if err := budget.chargeResult(64 + uint64(len(clause.Projections))*32); err != nil {
 		return nil, err
 	}
@@ -4916,11 +4959,40 @@ func (clause *returnClause) renderRow(row queryRow, budget *queryBudget) (map[st
 			default:
 				resultRow[projection.Alias] = nil
 			}
+		case projectionExpr:
+			value, err := projection.Expr.eval(row, params)
+			if err != nil {
+				return nil, err
+			}
+			public := publicProjectionValue(value)
+			if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+				return nil, err
+			}
+			resultRow[projection.Alias] = public
 		default:
 			return nil, fmt.Errorf("unsupported projection kind %q", projection.Kind)
 		}
 	}
 	return resultRow, nil
+}
+
+// publicProjectionValue converts an evaluated expression result into the public
+// value shape used by query result rows, mirroring the bare-binding projection.
+func publicProjectionValue(value any) any {
+	binding, ok := value.(boundValue)
+	if !ok {
+		return store.CloneValue(value)
+	}
+	switch {
+	case binding.Node != nil:
+		return publicNode(binding.Node)
+	case binding.Edge != nil:
+		return publicEdge(binding.Edge)
+	case binding.HasValue:
+		return store.CloneValue(binding.Value)
+	default:
+		return nil
+	}
 }
 
 func queryStoredPropertyBytes(properties store.Properties) uint64 {
@@ -5374,6 +5446,11 @@ func parseValueExpr(text string) (valueExpr, error) {
 		}
 		return literalExpr{Value: unquoted}, nil
 	default:
+		if call, ok, err := parseCallExpr(text); err != nil {
+			return nil, err
+		} else if ok {
+			return call, nil
+		}
 		if number, ok := parseQueryNumber(text); ok {
 			return literalExpr{Value: number}, nil
 		}
@@ -5429,6 +5506,38 @@ func parseQueryNumber(text string) (any, bool) {
 	}
 	value, err := strconv.ParseFloat(text, 64)
 	return value, err == nil
+}
+
+// parseCallExpr parses `name(arg, ...)` into a callExpr. It reports ok=false for
+// text that is not a single well-formed call so other value expressions keep
+// their existing meaning.
+func parseCallExpr(text string) (callExpr, bool, error) {
+	open := findTopLevelRune(text, '(')
+	if open <= 0 || findMatchingBrace(text, open, '(', ')') != len(text)-1 {
+		return callExpr{}, false, nil
+	}
+	name, err := parseQueryIdentifier(text[:open])
+	if err != nil {
+		return callExpr{}, false, nil
+	}
+	argsText := strings.TrimSpace(text[open+1 : len(text)-1])
+	var args []valueExpr
+	if argsText != "" {
+		parts := splitTopLevel(argsText, ',')
+		args = make([]valueExpr, 0, len(parts))
+		for _, part := range parts {
+			arg, err := parseValueExpr(part)
+			if err != nil {
+				return callExpr{}, false, fmt.Errorf("invalid argument in %s: %w", name, err)
+			}
+			args = append(args, arg)
+		}
+	}
+	call := callExpr{Name: name, Args: args}
+	if err := validateCallExpr(call); err != nil {
+		return callExpr{}, false, err
+	}
+	return call, true, nil
 }
 
 func unquoteQueryString(text string) (string, error) {
