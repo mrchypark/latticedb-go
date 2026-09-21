@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "ff748869421d242256dd7479f297c6d767fd90c21559257198ea937f5177d2e3"
+const auditedCypherParserDigest = "b36db2c714931cdd4cae814a7cc3d5c95e0901076465c34463190dd53459c6c4"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -286,6 +286,10 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"with chained":                     `MATCH (n) WITH n AS m WITH m AS k RETURN k.name AS name`,
 		"with distinct":                    `MATCH (n) WITH DISTINCT n.team AS team RETURN team AS team`,
 		"with after unwind":                `UNWIND $ids AS id WITH id AS value RETURN value AS value`,
+		"with starts with filter":          `MATCH (n) WITH n WHERE n.name STARTS WITH 'A' RETURN n.name AS name`,
+		"with three chained":               `MATCH (n) WITH n AS a WITH a AS b WITH b AS c RETURN c.name AS name`,
+		"with order by alias":              `MATCH (n) WITH n.age AS age ORDER BY age DESC LIMIT 1 RETURN age AS age`,
+		"count with projection list":       `MATCH (n) RETURN count(n), n.name`,
 	}
 	for name, query := range accepted {
 		t.Run("accept/"+name, func(t *testing.T) {
@@ -337,7 +341,6 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"duplicate return alias":       `MATCH (n) RETURN id(n) AS value, n.name AS value`,
 		"distinct hidden order":        `MATCH (n) RETURN DISTINCT n.name ORDER BY id(n)`,
 		"empty distinct return":        `MATCH (n) RETURN DISTINCT`,
-		"count with projection":        `MATCH (n) RETURN count(n), n.name`,
 		"literal return":               `MATCH (n) RETURN 1`,
 		"negative limit":               `MATCH (n) RETURN n LIMIT -1`,
 		"negative skip":                `MATCH (n) RETURN n SKIP -1`,

@@ -44,6 +44,8 @@ type queryPlan struct {
 	withLimitExpr  valueExpr
 	next           *queryPlan
 	inherited      []string
+	inheritedSlots []string
+	inheritedRoles map[string]bindingRole
 }
 
 type matchPattern interface {
@@ -737,14 +739,13 @@ func parseQueryText(query string) (*queryPlan, error) {
 	head := query
 	withTail := ""
 	hasWith := false
-	if withIndex >= 0 {
-		head = strings.TrimSpace(query[:withIndex])
-		withTail = strings.TrimSpace(query[withIndex+len(" WITH "):])
-		hasWith = true
-	} else if strings.HasPrefix(query, "WITH ") {
-		// A part that starts with WITH continues the chain without a new pattern.
+	if strings.HasPrefix(query, "WITH ") {
 		head = ""
 		withTail = strings.TrimSpace(strings.TrimPrefix(query, "WITH "))
+		hasWith = true
+	} else if withIndex >= 0 {
+		head = strings.TrimSpace(query[:withIndex])
+		withTail = strings.TrimSpace(query[withIndex+len(" WITH "):])
 		hasWith = true
 	}
 	var plan *queryPlan
@@ -781,7 +782,7 @@ func attachWithPart(plan *queryPlan, text string) error {
 	if text == "" {
 		return errors.New("WITH must be followed by another clause")
 	}
-	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " WITH ", " UNWIND ", " RETURN ")
+	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " UNWIND ", " RETURN ")
 	if withIndex := findWithToken(text); withIndex >= 0 && (keyword == "" || withIndex < strings.Index(text, keyword)) {
 		itemsText = strings.TrimSpace(text[:withIndex])
 		keyword = " WITH "
@@ -824,12 +825,47 @@ func attachWithPart(plan *queryPlan, text string) error {
 	}
 	plan.withClause = clause
 	plan.withWhere = predicate
-	plan.withOrder = resolveOrderAliases(clause, orders)
+	plan.withOrder = resolveWithOrderAliases(clause, orders)
 	plan.withSkipExpr = skipExpr
 	plan.withLimitExpr = limitExpr
 	plan.next = next
 	next.inherited = withOutputNames(clause)
+	next.inheritedSlots = withProjectionNames(clause)
 	return nil
+}
+
+// resolveWithOrderAliases rewrites a WITH ORDER BY clause that names a
+// projected alias so the comparison reads the projected row, not the source row.
+func resolveWithOrderAliases(clause *returnClause, orders []orderClause) []orderClause {
+	resolved := orders[:0]
+	for _, order := range orders {
+		if order.Kind == projectionValue {
+			for _, projection := range clause.Projections {
+				if projection.Alias == order.Var {
+					order.Alias = projection.Alias
+					break
+				}
+			}
+		}
+		resolved = append(resolved, order)
+	}
+	return resolved
+}
+
+// withProjectionNames lists every projected column name, including names that
+// are not identifiers: they carry values across the boundary but stay
+// unreferenceable.
+func withProjectionNames(clause *returnClause) []string {
+	if clause.CountAlias != "" {
+		return []string{clause.CountAlias}
+	}
+	names := make([]string, 0, len(clause.Projections))
+	for _, projection := range clause.Projections {
+		if projection.Alias != "" {
+			names = append(names, projection.Alias)
+		}
+	}
+	return names
 }
 
 // findWithToken finds the top-level WITH clause keyword, skipping the STARTS
@@ -843,11 +879,28 @@ func findWithToken(text string) int {
 		}
 		index += search
 		prefix := strings.TrimSpace(text[:index])
-		if !strings.HasSuffix(prefix, "STARTS") && !strings.HasSuffix(prefix, "ENDS") {
+		operator := ""
+		if strings.HasSuffix(prefix, "STARTS") {
+			operator = "STARTS"
+		} else if strings.HasSuffix(prefix, "ENDS") {
+			operator = "ENDS"
+		}
+		if operator == "" {
+			return index
+		}
+		// The operator is a standalone word: in "WEEKENDS WITH n" the ENDS is
+		// part of an identifier, so the WITH really is a clause keyword.
+		before := strings.TrimSuffix(prefix, operator)
+		if before != "" && !isQuerySpace(before[len(before)-1]) {
 			return index
 		}
 		search = index + len(" WITH ")
 	}
+}
+
+// isQueryIdentifierChar reports whether char can appear in an unquoted identifier.
+func isQueryIdentifierChar(char byte) bool {
+	return char == '_' || char >= '0' && char <= '9' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z'
 }
 
 // parseWithTail parses the clause that follows a WITH part.
@@ -955,6 +1008,14 @@ func (plan *queryPlan) validateBindings() error {
 			plan.slots[name] = len(plan.slots)
 		}
 	}
+	for _, name := range plan.inheritedSlots {
+		if name == "" {
+			continue
+		}
+		if _, exists := plan.slots[name]; !exists {
+			plan.slots[name] = len(plan.slots)
+		}
+	}
 	bind := func(name string, role bindingRole) error {
 		if name == "" {
 			return nil
@@ -963,10 +1024,11 @@ func (plan *queryPlan) validateBindings() error {
 			return fmt.Errorf("invalid binding %q", name)
 		}
 		if _, ok := inherited[name]; ok {
-			// The name comes from a preceding WITH part, so its role is not
-			// known here and any use is accepted.
 			if _, exists := plan.slots[name]; !exists {
 				plan.slots[name] = len(plan.slots)
+			}
+			if inheritedRole, ok := plan.inheritedRoles[name]; ok && inheritedRole != role {
+				return fmt.Errorf("binding %q has conflicting roles", name)
 			}
 			return nil
 		}
@@ -980,8 +1042,14 @@ func (plan *queryPlan) validateBindings() error {
 		return nil
 	}
 	if plan.unwindClause != nil {
-		if names := valueExprBindings(plan.unwindClause.Expr); len(names) != 0 {
-			return fmt.Errorf("unknown binding %q", names[0])
+		for _, name := range valueExprBindings(plan.unwindClause.Expr) {
+			if _, ok := inherited[name]; ok {
+				if _, exists := plan.slots[name]; !exists {
+					plan.slots[name] = len(plan.slots)
+				}
+				continue
+			}
+			return fmt.Errorf("unknown binding %q", name)
 		}
 		if err := bind(plan.unwindClause.Var, bindingValue); err != nil {
 			return err
@@ -1010,6 +1078,14 @@ func (plan *queryPlan) validateBindings() error {
 		}
 	}
 	require := func(name string, roles ...bindingRole) error {
+		if inheritedRole, ok := plan.inheritedRoles[name]; ok {
+			for _, allowed := range roles {
+				if inheritedRole == allowed {
+					return nil
+				}
+			}
+			return fmt.Errorf("binding %q has incompatible role", name)
+		}
 		if _, ok := inherited[name]; ok {
 			if _, exists := plan.slots[name]; !exists {
 				plan.slots[name] = len(plan.slots)
@@ -1138,6 +1214,69 @@ func (plan *queryPlan) validateBindings() error {
 		}
 		if err := require(clause.Var, bindingNode, bindingEdge, bindingValue); err != nil {
 			return err
+		}
+	}
+	if plan.withClause != nil {
+		clause := plan.withClause
+		if clause.CountAlias != "" {
+			if clause.CountVar != "*" {
+				if err := require(clause.CountVar, bindingNode, bindingEdge, bindingValue); err != nil {
+					return err
+				}
+			}
+			if plan.next != nil {
+				plan.next.inheritedRoles = map[string]bindingRole{clause.CountAlias: bindingValue}
+			}
+			return nil
+		}
+		roles := make(map[string]bindingRole, len(clause.Projections))
+		for _, projection := range clause.Projections {
+			switch projection.Kind {
+			case projectionValue, projectionProperty:
+				if err := require(projection.Var, bindingNode, bindingEdge, bindingValue); err != nil {
+					return err
+				}
+			case projectionBindingID:
+				if err := require(projection.Var, bindingNode, bindingEdge); err != nil {
+					return err
+				}
+			case projectionExpr, projectionAggregate:
+				for _, name := range valueExprBindings(projection.Expr) {
+					if err := require(name, bindingNode, bindingEdge, bindingValue); err != nil {
+						return err
+					}
+				}
+			}
+			if !isQueryIdentifier(projection.Alias) {
+				continue
+			}
+			role := bindingValue
+			if projection.Kind == projectionValue {
+				if source, ok := bindings[projection.Var]; ok {
+					role = source
+				}
+			}
+			roles[projection.Alias] = role
+		}
+		projected := make(map[string]struct{}, len(clause.Projections))
+		for _, name := range withOutputNames(clause) {
+			projected[name] = struct{}{}
+		}
+		for _, item := range wherePredicateClauses(plan.withWhere) {
+			if _, ok := projected[item.Var]; !ok {
+				return fmt.Errorf("unknown binding %q", item.Var)
+			}
+		}
+		for _, order := range plan.withOrder {
+			if order.Var == "" {
+				continue
+			}
+			if _, ok := projected[order.Var]; !ok {
+				return fmt.Errorf("unknown binding %q", order.Var)
+			}
+		}
+		if plan.next != nil {
+			plan.next.inheritedRoles = roles
 		}
 	}
 	return nil
@@ -1326,6 +1465,17 @@ func parseCreateQuery(query string) (*queryPlan, error) {
 }
 
 func (plan *queryPlan) mutates() bool {
+	for current := plan; current != nil; current = current.next {
+		if current.mutatesLocally() {
+			return true
+		}
+	}
+	return false
+}
+
+// mutatesLocally reports whether this part alone writes, which the per-part
+// execution fast paths need.
+func (plan *queryPlan) mutatesLocally() bool {
 	return plan.createNode != nil || len(plan.setClauses) != 0 || plan.createClause != nil || plan.removeClause != nil || plan.deleteClause != nil
 }
 
@@ -3499,25 +3649,27 @@ func parseReturnClause(text string) (*returnClause, error) {
 		}
 		if countVar != "" {
 			rest := strings.TrimSpace(text[closeIdx+1:])
-			switch {
-			case rest == "":
+			single := rest == "" || strings.HasPrefix(rest, "AS ") && !strings.Contains(rest, ",")
+			if single && rest == "" {
 				return &returnClause{
 					CountVar:   countVar,
 					CountAlias: derivedAlias,
 					Distinct:   distinct,
 				}, nil
-			case !strings.HasPrefix(rest, "AS "):
-				return nil, fmt.Errorf("invalid count return %q", text)
 			}
-			alias, err := parseQueryIdentifier(strings.TrimSpace(strings.TrimPrefix(rest, "AS ")))
-			if err != nil {
-				return nil, fmt.Errorf("invalid count alias %q", rest)
+			if single {
+				alias, err := parseQueryIdentifier(strings.TrimSpace(strings.TrimPrefix(rest, "AS ")))
+				if err != nil {
+					return nil, fmt.Errorf("invalid count alias %q", rest)
+				}
+				return &returnClause{
+					CountVar:   countVar,
+					CountAlias: alias,
+					Distinct:   distinct,
+				}, nil
 			}
-			return &returnClause{
-				CountVar:   countVar,
-				CountAlias: alias,
-				Distinct:   distinct,
-			}, nil
+			// A multi-item list falls through to the general projection parser,
+			// where count becomes an aggregate projection.
 		}
 	}
 
@@ -5404,6 +5556,9 @@ func (clause *returnClause) withRows(rows []queryRow, next *queryPlan, params ma
 		projected := make([]queryRow, 0, len(rows))
 		for _, row := range rows {
 			nextRow := next.newRow()
+			if err := budget.chargeResult(64 + uint64(len(clause.Projections))*32); err != nil {
+				return nil, err
+			}
 			for _, projection := range clause.Projections {
 				binding, err := clause.withItemBinding(projection, row, params, budget)
 				if err != nil {
@@ -5425,17 +5580,17 @@ func (clause *returnClause) withItemBinding(projection projection, row queryRow,
 	case projectionValue:
 		binding, ok := row.get(projection.Var)
 		if !ok {
-			return boundValue{}, nil
+			return boundValue{HasValue: true}, nil
 		}
 		return binding, nil
 	case projectionProperty:
 		binding, ok := row.get(projection.Var)
 		if !ok {
-			return boundValue{}, nil
+			return boundValue{HasValue: true}, nil
 		}
 		value, exists := propertyFromBinding(binding, projection.Property)
 		if !exists {
-			return boundValue{}, nil
+			return boundValue{HasValue: true}, nil
 		}
 		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 			return boundValue{}, err
@@ -5444,11 +5599,11 @@ func (clause *returnClause) withItemBinding(projection projection, row queryRow,
 	case projectionBindingID:
 		binding, ok := row.get(projection.Var)
 		if !ok {
-			return boundValue{}, nil
+			return boundValue{HasValue: true}, nil
 		}
 		value, ok := bindingID(binding)
 		if !ok {
-			return boundValue{}, nil
+			return boundValue{HasValue: true}, nil
 		}
 		return boundValue{Value: value, HasValue: true}, nil
 	case projectionExpr:
@@ -5460,7 +5615,7 @@ func (clause *returnClause) withItemBinding(projection projection, row queryRow,
 		if err := budget.chargeResult(queryValueBytes(public)); err != nil {
 			return boundValue{}, err
 		}
-		return boundValue{Value: public, HasValue: public != nil}, nil
+		return boundValue{Value: public, HasValue: true}, nil
 	default:
 		return boundValue{}, fmt.Errorf("unsupported WITH item kind %q", projection.Kind)
 	}
@@ -5517,7 +5672,7 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 				return nil, err
 			}
 			values = append(values, binding)
-			if err := writeDistinctValueKey(&keyBuilder, binding.Value, budget); err != nil {
+			if err := writeDistinctValueKey(&keyBuilder, publicProjectionValue(binding), budget); err != nil {
 				return nil, err
 			}
 		}
@@ -5545,7 +5700,10 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 			if err != nil {
 				return nil, err
 			}
-			if err := accumulator.add(value, true); err != nil {
+			if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+				return nil, err
+			}
+			if err := accumulator.add(value, value != nil); err != nil {
 				return nil, err
 			}
 		}
@@ -5561,7 +5719,7 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 			if projection.Kind == projectionAggregate {
 				value := group.aggregates[aggregateIndex].result()
 				aggregateIndex++
-				nextRow.set(projection.Alias, boundValue{Value: value, HasValue: value != nil})
+				nextRow.set(projection.Alias, boundValue{Value: value, HasValue: true})
 				continue
 			}
 			nextRow.set(projection.Alias, group.values[keyIndex])
@@ -5662,7 +5820,7 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 			if err != nil {
 				return QueryResult{}, err
 			}
-			if err := accumulator.add(value, true); err != nil {
+			if err := accumulator.add(value, value != nil); err != nil {
 				return QueryResult{}, err
 			}
 		}
