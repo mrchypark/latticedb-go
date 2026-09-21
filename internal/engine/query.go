@@ -307,6 +307,9 @@ type projection struct {
 	Expr      valueExpr
 	Aggregate aggregateKind
 	CountAll  bool
+	// ExplicitAlias records whether the item carried an AS alias, which decides
+	// whether its name crosses a WITH boundary.
+	ExplicitAlias bool
 }
 
 type orderClause struct {
@@ -928,8 +931,13 @@ func withOutputNames(clause *returnClause) []string {
 	}
 	names := make([]string, 0, len(clause.Projections))
 	for _, projection := range clause.Projections {
-		if projection.Alias != "" && isQueryIdentifier(projection.Alias) {
+		switch {
+		case projection.ExplicitAlias && projection.Alias != "":
 			names = append(names, projection.Alias)
+		case projection.Kind == projectionValue && projection.Var != "":
+			// A plain binding keeps its decoded name; a derived display alias such
+			// as n.p never crosses the boundary.
+			names = append(names, projection.Var)
 		}
 	}
 	return names
@@ -3697,6 +3705,7 @@ func parseReturnClause(text string) (*returnClause, error) {
 			return nil, errors.New("RETURN projection must be non-empty")
 		}
 		alias := exprText
+		explicitAlias := false
 		if expression, name, ok := splitOperator(exprText, " AS "); ok {
 			exprText = strings.TrimSpace(expression)
 			var err error
@@ -3704,6 +3713,7 @@ func parseReturnClause(text string) (*returnClause, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid RETURN alias %q", alias)
 			}
+			explicitAlias = true
 		}
 		if exprText == "" || alias == "" {
 			return nil, fmt.Errorf("invalid RETURN projection %q", part)
@@ -3714,9 +3724,10 @@ func parseReturnClause(text string) (*returnClause, error) {
 		aliases[alias] = struct{}{}
 		if varName, ok := parseBindingIDAccess(exprText); ok {
 			projections = append(projections, projection{
-				Kind:  projectionBindingID,
-				Var:   varName,
-				Alias: alias,
+				Kind:          projectionBindingID,
+				Var:           varName,
+				Alias:         alias,
+				ExplicitAlias: explicitAlias,
 			})
 			continue
 		}
@@ -3724,15 +3735,17 @@ func parseReturnClause(text string) (*returnClause, error) {
 			return nil, err
 		} else if ok {
 			aggregate.Alias = alias
+			aggregate.ExplicitAlias = explicitAlias
 			projections = append(projections, aggregate)
 			continue
 		}
 		if name, property, err := parsePropertyAccess(exprText); err == nil {
 			projections = append(projections, projection{
-				Kind:     projectionProperty,
-				Var:      name,
-				Property: property,
-				Alias:    alias,
+				Kind:          projectionProperty,
+				Var:           name,
+				Property:      property,
+				Alias:         alias,
+				ExplicitAlias: explicitAlias,
 			})
 			continue
 		}
@@ -3746,15 +3759,17 @@ func parseReturnClause(text string) (*returnClause, error) {
 				return nil, fmt.Errorf("invalid RETURN projection %q", exprText)
 			}
 			projections = append(projections, projection{
-				Kind:  projectionExpr,
-				Expr:  call,
-				Alias: alias,
+				Kind:          projectionExpr,
+				Expr:          call,
+				Alias:         alias,
+				ExplicitAlias: explicitAlias,
 			})
 		} else {
 			projections = append(projections, projection{
-				Kind:  projectionValue,
-				Var:   name,
-				Alias: alias,
+				Kind:          projectionValue,
+				Var:           name,
+				Alias:         alias,
+				ExplicitAlias: explicitAlias,
 			})
 		}
 	}
@@ -5570,10 +5585,10 @@ func (clause *returnClause) withRows(rows []queryRow, next *queryPlan, params ma
 	if !clause.hasAggregates() && clause.CountAlias == "" {
 		projected := make([]queryRow, 0, len(rows))
 		for _, row := range rows {
-			nextRow := next.newRow()
-			if err := budget.chargeResult(64 + uint64(len(clause.Projections))*32); err != nil {
+			if err := budget.chargeResult(64 + uint64(len(next.slots))*32); err != nil {
 				return nil, err
 			}
+			nextRow := next.newRow()
 			for _, projection := range clause.Projections {
 				binding, err := clause.withItemBinding(projection, row, params, budget)
 				if err != nil {
@@ -5653,6 +5668,9 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 				count++
 			}
 		}
+		if err := budget.chargeResult(64 + uint64(len(next.slots))*32); err != nil {
+			return nil, err
+		}
 		target := next.newRow()
 		target.set(clause.CountAlias, boundValue{Value: count, HasValue: true})
 		return []queryRow{target}, nil
@@ -5687,11 +5705,18 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 				return nil, err
 			}
 			values = append(values, binding)
-			if err := writeDistinctValueKey(&keyBuilder, publicProjectionValue(binding), budget); err != nil {
+			public := publicProjectionValue(binding)
+			if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+				return nil, err
+			}
+			if err := writeDistinctValueKey(&keyBuilder, public, budget); err != nil {
 				return nil, err
 			}
 		}
 		key := keyBuilder.String()
+		if err := budget.chargeResult(uint64(len(key))); err != nil {
+			return nil, err
+		}
 		group, ok := groups[key]
 		if !ok {
 			group = newGroup(values)
@@ -5728,6 +5753,9 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 	}
 	projected := make([]queryRow, 0, len(ordered))
 	for _, group := range ordered {
+		if err := budget.chargeResult(64 + uint64(len(next.slots))*32); err != nil {
+			return nil, err
+		}
 		nextRow := next.newRow()
 		keyIndex, aggregateIndex := 0, 0
 		for _, projection := range clause.Projections {
@@ -5762,6 +5790,9 @@ func (clause *returnClause) distinctWithRows(rows []queryRow, budget *queryBudge
 			}
 		}
 		key := keyBuilder.String()
+		if err := budget.chargeResult(uint64(len(key))); err != nil {
+			return nil, err
+		}
 		if _, ok := seen[key]; ok {
 			continue
 		}

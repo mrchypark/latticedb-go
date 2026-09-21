@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -98,5 +99,37 @@ func TestWithMutationAfterWithUsesWritePath(t *testing.T) {
 	}
 	if got := fmt.Sprint(result.Rows[0]["c"]); got != "3" {
 		t.Fatalf("flagged rows = %q, want 3", got)
+	}
+}
+
+func TestWithRoleSurvivesChainedParts(t *testing.T) {
+	db := openWithDB(t)
+	result, err := db.Query("MATCH (p:Person) WITH p WITH p MATCH (p)-[:WORKS_AT]->(c:Company) RETURN count(*) AS c", nil)
+	if err != nil {
+		t.Fatalf("chained entity traversal: %v", err)
+	}
+	if got := fmt.Sprint(result.Rows[0]["c"]); got != "2" {
+		t.Fatalf("chained traversal count = %q, want 2", got)
+	}
+}
+
+func TestWithMaterializationRespectsByteBudget(t *testing.T) {
+	db := openWithDB(t)
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Big"}, Properties: map[string]any{"blob": make([]byte, 1<<20)}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	queries := []string{
+		"MATCH (n:Big) WITH n, count(*) AS c RETURN count(*) AS groups",
+		"MATCH (n:Big) WITH DISTINCT n RETURN count(*) AS groups",
+		"MATCH (n:Big) WITH collect(n.blob) AS blobs RETURN count(*) AS groups",
+	}
+	for _, query := range queries {
+		_, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxBytes: 4096})
+		if !errors.Is(err, ErrResourceLimit) {
+			t.Fatalf("query %q error = %v, want ErrResourceLimit", query, err)
+		}
 	}
 }
