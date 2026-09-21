@@ -291,11 +291,13 @@ type returnClause struct {
 }
 
 type projection struct {
-	Kind     projectionKind
-	Var      string
-	Property string
-	Alias    string
-	Expr     valueExpr
+	Kind      projectionKind
+	Var       string
+	Property  string
+	Alias     string
+	Expr      valueExpr
+	Aggregate aggregateKind
+	CountAll  bool
 }
 
 type orderClause struct {
@@ -303,6 +305,7 @@ type orderClause struct {
 	Var      string
 	Property string
 	Desc     bool
+	Alias    string
 }
 
 type projectionKind string
@@ -312,6 +315,7 @@ const (
 	projectionBindingID projectionKind = "binding_id"
 	projectionValue     projectionKind = "value"
 	projectionExpr      projectionKind = "expr"
+	projectionAggregate projectionKind = "aggregate"
 )
 
 type queryRow struct {
@@ -936,7 +940,10 @@ func (plan *queryPlan) validateBindings() error {
 			}
 		}
 		for _, projection := range plan.returnClause.Projections {
-			if projection.Kind == projectionExpr {
+			if projection.Kind == projectionExpr || projection.Kind == projectionAggregate {
+				if projection.Expr == nil {
+					continue
+				}
 				for _, name := range valueExprBindings(projection.Expr) {
 					if err := require(name, bindingNode, bindingEdge, bindingValue); err != nil {
 						return err
@@ -954,6 +961,9 @@ func (plan *queryPlan) validateBindings() error {
 		}
 	}
 	for _, clause := range plan.orderClauses {
+		if clause.Var == "" {
+			continue
+		}
 		if err := require(clause.Var, bindingNode, bindingEdge, bindingValue); err != nil {
 			return err
 		}
@@ -1148,9 +1158,11 @@ func parsePlanReturn(plan *queryPlan, text string) error {
 	}
 	plan.returnClause = returnClause
 	plan.orderClauses = resolveOrderAliases(returnClause, orderClauses)
-	for _, order := range plan.orderClauses {
-		if order.Kind == projectionExpr {
-			return errors.New("ORDER BY on a computed projection is not supported")
+	if !returnClause.hasAggregates() {
+		for _, order := range plan.orderClauses {
+			if order.Kind == projectionExpr {
+				return errors.New("ORDER BY on a computed projection is not supported")
+			}
 		}
 	}
 	if returnClause.Distinct {
@@ -1263,14 +1275,14 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 			return match == predicateTrue, err
 		}}
 	}
-	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) == 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" {
+	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) == 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() {
 		iteratorLimit := limit
 		if plan.limitExpr == nil {
 			iteratorLimit = -1
 		}
 		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit, budget: budget}, params, budget)
 	}
-	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit {
+	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit {
 		rows, err := plan.collectTopKRows(stream, skip, limit, budget)
 		if err != nil {
 			return QueryResult{}, err
@@ -1330,6 +1342,13 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 
 	if plan.returnClause == nil {
 		return QueryResult{}, nil
+	}
+	if plan.returnClause.hasAggregates() {
+		aggregateLimit := -1
+		if plan.limitExpr != nil {
+			aggregateLimit = limit
+		}
+		return plan.returnClause.renderAggregates(rows, params, plan.orderClauses, skip, aggregateLimit, budget)
 	}
 	if len(plan.orderClauses) != 0 {
 		slices.SortStableFunc(rows, plan.compareOrderedRows)
@@ -3269,32 +3288,36 @@ func parseReturnClause(text string) (*returnClause, error) {
 		countVarText := strings.TrimSpace(text[len("count("):closeIdx])
 		countVar := countVarText
 		if countVarText != "*" {
-			var err error
-			countVar, err = parseQueryIdentifier(countVarText)
+			parsed, err := parseQueryIdentifier(countVarText)
 			if err != nil {
-				return nil, fmt.Errorf("invalid count expression %q", text)
+				// count(expression) is evaluated as an aggregate projection.
+				countVar = ""
+			} else {
+				countVar = parsed
 			}
 		}
-		rest := strings.TrimSpace(text[closeIdx+1:])
-		switch {
-		case rest == "":
+		if countVar != "" {
+			rest := strings.TrimSpace(text[closeIdx+1:])
+			switch {
+			case rest == "":
+				return &returnClause{
+					CountVar:   countVar,
+					CountAlias: derivedAlias,
+					Distinct:   distinct,
+				}, nil
+			case !strings.HasPrefix(rest, "AS "):
+				return nil, fmt.Errorf("invalid count return %q", text)
+			}
+			alias, err := parseQueryIdentifier(strings.TrimSpace(strings.TrimPrefix(rest, "AS ")))
+			if err != nil {
+				return nil, fmt.Errorf("invalid count alias %q", rest)
+			}
 			return &returnClause{
 				CountVar:   countVar,
-				CountAlias: derivedAlias,
+				CountAlias: alias,
 				Distinct:   distinct,
 			}, nil
-		case !strings.HasPrefix(rest, "AS "):
-			return nil, fmt.Errorf("invalid count return %q", text)
 		}
-		alias, err := parseQueryIdentifier(strings.TrimSpace(strings.TrimPrefix(rest, "AS ")))
-		if err != nil {
-			return nil, fmt.Errorf("invalid count alias %q", rest)
-		}
-		return &returnClause{
-			CountVar:   countVar,
-			CountAlias: alias,
-			Distinct:   distinct,
-		}, nil
 	}
 
 	parts := splitTopLevel(text, ',')
@@ -3329,6 +3352,13 @@ func parseReturnClause(text string) (*returnClause, error) {
 			})
 			continue
 		}
+		if aggregate, ok, err := parseAggregateProjection(exprText); err != nil {
+			return nil, err
+		} else if ok {
+			aggregate.Alias = alias
+			projections = append(projections, aggregate)
+			continue
+		}
 		if name, property, err := parsePropertyAccess(exprText); err == nil {
 			projections = append(projections, projection{
 				Kind:     projectionProperty,
@@ -3361,6 +3391,42 @@ func parseReturnClause(text string) (*returnClause, error) {
 		}
 	}
 	return &returnClause{Projections: projections, Distinct: distinct}, nil
+}
+
+// parseAggregateProjection parses `name(expression)` for an aggregate function
+// name, accepting `count(*)` as the row-count form.
+func parseAggregateProjection(text string) (projection, bool, error) {
+	open := findTopLevelRune(text, '(')
+	if open <= 0 || findMatchingBrace(text, open, '(', ')') != len(text)-1 {
+		return projection{}, false, nil
+	}
+	name, err := parseQueryIdentifier(text[:open])
+	if err != nil {
+		return projection{}, false, nil
+	}
+	kind, ok := aggregateKindFor(name)
+	if !ok {
+		return projection{}, false, nil
+	}
+	inner := strings.TrimSpace(text[open+1 : len(text)-1])
+	if kind == aggregateCount && inner == "*" {
+		return projection{Kind: projectionAggregate, Aggregate: kind, CountAll: true}, true, nil
+	}
+	expr, err := parseValueExpr(inner)
+	if err != nil {
+		return projection{}, false, fmt.Errorf("invalid %s argument %q: %w", name, inner, err)
+	}
+	return projection{Kind: projectionAggregate, Aggregate: kind, Expr: expr}, true, nil
+}
+
+// hasAggregates reports whether any projection folds rows into an aggregate.
+func (clause *returnClause) hasAggregates() bool {
+	for _, projection := range clause.Projections {
+		if projection.Kind == projectionAggregate {
+			return true
+		}
+	}
+	return false
 }
 
 func parseReturnTail(text string) (string, []orderClause, valueExpr, valueExpr, error) {
@@ -3414,7 +3480,16 @@ func resolveOrderAliases(clause *returnClause, orders []orderClause) []orderClau
 				order.Kind = projection.Kind
 				order.Var = projection.Var
 				order.Property = projection.Property
+				order.Alias = projection.Alias
 				break
+			}
+		}
+		if order.Alias == "" {
+			for _, projection := range clause.Projections {
+				if projection.Kind == order.Kind && projection.Var == order.Var && projection.Property == order.Property {
+					order.Alias = projection.Alias
+					break
+				}
 			}
 		}
 		resolved = append(resolved, order)
@@ -4993,6 +5068,194 @@ func publicProjectionValue(value any) any {
 	default:
 		return nil
 	}
+}
+
+// projectionValue evaluates one non-aggregate projection for a single row and
+// returns the public value shape used by result rows.
+func (clause *returnClause) projectionValue(projection projection, row queryRow, params map[string]any, budget *queryBudget) (any, error) {
+	binding, bound := row.get(projection.Var)
+	switch projection.Kind {
+	case projectionBindingID:
+		if value, ok := bindingID(binding); bound && ok {
+			return value, nil
+		}
+		return nil, nil
+	case projectionProperty:
+		value, exists := propertyFromBinding(binding, projection.Property)
+		if !bound || !exists {
+			return nil, nil
+		}
+		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+			return nil, err
+		}
+		return store.CloneValue(value), nil
+	case projectionExpr:
+		value, err := projection.Expr.eval(row, params)
+		if err != nil {
+			return nil, err
+		}
+		public := publicProjectionValue(value)
+		if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+			return nil, err
+		}
+		return public, nil
+	case projectionValue:
+		if !bound {
+			return nil, nil
+		}
+		switch {
+		case binding.Node != nil:
+			if err := budget.chargeResult(queryStoredPropertyBytes(binding.Node.Properties)); err != nil {
+				return nil, err
+			}
+			return publicNode(binding.Node), nil
+		case binding.Edge != nil:
+			if err := budget.chargeResult(queryStoredPropertyBytes(binding.Edge.Properties)); err != nil {
+				return nil, err
+			}
+			return publicEdge(binding.Edge), nil
+		case binding.HasValue:
+			if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
+				return nil, err
+			}
+			return store.CloneValue(binding.Value), nil
+		}
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported projection kind %q", projection.Kind)
+	}
+}
+
+// renderAggregates folds materialized rows into grouped result rows. Rows are
+// grouped by the non-aggregate projections; an aggregate-only return produces
+// one row even when no input row exists.
+func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]any, orders []orderClause, skip, limit int, budget *queryBudget) (QueryResult, error) {
+	var groupKeys []projection
+	for _, projection := range clause.Projections {
+		if projection.Kind != projectionAggregate {
+			groupKeys = append(groupKeys, projection)
+		}
+	}
+	type aggregateGroup struct {
+		keys       []any
+		aggregates []*aggregateAccumulator
+	}
+	newGroup := func(keys []any) *aggregateGroup {
+		group := &aggregateGroup{keys: keys}
+		for _, projection := range clause.Projections {
+			if projection.Kind == projectionAggregate {
+				group.aggregates = append(group.aggregates, newAggregateAccumulator(projection.Aggregate))
+			}
+		}
+		return group
+	}
+	groups := map[string]*aggregateGroup{}
+	var ordered []*aggregateGroup
+	for _, row := range rows {
+		values := make([]any, 0, len(groupKeys))
+		for _, projection := range groupKeys {
+			value, err := clause.projectionValue(projection, row, params, budget)
+			if err != nil {
+				return QueryResult{}, err
+			}
+			values = append(values, value)
+		}
+		var keyBuilder strings.Builder
+		for _, value := range values {
+			if err := writeDistinctValueKey(&keyBuilder, value, budget); err != nil {
+				return QueryResult{}, err
+			}
+		}
+		key := keyBuilder.String()
+		group, ok := groups[key]
+		if !ok {
+			group = newGroup(values)
+			groups[key] = group
+			ordered = append(ordered, group)
+		}
+		aggregateIndex := 0
+		for _, projection := range clause.Projections {
+			if projection.Kind != projectionAggregate {
+				continue
+			}
+			accumulator := group.aggregates[aggregateIndex]
+			aggregateIndex++
+			if projection.CountAll {
+				if err := accumulator.add(nil, true); err != nil {
+					return QueryResult{}, err
+				}
+				continue
+			}
+			value, err := projection.Expr.eval(row, params)
+			if err != nil {
+				return QueryResult{}, err
+			}
+			if err := accumulator.add(value, true); err != nil {
+				return QueryResult{}, err
+			}
+		}
+	}
+	if len(ordered) == 0 && len(groupKeys) == 0 {
+		ordered = append(ordered, newGroup(nil))
+	}
+	result := QueryResult{Columns: make([]string, 0, len(clause.Projections))}
+	for _, projection := range clause.Projections {
+		result.Columns = append(result.Columns, projection.Alias)
+	}
+	rowsOut := make([]map[string]any, 0, len(ordered))
+	for _, group := range ordered {
+		if err := budget.chargeResult(64 + uint64(len(clause.Projections))*32); err != nil {
+			return QueryResult{}, err
+		}
+		resultRow := make(map[string]any, len(clause.Projections))
+		keyIndex, aggregateIndex := 0, 0
+		for _, projection := range clause.Projections {
+			if projection.Kind == projectionAggregate {
+				resultRow[projection.Alias] = group.aggregates[aggregateIndex].result()
+				aggregateIndex++
+				continue
+			}
+			resultRow[projection.Alias] = group.keys[keyIndex]
+			keyIndex++
+		}
+		rowsOut = append(rowsOut, resultRow)
+	}
+	if len(orders) != 0 {
+		for _, order := range orders {
+			if order.Alias == "" {
+				return QueryResult{}, errors.New("ORDER BY expressions must be projected when aggregating")
+			}
+		}
+		slices.SortStableFunc(rowsOut, func(left, right map[string]any) int {
+			for _, order := range orders {
+				comparison := compareOrderValues(left[order.Alias], right[order.Alias])
+				if comparison == 0 {
+					continue
+				}
+				if order.Desc {
+					return -comparison
+				}
+				return comparison
+			}
+			return 0
+		})
+	}
+	if clause.Distinct {
+		distinct, err := distinctResultRows(result.Columns, rowsOut, budget)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		rowsOut = distinct
+	}
+	if skip > len(rowsOut) {
+		skip = len(rowsOut)
+	}
+	rowsOut = rowsOut[skip:]
+	if limit >= 0 && len(rowsOut) > limit {
+		rowsOut = rowsOut[:limit]
+	}
+	result.Rows = rowsOut
+	return result, nil
 }
 
 func queryStoredPropertyBytes(properties store.Properties) uint64 {
