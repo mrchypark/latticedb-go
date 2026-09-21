@@ -887,7 +887,9 @@ func projectionSlotName(projection projection) string {
 	if projection.Kind == projectionValue && (projection.QuotedVar || isUnquotedIdentifierShape(projection.Var)) {
 		return projection.Var
 	}
-	return projection.Alias
+	// A value that is only carried for internal use (DISTINCT, aggregation)
+	// lives under a private name so no query text can reference it.
+	return "\x00with:" + projection.Alias
 }
 
 // findWithToken finds the top-level WITH clause keyword, skipping the STARTS
@@ -1295,7 +1297,9 @@ func (plan *queryPlan) validateBindings() error {
 					}
 				}
 			}
-			if !isQueryIdentifier(projection.Alias) {
+			name := projectionSlotName(projection)
+			if name == "" || strings.HasPrefix(name, "\x00with:") {
+				// The item exports no name, so it cannot be referenced downstream.
 				continue
 			}
 			role := bindingValue
@@ -1306,7 +1310,7 @@ func (plan *queryPlan) validateBindings() error {
 					role = source
 				}
 			}
-			roles[projection.Alias] = role
+			roles[name] = role
 		}
 		projected := make(map[string]struct{}, len(clause.Projections))
 		for _, name := range withOutputNames(clause) {

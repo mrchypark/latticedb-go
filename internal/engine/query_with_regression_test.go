@@ -145,3 +145,18 @@ func TestWithExportedNamesAreDecodedAndScoped(t *testing.T) {
 		t.Fatalf("quoted binding count = %q, want 3", got)
 	}
 }
+
+func TestWithUnaliasedItemStaysInternal(t *testing.T) {
+	db := openWithDB(t)
+	quote := string(rune(96))
+	query := "MATCH (p:Person) WITH p.name RETURN " + quote + "p.name" + quote + " AS value"
+	if _, err := parseQuery(query); err == nil {
+		t.Fatal("parseQuery accepted an unaliased property reference")
+	}
+	if _, err := db.Query(query, nil); err == nil {
+		t.Fatal("db.Query accepted an unaliased property reference")
+	}
+	if _, err := db.Query("MATCH (p:Person) WITH DISTINCT p.name RETURN count(*) AS c", nil); err != nil {
+		t.Fatalf("DISTINCT over an unaliased item: %v", err)
+	}
+}
