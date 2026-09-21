@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "91c979620500f705654a25e9efba7c0636887e2a73c87bf551f736d5353c0de2"
+const auditedCypherParserDigest = "ff748869421d242256dd7479f297c6d767fd90c21559257198ea937f5177d2e3"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -279,6 +279,13 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"aggregate collect":                `MATCH (n:Person) RETURN collect(n.name) AS names`,
 		"aggregate min max":                `MATCH (n:Person) RETURN min(n.age) AS low, max(n.age) AS high`,
 		"function with count projection":   `MATCH (n:Person) RETURN toLower(n.name) AS lowered, count(*) AS total`,
+		"with passthrough":                 `MATCH (n) WITH n MATCH (n) RETURN count(*) AS count`,
+		"with alias filter":                `MATCH (n) WITH n AS m WHERE m.age >= 30 RETURN m.name AS name`,
+		"with aggregate":                   `MATCH (n) WITH n.team AS team, count(*) AS total RETURN team AS team, total AS total`,
+		"with ordered limit":               `MATCH (n) WITH n ORDER BY n.age DESC LIMIT 2 MATCH (n) RETURN n.name AS name`,
+		"with chained":                     `MATCH (n) WITH n AS m WITH m AS k RETURN k.name AS name`,
+		"with distinct":                    `MATCH (n) WITH DISTINCT n.team AS team RETURN team AS team`,
+		"with after unwind":                `UNWIND $ids AS id WITH id AS value RETURN value AS value`,
 	}
 	for name, query := range accepted {
 		t.Run("accept/"+name, func(t *testing.T) {
@@ -337,7 +344,8 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"skip after limit":             `MATCH (n) RETURN n LIMIT 1 SKIP 1`,
 		"unknown order binding":        `MATCH (n) RETURN n ORDER BY missing`,
 		"union":                        `MATCH (n) RETURN n UNION MATCH (m) RETURN m`,
-		"with":                         `MATCH (n) WITH n RETURN n`,
+		"with as final clause":         `MATCH (n) WITH n`,
+		"with drops bindings":          `MATCH (n) WITH n.name AS name RETURN n.name AS value`,
 		"unwind without as":            `UNWIND $items RETURN item`,
 		"unwind without return":        `UNWIND $items AS item`,
 		"unwind twice":                 `UNWIND $items AS item UNWIND item AS nested RETURN nested`,

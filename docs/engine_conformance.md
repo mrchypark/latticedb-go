@@ -229,7 +229,10 @@ Structural keywords are uppercase. Bindings, property names, labels, relationshi
 
 <!-- BEGIN supported-cypher-grammar -->
 ```text
-query          = (match-query | create-node-query | unwind-query) [";"]
+query          = query-part {WITH with-clause query-part} [";"]
+query-part     = match-query | create-node-query | unwind-query | RETURN return-tail
+with-clause    = [DISTINCT] projection {"," projection} [WHERE predicates]
+                [ORDER BY order {"," order}] [SKIP pagination] [LIMIT pagination]
 match-query    = MATCH patterns [WHERE predicates] [match-terminal]
 match-terminal = RETURN return-tail
                 | SET assignments [RETURN return-tail]
@@ -310,6 +313,8 @@ Fixed-length `MATCH` paths may be incoming, outgoing, or undirected; relationshi
 Function calls are limited to the built-in helpers `id`, `labels`, `type`, `properties`, `size`, `head`, `last`, `tail`, `range`, `split`, `replace`, `substring`, `trim`, `toLower`, `toUpper`, `toInteger`, `toFloat`, `toString`, `abs`, and `coalesce`. Unknown names and wrong argument counts are rejected while the query is parsed. Calls may appear wherever a value expression is accepted, including `RETURN` projections, `SET` assignments, `CREATE` property maps, and the right side of a `WHERE` comparison. The left side of a comparison remains a property access, and `ORDER BY` on a computed projection is not supported.
 
 `RETURN` projections also accept the aggregate calls `count`, `sum`, `avg`, `min`, `max`, and `collect`, with `count(*)` counting rows. Rows are grouped by the non-aggregate projections, so a projection list that mixes group keys and aggregates produces one row per distinct group. An aggregate-only projection list produces exactly one row even when the match found no rows. `count(expression)` is an aggregate projection; `count(*)` or `count(binding)` on its own keeps the dedicated single-column form. `ORDER BY` may reference a projected alias when aggregating, and every ordered expression must be projected. Aggregate-level `DISTINCT` such as `count(DISTINCT n)` remains unsupported.
+
+`WITH` separates a query into parts. It takes the same projection list as `RETURN` plus an optional inline `WHERE`, and optional `ORDER BY`, `SKIP`, and `LIMIT` that apply to its own output before the next part runs. Only the projected names reach the following part: the name is the `AS` alias, or the binding name when the item is a plain binding, and nothing otherwise. Referencing a binding that was not projected is an error, and duplicate names inside one `WITH` are rejected. `WITH` items may aggregate, with the same grouping rules as `RETURN`. Every `WITH` must be followed by another part; a query may not end with `WITH`, and a `WITH` filter uses the same predicate grammar as `WHERE`, so its left side is a property access.
 
 An undirected relationship produces one row per matching orientation. A non-self edge can therefore produce two rows when both endpoints are unbound; a self-loop produces one.
 
