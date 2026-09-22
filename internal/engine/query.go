@@ -636,10 +636,15 @@ func (plan *queryPlan) collectTopKRows(it queryIterator, skip, limit int, budget
 			budget.releaseTemporary(candidateBytes)
 			candidateBytes = nextBytes
 		}
-		candidates = plan.pushTopKRow(candidates, orderedQueryRow{row: row, sequence: sequence}, candidateLimit)
+		candidates, err = plan.pushTopKRow(candidates, orderedQueryRow{row: row, sequence: sequence}, candidateLimit, budget)
 		budget.releaseRows(1)
+		if err != nil {
+			return nil, err
+		}
 	}
-	slices.SortFunc(candidates, plan.compareOrderedQueryRows)
+	if err := sortQueryRows(candidates, plan.compareOrderedQueryRows, budget); err != nil {
+		return nil, err
+	}
 	if err := budget.check(0, 0); err != nil {
 		return nil, err
 	}
@@ -654,35 +659,53 @@ func (plan *queryPlan) collectTopKRows(it queryIterator, skip, limit int, budget
 	return rows, nil
 }
 
-func (plan *queryPlan) pushTopKRow(heap []orderedQueryRow, row orderedQueryRow, limit int) []orderedQueryRow {
+func (plan *queryPlan) pushTopKRow(heap []orderedQueryRow, row orderedQueryRow, limit int, budget *queryBudget) ([]orderedQueryRow, error) {
+	compare := func(left, right orderedQueryRow) (int, error) {
+		if err := budget.check(1, 0); err != nil {
+			return 0, err
+		}
+		return plan.compareOrderedQueryRows(left, right), nil
+	}
 	if len(heap) < limit {
 		heap = append(heap, row)
 		for child := len(heap) - 1; child > 0; {
 			parent := (child - 1) / 2
-			if plan.compareOrderedQueryRows(heap[child], heap[parent]) <= 0 {
+			comparison, err := compare(heap[child], heap[parent])
+			if err != nil {
+				return nil, err
+			}
+			if comparison <= 0 {
 				break
 			}
 			heap[child], heap[parent] = heap[parent], heap[child]
 			child = parent
 		}
-		return heap
+		return heap, nil
 	}
-	if plan.compareOrderedQueryRows(row, heap[0]) >= 0 {
-		return heap
+	comparison, err := compare(row, heap[0])
+	if err != nil {
+		return nil, err
+	}
+	if comparison >= 0 {
+		return heap, nil
 	}
 	heap[0] = row
 	for parent := 0; ; {
 		worst := parent
-		left := parent*2 + 1
-		right := left + 1
-		if left < len(heap) && plan.compareOrderedQueryRows(heap[left], heap[worst]) > 0 {
-			worst = left
-		}
-		if right < len(heap) && plan.compareOrderedQueryRows(heap[right], heap[worst]) > 0 {
-			worst = right
+		for _, child := range [2]int{parent*2 + 1, parent*2 + 2} {
+			if child >= len(heap) {
+				continue
+			}
+			comparison, err := compare(heap[child], heap[worst])
+			if err != nil {
+				return nil, err
+			}
+			if comparison > 0 {
+				worst = child
+			}
 		}
 		if worst == parent {
-			return heap
+			return heap, nil
 		}
 		heap[parent], heap[worst] = heap[worst], heap[parent]
 		parent = worst
@@ -1794,7 +1817,9 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		return plan.returnClause.renderAggregates(rows, params, plan.orderClauses, skip, aggregateLimit, budget)
 	}
 	if len(plan.orderClauses) != 0 {
-		slices.SortStableFunc(rows, plan.compareOrderedRows)
+		if err := sortQueryRows(rows, plan.compareOrderedRows, budget); err != nil {
+			return QueryResult{}, err
+		}
 	}
 	result, err := plan.returnClause.render(rows, params, budget)
 	if err != nil {
@@ -4559,7 +4584,7 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 	}
 
 	if clause.Kind == whereVector || clause.Kind == whereFTS {
-		slices.SortFunc(filtered, func(a queryRow, b queryRow) int {
+		if err := sortQueryRows(filtered, func(a queryRow, b queryRow) int {
 			if a.Order < b.Order {
 				return -1
 			}
@@ -4567,7 +4592,9 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 				return 1
 			}
 			return compareRowBindings(a, b)
-		})
+		}, budget); err != nil {
+			return nil, err
+		}
 	}
 	return filtered, nil
 }
@@ -5704,7 +5731,7 @@ func (clause *returnClause) projectRows(rows []queryRow, plan *queryPlan, params
 		}
 	}
 	if len(plan.withOrder) != 0 {
-		slices.SortStableFunc(projected, func(left, right queryRow) int {
+		if err := sortQueryRows(projected, func(left, right queryRow) int {
 			for _, order := range plan.withOrder {
 				comparison := compareOrderValues(order.value(left), order.value(right))
 				if comparison == 0 {
@@ -5716,7 +5743,9 @@ func (clause *returnClause) projectRows(rows []queryRow, plan *queryPlan, params
 				return comparison
 			}
 			return 0
-		})
+		}, budget); err != nil {
+			return nil, err
+		}
 	}
 	skip, err := paginationValue("SKIP", plan.withSkipExpr, params)
 	if err != nil {
@@ -6104,7 +6133,7 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 				return QueryResult{}, errors.New("ORDER BY expressions must be projected when aggregating")
 			}
 		}
-		slices.SortStableFunc(rowsOut, func(left, right map[string]any) int {
+		if err := sortQueryRows(rowsOut, func(left, right map[string]any) int {
 			for _, order := range orders {
 				comparison := compareOrderValues(left[order.Alias], right[order.Alias])
 				if comparison == 0 {
@@ -6116,7 +6145,9 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 				return comparison
 			}
 			return 0
-		})
+		}, budget); err != nil {
+			return QueryResult{}, err
+		}
 	}
 	if clause.Distinct {
 		distinct, err := distinctResultRows(result.Columns, rowsOut, budget)

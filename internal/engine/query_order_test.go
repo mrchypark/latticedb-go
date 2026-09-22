@@ -86,9 +86,10 @@ func TestIndependentMatchPatternsStartWithSmallestLabel(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Include planning work while keeping the allowance below source-order expansion.
+	// Include planning and sorting work; the unordered control below isolates
+	// the original source-order expansion budget.
 	query := `MATCH (b:Broad), (r:Rare) RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`
-	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 150})
+	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 350})
 	if err != nil {
 		t.Fatalf("rare-first query failed: %v", err)
 	}
@@ -218,9 +219,9 @@ func TestIndependentMatchPatternsUseWherePropertyCardinality(t *testing.T) {
 	if err := db.CreateNodePropertyIndex("Item", "kind"); err != nil {
 		t.Fatal(err)
 	}
-	// Count predicate comparisons as well as candidate visits; the unplanned
-	// repeated indexed lookup still exceeds this linear-work allowance.
-	result, err := db.QueryContext(t.Context(), `MATCH (b:Item), (r:Item) WHERE r.kind = "rare" RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`, nil, QueryOptions{MaxWork: 450})
+	// Count sorting as well as predicate comparisons and candidate visits.
+	// The unordered control retains its original expansion-only allowance.
+	result, err := db.QueryContext(t.Context(), `MATCH (b:Item), (r:Item) WHERE r.kind = "rare" RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`, nil, QueryOptions{MaxWork: 650})
 	if err != nil {
 		t.Fatal(err)
 	}
