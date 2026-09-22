@@ -192,5 +192,8 @@ func (a *aggregateAccumulator) addExpr(expr valueExpr, row queryRow, params map[
 			budget.releaseTemporary(queryValueBytes(a.extreme))
 		}
 	}
+	if a.kind == aggregateCollect || a.kind == aggregateMin || a.kind == aggregateMax {
+		value = cloneRetainedQueryValue(value)
+	}
 	return a.add(value, value != nil)
 }

@@ -3,7 +3,9 @@ package latticedb_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	latticedb "github.com/mrchypark/latticedb-go"
+	"strings"
 	"testing"
 )
 
@@ -80,5 +82,25 @@ func TestQueryExpressionScratchLifetime(t *testing.T) {
 	}
 	if _, err := db.QueryContext(context.Background(), "MATCH (n:Big) RETURN size(n.blob) AS value LIMIT 1", nil, latticedb.QueryOptions{MaxBytes: 4096}); !errors.Is(err, latticedb.ErrResourceLimit) {
 		t.Fatalf("oversized temporary: %v", err)
+	}
+}
+
+func TestEmptyAggregationReservesGroups(t *testing.T) {
+	db, err := latticedb.Open(t.TempDir(), latticedb.OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	projections := make([]string, 64)
+	for i := range projections {
+		projections[i] = fmt.Sprintf("sum(n.x) AS s%d", i)
+	}
+	for _, query := range []string{
+		"MATCH (n:Absent) RETURN " + strings.Join(projections, ", "),
+		"MATCH (n:Absent) WITH " + strings.Join(projections, ", ") + " RETURN s0",
+	} {
+		if _, err := db.QueryContext(context.Background(), query, nil, latticedb.QueryOptions{MaxBytes: 4096}); !errors.Is(err, latticedb.ErrResourceLimit) {
+			t.Fatalf("empty aggregation: %v", err)
+		}
 	}
 }
