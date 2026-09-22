@@ -107,6 +107,14 @@ func TestApproximateVectorCandidatePathUsesBudgetAndMatchesDirectSearch(t *testi
 		t.Fatalf("approximate query IDs=%v, direct IDs=%v", indexedIDs, directIDs)
 	}
 
+	// Aggregate LIMIT applies to output rows, not the ANN candidate count.
+	for _, prefix := range []string{"", "WITH coalesce(0) AS seed "} {
+		result, err := db.QueryContext(t.Context(), prefix+"MATCH (n:Group) WHERE n.embedding <=> $vector RETURN count(*) AS c, count(*) AS d LIMIT 1", params, QueryOptions{VectorNamespace: &namespace, ApproximateVector: true})
+		if err != nil || len(result.Rows) != 1 || result.Rows[0]["c"] != int64(1000) {
+			t.Fatalf("aggregate candidate truncation: %#v, %v", result.Rows, err)
+		}
+	}
+
 	_, err = db.QueryContext(context.Background(), query, params, QueryOptions{
 		MaxWork: 3_000, VectorNamespace: &namespace,
 	})

@@ -83,3 +83,38 @@ func TestIndexedLimitMatchesUnindexedQueries(t *testing.T) {
 		})
 	}
 }
+
+func TestIndexedLimitPreservesAggregateInput(t *testing.T) {
+	indexed, unindexed := openWithDB(t), openWithDB(t)
+	if err := indexed.CreateNodePropertyIndex("Person", "team"); err != nil {
+		t.Fatal(err)
+	}
+	for _, prefix := range []string{"", "WITH coalesce(0) AS seed "} {
+		for _, projection := range []string{
+			"sum(n.age) AS total",
+			"count(*) AS c, sum(n.age) AS total",
+			"n.team AS team, sum(n.age) AS total",
+			"avg(n.age) AS average, sum(n.age) AS total",
+		} {
+			query := prefix + "MATCH (n:Person) WHERE n.team = 'red' RETURN " + projection
+			expected, err := unindexed.Query(query, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(expected.Rows) != 1 || !queryValuesEqual(expected.Rows[0]["total"], int64(70)) {
+				t.Fatalf("wrong control: %#v", expected.Rows)
+			}
+			for _, db := range []*DB{indexed, unindexed} {
+				for _, suffix := range []string{"", " LIMIT 1"} {
+					result, err := db.Query(query+suffix, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(result.Rows, expected.Rows) {
+						t.Fatalf("%s%s: %#v, want %#v", query, suffix, result.Rows, expected.Rows)
+					}
+				}
+			}
+		}
+	}
+}

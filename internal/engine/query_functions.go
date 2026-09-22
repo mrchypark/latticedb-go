@@ -20,10 +20,10 @@ type callExpr struct {
 	Args []valueExpr
 }
 
-func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*queryBudget) (any, error) {
+func (expr callExpr) eval(row queryRow, params map[string]any, budget *queryBudget) (any, error) {
 	switch expr.Name {
 	case "id":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -39,7 +39,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 	case "coalesce":
 		// Unrestricted arity upstream, and later arguments stay unevaluated.
 		for _, arg := range expr.Args {
-			value, err := arg.eval(row, params, budgets...)
+			value, err := arg.eval(row, params, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -50,7 +50,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return nil, nil
 
 	case "labels":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -61,7 +61,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		if !ok {
 			return nil, expr.typeError("a node", args[0])
 		}
-		if err := reserveExpression(budgets, uint64(len(node.Labels))*16); err != nil {
+		if err := reserveExpression(budget, uint64(len(node.Labels))*16); err != nil {
 			return nil, err
 		}
 		labels := make([]any, 0, len(node.Labels))
@@ -71,7 +71,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return labels, nil
 
 	case "type":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -85,7 +85,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return edge.Type, nil
 
 	case "properties":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -93,13 +93,13 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 			return nil, nil
 		}
 		if node, ok := nodeBinding(args[0]); ok {
-			if err := reserveExpression(budgets, queryStoredPropertyBytes(node.Properties)); err != nil {
+			if err := reserveExpression(budget, queryStoredPropertyBytes(node.Properties)); err != nil {
 				return nil, err
 			}
 			return node.Properties.CloneMap(), nil
 		}
 		if edge, ok := edgeBinding(args[0]); ok {
-			if err := reserveExpression(budgets, queryStoredPropertyBytes(edge.Properties)); err != nil {
+			if err := reserveExpression(budget, queryStoredPropertyBytes(edge.Properties)); err != nil {
 				return nil, err
 			}
 			return edge.Properties.CloneMap(), nil
@@ -107,7 +107,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return nil, expr.typeError("a node or edge", args[0])
 
 	case "size":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -124,7 +124,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		}
 
 	case "head":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -138,7 +138,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return list[0], nil
 
 	case "last":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -152,7 +152,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return list[len(list)-1], nil
 
 	case "tail":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -166,7 +166,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return []any{}, nil
 
 	case "range":
-		args, err := expr.evalArgs(2, 3, row, params, budgets...)
+		args, err := expr.evalArgs(2, 3, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -193,12 +193,12 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		items := make([]any, 0)
 		if step > 0 {
 			for i := start; i <= end; i += step {
-				if len(budgets) > 0 && budgets[0] != nil {
-					if err := budgets[0].check(1, 0); err != nil {
+				if budget != nil {
+					if err := budget.check(1, 0); err != nil {
 						return nil, err
 					}
 				}
-				if err := reserveExpression(budgets, 16); err != nil {
+				if err := reserveExpression(budget, 16); err != nil {
 					return nil, err
 				}
 				items = append(items, i)
@@ -208,12 +208,12 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 			}
 		} else {
 			for i := start; i >= end; i += step {
-				if len(budgets) > 0 && budgets[0] != nil {
-					if err := budgets[0].check(1, 0); err != nil {
+				if budget != nil {
+					if err := budget.check(1, 0); err != nil {
 						return nil, err
 					}
 				}
-				if err := reserveExpression(budgets, 16); err != nil {
+				if err := reserveExpression(budget, 16); err != nil {
 					return nil, err
 				}
 				items = append(items, i)
@@ -225,7 +225,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return items, nil
 
 	case "split":
-		args, err := expr.evalArgs(2, 2, row, params, budgets...)
+		args, err := expr.evalArgs(2, 2, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -242,7 +242,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		}
 		if delimiter == "" {
 			// Upstream splits an empty delimiter into individual bytes.
-			if err := reserveExpression(budgets, uint64(len(text))*16); err != nil {
+			if err := reserveExpression(budget, uint64(len(text))*16); err != nil {
 				return nil, err
 			}
 			parts := make([]any, 0, len(text))
@@ -251,7 +251,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 			}
 			return parts, nil
 		}
-		if err := reserveExpression(budgets, uint64(strings.Count(text, delimiter)+1)*32); err != nil {
+		if err := reserveExpression(budget, uint64(strings.Count(text, delimiter)+1)*32); err != nil {
 			return nil, err
 		}
 		parts := strings.Split(text, delimiter)
@@ -262,7 +262,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return values, nil
 
 	case "replace":
-		args, err := expr.evalArgs(3, 3, row, params, budgets...)
+		args, err := expr.evalArgs(3, 3, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -289,13 +289,13 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		if len(replacement) > len(search) {
 			size += count * uint64(len(replacement)-len(search))
 		}
-		if err := reserveExpression(budgets, size); err != nil {
+		if err := reserveExpression(budget, size); err != nil {
 			return nil, err
 		}
 		return strings.ReplaceAll(text, search, replacement), nil
 
 	case "substring":
-		args, err := expr.evalArgs(2, 3, row, params, budgets...)
+		args, err := expr.evalArgs(2, 3, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -332,7 +332,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return text[start : start+length], nil
 
 	case "trim":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -347,13 +347,13 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		return strings.Trim(text, " \t\n\r"), nil
 
 	case "toLower":
-		return expr.evalASCIIString(false, row, params, budgets...)
+		return expr.evalASCIIString(false, row, params, budget)
 
 	case "toUpper":
-		return expr.evalASCIIString(true, row, params, budgets...)
+		return expr.evalASCIIString(true, row, params, budget)
 
 	case "toInteger":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -380,7 +380,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		}
 
 	case "toFloat":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -402,7 +402,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		}
 
 	case "toString":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -428,7 +428,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budgets ...*query
 		}
 
 	case "abs":
-		args, err := expr.evalArgs(1, 1, row, params, budgets...)
+		args, err := expr.evalArgs(1, 1, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -505,7 +505,7 @@ func validateCallExpr(call callExpr) error {
 
 // evalArgs checks that the call has between min and max arguments, then
 // evaluates every argument in order and propagates the first error.
-func (expr callExpr) evalArgs(min, max int, row queryRow, params map[string]any, budgets ...*queryBudget) ([]any, error) {
+func (expr callExpr) evalArgs(min, max int, row queryRow, params map[string]any, budget *queryBudget) ([]any, error) {
 	if len(expr.Args) < min || len(expr.Args) > max {
 		if min == max {
 			return nil, fmt.Errorf("%s expects %d argument%s, got %d", expr.Name, min, plural(min), len(expr.Args))
@@ -514,7 +514,7 @@ func (expr callExpr) evalArgs(min, max int, row queryRow, params map[string]any,
 	}
 	args := make([]any, len(expr.Args))
 	for i, arg := range expr.Args {
-		value, err := arg.eval(row, params, budgets...)
+		value, err := arg.eval(row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -538,8 +538,8 @@ func (expr callExpr) listArg(value any) ([]any, bool, error) {
 }
 
 // evalASCIIString implements toLower/toUpper with byte-wise ASCII folding.
-func (expr callExpr) evalASCIIString(upper bool, row queryRow, params map[string]any, budgets ...*queryBudget) (any, error) {
-	args, err := expr.evalArgs(1, 1, row, params, budgets...)
+func (expr callExpr) evalASCIIString(upper bool, row queryRow, params map[string]any, budget *queryBudget) (any, error) {
+	args, err := expr.evalArgs(1, 1, row, params, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -550,7 +550,7 @@ func (expr callExpr) evalASCIIString(upper bool, row queryRow, params map[string
 		}
 		return nil, expr.typeError("a string", args[0])
 	}
-	if err := reserveExpression(budgets, uint64(len(text))*2); err != nil {
+	if err := reserveExpression(budget, uint64(len(text))*2); err != nil {
 		return nil, err
 	}
 	out := []byte(text)

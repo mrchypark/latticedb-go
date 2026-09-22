@@ -215,7 +215,7 @@ func TestCallExprFunctionCases(t *testing.T) {
 	params := map[string]any{}
 	for i, tc := range callExprCases() {
 		t.Run(fmt.Sprintf("%d_%s", i, tc.expr.Name), func(t *testing.T) {
-			got, err := tc.expr.eval(row, params)
+			got, err := tc.expr.eval(row, params, nil)
 			if tc.wantErr != "" {
 				if err == nil {
 					t.Fatalf("eval() = %#v, want error %q", got, tc.wantErr)
@@ -280,7 +280,7 @@ func TestCallExprCoverage(t *testing.T) {
 // arguments are never touched once a non-NULL value is found.
 func TestCallExprCoalesceShortCircuits(t *testing.T) {
 	row := callExprRow()
-	got, err := fnCall("coalesce", fnLit(int64(1)), fnVar("absent")).eval(row, map[string]any{})
+	got, err := fnCall("coalesce", fnLit(int64(1)), fnVar("absent")).eval(row, map[string]any{}, nil)
 	if err != nil {
 		t.Fatalf("eval() unexpected error: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestCallExprCoalesceShortCircuits(t *testing.T) {
 		t.Fatalf("eval() = %#v, want int64(1)", got)
 	}
 	// A node binding is not NULL, so coalesce passes the binding through.
-	node, err := fnCall("coalesce", fnVar("n")).eval(row, map[string]any{})
+	node, err := fnCall("coalesce", fnVar("n")).eval(row, map[string]any{}, nil)
 	if err != nil {
 		t.Fatalf("eval() unexpected error: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestCallExprCoalesceShortCircuits(t *testing.T) {
 // surfaces unchanged from the enclosing call.
 func TestCallExprErrorPropagatesFromArgument(t *testing.T) {
 	row := callExprRow()
-	_, err := fnCall("trim", fnVar("absent")).eval(row, map[string]any{})
+	_, err := fnCall("trim", fnVar("absent")).eval(row, map[string]any{}, nil)
 	if err == nil || err.Error() != `unknown binding "absent"` {
 		t.Fatalf("eval() error = %v, want unknown binding error", err)
 	}
@@ -311,7 +311,7 @@ func TestCallExprErrorPropagatesFromArgument(t *testing.T) {
 // TestCallExprMissingParameterPropagates covers the parameter path as well.
 func TestCallExprMissingParameterPropagates(t *testing.T) {
 	row := callExprRow()
-	_, err := fnCall("size", paramExpr{Name: "p"}).eval(row, map[string]any{})
+	_, err := fnCall("size", paramExpr{Name: "p"}).eval(row, map[string]any{}, nil)
 	if err == nil || err.Error() != `missing query parameter "p"` {
 		t.Fatalf("eval() error = %v, want missing parameter error", err)
 	}

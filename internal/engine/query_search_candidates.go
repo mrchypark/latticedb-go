@@ -50,7 +50,7 @@ func (plan *queryPlan) searchCandidate(tx *Tx, patterns []matchPattern, params m
 		}
 		return plan.ftsSearchCandidate(tx, node, searchClause, params, budget)
 	}
-	if !budget.approximateVector || budget.vectorNamespace == nil || plan.skipExpr != nil || skip != 0 || plan.limitExpr == nil || limit <= 0 || len(plan.orderClauses) != 0 || plan.returnClause == nil || plan.returnClause.Distinct || plan.returnClause.CountAlias != "" {
+	if !budget.approximateVector || budget.vectorNamespace == nil || plan.skipExpr != nil || skip != 0 || plan.limitExpr == nil || limit <= 0 || len(plan.orderClauses) != 0 || plan.returnClause == nil || plan.returnClause.Distinct || plan.returnClause.CountAlias != "" || plan.returnClause.hasAggregates() {
 		return nil, nil
 	}
 	if len(plan.whereClauses) != 1 {
@@ -62,7 +62,7 @@ func (plan *queryPlan) searchCandidate(tx *Tx, patterns []matchPattern, params m
 	if limit > math.MaxUint32 {
 		return nil, nil
 	}
-	expected, err := searchClause.Expr.eval(queryRow{}, params)
+	expected, err := searchClause.Expr.eval(queryRow{}, params, nil)
 	if err != nil {
 		return nil, nil
 	}
@@ -122,7 +122,7 @@ func (plan *queryPlan) ftsSearchCandidate(tx *Tx, node nodePattern, clause *wher
 	if !configured {
 		return nil, nil
 	}
-	expected, err := clause.Expr.eval(queryRow{}, params)
+	expected, err := clause.Expr.eval(queryRow{}, params, nil)
 	if err != nil {
 		return nil, nil
 	}

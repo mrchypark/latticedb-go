@@ -698,7 +698,7 @@ type boundValue struct {
 }
 
 type valueExpr interface {
-	eval(row queryRow, params map[string]any, budgets ...*queryBudget) (any, error)
+	eval(row queryRow, params map[string]any, budget *queryBudget) (any, error)
 }
 
 type literalExpr struct {
@@ -2276,7 +2276,7 @@ func (plan *queryPlan) hasUnsafeBindingNodeID(params map[string]any, budget *que
 		default:
 			continue
 		}
-		value, err := clause.Expr.eval(queryRow{}, params)
+		value, err := clause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return true, nil
 		}
@@ -2351,7 +2351,7 @@ func (plan *queryPlan) patternCardinalityWithBudget(tx *Tx, pattern matchPattern
 				return nil
 			}
 		}
-		value, err := expr.eval(queryRow{}, params)
+		value, err := expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return err
 		}
@@ -2482,7 +2482,7 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 		default:
 			continue
 		}
-		value, err := clause.Expr.eval(queryRow{}, params)
+		value, err := clause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -2528,7 +2528,7 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 		return nil, false, nil
 	}
 	if len(indexed) == 1 && limit != ^uint(0) && len(plan.whereClauses) > 1 {
-		value, err := indexedClause.Expr.eval(queryRow{}, params)
+		value, err := indexedClause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -2550,7 +2550,7 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 }
 
 func (plan *queryPlan) indexedNodeLookupLimit(pattern nodePattern, limit, skip int) uint {
-	if plan.limitExpr == nil || limit == 0 || skip != 0 || len(plan.orderClauses) != 0 || len(pattern.Labels) != 1 || len(pattern.Properties) != 0 || len(pattern.PropertyExprs) != 0 || plan.wherePredicate != nil || plan.returnClause == nil || plan.returnClause.CountAlias != "" || plan.returnClause.Distinct || len(plan.matchPatterns) != 1 || plan.mutates() {
+	if plan.limitExpr == nil || limit == 0 || skip != 0 || len(plan.orderClauses) != 0 || len(pattern.Labels) != 1 || len(pattern.Properties) != 0 || len(pattern.PropertyExprs) != 0 || plan.wherePredicate != nil || plan.returnClause == nil || plan.returnClause.CountAlias != "" || plan.returnClause.hasAggregates() || plan.returnClause.Distinct || len(plan.matchPatterns) != 1 || plan.mutates() {
 		return ^uint(0)
 	}
 	for _, clause := range plan.whereClauses {
@@ -2589,7 +2589,7 @@ func (plan *queryPlan) boundedFilteredNodeIDs(tx *Tx, pattern nodePattern, defin
 			continue
 		}
 		if clause.Kind == whereEquals || clause.Kind == whereBindingID {
-			expected[i], err = clause.Expr.eval(queryRow{}, params)
+			expected[i], err = clause.Expr.eval(queryRow{}, params, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -2739,7 +2739,7 @@ func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[st
 		default:
 			continue
 		}
-		value, err := clause.Expr.eval(queryRow{}, params)
+		value, err := clause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -3074,7 +3074,7 @@ func (plan *queryPlan) bindingNodeID(name string, params map[string]any) (uint64
 		default:
 			continue
 		}
-		value, err := clause.Expr.eval(queryRow{}, params)
+		value, err := clause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return 0, false, err
 		}
@@ -5821,11 +5821,10 @@ func (clause *returnClause) withItemBinding(projection projection, row queryRow,
 func evalQueryExpr(expr valueExpr, row queryRow, params map[string]any, budget *queryBudget) (any, error) {
 	return expr.eval(row, params, budget)
 }
-func reserveExpression(budgets []*queryBudget, bytes uint64) error {
-	if len(budgets) == 0 || budgets[0] == nil {
+func reserveExpression(budget *queryBudget, bytes uint64) error {
+	if budget == nil {
 		return nil
 	}
-	budget := budgets[0]
 	if err := budget.check(0, 0); err != nil {
 		return err
 	}
@@ -6544,24 +6543,24 @@ func queryValueBytes(value any) uint64 {
 	}
 }
 
-func (expr literalExpr) eval(row queryRow, _ map[string]any, budgets ...*queryBudget) (any, error) {
-	if err := reserveExpression(budgets, queryValueBytes(expr.Value)); err != nil {
+func (expr literalExpr) eval(row queryRow, _ map[string]any, budget *queryBudget) (any, error) {
+	if err := reserveExpression(budget, queryValueBytes(expr.Value)); err != nil {
 		return nil, err
 	}
 	return store.CloneValue(expr.Value), nil
 }
 
-func (expr mapLiteralExpr) eval(row queryRow, params map[string]any, budgets ...*queryBudget) (any, error) {
-	if err := reserveExpression(budgets, uint64(len(expr.Entries))*32); err != nil {
+func (expr mapLiteralExpr) eval(row queryRow, params map[string]any, budget *queryBudget) (any, error) {
+	if err := reserveExpression(budget, uint64(len(expr.Entries))*32); err != nil {
 		return nil, err
 	}
 	out := make(map[string]any, len(expr.Entries))
 	for key, item := range expr.Entries {
-		value, err := item.eval(row, params, budgets...)
+		value, err := item.eval(row, params, budget)
 		if err != nil {
 			return nil, err
 		}
-		normalized, err := store.NormalizeValueWithReserve(value, func(bytes uint64) error { return reserveExpression(budgets, bytes) })
+		normalized, err := store.NormalizeValueWithReserve(value, func(bytes uint64) error { return reserveExpression(budget, bytes) })
 		if err != nil {
 			return nil, err
 		}
@@ -6570,7 +6569,7 @@ func (expr mapLiteralExpr) eval(row queryRow, params map[string]any, budgets ...
 	return out, nil
 }
 
-func (expr paramExpr) eval(_ queryRow, params map[string]any, budgets ...*queryBudget) (any, error) {
+func (expr paramExpr) eval(_ queryRow, params map[string]any, budget *queryBudget) (any, error) {
 	value, ok := params[expr.Name]
 	if !ok {
 		return nil, fmt.Errorf("missing query parameter %q", expr.Name)
@@ -6578,13 +6577,13 @@ func (expr paramExpr) eval(_ queryRow, params map[string]any, budgets ...*queryB
 	return value, nil
 }
 
-func (expr variableExpr) eval(row queryRow, _ map[string]any, budgets ...*queryBudget) (any, error) {
+func (expr variableExpr) eval(row queryRow, _ map[string]any, budget *queryBudget) (any, error) {
 	value, ok := row.get(expr.Name)
 	if !ok {
 		return nil, fmt.Errorf("unknown binding %q", expr.Name)
 	}
 	if value.HasValue {
-		if err := reserveExpression(budgets, queryValueBytes(value.Value)); err != nil {
+		if err := reserveExpression(budget, queryValueBytes(value.Value)); err != nil {
 			return nil, err
 		}
 		return store.CloneValue(value.Value), nil
@@ -6592,13 +6591,13 @@ func (expr variableExpr) eval(row queryRow, _ map[string]any, budgets ...*queryB
 	return value, nil
 }
 
-func (expr propertyExpr) eval(row queryRow, _ map[string]any, budgets ...*queryBudget) (any, error) {
+func (expr propertyExpr) eval(row queryRow, _ map[string]any, budget *queryBudget) (any, error) {
 	binding, ok := row.get(expr.Var)
 	if !ok {
 		return nil, fmt.Errorf("unknown binding %q", expr.Var)
 	}
 	value, _ := propertyFromBinding(binding, expr.Property)
-	if err := reserveExpression(budgets, queryValueBytes(value)); err != nil {
+	if err := reserveExpression(budget, queryValueBytes(value)); err != nil {
 		return nil, err
 	}
 	return store.CloneValue(value), nil
@@ -7011,7 +7010,7 @@ func paginationValue(name string, expr valueExpr, params map[string]any) (int, e
 	if expr == nil {
 		return 0, nil
 	}
-	value, err := expr.eval(queryRow{}, params)
+	value, err := expr.eval(queryRow{}, params, nil)
 	if err != nil {
 		return 0, err
 	}

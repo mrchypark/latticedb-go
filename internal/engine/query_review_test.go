@@ -77,11 +77,11 @@ func TestNormalizeQueryParamsReusesNormalizedValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := (paramExpr{Name: "items"}).eval(queryRow{}, params)
+	first, err := (paramExpr{Name: "items"}).eval(queryRow{}, params, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := (paramExpr{Name: "items"}).eval(queryRow{}, params)
+	second, err := (paramExpr{Name: "items"}).eval(queryRow{}, params, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
