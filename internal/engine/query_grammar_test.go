@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "91c979620500f705654a25e9efba7c0636887e2a73c87bf551f736d5353c0de2"
+const auditedCypherParserDigest = "a5f2932fc2770f2ba5cc5fe388b2e90cfa4e00b7404932509917e8ee91fdde78"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -158,6 +158,7 @@ func TestQueryGrammarASTShape(t *testing.T) {
 
 func TestQueryGrammarMatrix(t *testing.T) {
 	accepted := map[string]string{
+		"with create":                      "MATCH (n) WITH n.name AS name CREATE (m:Copy {name: name}) RETURN m",
 		"create anonymous node":            `CREATE ()`,
 		"create labeled node":              `CREATE (n:Person:Employee)`,
 		"create node properties":           `CREATE (n:Person {name: "Alice", age: -1, ratio: 1.5, active: true, disabled: false, note: null, copy: $name, nested: {team: 'graph'}}) RETURN id(n) AS id`,
@@ -279,6 +280,17 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"aggregate collect":                `MATCH (n:Person) RETURN collect(n.name) AS names`,
 		"aggregate min max":                `MATCH (n:Person) RETURN min(n.age) AS low, max(n.age) AS high`,
 		"function with count projection":   `MATCH (n:Person) RETURN toLower(n.name) AS lowered, count(*) AS total`,
+		"with passthrough":                 `MATCH (n) WITH n MATCH (n) RETURN count(*) AS count`,
+		"with alias filter":                `MATCH (n) WITH n AS m WHERE m.age >= 30 RETURN m.name AS name`,
+		"with aggregate":                   `MATCH (n) WITH n.team AS team, count(*) AS total RETURN team AS team, total AS total`,
+		"with ordered limit":               `MATCH (n) WITH n ORDER BY n.age DESC LIMIT 2 MATCH (n) RETURN n.name AS name`,
+		"with chained":                     `MATCH (n) WITH n AS m WITH m AS k RETURN k.name AS name`,
+		"with distinct":                    `MATCH (n) WITH DISTINCT n.team AS team RETURN team AS team`,
+		"with after unwind":                `UNWIND $ids AS id WITH id AS value RETURN value AS value`,
+		"with starts with filter":          `MATCH (n) WITH n WHERE n.name STARTS WITH 'A' RETURN n.name AS name`,
+		"with three chained":               `MATCH (n) WITH n AS a WITH a AS b WITH b AS c RETURN c.name AS name`,
+		"with order by alias":              `MATCH (n) WITH n.age AS age ORDER BY age DESC LIMIT 1 RETURN age AS age`,
+		"count with projection list":       `MATCH (n) RETURN count(n), n.name`,
 	}
 	for name, query := range accepted {
 		t.Run("accept/"+name, func(t *testing.T) {
@@ -289,6 +301,8 @@ func TestQueryGrammarMatrix(t *testing.T) {
 	}
 
 	rejected := map[string]string{
+		"private count display":        "MATCH (n) WITH count(*) RETURN `count(*)`",
+		"decoded duplicate with":       "MATCH (a), (b) WITH a AS b, `b` RETURN b",
 		"empty query":                  ``,
 		"unsupported root":             `RETURN 1`,
 		"lowercase keyword":            `match (n) RETURN n`,
@@ -330,14 +344,14 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"duplicate return alias":       `MATCH (n) RETURN id(n) AS value, n.name AS value`,
 		"distinct hidden order":        `MATCH (n) RETURN DISTINCT n.name ORDER BY id(n)`,
 		"empty distinct return":        `MATCH (n) RETURN DISTINCT`,
-		"count with projection":        `MATCH (n) RETURN count(n), n.name`,
 		"literal return":               `MATCH (n) RETURN 1`,
 		"negative limit":               `MATCH (n) RETURN n LIMIT -1`,
 		"negative skip":                `MATCH (n) RETURN n SKIP -1`,
 		"skip after limit":             `MATCH (n) RETURN n LIMIT 1 SKIP 1`,
 		"unknown order binding":        `MATCH (n) RETURN n ORDER BY missing`,
 		"union":                        `MATCH (n) RETURN n UNION MATCH (m) RETURN m`,
-		"with":                         `MATCH (n) WITH n RETURN n`,
+		"with as final clause":         `MATCH (n) WITH n`,
+		"with drops bindings":          `MATCH (n) WITH n.name AS name RETURN n.name AS value`,
 		"unwind without as":            `UNWIND $items RETURN item`,
 		"unwind without return":        `UNWIND $items AS item`,
 		"unwind twice":                 `UNWIND $items AS item UNWIND item AS nested RETURN nested`,

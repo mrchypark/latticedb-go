@@ -1,4 +1,7 @@
-query          = (match-query | create-node-query | unwind-query) [";"]
+query          = query-part {WITH with-clause query-part} [";"]
+query-part     = match-query | create-node-query | unwind-query | RETURN return-tail
+with-clause    = [DISTINCT] projection {"," projection} [WHERE predicates]
+                [ORDER BY order {"," order}] [SKIP pagination] [LIMIT pagination]
 match-query    = MATCH patterns [WHERE predicates] [match-terminal]
 match-terminal = RETURN return-tail
                 | SET assignments [RETURN return-tail]

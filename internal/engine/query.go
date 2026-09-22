@@ -37,6 +37,15 @@ type queryPlan struct {
 	orderClauses   []orderClause
 	skipExpr       valueExpr
 	limitExpr      valueExpr
+	withClause     *returnClause
+	withWhere      wherePredicate
+	withOrder      []orderClause
+	withSkipExpr   valueExpr
+	withLimitExpr  valueExpr
+	next           *queryPlan
+	inherited      []string
+	inheritedSlots []string
+	inheritedRoles map[string]bindingRole
 }
 
 type matchPattern interface {
@@ -284,10 +293,11 @@ type unwindClause struct {
 }
 
 type returnClause struct {
-	CountVar    string
-	CountAlias  string
-	Projections []projection
-	Distinct    bool
+	CountVar      string
+	CountAlias    string
+	CountExported bool
+	Projections   []projection
+	Distinct      bool
 }
 
 type projection struct {
@@ -298,6 +308,12 @@ type projection struct {
 	Expr      valueExpr
 	Aggregate aggregateKind
 	CountAll  bool
+	// ExplicitAlias records whether the item carried an AS alias, which decides
+	// whether its name crosses a WITH boundary.
+	ExplicitAlias bool
+	// QuotedVar records a backtick-quoted binding item, whose decoded name is a
+	// legitimate export even though it is not shaped like an unquoted identifier.
+	QuotedVar bool
 }
 
 type orderClause struct {
@@ -682,7 +698,7 @@ type boundValue struct {
 }
 
 type valueExpr interface {
-	eval(row queryRow, params map[string]any) (any, error)
+	eval(row queryRow, params map[string]any, budget *queryBudget) (any, error)
 }
 
 type literalExpr struct {
@@ -707,29 +723,273 @@ type propertyExpr struct {
 }
 
 func parseQuery(query string) (*queryPlan, error) {
+	plan, err := parseQueryText(query)
+	if err != nil {
+		return nil, err
+	}
+	for current := plan; current != nil; current = current.next {
+		if err := current.validateBindings(); err != nil {
+			return nil, err
+		}
+	}
+	return plan, nil
+}
+
+// parseQueryText parses one query part. A top-level WITH splits the text into
+// the part before it and the chain parsed into plan.next.
+func parseQueryText(query string) (*queryPlan, error) {
 	if err := validateQueryQuotes(query); err != nil {
 		return nil, err
 	}
 	query = normalizeQueryText(query)
+	withIndex := findWithToken(query)
+	head := query
+	withTail := ""
+	hasWith := false
+	if strings.HasPrefix(query, "WITH ") {
+		head = ""
+		withTail = strings.TrimSpace(strings.TrimPrefix(query, "WITH "))
+		hasWith = true
+	} else if withIndex >= 0 {
+		head = strings.TrimSpace(query[:withIndex])
+		withTail = strings.TrimSpace(query[withIndex+len(" WITH "):])
+		hasWith = true
+	}
 	var plan *queryPlan
 	var err error
 	switch {
-	case strings.HasPrefix(query, "MATCH "):
-		plan, err = parseMatchQuery(query)
-	case strings.HasPrefix(query, "CREATE "):
-		plan, err = parseCreateQuery(query)
-	case strings.HasPrefix(query, "UNWIND "):
-		plan, err = parseUnwindQuery(query)
+	case head == "":
+		if withTail == "" {
+			return nil, fmt.Errorf("unsupported query %q", query)
+		}
+		plan = &queryPlan{}
+	case strings.HasPrefix(head, "MATCH "):
+		plan, err = parseMatchQuery(head)
+	case strings.HasPrefix(head, "CREATE "):
+		plan, err = parseCreateQuery(head)
+	case strings.HasPrefix(head, "UNWIND "):
+		plan, err = parseUnwindQueryPart(head, hasWith)
 	default:
-		return nil, fmt.Errorf("unsupported query %q", query)
+		return nil, fmt.Errorf("unsupported query %q", head)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := plan.validateBindings(); err != nil {
-		return nil, err
+	if hasWith {
+		if err := attachWithPart(plan, withTail); err != nil {
+			return nil, err
+		}
 	}
 	return plan, nil
+}
+
+// attachWithPart parses `items [WHERE predicates] [ORDER BY ...] [SKIP ...] [LIMIT ...]`
+// plus the part that follows it.
+func attachWithPart(plan *queryPlan, text string) error {
+	if text == "" {
+		return errors.New("WITH must be followed by another clause")
+	}
+	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " UNWIND ", " CREATE ", " RETURN ")
+	keywordIndex := -1
+	if keyword != "" {
+		keywordIndex = findTopLevelToken(text, keyword)
+	}
+	if withIndex := findWithToken(text); withIndex >= 0 && (keyword == "" || keywordIndex < 0 || withIndex < keywordIndex) {
+		itemsText = strings.TrimSpace(text[:withIndex])
+		keyword = " WITH "
+		tail = strings.TrimSpace(text[withIndex+len(" WITH "):])
+	}
+	if keyword == "" {
+		return errors.New("WITH must be followed by another clause")
+	}
+	itemsText, orders, skipExpr, limitExpr, err := parseReturnTail(itemsText)
+	if err != nil {
+		return err
+	}
+	whereText := ""
+	if index := findTopLevelToken(itemsText, " WHERE "); index >= 0 {
+		whereText = strings.TrimSpace(itemsText[index+len(" WHERE "):])
+		itemsText = strings.TrimSpace(itemsText[:index])
+	}
+	clause, err := parseReturnClause(itemsText)
+	if err != nil {
+		return err
+	}
+	slots := map[string]struct{}{}
+	for _, item := range clause.Projections {
+		name := projectionSlotName(item)
+		if _, duplicate := slots[name]; duplicate {
+			return fmt.Errorf("duplicate projection name %q", name)
+		}
+		slots[name] = struct{}{}
+	}
+	if clause.CountAlias == "" && len(clause.Projections) == 0 {
+		return errors.New("WITH items must be non-empty")
+	}
+	var predicate wherePredicate
+	if whereText != "" {
+		predicate, err = parseWherePredicate(whereText)
+		if err != nil {
+			return err
+		}
+		for _, item := range wherePredicateClauses(predicate) {
+			if item.Kind == whereVector || item.Kind == whereFTS {
+				return errors.New("vector and full-text search cannot be used in a WITH filter")
+			}
+		}
+	}
+	next, err := parseWithTail(strings.TrimSpace(keyword) + " " + strings.TrimSpace(tail))
+	if err != nil {
+		return err
+	}
+	plan.withClause = clause
+	plan.withWhere = predicate
+	plan.withOrder = resolveWithOrderAliases(clause, orders)
+	plan.withSkipExpr = skipExpr
+	plan.withLimitExpr = limitExpr
+	plan.next = next
+	next.inherited = withOutputNames(clause)
+	next.inheritedSlots = withProjectionNames(clause)
+	return nil
+}
+
+// resolveWithOrderAliases rewrites a WITH ORDER BY clause that names a
+// projected alias so the comparison reads the projected row, not the source row.
+func resolveWithOrderAliases(clause *returnClause, orders []orderClause) []orderClause {
+	resolved := orders[:0]
+	for _, order := range orders {
+		if order.Kind == projectionValue {
+			for _, projection := range clause.Projections {
+				if projection.Alias == order.Var {
+					order.Alias = projection.Alias
+					break
+				}
+			}
+		}
+		resolved = append(resolved, order)
+	}
+	return resolved
+}
+
+// withProjectionNames lists every projected column name, including names that
+// are not identifiers: they carry values across the boundary but stay
+// unreferenceable.
+func withProjectionNames(clause *returnClause) []string {
+	if clause.CountAlias != "" {
+		return []string{clause.countSlotName()}
+	}
+	names := make([]string, 0, len(clause.Projections))
+	for _, projection := range clause.Projections {
+		if name := projectionSlotName(projection); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func (clause *returnClause) countSlotName() string {
+	if clause.CountExported {
+		return clause.CountAlias
+	}
+	return "\x00with:" + clause.CountAlias
+}
+
+// projectionSlotName separates exported names from private display labels.
+func projectionSlotName(projection projection) string {
+	if projection.ExplicitAlias && projection.Alias != "" {
+		return projection.Alias
+	}
+	if projection.Kind == projectionValue && (projection.QuotedVar || isUnquotedIdentifierShape(projection.Var)) {
+		return projection.Var
+	}
+	// A value that is only carried for internal use (DISTINCT, aggregation)
+	// lives under a private name so no query text can reference it.
+	return "\x00with:" + projection.Alias
+}
+
+// findWithToken finds the top-level WITH clause keyword, skipping the STARTS
+// WITH and ENDS WITH predicate operators.
+func findWithToken(text string) int {
+	search := 0
+	for {
+		index := findTopLevelToken(text[search:], " WITH ")
+		if index < 0 {
+			return -1
+		}
+		index += search
+		prefix := strings.TrimSpace(text[:index])
+		operator := ""
+		if strings.HasSuffix(prefix, "STARTS") {
+			operator = "STARTS"
+		} else if strings.HasSuffix(prefix, "ENDS") {
+			operator = "ENDS"
+		}
+		if operator == "" {
+			return index
+		}
+		// The operator is a standalone word: in "WEEKENDS WITH n" the ENDS is
+		// part of an identifier, so the WITH really is a clause keyword.
+		before := strings.TrimSuffix(prefix, operator)
+		if before != "" && !isQuerySpace(before[len(before)-1]) {
+			return index
+		}
+		search = index + len(" WITH ")
+	}
+}
+
+// isQueryIdentifierChar reports whether char can appear in an unquoted identifier.
+func isQueryIdentifierChar(char byte) bool {
+	return char == '_' || char >= '0' && char <= '9' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z'
+}
+
+// parseWithTail parses the clause that follows a WITH part.
+func parseWithTail(text string) (*queryPlan, error) {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "RETURN ") {
+		plan := &queryPlan{}
+		if err := parsePlanReturn(plan, strings.TrimSpace(strings.TrimPrefix(text, "RETURN "))); err != nil {
+			return nil, err
+		}
+		return plan, nil
+	}
+	return parseQueryText(text)
+}
+
+// withOutputNames lists the binding names a WITH part publishes to the next
+// part: the alias when it is a usable identifier, and nothing otherwise.
+func withOutputNames(clause *returnClause) []string {
+	if clause.CountAlias != "" {
+		if clause.CountExported {
+			return []string{clause.CountAlias}
+		}
+		return nil
+	}
+	names := make([]string, 0, len(clause.Projections))
+	for _, projection := range clause.Projections {
+		switch {
+		case projection.ExplicitAlias && projection.Alias != "":
+			names = append(names, projection.Alias)
+		case projection.Kind == projectionValue && (projection.QuotedVar || isUnquotedIdentifierShape(projection.Var)):
+			// A plain binding keeps its decoded name; a derived display alias such
+			// as n.p never crosses the boundary.
+			names = append(names, projection.Var)
+		}
+	}
+	return names
+}
+
+// isUnquotedIdentifierShape reports whether value can be written as an unquoted
+// identifier, which keeps derived display labels such as n.p out of scope.
+func isUnquotedIdentifierShape(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if !isQueryIdentifierChar(value[index]) {
+			return false
+		}
+	}
+	return !(value[0] >= '0' && value[0] <= '9')
 }
 
 func (plan *queryPlan) newRow() queryRow {
@@ -796,13 +1056,46 @@ const (
 
 func (plan *queryPlan) validateBindings() error {
 	bindings := map[string]bindingRole{}
+	inherited := make(map[string]struct{}, len(plan.inherited))
+	for _, name := range plan.inherited {
+		inherited[name] = struct{}{}
+	}
+	internalSlots := make(map[string]struct{}, len(plan.inheritedSlots))
+	for _, name := range plan.inheritedSlots {
+		internalSlots[name] = struct{}{}
+	}
 	plan.slots = make(map[string]int)
+	for _, name := range plan.inherited {
+		if name == "" || (name[0] != 0 && !isQueryIdentifier(name)) {
+			continue
+		}
+		if _, exists := plan.slots[name]; !exists {
+			plan.slots[name] = len(plan.slots)
+		}
+	}
+	for _, name := range plan.inheritedSlots {
+		if name == "" {
+			continue
+		}
+		if _, exists := plan.slots[name]; !exists {
+			plan.slots[name] = len(plan.slots)
+		}
+	}
 	bind := func(name string, role bindingRole) error {
 		if name == "" {
 			return nil
 		}
 		if name[0] != 0 && !isQueryIdentifier(name) {
 			return fmt.Errorf("invalid binding %q", name)
+		}
+		if _, ok := inherited[name]; ok {
+			if _, exists := plan.slots[name]; !exists {
+				plan.slots[name] = len(plan.slots)
+			}
+			if inheritedRole, ok := plan.inheritedRoles[name]; ok && inheritedRole != role {
+				return fmt.Errorf("binding %q has conflicting roles", name)
+			}
+			return nil
 		}
 		if existing, ok := bindings[name]; ok && existing != role {
 			return fmt.Errorf("binding %q has conflicting roles", name)
@@ -814,8 +1107,14 @@ func (plan *queryPlan) validateBindings() error {
 		return nil
 	}
 	if plan.unwindClause != nil {
-		if names := valueExprBindings(plan.unwindClause.Expr); len(names) != 0 {
-			return fmt.Errorf("unknown binding %q", names[0])
+		for _, name := range valueExprBindings(plan.unwindClause.Expr) {
+			if _, ok := inherited[name]; ok {
+				if _, exists := plan.slots[name]; !exists {
+					plan.slots[name] = len(plan.slots)
+				}
+				continue
+			}
+			return fmt.Errorf("unknown binding %q", name)
 		}
 		if err := bind(plan.unwindClause.Var, bindingValue); err != nil {
 			return err
@@ -844,6 +1143,24 @@ func (plan *queryPlan) validateBindings() error {
 		}
 	}
 	require := func(name string, roles ...bindingRole) error {
+		if inheritedRole, ok := plan.inheritedRoles[name]; ok {
+			for _, allowed := range roles {
+				if inheritedRole == allowed {
+					return nil
+				}
+			}
+			return fmt.Errorf("binding %q has incompatible role", name)
+		}
+		if _, ok := inherited[name]; ok {
+			if _, exists := plan.slots[name]; !exists {
+				plan.slots[name] = len(plan.slots)
+			}
+			return nil
+		}
+		if _, ok := internalSlots[name]; ok {
+			// The value crossed the WITH boundary for internal use only.
+			return fmt.Errorf("unknown binding %q", name)
+		}
 		role, ok := bindings[name]
 		if !ok {
 			return fmt.Errorf("unknown binding %q", name)
@@ -968,6 +1285,90 @@ func (plan *queryPlan) validateBindings() error {
 			return err
 		}
 	}
+	if plan.withClause != nil {
+		clause := plan.withClause
+		if clause.CountAlias != "" {
+			if clause.CountVar != "*" {
+				if err := require(clause.CountVar, bindingNode, bindingEdge, bindingValue); err != nil {
+					return err
+				}
+			}
+		}
+		roles := make(map[string]bindingRole, len(clause.Projections))
+		if clause.CountAlias != "" && clause.CountExported {
+			roles[clause.CountAlias] = bindingValue
+		}
+		for _, projection := range clause.Projections {
+			switch projection.Kind {
+			case projectionValue, projectionProperty:
+				if err := require(projection.Var, bindingNode, bindingEdge, bindingValue); err != nil {
+					return err
+				}
+			case projectionBindingID:
+				if err := require(projection.Var, bindingNode, bindingEdge); err != nil {
+					return err
+				}
+			case projectionExpr, projectionAggregate:
+				for _, name := range valueExprBindings(projection.Expr) {
+					if err := require(name, bindingNode, bindingEdge, bindingValue); err != nil {
+						return err
+					}
+				}
+			}
+			name := projectionSlotName(projection)
+			if name == "" || strings.HasPrefix(name, "\x00with:") {
+				// The item exports no name, so it cannot be referenced downstream.
+				continue
+			}
+			role := bindingValue
+			sourceName := projection.Var
+			preservesEntity := projection.Kind == projectionValue
+			if projection.Kind == projectionAggregate && (projection.Aggregate == aggregateMin || projection.Aggregate == aggregateMax) {
+				if variable, ok := projection.Expr.(variableExpr); ok {
+					sourceName = variable.Name
+					preservesEntity = true
+				}
+			}
+			if preservesEntity {
+				if source, ok := bindings[sourceName]; ok {
+					role = source
+				} else if source, ok := plan.inheritedRoles[sourceName]; ok {
+					role = source
+				}
+			}
+			roles[name] = role
+		}
+		projected := make(map[string]struct{}, len(clause.Projections))
+		for _, name := range withOutputNames(clause) {
+			projected[name] = struct{}{}
+		}
+		for _, item := range wherePredicateClauses(plan.withWhere) {
+			if _, ok := projected[item.Var]; !ok {
+				return fmt.Errorf("unknown binding %q", item.Var)
+			}
+			for _, name := range valueExprBindings(item.Expr) {
+				if _, ok := projected[name]; !ok {
+					return fmt.Errorf("unknown binding %q", name)
+				}
+			}
+		}
+		for _, order := range plan.withOrder {
+			if order.Var == "" {
+				continue
+			}
+			if _, ok := projected[order.Var]; !ok {
+				return fmt.Errorf("unknown binding %q", order.Var)
+			}
+			for _, projection := range clause.Projections {
+				if projection.Alias == order.Var && projection.Kind == projectionExpr {
+					return errors.New("ORDER BY on a computed projection is not supported")
+				}
+			}
+		}
+		if plan.next != nil {
+			plan.next.inheritedRoles = roles
+		}
+	}
 	return nil
 }
 
@@ -1087,6 +1488,12 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 }
 
 func parseUnwindQuery(query string) (*queryPlan, error) {
+	return parseUnwindQueryPart(query, false)
+}
+
+// parseUnwindQueryPart parses an UNWIND part. When a WITH follows, the part may
+// end after its binding without a terminal clause.
+func parseUnwindQueryPart(query string, allowNoTerminal bool) (*queryPlan, error) {
 	rest := strings.TrimSpace(strings.TrimPrefix(query, "UNWIND "))
 	exprText, keyword, tail := splitOnNextClause(rest, " AS ")
 	if keyword == "" {
@@ -1112,6 +1519,10 @@ func parseUnwindQuery(query string) (*queryPlan, error) {
 		plan = &queryPlan{}
 		err = parsePlanReturn(plan, afterVar)
 	default:
+		if allowNoTerminal && nextKeyword == "" {
+			plan = &queryPlan{}
+			break
+		}
 		return nil, fmt.Errorf("unsupported terminal clause %q", nextKeyword)
 	}
 	if err != nil {
@@ -1144,6 +1555,17 @@ func parseCreateQuery(query string) (*queryPlan, error) {
 }
 
 func (plan *queryPlan) mutates() bool {
+	for current := plan; current != nil; current = current.next {
+		if current.mutatesLocally() {
+			return true
+		}
+	}
+	return false
+}
+
+// mutatesLocally reports whether this part alone writes, which the per-part
+// execution fast paths need.
+func (plan *queryPlan) mutatesLocally() bool {
 	return plan.createNode != nil || len(plan.setClauses) != 0 || plan.createClause != nil || plan.removeClause != nil || plan.deleteClause != nil
 }
 
@@ -1180,6 +1602,12 @@ func parsePlanReturn(plan *queryPlan, text string) error {
 }
 
 func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudget) (QueryResult, error) {
+	return plan.executeWithInput(tx, params, budget, nil)
+}
+
+// executeWithInput runs one query part over the rows produced by a preceding
+// WITH part and either hands the projection to plan.next or renders the result.
+func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *queryBudget, input []queryRow) (QueryResult, error) {
 	if budget.vectorNamespace != nil {
 		namespace, err := resolveVectorNamespace(tx.graph, budget.vectorNamespace)
 		if err != nil {
@@ -1203,9 +1631,12 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	if err != nil {
 		return QueryResult{}, err
 	}
-	rows := []queryRow{plan.newRow()}
-	if err := budget.chargeRows(len(rows)); err != nil {
-		return QueryResult{}, err
+	rows := input
+	if rows == nil {
+		rows = []queryRow{plan.newRow()}
+		if err := budget.chargeRows(len(rows)); err != nil {
+			return QueryResult{}, err
+		}
 	}
 	var stream queryIterator = &sliceQueryIterator{rows: rows, budget: budget}
 	defer func() { stream.Close() }()
@@ -1275,14 +1706,14 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 			return match == predicateTrue, err
 		}}
 	}
-	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) == 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() {
+	if plan.returnClause != nil && input == nil && plan.next == nil && !plan.mutates() && len(plan.orderClauses) == 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() {
 		iteratorLimit := limit
 		if plan.limitExpr == nil {
 			iteratorLimit = -1
 		}
 		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit, budget: budget}, params, budget)
 	}
-	if plan.returnClause != nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit {
+	if plan.returnClause != nil && input == nil && plan.next == nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit {
 		rows, err := plan.collectTopKRows(stream, skip, limit, budget)
 		if err != nil {
 			return QueryResult{}, err
@@ -1336,8 +1767,20 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	}
 	if plan.mutates() {
 		for index := range rows {
-			refreshRowBindings(tx, &rows[index])
+			if err := refreshRowBindings(tx, &rows[index], budget); err != nil {
+				return QueryResult{}, err
+			}
 		}
+	}
+	if plan.withClause != nil {
+		projected, err := plan.withClause.projectRows(rows, plan, params, budget)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		if plan.next == nil {
+			return QueryResult{}, errors.New("WITH must be followed by another clause")
+		}
+		return plan.next.executeWithInput(tx, params, budget, projected)
 	}
 
 	if plan.returnClause == nil {
@@ -1833,7 +2276,7 @@ func (plan *queryPlan) hasUnsafeBindingNodeID(params map[string]any, budget *que
 		default:
 			continue
 		}
-		value, err := clause.Expr.eval(queryRow{}, params)
+		value, err := clause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return true, nil
 		}
@@ -1908,7 +2351,7 @@ func (plan *queryPlan) patternCardinalityWithBudget(tx *Tx, pattern matchPattern
 				return nil
 			}
 		}
-		value, err := expr.eval(queryRow{}, params)
+		value, err := expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return err
 		}
@@ -2039,7 +2482,7 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 		default:
 			continue
 		}
-		value, err := clause.Expr.eval(queryRow{}, params)
+		value, err := clause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -2085,7 +2528,7 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 		return nil, false, nil
 	}
 	if len(indexed) == 1 && limit != ^uint(0) && len(plan.whereClauses) > 1 {
-		value, err := indexedClause.Expr.eval(queryRow{}, params)
+		value, err := indexedClause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -2107,7 +2550,7 @@ func (plan *queryPlan) indexedNodeIDs(tx *Tx, pattern nodePattern, params map[st
 }
 
 func (plan *queryPlan) indexedNodeLookupLimit(pattern nodePattern, limit, skip int) uint {
-	if plan.limitExpr == nil || limit == 0 || skip != 0 || len(plan.orderClauses) != 0 || len(pattern.Labels) != 1 || len(pattern.Properties) != 0 || len(pattern.PropertyExprs) != 0 || plan.wherePredicate != nil || plan.returnClause == nil || plan.returnClause.CountAlias != "" || plan.returnClause.Distinct || len(plan.matchPatterns) != 1 || plan.mutates() {
+	if plan.limitExpr == nil || limit == 0 || skip != 0 || len(plan.orderClauses) != 0 || len(pattern.Labels) != 1 || len(pattern.Properties) != 0 || len(pattern.PropertyExprs) != 0 || plan.wherePredicate != nil || plan.returnClause == nil || plan.returnClause.CountAlias != "" || plan.returnClause.hasAggregates() || plan.returnClause.Distinct || len(plan.matchPatterns) != 1 || plan.mutates() {
 		return ^uint(0)
 	}
 	for _, clause := range plan.whereClauses {
@@ -2146,7 +2589,7 @@ func (plan *queryPlan) boundedFilteredNodeIDs(tx *Tx, pattern nodePattern, defin
 			continue
 		}
 		if clause.Kind == whereEquals || clause.Kind == whereBindingID {
-			expected[i], err = clause.Expr.eval(queryRow{}, params)
+			expected[i], err = clause.Expr.eval(queryRow{}, params, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -2296,7 +2739,7 @@ func (plan *queryPlan) indexedEdgeIDs(tx *Tx, pattern edgePattern, params map[st
 		default:
 			continue
 		}
-		value, err := clause.Expr.eval(queryRow{}, params)
+		value, err := clause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return nil, false, err
 		}
@@ -2631,7 +3074,7 @@ func (plan *queryPlan) bindingNodeID(name string, params map[string]any) (uint64
 		default:
 			continue
 		}
-		value, err := clause.Expr.eval(queryRow{}, params)
+		value, err := clause.Expr.eval(queryRow{}, params, nil)
 		if err != nil {
 			return 0, false, err
 		}
@@ -2650,7 +3093,7 @@ func (plan *queryPlan) bindingNodeID(name string, params map[string]any) (uint64
 func (clause *unwindClause) apply(rows []queryRow, params map[string]any, budget *queryBudget) ([]queryRow, error) {
 	nextRows := make([]queryRow, 0)
 	for _, row := range rows {
-		value, err := clause.Expr.eval(row, params)
+		value, err := evalQueryExpr(clause.Expr, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -2663,10 +3106,11 @@ func (clause *unwindClause) apply(rows []queryRow, params map[string]any, budget
 				return nil, err
 			}
 			nextRow := row.clone()
-			nextRow.set(clause.Var, boundValue{
-				Value:    item,
-				HasValue: true,
-			})
+			binding, ok := item.(boundValue)
+			if !ok {
+				binding = boundValue{Value: item, HasValue: true}
+			}
+			nextRow.set(clause.Var, binding)
 			nextRows = append(nextRows, nextRow)
 		}
 	}
@@ -3298,25 +3742,28 @@ func parseReturnClause(text string) (*returnClause, error) {
 		}
 		if countVar != "" {
 			rest := strings.TrimSpace(text[closeIdx+1:])
-			switch {
-			case rest == "":
+			single := rest == "" || strings.HasPrefix(rest, "AS ") && !strings.Contains(rest, ",")
+			if single && rest == "" {
 				return &returnClause{
 					CountVar:   countVar,
 					CountAlias: derivedAlias,
 					Distinct:   distinct,
 				}, nil
-			case !strings.HasPrefix(rest, "AS "):
-				return nil, fmt.Errorf("invalid count return %q", text)
 			}
-			alias, err := parseQueryIdentifier(strings.TrimSpace(strings.TrimPrefix(rest, "AS ")))
-			if err != nil {
-				return nil, fmt.Errorf("invalid count alias %q", rest)
+			if single {
+				alias, err := parseQueryIdentifier(strings.TrimSpace(strings.TrimPrefix(rest, "AS ")))
+				if err != nil {
+					return nil, fmt.Errorf("invalid count alias %q", rest)
+				}
+				return &returnClause{
+					CountVar:      countVar,
+					CountAlias:    alias,
+					CountExported: true,
+					Distinct:      distinct,
+				}, nil
 			}
-			return &returnClause{
-				CountVar:   countVar,
-				CountAlias: alias,
-				Distinct:   distinct,
-			}, nil
+			// A multi-item list falls through to the general projection parser,
+			// where count becomes an aggregate projection.
 		}
 	}
 
@@ -3329,6 +3776,7 @@ func parseReturnClause(text string) (*returnClause, error) {
 			return nil, errors.New("RETURN projection must be non-empty")
 		}
 		alias := exprText
+		explicitAlias := false
 		if expression, name, ok := splitOperator(exprText, " AS "); ok {
 			exprText = strings.TrimSpace(expression)
 			var err error
@@ -3336,6 +3784,7 @@ func parseReturnClause(text string) (*returnClause, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid RETURN alias %q", alias)
 			}
+			explicitAlias = true
 		}
 		if exprText == "" || alias == "" {
 			return nil, fmt.Errorf("invalid RETURN projection %q", part)
@@ -3346,9 +3795,10 @@ func parseReturnClause(text string) (*returnClause, error) {
 		aliases[alias] = struct{}{}
 		if varName, ok := parseBindingIDAccess(exprText); ok {
 			projections = append(projections, projection{
-				Kind:  projectionBindingID,
-				Var:   varName,
-				Alias: alias,
+				Kind:          projectionBindingID,
+				Var:           varName,
+				Alias:         alias,
+				ExplicitAlias: explicitAlias,
 			})
 			continue
 		}
@@ -3356,15 +3806,17 @@ func parseReturnClause(text string) (*returnClause, error) {
 			return nil, err
 		} else if ok {
 			aggregate.Alias = alias
+			aggregate.ExplicitAlias = explicitAlias
 			projections = append(projections, aggregate)
 			continue
 		}
 		if name, property, err := parsePropertyAccess(exprText); err == nil {
 			projections = append(projections, projection{
-				Kind:     projectionProperty,
-				Var:      name,
-				Property: property,
-				Alias:    alias,
+				Kind:          projectionProperty,
+				Var:           name,
+				Property:      property,
+				Alias:         alias,
+				ExplicitAlias: explicitAlias,
 			})
 			continue
 		}
@@ -3378,15 +3830,18 @@ func parseReturnClause(text string) (*returnClause, error) {
 				return nil, fmt.Errorf("invalid RETURN projection %q", exprText)
 			}
 			projections = append(projections, projection{
-				Kind:  projectionExpr,
-				Expr:  call,
-				Alias: alias,
+				Kind:          projectionExpr,
+				Expr:          call,
+				Alias:         alias,
+				ExplicitAlias: explicitAlias,
 			})
 		} else {
 			projections = append(projections, projection{
-				Kind:  projectionValue,
-				Var:   name,
-				Alias: alias,
+				Kind:          projectionValue,
+				Var:           name,
+				Alias:         alias,
+				ExplicitAlias: explicitAlias,
+				QuotedVar:     strings.HasPrefix(exprText, "`"),
 			})
 		}
 	}
@@ -3531,6 +3986,13 @@ func parseOrderClauses(text string) ([]orderClause, error) {
 }
 
 func (clause orderClause) value(row queryRow) any {
+	if clause.Var == "" && clause.Alias != "" {
+		binding, ok := row.get(clause.Alias)
+		if !ok {
+			return nil
+		}
+		return orderComparable(binding)
+	}
 	binding, ok := row.get(clause.Var)
 	if !ok {
 		return nil
@@ -3560,7 +4022,25 @@ func bindingIDValue(binding boundValue) any {
 	return value
 }
 
+// orderComparable unwraps entity references without cloning their properties.
+func orderComparable(value any) any {
+	switch value := value.(type) {
+	case boundValue:
+		if value.HasValue {
+			return orderComparable(value.Value)
+		}
+		return bindingIDValue(value)
+	case Node:
+		return int64(value.ID)
+	case Edge:
+		return int64(value.ID)
+	default:
+		return value
+	}
+}
+
 func compareOrderValues(left, right any) int {
+	left, right = orderComparable(left), orderComparable(right)
 	leftRank, rightRank := orderValueRank(left), orderValueRank(right)
 	if leftRank != rightRank {
 		return cmp.Compare(leftRank, rightRank)
@@ -4002,7 +4482,8 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 				}
 				continue
 			}
-			expected, err := clause.Expr.eval(row, params)
+			beforeExpr := budget.bytes
+			expected, err := evalQueryExpr(clause.Expr, row, params, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -4014,6 +4495,7 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 				return nil, err
 			}
 			distance, err := search.VectorDistanceContext(budget.ctx, vector, queryVector)
+			budget.releaseTemporary(uint64(budget.bytes - beforeExpr))
 			if err != nil {
 				return nil, err
 			}
@@ -4023,7 +4505,9 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 			var err error
 			terms, termBytes := queryTerms, queryTermBytes
 			if !queryTermsReady {
-				expected, evalErr := clause.Expr.eval(row, params)
+				beforeExpr := budget.bytes
+				expected, evalErr := evalQueryExpr(clause.Expr, row, params, budget)
+				exprBytes := uint64(budget.bytes - beforeExpr)
 				if evalErr != nil {
 					return nil, evalErr
 				}
@@ -4032,6 +4516,7 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 					return nil, fmt.Errorf("fts comparison requires string, got %T", expected)
 				}
 				terms, termBytes, err = tokenizeQueryText(queryText, budget)
+				budget.releaseTemporary(exprBytes)
 				if err != nil {
 					return nil, err
 				}
@@ -4124,12 +4609,14 @@ func scoreQueryFTSTokens(tokens, terms []string, budget *queryBudget) (float32, 
 }
 
 func (clause *whereClause) eval(row queryRow, params map[string]any, budget *queryBudget) (predicateTruth, error) {
+	initialBytes := budget.bytes
+	defer func() { budget.releaseTemporary(uint64(budget.bytes - initialBytes)) }()
 	binding, ok := row.get(clause.Var)
 	if !ok {
 		return predicateUnknown, nil
 	}
 	if clause.Kind == whereBindingID {
-		expected, err := clause.Expr.eval(row, params)
+		expected, err := evalQueryExpr(clause.Expr, row, params, budget)
 		if err != nil {
 			return predicateUnknown, err
 		}
@@ -4147,21 +4634,21 @@ func (clause *whereClause) eval(row queryRow, params map[string]any, budget *que
 	case whereIsNotNull:
 		return predicateBool(exists && value != nil), nil
 	case whereEquals:
-		expected, err := clause.Expr.eval(row, params)
+		expected, err := evalQueryExpr(clause.Expr, row, params, budget)
 		if err != nil || !exists || value == nil || expected == nil {
 			return predicateUnknown, err
 		}
 		match, err := queryValuesEqualWithBudget(value, expected, budget)
 		return predicateBool(match), err
 	case whereNotEquals:
-		expected, err := clause.Expr.eval(row, params)
+		expected, err := evalQueryExpr(clause.Expr, row, params, budget)
 		if err != nil || !exists || value == nil || expected == nil {
 			return predicateUnknown, err
 		}
 		match, err := queryValuesEqualWithBudget(value, expected, budget)
 		return predicateBool(!match), err
 	case whereLess, whereLessEqual, whereGreater, whereGreaterEqual:
-		expected, err := clause.Expr.eval(row, params)
+		expected, err := evalQueryExpr(clause.Expr, row, params, budget)
 		if err != nil || !exists {
 			return predicateUnknown, err
 		}
@@ -4171,7 +4658,7 @@ func (clause *whereClause) eval(row queryRow, params map[string]any, budget *que
 		}
 		return predicateBool(comparisonMatches(clause.Kind, comparison)), nil
 	case whereIn:
-		expected, err := clause.Expr.eval(row, params)
+		expected, err := evalQueryExpr(clause.Expr, row, params, budget)
 		if err != nil || !exists || value == nil || expected == nil {
 			return predicateUnknown, err
 		}
@@ -4198,7 +4685,7 @@ func (clause *whereClause) eval(row queryRow, params map[string]any, budget *que
 		}
 		return predicateFalse, nil
 	case whereStartsWith, whereEndsWith, whereContains:
-		expected, err := clause.Expr.eval(row, params)
+		expected, err := evalQueryExpr(clause.Expr, row, params, budget)
 		if err != nil || !exists || value == nil || expected == nil {
 			return predicateUnknown, err
 		}
@@ -4503,7 +4990,9 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 			return err
 		}
 		row := rows[index]
-		refreshRowBindings(tx, &row)
+		if err := refreshRowBindings(tx, &row, budget); err != nil {
+			return err
+		}
 		binding, ok := row.get(clause.Var)
 		if !ok {
 			continue
@@ -4511,7 +5000,7 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 		var normalized any
 		var err error
 		if clause.Kind != setLabel {
-			value, evalErr := clause.Expr.eval(row, params)
+			value, evalErr := evalQueryExpr(clause.Expr, row, params, budget)
 			if evalErr != nil {
 				return evalErr
 			}
@@ -4630,22 +5119,64 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 	return nil
 }
 
-func refreshRowBindings(tx *Tx, row *queryRow) {
+func refreshRowBindings(tx *Tx, row *queryRow, budget *queryBudget) error {
 	for slot, binding := range row.slots {
 		if !binding.Bound {
 			continue
 		}
+		refreshed, err := refreshQueryEntities(tx, binding, budget)
+		if err != nil {
+			return err
+		}
+		row.slots[slot] = refreshed.(boundValue)
+	}
+	return nil
+}
+
+// Retained collections carry references, so mutations refresh nested entities too.
+func refreshQueryEntities(tx *Tx, value any, budget *queryBudget) (any, error) {
+	if err := budget.check(1, 0); err != nil {
+		return nil, err
+	}
+	switch value := value.(type) {
+	case boundValue:
 		switch {
-		case binding.Node != nil:
-			if current := tx.graph.Nodes.Get(binding.Node.ID); current != nil {
-				binding.Node = current
+		case value.Node != nil:
+			if current := tx.graph.Nodes.Get(value.Node.ID); current != nil {
+				value.Node = current
 			}
-		case binding.Edge != nil:
-			if current := tx.graph.Edges.Get(binding.Edge.ID); current != nil {
-				binding.Edge = current
+		case value.Edge != nil:
+			if current := tx.graph.Edges.Get(value.Edge.ID); current != nil {
+				value.Edge = current
+			}
+		case value.HasValue:
+			var err error
+			value.Value, err = refreshQueryEntities(tx, value.Value, budget)
+			if err != nil {
+				return nil, err
 			}
 		}
-		row.slots[slot] = binding
+		return value, nil
+	case []any:
+		for index, item := range value {
+			refreshed, err := refreshQueryEntities(tx, item, budget)
+			if err != nil {
+				return nil, err
+			}
+			value[index] = refreshed
+		}
+		return value, nil
+	case map[string]any:
+		for key, item := range value {
+			refreshed, err := refreshQueryEntities(tx, item, budget)
+			if err != nil {
+				return nil, err
+			}
+			value[key] = refreshed
+		}
+		return value, nil
+	default:
+		return value, nil
 	}
 }
 
@@ -4662,7 +5193,7 @@ func (clause *createNodeClause) apply(tx *Tx, rows []queryRow, params map[string
 			if err := budget.check(1, 0); err != nil {
 				return nil, err
 			}
-			value, err := expr.eval(row, params)
+			value, err := evalQueryExpr(expr, row, params, budget)
 			if err != nil {
 				return nil, err
 			}
@@ -4773,7 +5304,7 @@ func (clause *createClause) apply(tx *Tx, rows []queryRow, params map[string]any
 			if err := budget.check(1, 0); err != nil {
 				return err
 			}
-			value, err := expr.eval(row, params)
+			value, err := evalQueryExpr(expr, row, params, budget)
 			if err != nil {
 				return err
 			}
@@ -4942,19 +5473,19 @@ func (clause *returnClause) render(rows []queryRow, params map[string]any, budge
 					if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
 						return QueryResult{}, err
 					}
-					resultRow[projection.Alias] = store.CloneValue(binding.Value)
+					resultRow[projection.Alias] = publicProjectionValue(binding.Value)
 				default:
 					resultRow[projection.Alias] = nil
 				}
 			case projectionExpr:
-				value, err := projection.Expr.eval(row, params)
+				value, err := evalQueryExpr(projection.Expr, row, params, budget)
 				if err != nil {
 					return QueryResult{}, err
 				}
-				public := publicProjectionValue(value)
-				if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 					return QueryResult{}, err
 				}
+				public := publicProjectionValue(value)
 				resultRow[projection.Alias] = public
 			default:
 				return QueryResult{}, fmt.Errorf("unsupported projection kind %q", projection.Kind)
@@ -5030,19 +5561,19 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 				if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
 					return nil, err
 				}
-				resultRow[projection.Alias] = store.CloneValue(binding.Value)
+				resultRow[projection.Alias] = publicProjectionValue(binding.Value)
 			default:
 				resultRow[projection.Alias] = nil
 			}
 		case projectionExpr:
-			value, err := projection.Expr.eval(row, params)
+			value, err := evalQueryExpr(projection.Expr, row, params, budget)
 			if err != nil {
 				return nil, err
 			}
-			public := publicProjectionValue(value)
-			if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+			if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 				return nil, err
 			}
+			public := publicProjectionValue(value)
 			resultRow[projection.Alias] = public
 		default:
 			return nil, fmt.Errorf("unsupported projection kind %q", projection.Kind)
@@ -5054,19 +5585,39 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 // publicProjectionValue converts an evaluated expression result into the public
 // value shape used by query result rows, mirroring the bare-binding projection.
 func publicProjectionValue(value any) any {
-	binding, ok := value.(boundValue)
-	if !ok {
-		return store.CloneValue(value)
-	}
-	switch {
-	case binding.Node != nil:
-		return publicNode(binding.Node)
-	case binding.Edge != nil:
-		return publicEdge(binding.Edge)
-	case binding.HasValue:
-		return store.CloneValue(binding.Value)
+	switch value := value.(type) {
+	case boundValue:
+		switch {
+		case value.Node != nil:
+			return publicNode(value.Node)
+		case value.Edge != nil:
+			return publicEdge(value.Edge)
+		case value.HasValue:
+			return publicProjectionValue(value.Value)
+		default:
+			return nil
+		}
+	case []any:
+		result := make([]any, len(value))
+		for i, item := range value {
+			result[i] = publicProjectionValue(item)
+		}
+		return result
+	case map[string]any:
+		result := make(map[string]any, len(value))
+		for key, item := range value {
+			result[key] = publicProjectionValue(item)
+		}
+		return result
+	case Node:
+		value.Labels = slices.Clone(value.Labels)
+		value.Properties = store.ClonePropertyMap(value.Properties)
+		return value
+	case Edge:
+		value.Properties = store.ClonePropertyMap(value.Properties)
+		return value
 	default:
-		return nil
+		return store.CloneValue(value)
 	}
 }
 
@@ -5090,14 +5641,14 @@ func (clause *returnClause) projectionValue(projection projection, row queryRow,
 		}
 		return store.CloneValue(value), nil
 	case projectionExpr:
-		value, err := projection.Expr.eval(row, params)
+		value, err := evalQueryExpr(projection.Expr, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
-		public := publicProjectionValue(value)
-		if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 			return nil, err
 		}
+		public := publicProjectionValue(value)
 		return public, nil
 	case projectionValue:
 		if !bound {
@@ -5118,12 +5669,330 @@ func (clause *returnClause) projectionValue(projection projection, row queryRow,
 			if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
 				return nil, err
 			}
-			return store.CloneValue(binding.Value), nil
+			return publicProjectionValue(binding.Value), nil
 		}
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unsupported projection kind %q", projection.Kind)
 	}
+}
+
+// projectRows materialises a WITH projection into rows for the following part,
+// applying the WITH filter, DISTINCT, ORDER BY, SKIP and LIMIT.
+func (clause *returnClause) projectRows(rows []queryRow, plan *queryPlan, params map[string]any, budget *queryBudget) ([]queryRow, error) {
+	next := plan.next
+	if next == nil {
+		return nil, errors.New("WITH must be followed by another clause")
+	}
+	projected, err := clause.withRows(rows, next, params, budget)
+	if err != nil {
+		return nil, err
+	}
+	if plan.withWhere != nil {
+		filtered := projected[:0]
+		for _, row := range projected {
+			truth, err := plan.withWhere.eval(row, params, budget)
+			if err != nil {
+				return nil, err
+			}
+			if truth == predicateTrue {
+				filtered = append(filtered, row)
+			}
+		}
+		projected = filtered
+	}
+	if clause.Distinct {
+		projected, err = clause.distinctWithRows(projected, budget)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(plan.withOrder) != 0 {
+		slices.SortStableFunc(projected, func(left, right queryRow) int {
+			for _, order := range plan.withOrder {
+				comparison := compareOrderValues(order.value(left), order.value(right))
+				if comparison == 0 {
+					continue
+				}
+				if order.Desc {
+					return -comparison
+				}
+				return comparison
+			}
+			return 0
+		})
+	}
+	skip, err := paginationValue("SKIP", plan.withSkipExpr, params)
+	if err != nil {
+		return nil, err
+	}
+	limit, err := paginationValue("LIMIT", plan.withLimitExpr, params)
+	if err != nil {
+		return nil, err
+	}
+	if skip > len(projected) {
+		skip = len(projected)
+	}
+	projected = projected[skip:]
+	if plan.withLimitExpr != nil && len(projected) > limit {
+		projected = projected[:limit]
+	}
+	return projected, nil
+}
+
+// withRows evaluates the WITH items for every input row, folding aggregates when
+// the item list contains any.
+func (clause *returnClause) withRows(rows []queryRow, next *queryPlan, params map[string]any, budget *queryBudget) ([]queryRow, error) {
+	if !clause.hasAggregates() && clause.CountAlias == "" {
+		if err := budget.chargeResult(uint64(len(rows)) * 64); err != nil {
+			return nil, err
+		}
+		projected := make([]queryRow, 0, len(rows))
+		for _, row := range rows {
+			if err := budget.chargeResult(64 + uint64(len(next.slots))*48); err != nil {
+				return nil, err
+			}
+			nextRow := next.newRow()
+			for _, projection := range clause.Projections {
+				binding, err := clause.withItemBinding(projection, row, params, budget)
+				if err != nil {
+					return nil, err
+				}
+				nextRow.set(projectionSlotName(projection), binding)
+			}
+			projected = append(projected, nextRow)
+		}
+		return projected, nil
+	}
+	return clause.aggregateWithRows(rows, next, params, budget)
+}
+
+// withItemBinding evaluates one WITH item while keeping node and edge bindings
+// usable by the following part.
+func (clause *returnClause) withItemBinding(projection projection, row queryRow, params map[string]any, budget *queryBudget) (boundValue, error) {
+	switch projection.Kind {
+	case projectionValue:
+		binding, ok := row.get(projection.Var)
+		if !ok {
+			return boundValue{HasValue: true}, nil
+		}
+		return binding, nil
+	case projectionProperty:
+		binding, ok := row.get(projection.Var)
+		if !ok {
+			return boundValue{HasValue: true}, nil
+		}
+		value, exists := propertyFromBinding(binding, projection.Property)
+		if !exists {
+			return boundValue{HasValue: true}, nil
+		}
+		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+			return boundValue{}, err
+		}
+		return boundValue{Value: store.CloneValue(value), HasValue: true}, nil
+	case projectionBindingID:
+		binding, ok := row.get(projection.Var)
+		if !ok {
+			return boundValue{HasValue: true}, nil
+		}
+		value, ok := bindingID(binding)
+		if !ok {
+			return boundValue{HasValue: true}, nil
+		}
+		return boundValue{Value: value, HasValue: true}, nil
+	case projectionExpr:
+		value, err := evalQueryExpr(projection.Expr, row, params, budget)
+		if err != nil {
+			return boundValue{}, err
+		}
+		if binding, ok := value.(boundValue); ok {
+			return binding, nil
+		}
+		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+			return boundValue{}, err
+		}
+		return boundValue{Value: store.CloneValue(value), HasValue: true}, nil
+	default:
+		return boundValue{}, fmt.Errorf("unsupported WITH item kind %q", projection.Kind)
+	}
+}
+
+// evalQueryExpr admits expression-owned allocations before materialization.
+func evalQueryExpr(expr valueExpr, row queryRow, params map[string]any, budget *queryBudget) (any, error) {
+	return expr.eval(row, params, budget)
+}
+func reserveExpression(budget *queryBudget, bytes uint64) error {
+	if budget == nil {
+		return nil
+	}
+	if err := budget.check(0, 0); err != nil {
+		return err
+	}
+	return budget.chargeResult(bytes)
+}
+
+// aggregateWithRows groups the input rows by the non-aggregate WITH items.
+func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, params map[string]any, budget *queryBudget) ([]queryRow, error) {
+	if clause.CountAlias != "" {
+		count := int64(0)
+		for _, row := range rows {
+			if clause.CountVar == "*" {
+				count++
+				continue
+			}
+			binding, ok := row.get(clause.CountVar)
+			if !ok {
+				return nil, fmt.Errorf("unknown binding %q", clause.CountVar)
+			}
+			if binding.Node != nil || binding.Edge != nil || binding.HasValue && binding.Value != nil {
+				count++
+			}
+		}
+		if err := budget.chargeResult(64 + uint64(len(next.slots))*48); err != nil {
+			return nil, err
+		}
+		target := next.newRow()
+		target.set(clause.countSlotName(), boundValue{Value: count, HasValue: true})
+		return []queryRow{target}, nil
+	}
+	var groupKeys []projection
+	for _, projection := range clause.Projections {
+		if projection.Kind != projectionAggregate {
+			groupKeys = append(groupKeys, projection)
+		}
+	}
+	type withGroup struct {
+		values     []boundValue
+		aggregates []*aggregateAccumulator
+	}
+	newGroup := func(values []boundValue) *withGroup {
+		group := &withGroup{values: values}
+		for _, projection := range clause.Projections {
+			if projection.Kind == projectionAggregate {
+				group.aggregates = append(group.aggregates, newAggregateAccumulator(projection.Aggregate))
+			}
+		}
+		return group
+	}
+	groups := map[string]*withGroup{}
+	var ordered []*withGroup
+	for _, row := range rows {
+		if err := budget.check(1, 0); err != nil {
+			return nil, err
+		}
+		if err := budget.chargeResult(uint64(len(groupKeys)) * 48); err != nil {
+			return nil, err
+		}
+		values := make([]boundValue, 0, len(groupKeys))
+		var keyBuilder strings.Builder
+		for _, projection := range groupKeys {
+			binding, err := clause.withItemBinding(projection, row, params, budget)
+			if err != nil {
+				return nil, err
+			}
+			values = append(values, binding)
+			if err := budget.chargeResult(queryValueBytes(binding)); err != nil {
+				return nil, err
+			}
+			public := publicProjectionValue(binding)
+			if err := writeDistinctValueKey(&keyBuilder, public, budget); err != nil {
+				return nil, err
+			}
+		}
+		key := keyBuilder.String()
+		group, ok := groups[key]
+		if !ok {
+			if err := budget.chargeResult(128 + uint64(len(clause.Projections))*96); err != nil {
+				return nil, err
+			}
+			group = newGroup(values)
+			groups[key] = group
+			ordered = append(ordered, group)
+		}
+		aggregateIndex := 0
+		for _, projection := range clause.Projections {
+			if projection.Kind != projectionAggregate {
+				continue
+			}
+			accumulator := group.aggregates[aggregateIndex]
+			aggregateIndex++
+			if projection.CountAll {
+				if err := accumulator.add(nil, true); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			value, err := evalQueryExpr(projection.Expr, row, params, budget)
+			if err != nil {
+				return nil, err
+			}
+			if err := budget.chargeResult(queryValueBytes(value) + 16); err != nil {
+				return nil, err
+			}
+			if err := accumulator.add(value, value != nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(ordered) == 0 && len(groupKeys) == 0 {
+		ordered = append(ordered, newGroup(nil))
+	}
+	if err := budget.chargeResult(uint64(len(ordered)) * 64); err != nil {
+		return nil, err
+	}
+	projected := make([]queryRow, 0, len(ordered))
+	for _, group := range ordered {
+		if err := budget.chargeResult(64 + uint64(len(next.slots))*48); err != nil {
+			return nil, err
+		}
+		nextRow := next.newRow()
+		keyIndex, aggregateIndex := 0, 0
+		for _, projection := range clause.Projections {
+			if projection.Kind == projectionAggregate {
+				value := group.aggregates[aggregateIndex].result()
+				aggregateIndex++
+				binding, ok := value.(boundValue)
+				if !ok {
+					binding = boundValue{Value: value, HasValue: true}
+				}
+				nextRow.set(projectionSlotName(projection), binding)
+				continue
+			}
+			nextRow.set(projectionSlotName(projection), group.values[keyIndex])
+			keyIndex++
+		}
+		projected = append(projected, nextRow)
+	}
+	return projected, nil
+}
+
+// distinctWithRows drops duplicate projected rows by their item values.
+func (clause *returnClause) distinctWithRows(rows []queryRow, budget *queryBudget) ([]queryRow, error) {
+	seen := map[string]struct{}{}
+	out := rows[:0]
+	for _, row := range rows {
+		var keyBuilder strings.Builder
+		for _, projection := range clause.Projections {
+			binding, ok := row.get(projectionSlotName(projection))
+			var value any
+			if ok {
+				if err := budget.chargeResult(queryValueBytes(binding)); err != nil {
+					return nil, err
+				}
+				value = publicProjectionValue(binding)
+			}
+			if err := writeDistinctValueKey(&keyBuilder, value, budget); err != nil {
+				return nil, err
+			}
+		}
+		key := keyBuilder.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, row)
+	}
+	return out, nil
 }
 
 // renderAggregates folds materialized rows into grouped result rows. Rows are
@@ -5186,11 +6055,14 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 				}
 				continue
 			}
-			value, err := projection.Expr.eval(row, params)
+			value, err := evalQueryExpr(projection.Expr, row, params, budget)
 			if err != nil {
 				return QueryResult{}, err
 			}
-			if err := accumulator.add(value, true); err != nil {
+			if err := budget.chargeResult(queryValueBytes(value) + 16); err != nil {
+				return QueryResult{}, err
+			}
+			if err := accumulator.add(value, value != nil); err != nil {
 				return QueryResult{}, err
 			}
 		}
@@ -5211,7 +6083,11 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 		keyIndex, aggregateIndex := 0, 0
 		for _, projection := range clause.Projections {
 			if projection.Kind == projectionAggregate {
-				resultRow[projection.Alias] = group.aggregates[aggregateIndex].result()
+				value := group.aggregates[aggregateIndex].result()
+				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+					return QueryResult{}, err
+				}
+				resultRow[projection.Alias] = publicProjectionValue(value)
 				aggregateIndex++
 				continue
 			}
@@ -5336,7 +6212,31 @@ func distinctResultRows(columns []string, rows []map[string]any, budget *queryBu
 	return distinct, nil
 }
 
+type distinctKeySize uint64
+
+func (size *distinctKeySize) Write(p []byte) (int, error) {
+	*size += distinctKeySize(len(p))
+	return len(p), nil
+}
+func (size *distinctKeySize) WriteString(p string) (int, error) {
+	*size += distinctKeySize(len(p))
+	return len(p), nil
+}
+
 func writeDistinctValueKey(writer io.Writer, value any, budget *queryBudget) error {
+	if builder, ok := writer.(*strings.Builder); ok {
+		var size distinctKeySize
+		if err := writeDistinctValueKey(&size, value, budget); err != nil {
+			return err
+		}
+		if err := budget.chargeResult(uint64(size)); err != nil {
+			return err
+		}
+		builder.Grow(int(size))
+		// Hide the builder from recursive calls: the complete value is reserved.
+		writer = struct{ io.Writer }{builder}
+	}
+
 	if err := budget.check(1, 0); err != nil {
 		return err
 	}
@@ -5606,6 +6506,22 @@ func distinctValuesEqual(left, right any) bool {
 
 func queryValueBytes(value any) uint64 {
 	switch value := value.(type) {
+	case boundValue:
+		switch {
+		case value.Node != nil:
+			return queryStoredPropertyBytes(value.Node.Properties) + uint64(len(value.Node.Labels))*16
+		case value.Edge != nil:
+			return queryStoredPropertyBytes(value.Edge.Properties)
+		case value.HasValue:
+			return queryValueBytes(value.Value)
+		default:
+			return 8
+		}
+	case Node:
+		return queryPropertyBytes(value.Properties) + uint64(len(value.Labels))*16
+	case Edge:
+		return queryPropertyBytes(value.Properties)
+
 	case nil, bool, int64, float64:
 		return 8
 	case string:
@@ -5627,18 +6543,24 @@ func queryValueBytes(value any) uint64 {
 	}
 }
 
-func (expr literalExpr) eval(_ queryRow, _ map[string]any) (any, error) {
+func (expr literalExpr) eval(row queryRow, _ map[string]any, budget *queryBudget) (any, error) {
+	if err := reserveExpression(budget, queryValueBytes(expr.Value)); err != nil {
+		return nil, err
+	}
 	return store.CloneValue(expr.Value), nil
 }
 
-func (expr mapLiteralExpr) eval(row queryRow, params map[string]any) (any, error) {
+func (expr mapLiteralExpr) eval(row queryRow, params map[string]any, budget *queryBudget) (any, error) {
+	if err := reserveExpression(budget, uint64(len(expr.Entries))*32); err != nil {
+		return nil, err
+	}
 	out := make(map[string]any, len(expr.Entries))
 	for key, item := range expr.Entries {
-		value, err := item.eval(row, params)
+		value, err := item.eval(row, params, budget)
 		if err != nil {
 			return nil, err
 		}
-		normalized, err := store.NormalizeValue(value)
+		normalized, err := store.NormalizeValueWithReserve(value, func(bytes uint64) error { return reserveExpression(budget, bytes) })
 		if err != nil {
 			return nil, err
 		}
@@ -5647,7 +6569,7 @@ func (expr mapLiteralExpr) eval(row queryRow, params map[string]any) (any, error
 	return out, nil
 }
 
-func (expr paramExpr) eval(_ queryRow, params map[string]any) (any, error) {
+func (expr paramExpr) eval(_ queryRow, params map[string]any, budget *queryBudget) (any, error) {
 	value, ok := params[expr.Name]
 	if !ok {
 		return nil, fmt.Errorf("missing query parameter %q", expr.Name)
@@ -5655,23 +6577,29 @@ func (expr paramExpr) eval(_ queryRow, params map[string]any) (any, error) {
 	return value, nil
 }
 
-func (expr variableExpr) eval(row queryRow, _ map[string]any) (any, error) {
+func (expr variableExpr) eval(row queryRow, _ map[string]any, budget *queryBudget) (any, error) {
 	value, ok := row.get(expr.Name)
 	if !ok {
 		return nil, fmt.Errorf("unknown binding %q", expr.Name)
 	}
 	if value.HasValue {
+		if err := reserveExpression(budget, queryValueBytes(value.Value)); err != nil {
+			return nil, err
+		}
 		return store.CloneValue(value.Value), nil
 	}
 	return value, nil
 }
 
-func (expr propertyExpr) eval(row queryRow, _ map[string]any) (any, error) {
+func (expr propertyExpr) eval(row queryRow, _ map[string]any, budget *queryBudget) (any, error) {
 	binding, ok := row.get(expr.Var)
 	if !ok {
 		return nil, fmt.Errorf("unknown binding %q", expr.Var)
 	}
 	value, _ := propertyFromBinding(binding, expr.Property)
+	if err := reserveExpression(budget, queryValueBytes(value)); err != nil {
+		return nil, err
+	}
 	return store.CloneValue(value), nil
 }
 
@@ -6082,7 +7010,7 @@ func paginationValue(name string, expr valueExpr, params map[string]any) (int, e
 	if expr == nil {
 		return 0, nil
 	}
-	value, err := expr.eval(queryRow{}, params)
+	value, err := expr.eval(queryRow{}, params, nil)
 	if err != nil {
 		return 0, err
 	}
