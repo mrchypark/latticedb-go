@@ -63,16 +63,18 @@ func main() {
 
 ## Query support
 
-LatticeDB supports a small, case-sensitive Cypher subset, not full openCypher or Neo4j query compatibility. Use uppercase clause keywords and lowercase `id(...)` and `count(...)`.
+LatticeDB supports a small, case-sensitive Cypher subset, not full openCypher or Neo4j query compatibility. Use uppercase clause keywords and the documented case-sensitive built-in function names.
 
 | Area | Supported scope |
 | --- | --- |
 | Matching | Nodes, multiple conjunctive labels, property maps, comma-separated patterns, and fixed-length paths with outgoing, incoming, or undirected relationships |
 | Filtering | Property comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`), `id(binding) = expression`, `AND` / `OR` / `NOT`, parentheses, `IN`, `IS NULL`, `IS NOT NULL`, `STARTS WITH`, `ENDS WITH`, `CONTAINS` |
-| Results | Bindings, properties, `id(binding)`, `AS`, `DISTINCT`, multi-key `ORDER BY`, `SKIP`, `LIMIT` |
-| Aggregation | A single `count(*)` or `count(binding)` result, optionally aliased; no grouped or mixed aggregate projections |
+| Results | Bindings, properties, built-in value expressions, `AS`, `DISTINCT`, multi-key `ORDER BY`, `SKIP`, `LIMIT` |
+| Aggregation | `count`, `sum`, `avg`, `min`, `max`, and `collect`; non-aggregate projections form grouping keys |
+| Query parts | `WITH` projection and scoped names, filtering, aggregation, `DISTINCT`, ordering, and pagination before the next query part |
+| Built-in functions | Graph metadata (`id`, `labels`, `type`, `properties`), list/string helpers, conversions, `abs`, and `coalesce`; see the [grammar contract](docs/engine_conformance.md) for the complete list |
 | Writes | Node `CREATE`; directed relationship `CREATE` between matched bindings; property and label `SET` / `REMOVE`; map replacement (`SET n = $props`) and merge (`SET n += $props`); `DELETE` / `DETACH DELETE` |
-| Batch input | One `UNWIND` feeding `RETURN`, node `CREATE`, or `MATCH` with its supported terminal clause |
+| Batch input | `UNWIND` over list parameters or expressions, including chained query parts through `WITH` |
 | Search | Vector ranking with `n.embedding <=> $vector`; property-scoped full-text search with `n.text @@ $query`. Search predicates can be combined with `AND`, but cannot occur under `OR` or `NOT`. |
 | Values | Scalar and map literals; parameters also carry lists, bytes, and vectors. Backtick-quoted identifiers support Unicode and spaces. |
 
@@ -90,10 +92,11 @@ result, err := db.Query(
 
 Important boundaries:
 
-- No `OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, variable-length paths, query comments, or multiple statements. One trailing semicolon is allowed.
-- No list literals, arithmetic expressions, general function calls, `RETURN *`, or literal projections such as `RETURN 1`. `count(n.name)`, `count(DISTINCT n)`, `sum`, `avg`, and `collect` are unsupported.
+- No `OPTIONAL MATCH`, `MERGE`, `UNION`, variable-length paths, query comments, or multiple statements. One trailing semicolon is allowed.
+- No list literals, arithmetic expressions, user-defined function calls, or `RETURN *`. Aggregate-level `DISTINCT`, such as `count(DISTINCT n)`, remains unsupported.
+- `WITH` exports explicit aliases and plain binding names; dropped names cannot be referenced by later parts. A `WITH` must be followed by another query part. See the [grammar contract](docs/engine_conformance.md) for expression and ordering restrictions.
 - Use spaces around binary predicate and assignment operators: `n.age = 1`, not `n.age=1`. Inequality is `<>`, not `!=`.
-- A `MATCH` has one terminal clause. `SET`, `REMOVE`, and relationship `CREATE` may be followed by `RETURN`; `DELETE` cannot. Top-level `CREATE` creates a node, not an entire path, and cannot be followed by `SET`.
+- Within each query part, a `MATCH` has one terminal clause. `SET`, `REMOVE`, and relationship `CREATE` may be followed by `RETURN`; `DELETE` cannot. Top-level `CREATE` creates a node, not an entire path, and cannot be followed by `SET`.
 - Missing properties evaluate to `NULL`. `SET n.prop = null` removes a property. Plain `DELETE` rejects nodes with incident edges; use `DETACH DELETE` to remove those edges too.
 - On mutation queries, `SKIP` and `LIMIT` restrict returned rows, not writes. With `RETURN DISTINCT`, every `ORDER BY` expression must also be projected.
 - An undirected match can return both orientations of an edge; a self-loop returns one. Use explicit `ORDER BY` when application behavior depends on result order.
