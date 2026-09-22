@@ -244,3 +244,22 @@ func (it *cancelAfterQueryIterator) Close() {
 	it.budget.releaseRows(len(it.rows) - it.index)
 	it.index = len(it.rows)
 }
+
+func TestCollectTopKRowsChargesComparisons(t *testing.T) {
+	plan := &queryPlan{slots: map[string]int{"rank": 0}, orderClauses: []orderClause{{Kind: projectionValue, Var: "rank"}}}
+	rows := []queryRow{topKTestRow(plan, 3, 0), topKTestRow(plan, 2, 1), topKTestRow(plan, 1, 2)}
+	for _, limit := range []int{1, 3} {
+		budget := newQueryBudget(t.Context(), QueryOptions{MaxWork: 1})
+		input := ownedTopKIterator(t, rows, budget)
+		got, err := plan.collectTopKRows(input, 0, limit, budget)
+		input.Close()
+		budget.releaseRows(len(got))
+		if !errors.Is(err, ErrResourceLimit) {
+			t.Errorf("limit %d: error = %v, want comparison work limit", limit, err)
+		}
+		if budget.bytes != 0 {
+			t.Errorf("limit %d: retained bytes = %d", limit, budget.bytes)
+		}
+		releaseQueryBudget(budget)
+	}
+}
