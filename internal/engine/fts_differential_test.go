@@ -116,3 +116,53 @@ func TestFuzzyTokenMatchBudgetLengthPruneRespectsCancellationAndBudget(t *testin
 		t.Fatalf("cancelled length-pruned match error = %v", err)
 	}
 }
+
+func TestFuzzyScoreReservesFrequencyMap(t *testing.T) {
+	// Result+query=56, frequency map=96, edit-distance scratch=400 bytes.
+	tokens := []string{"abcdefghijklmnop", "abcdefghijklmnoq"}
+	for _, test := range []struct {
+		name              string
+		maxBytes, maxWork uint64
+		wantError         bool
+	}{
+		{"map reservation", 100, 10000, true},
+		{"overlapping scratch", 512, 10000, true},
+		{"exact fit", 552, 10000, false},
+		{"work failure", 552, 1, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			budget := &directSearchBudget{ctx: t.Context(), maxWork: test.maxWork, maxBytes: test.maxBytes, bytes: 56}
+			score, err := ftsScoreBudget(tokens, []string{tokens[0]}, 1, 1, budget)
+			if test.wantError {
+				if !errors.Is(err, ErrResourceLimit) {
+					t.Fatalf("error=%v, want resource limit", err)
+				}
+			} else if err != nil || score != 1 {
+				t.Fatalf("score=%v error=%v", score, err)
+			}
+			if budget.bytes != 56 {
+				t.Fatalf("retained bytes=%d, want 56", budget.bytes)
+			}
+		})
+	}
+}
+
+func TestFuzzySearchOverlappingMemoryBudget(t *testing.T) {
+	graph := store.NewGraphState()
+	tokens := []string{"abcdefghijklmnop", "abcdefghijklmnoq"}
+	graph.FTS.Set(1, &store.FTSRecord{Text: tokens[0] + " " + tokens[1], Tokens: tokens})
+	for _, token := range tokens {
+		graph.FTSTokens.Add(token, 1)
+	}
+	db := &DB{graph: graph, queryCache: map[string]*queryPlan{}}
+	for _, maxBytes := range []uint64{512, 552} {
+		got, err := db.FTSSearch(tokens[0], FTSSearchOptions{Limit: 1, MaxDistance: 1, MinTermLength: 1, MaxBytes: maxBytes})
+		if maxBytes == 512 {
+			if !errors.Is(err, ErrResourceLimit) {
+				t.Fatalf("512-byte search=%v error=%v", got, err)
+			}
+		} else if err != nil || len(got) != 1 || got[0].NodeID != 1 || got[0].Score != 1 {
+			t.Fatalf("exact-fit search=%v error=%v", got, err)
+		}
+	}
+}

@@ -2310,9 +2310,11 @@ func levenshteinDistanceBudget(left, right string, maxDistance uint32, budget *d
 }
 
 func ftsScoreBudget(tokens, terms []string, maxDistance, minTermLength uint32, budget *directSearchBudget) (float32, error) {
-	if err := budget.checkTempBytes(saturatingMul(uint64(len(tokens)), 48)); err != nil {
+	frequencyBytes := saturatingMul(uint64(len(tokens)), 48)
+	if err := budget.reserveBytes(frequencyBytes); err != nil {
 		return 0, err
 	}
+	defer budget.releaseBytes(frequencyBytes)
 	freq := make(map[string]int, len(tokens))
 	for _, token := range tokens {
 		freq[token]++
