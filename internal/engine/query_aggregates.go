@@ -159,3 +159,41 @@ func compareAggregateValues(left, right any) (int, bool) {
 	}
 	return 0, false
 }
+
+// addExpr releases evaluated scratch after folding, retaining only collection
+// elements or the current min/max value. Reservations precede materialization.
+func (a *aggregateAccumulator) addExpr(expr valueExpr, row queryRow, params map[string]any, budget *queryBudget) error {
+	before := budget.bytes
+	value, err := evalQueryExpr(expr, row, params, budget)
+	defer budget.releaseTemporary(uint64(budget.bytes - before))
+	if err != nil {
+		return err
+	}
+	// The defer above captures only expression scratch, before retained charges.
+	switch a.kind {
+	case aggregateCollect:
+		if err := budget.chargeResult(queryValueBytes(value) + 16); err != nil {
+			return err
+		}
+	case aggregateMin, aggregateMax:
+		if value == nil {
+			return nil
+		}
+		if a.seen {
+			comparison, ordered := compareAggregateValues(value, a.extreme)
+			if !ordered || a.kind == aggregateMin && comparison >= 0 || a.kind == aggregateMax && comparison <= 0 {
+				return nil
+			}
+		}
+		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+			return err
+		}
+		if a.seen {
+			budget.releaseTemporary(queryValueBytes(a.extreme))
+		}
+	}
+	if a.kind == aggregateCollect || a.kind == aggregateMin || a.kind == aggregateMax {
+		value = cloneRetainedQueryValue(value)
+	}
+	return a.add(value, value != nil)
+}
