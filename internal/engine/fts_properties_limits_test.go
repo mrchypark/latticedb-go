@@ -164,3 +164,97 @@ func TestFTSCancellationPropagatesFromTokenizer(t *testing.T) {
 		t.Fatalf("want context.Canceled, got %v", err)
 	}
 }
+
+func TestFTSPropertyBuildCountsAllNodeVisits(t *testing.T) {
+	graph := store.NewGraphState()
+	for id := uint64(1); id <= 3; id++ {
+		graph.Nodes.Set(id, &store.NodeRecord{ID: id, Properties: store.PropertiesFromMap(map[string]any{"body": int64(id)})})
+	}
+	for _, maxWork := range []uint64{7, 8} {
+		db := &DB{derivedIndexBuildMaxWork: maxWork, derivedIndexBuildMaxLogicalBytes: 4096}
+		postings, work, _, err := buildFTSPropertyPostings(t.Context(), graph, []string{"body", "missing"}, db)
+		if maxWork == 7 {
+			if !errors.Is(err, ErrResourceLimit) {
+				t.Fatalf("seven work units: error=%v", err)
+			}
+		} else if err != nil || len(postings) != 2 || work != 2 {
+			t.Fatalf("eight work units: postings=%v persistent work=%d error=%v", postings, work, err)
+		}
+		if graph.DerivedIndexWork != 0 {
+			t.Fatal("build modified input ledger")
+		}
+	}
+}
+
+func TestFTSPropertyScanBudgetReopenAndLedger(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fts-scans")
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstID uint64
+	if err := db.Update(func(tx *Tx) error {
+		for i := range 32 {
+			n, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"body": int64(i)}})
+			if err != nil {
+				return err
+			}
+			if i == 0 {
+				firstID = n.ID
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opts := OpenOptions{FTSProperties: []string{"body", "missing"}}
+	db, err = Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantWork, wantBytes := db.graph.DerivedIndexWork, db.graph.DerivedIndexLogicalBytes
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Two property scans over 32 nodes are transient; definition costs are
+	// already in wantWork. A failed open must release the database lock.
+	opts.DerivedIndexBuildMaxWork = wantWork + 64 - 1
+	failed, err := Open(path, opts)
+	if failed != nil {
+		_ = failed.Close()
+	}
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("under-budget reopen: %v", err)
+	}
+	opts.DerivedIndexBuildMaxWork++
+	db, err = Open(path, opts)
+	if err != nil {
+		t.Fatalf("exact-budget reopen / lock release: %v", err)
+	}
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
+	for _, value := range []any{"hello", int64(0)} {
+		if err := db.Update(func(tx *Tx) error { return tx.SetProperty(firstID, "body", value) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if db.graph.DerivedIndexWork != wantWork || db.graph.DerivedIndexLogicalBytes != wantBytes {
+		t.Fatalf("scan work leaked into live ledger: (%d,%d), want (%d,%d)", db.graph.DerivedIndexWork, db.graph.DerivedIndexLogicalBytes, wantWork, wantBytes)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.graph.DerivedIndexWork != wantWork || db.graph.DerivedIndexLogicalBytes != wantBytes {
+		t.Fatal("reopen changed persistent ledger")
+	}
+}

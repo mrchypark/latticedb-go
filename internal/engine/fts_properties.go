@@ -47,13 +47,19 @@ func buildFTSPropertyPostings(ctx context.Context, graph *store.GraphState, prop
 	if len(properties) == 0 {
 		return nil, 0, 0, nil
 	}
+	// Reserve every property/node visit up front, including absent and non-string
+	// values. Scan work is transient and must not enter the live index ledger.
+	scanWork := saturatingMul(uint64(len(properties)), uint64(graph.Nodes.Len()))
+	if exceedsDerivedBudget(graph, db, scanWork, 0) {
+		return nil, 0, 0, fmt.Errorf("%w: FTS property scan exceeds derived-index budget", ErrResourceLimit)
+	}
 	postings := make(map[string]store.StringPostings, len(properties))
 	var work, bytes uint64
 	for _, property := range properties {
 		postings[property] = store.NewStringPostings()
 		work = saturatingAdd(work, 1)
 		bytes = saturatingAdd(bytes, saturatingAdd(uint64(len(property)), 192))
-		if exceedsDerivedBudget(graph, db, work, bytes) {
+		if exceedsDerivedBudget(graph, db, saturatingAdd(scanWork, work), bytes) {
 			return nil, 0, 0, fmt.Errorf("%w: FTS property index build exceeds derived-index budget", ErrResourceLimit)
 		}
 		for id, node := range graph.Nodes.Ordered() {
@@ -65,10 +71,10 @@ func buildFTSPropertyPostings(ctx context.Context, graph *store.GraphState, prop
 				continue
 			}
 			estimatedWork := saturatingMul(uint64(len(value)), 3)
-			if exceedsDerivedBudget(graph, db, saturatingAdd(work, estimatedWork), bytes) {
+			if exceedsDerivedBudget(graph, db, saturatingAdd(scanWork, saturatingAdd(work, estimatedWork)), bytes) {
 				return nil, 0, 0, fmt.Errorf("%w: FTS property index build exceeds derived-index budget", ErrResourceLimit)
 			}
-			remainingWork := db.derivedIndexBuildMaxWork - min(db.derivedIndexBuildMaxWork, saturatingAdd(graph.DerivedIndexWork, work))
+			remainingWork := db.derivedIndexBuildMaxWork - min(db.derivedIndexBuildMaxWork, saturatingAdd(graph.DerivedIndexWork, saturatingAdd(scanWork, work)))
 			remaining := db.derivedIndexBuildMaxLogicalBytes - min(db.derivedIndexBuildMaxLogicalBytes, saturatingAdd(graph.DerivedIndexLogicalBytes, bytes))
 			tokens, err := tokenizeFTSProperty(ctx, value, remainingWork, remaining)
 			if err != nil {
@@ -77,7 +83,7 @@ func buildFTSPropertyPostings(ctx context.Context, graph *store.GraphState, prop
 			entryWork, entryBytes := store.FTSDerivedCost(value, tokens)
 			work = saturatingAdd(work, entryWork)
 			bytes = saturatingAdd(bytes, entryBytes)
-			if exceedsDerivedBudget(graph, db, work, bytes) {
+			if exceedsDerivedBudget(graph, db, saturatingAdd(scanWork, work), bytes) {
 				return nil, 0, 0, fmt.Errorf("%w: FTS property index build exceeds derived-index budget", ErrResourceLimit)
 			}
 			slices.Sort(tokens)
