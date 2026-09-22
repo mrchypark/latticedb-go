@@ -861,16 +861,31 @@ func convertEdge(edge engine.Edge) Edge {
 func convertQueryResult(result engine.QueryResult) QueryResult {
 	for _, row := range result.Rows {
 		for column, value := range row {
-			switch value := value.(type) {
-			case engine.Node:
-				row[column] = convertNode(value)
-			case engine.Edge:
-				row[column] = convertEdge(value)
-			}
+			row[column] = convertQueryValue(value)
 		}
 	}
 	return QueryResult{
 		Columns: result.Columns,
 		Rows:    result.Rows,
 	}
+}
+
+// Query results already own their containers; convert entities in place without
+// copying their property payloads again.
+func convertQueryValue(value any) any {
+	switch value := value.(type) {
+	case engine.Node:
+		return convertNode(value)
+	case engine.Edge:
+		return convertEdge(value)
+	case []any:
+		for i, item := range value {
+			value[i] = convertQueryValue(item)
+		}
+	case map[string]any:
+		for key, item := range value {
+			value[key] = convertQueryValue(item)
+		}
+	}
+	return value
 }

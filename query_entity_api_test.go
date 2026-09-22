@@ -77,3 +77,74 @@ func TestQueryReturnsPublicEntities(t *testing.T) {
 		})
 	}
 }
+
+func TestQueryReturnsNestedPublicEntities(t *testing.T) {
+	db, err := latticedb.Open(t.TempDir(), latticedb.OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *latticedb.Tx) error {
+		n, err := tx.CreateNode(latticedb.CreateNodeOptions{Labels: []string{"Nested"}, Properties: map[string]any{"name": "original"}})
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateEdge(n.ID, n.ID, "SELF", latticedb.CreateEdgeOptions{Properties: map[string]any{"name": "original"}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, query := range []string{
+		"MATCH (n:Nested)-[e:SELF]->(n) RETURN collect(n) AS ns, collect(e) AS es",
+		"MATCH (n:Nested)-[e:SELF]->(n) WITH collect(n) AS ns, collect(e) AS es RETURN collect(ns) AS ns, collect(es) AS es",
+	} {
+		calls := map[string]func() (latticedb.QueryResult, error){
+			"DB": func() (latticedb.QueryResult, error) { return db.Query(query, nil) },
+			"DBContext": func() (latticedb.QueryResult, error) {
+				return db.QueryContext(context.Background(), query, nil, latticedb.QueryOptions{})
+			},
+			"Tx": func() (latticedb.QueryResult, error) { return tx.Query(query, nil) },
+			"TxContext": func() (latticedb.QueryResult, error) {
+				return tx.QueryContext(context.Background(), query, nil, latticedb.QueryOptions{})
+			},
+		}
+		for name, call := range calls {
+			t.Run(name+query, func(t *testing.T) {
+				result, err := call()
+				if err != nil {
+					t.Fatal(err)
+				}
+				leaf := func(value any) any {
+					for {
+						list, ok := value.([]any)
+						if !ok {
+							return value
+						}
+						if len(list) != 1 {
+							t.Fatalf("list=%v", list)
+						}
+						value = list[0]
+					}
+				}
+				n, ok := leaf(result.Rows[0]["ns"]).(latticedb.Node)
+				if !ok {
+					t.Fatalf("node type=%T", leaf(result.Rows[0]["ns"]))
+				}
+				e, ok := leaf(result.Rows[0]["es"]).(latticedb.Edge)
+				if !ok {
+					t.Fatalf("edge type=%T", leaf(result.Rows[0]["es"]))
+				}
+				if n.Properties["name"] != "original" || e.Properties["name"] != "original" {
+					t.Fatal("result mutation leaked")
+				}
+				n.Properties["name"] = "changed"
+				e.Properties["name"] = "changed"
+			})
+		}
+	}
+}

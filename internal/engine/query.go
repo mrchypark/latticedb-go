@@ -5478,15 +5478,11 @@ func (clause *returnClause) render(rows []queryRow, params map[string]any, budge
 					resultRow[projection.Alias] = nil
 				}
 			case projectionExpr:
-				value, err := evalQueryExpr(projection.Expr, row, params, budget)
+				value, err := clause.projectionValue(projection, row, params, budget)
 				if err != nil {
 					return QueryResult{}, err
 				}
-				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
-					return QueryResult{}, err
-				}
-				public := publicProjectionValue(value)
-				resultRow[projection.Alias] = public
+				resultRow[projection.Alias] = value
 			default:
 				return QueryResult{}, fmt.Errorf("unsupported projection kind %q", projection.Kind)
 			}
@@ -5566,15 +5562,11 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 				resultRow[projection.Alias] = nil
 			}
 		case projectionExpr:
-			value, err := evalQueryExpr(projection.Expr, row, params, budget)
+			value, err := clause.projectionValue(projection, row, params, budget)
 			if err != nil {
 				return nil, err
 			}
-			if err := budget.chargeResult(queryValueBytes(value)); err != nil {
-				return nil, err
-			}
-			public := publicProjectionValue(value)
-			resultRow[projection.Alias] = public
+			resultRow[projection.Alias] = value
 		default:
 			return nil, fmt.Errorf("unsupported projection kind %q", projection.Kind)
 		}
@@ -5641,7 +5633,9 @@ func (clause *returnClause) projectionValue(projection projection, row queryRow,
 		}
 		return store.CloneValue(value), nil
 	case projectionExpr:
+		before := budget.bytes
 		value, err := evalQueryExpr(projection.Expr, row, params, budget)
+		defer budget.releaseTemporary(uint64(budget.bytes - before))
 		if err != nil {
 			return nil, err
 		}
@@ -5801,7 +5795,9 @@ func (clause *returnClause) withItemBinding(projection projection, row queryRow,
 		}
 		return boundValue{Value: value, HasValue: true}, nil
 	case projectionExpr:
+		before := budget.bytes
 		value, err := evalQueryExpr(projection.Expr, row, params, budget)
+		defer budget.releaseTemporary(uint64(budget.bytes - before))
 		if err != nil {
 			return boundValue{}, err
 		}
@@ -5880,6 +5876,7 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 		if err := budget.check(1, 0); err != nil {
 			return nil, err
 		}
+		beforeKeys := budget.bytes
 		if err := budget.chargeResult(uint64(len(groupKeys)) * 48); err != nil {
 			return nil, err
 		}
@@ -5908,6 +5905,8 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 			group = newGroup(values)
 			groups[key] = group
 			ordered = append(ordered, group)
+		} else {
+			budget.releaseTemporary(uint64(budget.bytes - beforeKeys))
 		}
 		aggregateIndex := 0
 		for _, projection := range clause.Projections {
@@ -5922,14 +5921,7 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 				}
 				continue
 			}
-			value, err := evalQueryExpr(projection.Expr, row, params, budget)
-			if err != nil {
-				return nil, err
-			}
-			if err := budget.chargeResult(queryValueBytes(value) + 16); err != nil {
-				return nil, err
-			}
-			if err := accumulator.add(value, value != nil); err != nil {
+			if err := accumulator.addExpr(projection.Expr, row, params, budget); err != nil {
 				return nil, err
 			}
 		}
@@ -6021,6 +6013,10 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 	groups := map[string]*aggregateGroup{}
 	var ordered []*aggregateGroup
 	for _, row := range rows {
+		if err := budget.check(1, 0); err != nil {
+			return QueryResult{}, err
+		}
+		beforeKeys := budget.bytes
 		values := make([]any, 0, len(groupKeys))
 		for _, projection := range groupKeys {
 			value, err := clause.projectionValue(projection, row, params, budget)
@@ -6038,9 +6034,14 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 		key := keyBuilder.String()
 		group, ok := groups[key]
 		if !ok {
+			if err := budget.chargeResult(128 + uint64(len(clause.Projections))*96); err != nil {
+				return QueryResult{}, err
+			}
 			group = newGroup(values)
 			groups[key] = group
 			ordered = append(ordered, group)
+		} else {
+			budget.releaseTemporary(uint64(budget.bytes - beforeKeys))
 		}
 		aggregateIndex := 0
 		for _, projection := range clause.Projections {
@@ -6055,14 +6056,7 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 				}
 				continue
 			}
-			value, err := evalQueryExpr(projection.Expr, row, params, budget)
-			if err != nil {
-				return QueryResult{}, err
-			}
-			if err := budget.chargeResult(queryValueBytes(value) + 16); err != nil {
-				return QueryResult{}, err
-			}
-			if err := accumulator.add(value, value != nil); err != nil {
+			if err := accumulator.addExpr(projection.Expr, row, params, budget); err != nil {
 				return QueryResult{}, err
 			}
 		}
