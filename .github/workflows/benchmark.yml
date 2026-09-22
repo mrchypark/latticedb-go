@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 90
     env:
       GOMAXPROCS: 2
+      ZIG_BENCH_CONFIG: "v1;repo=jeffhajewski/latticedb;host=ubuntu-x86_64;target=native;optimize=ReleaseFast;step=vector-benchmark;args=--scale 100000 --scale-only"
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -109,7 +110,8 @@ jobs:
             if ! gh run download "$run_id" --name performance-results --dir "$download_dir"; then
               continue
             fi
-            if [[ -f "$download_dir/zig.txt" && -f "$download_dir/zig-revision.txt" && -f "$download_dir/zig-version.txt" && -f "$download_dir/zig-ref.txt" && -f "$download_dir/zig-sha256.txt" && -f "$download_dir/lattice-version.txt" && -f "$download_dir/zig-archive-sha256.txt" && -f "$download_dir/zig-tag.txt" ]] \
+            if [[ -f "$download_dir/zig.txt" && -f "$download_dir/zig-revision.txt" && -f "$download_dir/zig-version.txt" && -f "$download_dir/zig-ref.txt" && -f "$download_dir/zig-sha256.txt" && -f "$download_dir/lattice-version.txt" && -f "$download_dir/zig-archive-sha256.txt" && -f "$download_dir/zig-tag.txt" && -f "$download_dir/zig-bench-config.txt" ]] \
+              && [[ "$(<"$download_dir/zig-bench-config.txt")" == "$ZIG_BENCH_CONFIG" ]] \
               && [[ "$(<"$download_dir/lattice-version.txt")" == "$LATTICE_VERSION" ]] \
               && [[ "$(<"$download_dir/zig-tag.txt")" == "$ZIG_TAG" ]] \
               && [[ "$(<"$download_dir/zig-version.txt")" == "$ZIG_VERSION" ]] \
@@ -118,7 +120,7 @@ jobs:
               && [[ "$(<"$download_dir/zig-revision.txt")" == "$ZIG_REF" ]] \
               && (cd "$download_dir" && sha256sum --check --status zig-sha256.txt) \
               && go run ./scripts/benchcmp.go -validate-zig "$download_dir/zig.txt" >/dev/null 2>&1; then
-              cp "$download_dir"/zig{.txt,-revision.txt,-version.txt,-ref.txt,-sha256.txt} previous/
+              cp "$download_dir"/zig{.txt,-revision.txt,-version.txt,-ref.txt,-sha256.txt,-bench-config.txt} previous/
               printf '%s\n' "$LATTICE_VERSION" > previous/lattice-version.txt
               printf '%s\n' "$ZIG_SHA256" > previous/zig-archive-sha256.txt
               printf '%s\n' "$ZIG_TAG" > previous/zig-tag.txt
@@ -129,7 +131,8 @@ jobs:
       - name: Reuse or prepare Zig reference
         run: |
           mkdir -p results
-          if [[ -f previous/zig.txt && -f previous/zig-revision.txt && -f previous/zig-version.txt && -f previous/lattice-version.txt && -f previous/zig-archive-sha256.txt && -f previous/zig-tag.txt && -f previous/zig-ref.txt && -f previous/zig-sha256.txt ]] \
+          if [[ -f previous/zig.txt && -f previous/zig-revision.txt && -f previous/zig-version.txt && -f previous/lattice-version.txt && -f previous/zig-archive-sha256.txt && -f previous/zig-tag.txt && -f previous/zig-ref.txt && -f previous/zig-sha256.txt && -f previous/zig-bench-config.txt ]] \
+            && [[ "$(<previous/zig-bench-config.txt)" == "$ZIG_BENCH_CONFIG" ]] \
             && [[ "$(<previous/lattice-version.txt)" == "$LATTICE_VERSION" ]] \
             && [[ "$(<previous/zig-version.txt)" == "$ZIG_VERSION" ]] \
             && [[ "$(<previous/zig-archive-sha256.txt)" == "$ZIG_SHA256" ]] \
@@ -147,6 +150,7 @@ jobs:
             cp previous/zig-tag.txt results/zig-tag.txt
             cp previous/zig-ref.txt results/zig-ref.txt
             cp previous/zig-sha256.txt results/zig-sha256.txt
+            cp previous/zig-bench-config.txt results/zig-bench-config.txt
             echo 'ZIG_REUSED=true' >> "$GITHUB_ENV"
           else
             echo 'ZIG_REUSED=false' >> "$GITHUB_ENV"
@@ -222,6 +226,7 @@ jobs:
           printf '%s\n' "$ZIG_SHA256" > results/zig-archive-sha256.txt
           printf '%s\n' "$ZIG_TAG" > results/zig-tag.txt
           printf '%s\n' "$ZIG_REF" > results/zig-ref.txt
+          printf '%s\n' "$ZIG_BENCH_CONFIG" > results/zig-bench-config.txt
           (cd results && sha256sum zig.txt > zig-sha256.txt)
 
       - name: Create comparison report
