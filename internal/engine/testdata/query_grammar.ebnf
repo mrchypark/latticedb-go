@@ -49,12 +49,13 @@ return-tail    = [DISTINCT] (count-return | projection {"," projection})
                  [ORDER BY order {"," order}]
                  [SKIP pagination] [LIMIT pagination]
 count-return   = "count(" ("*" | binding) ")" [AS alias]
-projection     = (binding | property-access | id-access | function-call | aggregate-call) [AS alias]
+projection     = (binding | property-access | id-access | function-call | aggregate-call | list) [AS alias]
 order          = (binding | property-access | id-access | alias) [ASC | DESC]
 pagination     = non-negative-integer | parameter
 
-value          = null | true | false | integer | float | string | parameter | map
+value          = null | true | false | integer | float | string | parameter | map | list
 map            = "{" [property ":" expression {"," property ":" expression}] "}"
+list           = "[" [expression {"," expression}] "]"
 expression     = value | binding | property-access | function-call
 function-call  = identifier "(" [expression {"," expression}] ")"
 aggregate-call = aggregate-name "(" ("*" | expression) ")"

@@ -728,6 +728,10 @@ type literalExpr struct {
 	Value any
 }
 
+type listLiteralExpr struct {
+	Items []valueExpr
+}
+
 type mapLiteralExpr struct {
 	Entries map[string]valueExpr
 }
@@ -1403,6 +1407,12 @@ func valueExprBindings(expr valueExpr) []string {
 		return []string{expr.Name}
 	case propertyExpr:
 		return []string{expr.Var}
+	case listLiteralExpr:
+		var names []string
+		for _, item := range expr.Items {
+			names = append(names, valueExprBindings(item)...)
+		}
+		return names
 	case mapLiteralExpr:
 		var names []string
 		for _, entry := range expr.Entries {
@@ -2275,6 +2285,13 @@ func missingValueExprParam(expr valueExpr, params map[string]any, budget *queryB
 	case paramExpr:
 		_, exists := params[expr.Name]
 		return !exists, nil
+	case listLiteralExpr:
+		for _, item := range expr.Items {
+			missing, err := missingValueExprParam(item, params, budget)
+			if err != nil || missing {
+				return missing, err
+			}
+		}
 	case mapLiteralExpr:
 		for _, entry := range expr.Entries {
 			missing, err := missingValueExprParam(entry, params, budget)
@@ -3850,13 +3867,14 @@ func parseReturnClause(text string) (*returnClause, error) {
 			if exprErr != nil {
 				return nil, fmt.Errorf("invalid RETURN projection %q: %w", exprText, exprErr)
 			}
-			call, ok := expr.(callExpr)
-			if !ok {
+			switch expr.(type) {
+			case callExpr, listLiteralExpr:
+			default:
 				return nil, fmt.Errorf("invalid RETURN projection %q", exprText)
 			}
 			projections = append(projections, projection{
 				Kind:          projectionExpr,
-				Expr:          call,
+				Expr:          expr,
 				Alias:         alias,
 				ExplicitAlias: explicitAlias,
 			})
@@ -6583,6 +6601,26 @@ func (expr literalExpr) eval(row queryRow, _ map[string]any, budget *queryBudget
 	return store.CloneValue(expr.Value), nil
 }
 
+func (expr listLiteralExpr) eval(row queryRow, params map[string]any, budget *queryBudget) (any, error) {
+	if err := reserveExpression(budget, uint64(len(expr.Items))*16); err != nil {
+		return nil, err
+	}
+	values := make([]any, len(expr.Items))
+	for i, item := range expr.Items {
+		if budget != nil {
+			if err := budget.check(1, 0); err != nil {
+				return nil, err
+			}
+		}
+		value, err := item.eval(row, params, budget)
+		if err != nil {
+			return nil, err
+		}
+		values[i] = value
+	}
+	return values, nil
+}
+
 func (expr mapLiteralExpr) eval(row queryRow, params map[string]any, budget *queryBudget) (any, error) {
 	if err := reserveExpression(budget, uint64(len(expr.Entries))*32); err != nil {
 		return nil, err
@@ -6657,6 +6695,22 @@ func parseValueExpr(text string) (valueExpr, error) {
 			return nil, fmt.Errorf("invalid parameter %q", text)
 		}
 		return paramExpr{Name: name}, nil
+	case strings.HasPrefix(text, "["):
+		if findMatchingBrace(text, 0, '[', ']') != len(text)-1 {
+			return nil, fmt.Errorf("invalid list expression %q", text)
+		}
+		list := listLiteralExpr{}
+		body := strings.TrimSpace(text[1 : len(text)-1])
+		if body != "" {
+			for _, part := range splitTopLevel(body, ',') {
+				item, err := parseValueExpr(part)
+				if err != nil {
+					return nil, err
+				}
+				list.Items = append(list.Items, item)
+			}
+		}
+		return list, nil
 	case strings.HasPrefix(text, "{") && strings.HasSuffix(text, "}"):
 		entries, err := parsePropertyExprMap(strings.TrimSpace(text[1 : len(text)-1]))
 		if err != nil {
