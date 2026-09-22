@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime/debug"
 	"slices"
+	"sync"
 
 	"github.com/mrchypark/latticedb-go/internal/engine"
 )
@@ -69,8 +70,10 @@ type Tx struct {
 	inner *engine.Tx
 }
 
-// Snapshot is one fixed committed database generation.
+// Snapshot is one fixed committed database generation. Its methods may be
+// called concurrently. A Snapshot must not be copied after first use.
 type Snapshot struct {
+	mu    sync.Mutex
 	inner *engine.Snapshot
 }
 
@@ -284,7 +287,12 @@ func (db *DB) BeginSnapshot() (*Snapshot, error) {
 
 // Backup writes the frozen generation as a standalone regular database file.
 func (snapshot *Snapshot) Backup(path string) error {
-	if snapshot == nil || snapshot.inner == nil {
+	if snapshot == nil {
+		return ErrDatabaseClosed
+	}
+	snapshot.mu.Lock()
+	defer snapshot.mu.Unlock()
+	if snapshot.inner == nil {
 		return ErrDatabaseClosed
 	}
 	return wrapError(snapshot.inner.Backup(path))
@@ -292,7 +300,12 @@ func (snapshot *Snapshot) Backup(path string) error {
 
 // Close releases the frozen generation. Close is idempotent.
 func (snapshot *Snapshot) Close() error {
-	if snapshot == nil || snapshot.inner == nil {
+	if snapshot == nil {
+		return nil
+	}
+	snapshot.mu.Lock()
+	defer snapshot.mu.Unlock()
+	if snapshot.inner == nil {
 		return nil
 	}
 	if err := snapshot.inner.Close(); err != nil {
