@@ -1,0 +1,18 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go/internal/engine
+cpu: Apple M3
+BenchmarkQueryLanguage/nodes_10000/count-2   	       1	   2418916 ns/op	 4248344 B/op	   10050 allocs/op
+BenchmarkQueryLanguage/nodes_10000/sum_avg-2 	       1	   5114917 ns/op	 4568600 B/op	   20057 allocs/op
+BenchmarkQueryLanguage/nodes_10000/group_100-2         	       1	   9978084 ns/op	 5665912 B/op	  110666 allocs/op
+BenchmarkQueryLanguage/nodes_10000/with_group_top10-2  	       1	   8097541 ns/op	 6448384 B/op	  120594 allocs/op
+BenchmarkQueryLanguage/nodes_10000/collect-2           	       1	   3538375 ns/op	 5398328 B/op	   20074 allocs/op
+BenchmarkQueryLanguage/nodes_10000/nested_functions-2  	       1	   2142291 ns/op	 5128488 B/op	   60054 allocs/op
+BenchmarkQueryLanguage/nodes_100000/count-2            	       1	  15455042 ns/op	50037072 B/op	  100076 allocs/op
+BenchmarkQueryLanguage/nodes_100000/sum_avg-2          	       1	  25486958 ns/op	53237328 B/op	  200083 allocs/op
+BenchmarkQueryLanguage/nodes_100000/group_100-2        	       1	  43484250 ns/op	63694640 B/op	 1100692 allocs/op
+BenchmarkQueryLanguage/nodes_100000/with_group_top10-2 	       1	  48828542 ns/op	71677112 B/op	 1200620 allocs/op
+BenchmarkQueryLanguage/nodes_100000/collect-2          	       1	  26452084 ns/op	63766384 B/op	  200110 allocs/op
+BenchmarkQueryLanguage/nodes_100000/nested_functions-2 	       1	  31793625 ns/op	58837216 B/op	  600080 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/engine	3.833s

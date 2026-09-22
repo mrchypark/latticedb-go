@@ -10,7 +10,11 @@ func BenchmarkQueryOrderLimitTopK(b *testing.B) {
 	for _, size := range []int{10_000, 100_000} {
 		b.Run(fmt.Sprintf("top_k_10/%d", size), func(b *testing.B) {
 			db := benchmarkOrderDB(b, size)
-			defer db.Close()
+			b.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					b.Error(err)
+				}
+			})
 			query := `MATCH (n:Item) RETURN n.value AS value ORDER BY value LIMIT 10`
 			if _, err := db.Query(query, nil); err != nil {
 				b.Fatal(err)
@@ -25,7 +29,11 @@ func BenchmarkQueryOrderLimitTopK(b *testing.B) {
 		})
 		b.Run(fmt.Sprintf("full_sort_all_rows_reference/%d", size), func(b *testing.B) {
 			db := benchmarkOrderDB(b, size)
-			defer db.Close()
+			b.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					b.Error(err)
+				}
+			})
 			query := `MATCH (n:Item) RETURN n.value AS value ORDER BY value`
 			if _, err := db.Query(query, nil); err != nil {
 				b.Fatal(err)

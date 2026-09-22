@@ -1,0 +1,42 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go/internal/engine
+cpu: Apple M3
+BenchmarkFTSSearchScaling/records_1000/rare-2    	  291573	       986.3 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_1000/rare-2    	  286017	       732.5 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_1000/rare-2    	  364834	       637.9 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_1000/common-2  	    6608	     55238 ns/op	     584 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_1000/common-2  	    6721	     32580 ns/op	     584 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_1000/common-2  	    8574	     32053 ns/op	     584 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_1000/multi_rare-2         	  309824	       759.0 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_1000/multi_rare-2         	  339758	       803.2 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_1000/multi_rare-2         	  259203	       836.6 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_1000/fuzzy_rare-2         	  139406	      2655 ns/op	    1112 B/op	      24 allocs/op
+BenchmarkFTSSearchScaling/records_1000/fuzzy_rare-2         	   75571	      3668 ns/op	    1112 B/op	      24 allocs/op
+BenchmarkFTSSearchScaling/records_1000/fuzzy_rare-2         	   83577	      2739 ns/op	    1112 B/op	      24 allocs/op
+BenchmarkFTSSearchScaling/records_10000/rare-2              	  327100	       651.8 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_10000/rare-2              	  314602	       637.0 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_10000/rare-2              	  415730	       624.0 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_10000/common-2            	     736	    316074 ns/op	     584 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_10000/common-2            	     861	    295024 ns/op	     584 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_10000/common-2            	     840	    287346 ns/op	     584 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_10000/multi_rare-2        	  321613	       750.4 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_10000/multi_rare-2        	  332130	      1199 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_10000/multi_rare-2        	  248385	       951.1 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_10000/fuzzy_rare-2        	  138675	      1671 ns/op	    1112 B/op	      24 allocs/op
+BenchmarkFTSSearchScaling/records_10000/fuzzy_rare-2        	  149336	      1564 ns/op	    1112 B/op	      24 allocs/op
+BenchmarkFTSSearchScaling/records_10000/fuzzy_rare-2        	  155916	      1527 ns/op	    1112 B/op	      24 allocs/op
+BenchmarkFTSSearchScaling/records_100000/rare-2             	  453932	       591.3 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_100000/rare-2             	  388543	       594.1 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_100000/rare-2             	  490358	       635.8 ns/op	     488 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_100000/common-2           	      45	   4473513 ns/op	     597 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_100000/common-2           	      61	   5752003 ns/op	     592 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_100000/common-2           	      52	   4672301 ns/op	     596 B/op	      11 allocs/op
+BenchmarkFTSSearchScaling/records_100000/multi_rare-2       	  362566	       774.1 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_100000/multi_rare-2       	  327414	       819.5 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_100000/multi_rare-2       	  290283	       798.3 ns/op	     656 B/op	      16 allocs/op
+BenchmarkFTSSearchScaling/records_100000/fuzzy_rare-2       	  159366	      1554 ns/op	    1112 B/op	      24 allocs/op
+BenchmarkFTSSearchScaling/records_100000/fuzzy_rare-2       	  149798	      2209 ns/op	    1112 B/op	      24 allocs/op
+BenchmarkFTSSearchScaling/records_100000/fuzzy_rare-2       	  165883	      1508 ns/op	    1112 B/op	      24 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/engine	11.414s

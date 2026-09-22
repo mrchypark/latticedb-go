@@ -1,0 +1,15 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go/internal/engine
+cpu: Apple M3
+BenchmarkVectorSearchClustered128D/1K-2         	       1	     55084 ns/op	   9.29 MB/s	       566.5 index-build-ms	     59962 mean-ns	    170042 p99-ns	       100.0 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/1K-2         	       1	     59708 ns/op	   8.58 MB/s	       620.3 index-build-ms	    142923 mean-ns	    505500 p99-ns	       100.0 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/1K-2         	       1	     71458 ns/op	   7.17 MB/s	       570.1 index-build-ms	     75557 mean-ns	    545542 p99-ns	       100.0 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/10K-2        	       1	    116125 ns/op	   4.41 MB/s	      9911 index-build-ms	    139150 mean-ns	    392416 p99-ns	        99.00 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/10K-2        	       1	    122959 ns/op	   4.16 MB/s	      8685 index-build-ms	    154686 mean-ns	    506250 p99-ns	        99.00 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/10K-2        	       1	    139917 ns/op	   3.66 MB/s	      8366 index-build-ms	    126795 mean-ns	    268292 p99-ns	        99.00 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/100K-2       	       1	    327291 ns/op	   1.56 MB/s	    152242 index-build-ms	    467608 mean-ns	   1082500 p99-ns	       100.0 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/100K-2       	       1	    504250 ns/op	   1.02 MB/s	    157583 index-build-ms	    341610 mean-ns	    953209 p99-ns	       100.0 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/100K-2       	       1	    276541 ns/op	   1.85 MB/s	    166594 index-build-ms	    396304 mean-ns	   1429833 p99-ns	       100.0 recall@10	     288 B/op	       3 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/engine	507.027s

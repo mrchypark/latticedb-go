@@ -30,18 +30,22 @@ func BenchmarkVectorSearchClustered128D(b *testing.B) {
 			buildStarted := time.Now()
 			db := zigHarnessIndexedDB(b, graph, scale.n)
 			buildTime := time.Since(buildStarted)
-			recall := zigHarnessRecallAt10(b, db, queries[:10])
 			for _, query := range queries[:10] { // Match the Zig harness warmup.
 				if _, err := db.VectorSearch(query, VectorSearchOptions{K: 10, EfSearch: 64}); err != nil {
 					b.Fatal(err)
 				}
 			}
+			beforeFallbacks := db.vectorExactFallbacks.Load()
 			mean, p99 := zigHarnessLatency(b, db, queries)
+			fallbacks := db.vectorExactFallbacks.Load() - beforeFallbacks
+			// Match upstream: measure recall only after latency sampling.
+			recall := zigHarnessRecallAt10(b, db, queries[:10])
 
 			b.ReportAllocs()
 			b.SetBytes(128 * 4)
 			b.ResetTimer()
 			b.ReportMetric(float64(buildTime.Nanoseconds())/1e6, "index-build-ms")
+			b.ReportMetric(float64(fallbacks), "exact-fallbacks/100queries")
 			b.ReportMetric(float64(mean.Nanoseconds()), "mean-ns")
 			b.ReportMetric(recall*100, "recall@10")
 			b.ReportMetric(float64(p99.Nanoseconds()), "p99-ns")

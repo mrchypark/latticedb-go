@@ -1,0 +1,106 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkPropertyEquality10K/indexed-2   	  620041	       419.3 ns/op	      88 B/op	       4 allocs/op
+BenchmarkPropertyEquality10K/indexed-2   	  544474	       385.5 ns/op	      88 B/op	       4 allocs/op
+BenchmarkPropertyEquality10K/indexed-2   	  650229	       382.1 ns/op	      88 B/op	       4 allocs/op
+BenchmarkPropertyEquality10K/query_indexed-2         	  122511	      2110 ns/op	    2136 B/op	      31 allocs/op
+BenchmarkPropertyEquality10K/query_indexed-2         	  112275	      2112 ns/op	    2136 B/op	      31 allocs/op
+BenchmarkPropertyEquality10K/query_indexed-2         	  109934	      2104 ns/op	    2136 B/op	      31 allocs/op
+BenchmarkPropertyIndexCommonValue10K/limit_1-2       	  585151	       431.6 ns/op	      96 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/limit_1-2       	  607767	       424.5 ns/op	      96 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/limit_1-2       	  592117	       423.2 ns/op	      96 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/full_then_limit_1-2         	     832	    295674 ns/op	   82012 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/full_then_limit_1-2         	     836	    293796 ns/op	   82012 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/full_then_limit_1-2         	     842	    299757 ns/op	   82012 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/unique_limit_1-2            	  512696	       570.7 ns/op	      96 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/unique_limit_1-2            	  557588	       418.4 ns/op	      96 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/unique_limit_1-2            	  615784	       419.9 ns/op	      96 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/unique_full_then_limit_1-2  	  539942	       446.5 ns/op	      96 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/unique_full_then_limit_1-2  	  575539	       449.7 ns/op	      96 B/op	       4 allocs/op
+BenchmarkPropertyIndexCommonValue10K/unique_full_then_limit_1-2  	  579913	       460.1 ns/op	      96 B/op	       4 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go	6.013s
+PASS
+ok  	github.com/mrchypark/latticedb-go/embedding	0.500s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go/internal/engine
+cpu: Apple M3
+BenchmarkQueryLanguage/nodes_10000/count-2         	     129	   2964363 ns/op	 4248453 B/op	   10050 allocs/op
+BenchmarkQueryLanguage/nodes_10000/count-2         	     100	   2154641 ns/op	 4248453 B/op	   10050 allocs/op
+BenchmarkQueryLanguage/nodes_10000/count-2         	     120	   2015109 ns/op	 4248453 B/op	   10050 allocs/op
+BenchmarkQueryLanguage/nodes_10000/sum_avg-2       	      96	   3677342 ns/op	 4568737 B/op	   20058 allocs/op
+BenchmarkQueryLanguage/nodes_10000/sum_avg-2       	      69	   4026353 ns/op	 4568731 B/op	   20057 allocs/op
+BenchmarkQueryLanguage/nodes_10000/sum_avg-2       	     100	   4832521 ns/op	 4568732 B/op	   20057 allocs/op
+BenchmarkQueryLanguage/nodes_10000/group_100-2     	      48	   7460006 ns/op	 5666102 B/op	  110667 allocs/op
+BenchmarkQueryLanguage/nodes_10000/group_100-2     	      43	   6960609 ns/op	 5666105 B/op	  110667 allocs/op
+BenchmarkQueryLanguage/nodes_10000/group_100-2     	      36	   6635018 ns/op	 5666096 B/op	  110667 allocs/op
+BenchmarkQueryLanguage/nodes_10000/with_group_top10-2         	      32	  10173906 ns/op	 6448591 B/op	  120595 allocs/op
+BenchmarkQueryLanguage/nodes_10000/with_group_top10-2         	      34	   5970582 ns/op	 6448604 B/op	  120595 allocs/op
+BenchmarkQueryLanguage/nodes_10000/with_group_top10-2         	      54	   5636558 ns/op	 6448698 B/op	  120595 allocs/op
+BenchmarkQueryLanguage/nodes_10000/collect-2                  	     100	   2976708 ns/op	 5398476 B/op	   20075 allocs/op
+BenchmarkQueryLanguage/nodes_10000/collect-2                  	      90	   3003969 ns/op	 5398474 B/op	   20075 allocs/op
+BenchmarkQueryLanguage/nodes_10000/collect-2                  	     100	   3350024 ns/op	 5398480 B/op	   20075 allocs/op
+BenchmarkQueryLanguage/nodes_10000/nested_functions-2         	     100	  10889490 ns/op	 5128639 B/op	   60055 allocs/op
+BenchmarkQueryLanguage/nodes_10000/nested_functions-2         	     100	   3558253 ns/op	 5128637 B/op	   60055 allocs/op
+BenchmarkQueryLanguage/nodes_10000/nested_functions-2         	     100	   3402695 ns/op	 5128629 B/op	   60055 allocs/op
+BenchmarkQueryLanguage/nodes_100000/count-2                   	      19	  23060454 ns/op	50036815 B/op	  100074 allocs/op
+BenchmarkQueryLanguage/nodes_100000/count-2                   	      15	  23430522 ns/op	50036859 B/op	  100074 allocs/op
+BenchmarkQueryLanguage/nodes_100000/count-2                   	      10	  42275112 ns/op	50036824 B/op	  100074 allocs/op
+BenchmarkQueryLanguage/nodes_100000/sum_avg-2                 	       7	  31338137 ns/op	53237328 B/op	  200083 allocs/op
+BenchmarkQueryLanguage/nodes_100000/sum_avg-2                 	       7	  32310333 ns/op	53237328 B/op	  200083 allocs/op
+BenchmarkQueryLanguage/nodes_100000/sum_avg-2                 	       7	  48318167 ns/op	53237328 B/op	  200083 allocs/op
+BenchmarkQueryLanguage/nodes_100000/group_100-2               	       4	  50595031 ns/op	63694652 B/op	 1100692 allocs/op
+BenchmarkQueryLanguage/nodes_100000/group_100-2               	       4	  78130188 ns/op	63694648 B/op	 1100692 allocs/op
+BenchmarkQueryLanguage/nodes_100000/group_100-2               	       3	  71395861 ns/op	63694645 B/op	 1100692 allocs/op
+BenchmarkQueryLanguage/nodes_100000/with_group_top10-2        	       4	  57315334 ns/op	71677120 B/op	 1200620 allocs/op
+BenchmarkQueryLanguage/nodes_100000/with_group_top10-2        	       4	  81542594 ns/op	71677112 B/op	 1200620 allocs/op
+BenchmarkQueryLanguage/nodes_100000/with_group_top10-2        	       4	  76386760 ns/op	71677116 B/op	 1200620 allocs/op
+BenchmarkQueryLanguage/nodes_100000/collect-2                 	       6	  38661181 ns/op	63766246 B/op	  200109 allocs/op
+BenchmarkQueryLanguage/nodes_100000/collect-2                 	       8	  28315792 ns/op	63766384 B/op	  200110 allocs/op
+BenchmarkQueryLanguage/nodes_100000/collect-2                 	       8	  27740302 ns/op	63766281 B/op	  200109 allocs/op
+BenchmarkQueryLanguage/nodes_100000/nested_functions-2        	       7	  51577494 ns/op	58837220 B/op	  600080 allocs/op
+BenchmarkQueryLanguage/nodes_100000/nested_functions-2        	       6	  36916590 ns/op	58837216 B/op	  600080 allocs/op
+BenchmarkQueryLanguage/nodes_100000/nested_functions-2        	       6	  40891562 ns/op	58837216 B/op	  600080 allocs/op
+BenchmarkQueryFTSCandidates10K/scan-2                         	      39	   7013882 ns/op	 7052604 B/op	  100095 allocs/op
+BenchmarkQueryFTSCandidates10K/scan-2                         	      39	   8102912 ns/op	 7052399 B/op	  100092 allocs/op
+BenchmarkQueryFTSCandidates10K/scan-2                         	      39	  11924868 ns/op	 7052399 B/op	  100092 allocs/op
+BenchmarkQueryFTSCandidates10K/postings-2                     	    2935	     73740 ns/op	   62403 B/op	    1074 allocs/op
+BenchmarkQueryFTSCandidates10K/postings-2                     	    3824	     78263 ns/op	   62401 B/op	    1074 allocs/op
+BenchmarkQueryFTSCandidates10K/postings-2                     	    3207	     88533 ns/op	   62401 B/op	    1074 allocs/op
+BenchmarkQueryVectorCandidates10K/exact-2                     	      88	   2483957 ns/op	 1775936 B/op	    5083 allocs/op
+BenchmarkQueryVectorCandidates10K/exact-2                     	     100	   2571816 ns/op	 1775929 B/op	    5083 allocs/op
+BenchmarkQueryVectorCandidates10K/exact-2                     	     104	   2529783 ns/op	 1775927 B/op	    5083 allocs/op
+BenchmarkQueryVectorCandidates10K/ann-2                       	    7515	     36025 ns/op	    8042 B/op	      72 allocs/op
+BenchmarkQueryVectorCandidates10K/ann-2                       	    5440	     39184 ns/op	    8043 B/op	      72 allocs/op
+BenchmarkQueryVectorCandidates10K/ann-2                       	    7140	     34895 ns/op	    8040 B/op	      72 allocs/op
+BenchmarkQueryMultiHopSlots-2                                 	    2320	     91145 ns/op	   83379 B/op	     616 allocs/op
+BenchmarkQueryMultiHopSlots-2                                 	    2144	    126809 ns/op	   83392 B/op	     616 allocs/op
+BenchmarkQueryMultiHopSlots-2                                 	    2143	    100592 ns/op	   83392 B/op	     616 allocs/op
+BenchmarkQueryMultiHopSlots100K-2                             	       2	 153789729 ns/op	123274480 B/op	  940854 allocs/op
+BenchmarkQueryMultiHopSlots100K-2                             	       2	 139165979 ns/op	123274488 B/op	  940854 allocs/op
+BenchmarkQueryMultiHopSlots100K-2                             	       2	 189050792 ns/op	123274072 B/op	  940852 allocs/op
+BenchmarkQueryOrderLimitTopK/top_k_10/10000-2                 	      28	   9221932 ns/op	 3391214 B/op	   16483 allocs/op
+BenchmarkQueryOrderLimitTopK/top_k_10/10000-2                 	      30	   8313640 ns/op	 3325880 B/op	   16055 allocs/op
+BenchmarkQueryOrderLimitTopK/top_k_10/10000-2                 	      34	   6933762 ns/op	 3218101 B/op	   15349 allocs/op
+BenchmarkQueryOrderLimitTopK/full_sort_all_rows_reference/10000-2         	      12	  24534597 ns/op	10207155 B/op	   45059 allocs/op
+BenchmarkQueryOrderLimitTopK/full_sort_all_rows_reference/10000-2         	      15	  14649636 ns/op	 9749583 B/op	   42062 allocs/op
+BenchmarkQueryOrderLimitTopK/full_sort_all_rows_reference/10000-2         	      10	  27429758 ns/op	10664728 B/op	   48056 allocs/op
+BenchmarkQueryOrderLimitTopK/top_k_10/100000-2                            	       1	 685643792 ns/op	115774120 B/op	  783271 allocs/op
+BenchmarkQueryOrderLimitTopK/top_k_10/100000-2                            	       1	 399757333 ns/op	115774080 B/op	  783271 allocs/op
+BenchmarkQueryOrderLimitTopK/top_k_10/100000-2                            	       1	 830880917 ns/op	115774064 B/op	  783271 allocs/op
+BenchmarkQueryOrderLimitTopK/full_sort_all_rows_reference/100000-2        	       1	3533080250 ns/op	176082496 B/op	  983300 allocs/op
+BenchmarkQueryOrderLimitTopK/full_sort_all_rows_reference/100000-2        	       1	1872325209 ns/op	176082696 B/op	  983300 allocs/op
+BenchmarkQueryOrderLimitTopK/full_sort_all_rows_reference/100000-2        	       1	1664384292 ns/op	176082680 B/op	  983300 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/engine	116.180s
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/exporter	0.601s
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/search	0.479s
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/store	0.598s
+PASS
+ok  	github.com/mrchypark/latticedb-go/scripts	0.467s

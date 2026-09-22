@@ -1,0 +1,9 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go/internal/engine
+cpu: Apple M3
+BenchmarkVectorSearchClustered128D/10K-2         	       1	    136292 ns/op	   3.76 MB/s	         0 exact-fallbacks/100queries	     10745 index-build-ms	    227879 mean-ns	    931417 p99-ns	        99.00 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/10K-2         	       1	    175459 ns/op	   2.92 MB/s	         0 exact-fallbacks/100queries	     12236 index-build-ms	    154153 mean-ns	    476625 p99-ns	        99.00 recall@10	     288 B/op	       3 allocs/op
+BenchmarkVectorSearchClustered128D/10K-2         	       1	    131666 ns/op	   3.89 MB/s	         0 exact-fallbacks/100queries	      9360 index-build-ms	    165780 mean-ns	    577625 p99-ns	        99.00 recall@10	     288 B/op	       3 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/engine	33.034s
