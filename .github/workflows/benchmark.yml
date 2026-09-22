@@ -30,6 +30,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Validate Zig benchmark cache configuration
+        run: python3 scripts/test_zig_benchmark_config.py
       - name: Resolve latest Zig reference
         id: resolve_zig
         env:
