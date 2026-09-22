@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "737f1400f7d941349ecfc4bc7f12e1c82cfecb4e794297b280c7b6d7b7882c4a"
+const auditedCypherParserDigest = "a5f2932fc2770f2ba5cc5fe388b2e90cfa4e00b7404932509917e8ee91fdde78"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -158,6 +158,7 @@ func TestQueryGrammarASTShape(t *testing.T) {
 
 func TestQueryGrammarMatrix(t *testing.T) {
 	accepted := map[string]string{
+		"with create":                      "MATCH (n) WITH n.name AS name CREATE (m:Copy {name: name}) RETURN m",
 		"create anonymous node":            `CREATE ()`,
 		"create labeled node":              `CREATE (n:Person:Employee)`,
 		"create node properties":           `CREATE (n:Person {name: "Alice", age: -1, ratio: 1.5, active: true, disabled: false, note: null, copy: $name, nested: {team: 'graph'}}) RETURN id(n) AS id`,
@@ -300,6 +301,8 @@ func TestQueryGrammarMatrix(t *testing.T) {
 	}
 
 	rejected := map[string]string{
+		"private count display":        "MATCH (n) WITH count(*) RETURN `count(*)`",
+		"decoded duplicate with":       "MATCH (a), (b) WITH a AS b, `b` RETURN b",
 		"empty query":                  ``,
 		"unsupported root":             `RETURN 1`,
 		"lowercase keyword":            `match (n) RETURN n`,

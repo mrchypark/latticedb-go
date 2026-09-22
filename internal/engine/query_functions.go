@@ -61,6 +61,9 @@ func (expr callExpr) eval(row queryRow, params map[string]any) (any, error) {
 		if !ok {
 			return nil, expr.typeError("a node", args[0])
 		}
+		if err := row.reserveExpression(uint64(len(node.Labels)) * 16); err != nil {
+			return nil, err
+		}
 		labels := make([]any, 0, len(node.Labels))
 		for _, label := range node.Labels {
 			labels = append(labels, label)
@@ -90,9 +93,15 @@ func (expr callExpr) eval(row queryRow, params map[string]any) (any, error) {
 			return nil, nil
 		}
 		if node, ok := nodeBinding(args[0]); ok {
+			if err := row.reserveExpression(queryStoredPropertyBytes(node.Properties)); err != nil {
+				return nil, err
+			}
 			return node.Properties.CloneMap(), nil
 		}
 		if edge, ok := edgeBinding(args[0]); ok {
+			if err := row.reserveExpression(queryStoredPropertyBytes(edge.Properties)); err != nil {
+				return nil, err
+			}
 			return edge.Properties.CloneMap(), nil
 		}
 		return nil, expr.typeError("a node or edge", args[0])
@@ -184,6 +193,9 @@ func (expr callExpr) eval(row queryRow, params map[string]any) (any, error) {
 		items := make([]any, 0)
 		if step > 0 {
 			for i := start; i <= end; i += step {
+				if err := row.reserveExpression(16); err != nil {
+					return nil, err
+				}
 				items = append(items, i)
 				if i > math.MaxInt64-step {
 					break
@@ -191,6 +203,9 @@ func (expr callExpr) eval(row queryRow, params map[string]any) (any, error) {
 			}
 		} else {
 			for i := start; i >= end; i += step {
+				if err := row.reserveExpression(16); err != nil {
+					return nil, err
+				}
 				items = append(items, i)
 				if i < math.MinInt64-step {
 					break
@@ -217,11 +232,17 @@ func (expr callExpr) eval(row queryRow, params map[string]any) (any, error) {
 		}
 		if delimiter == "" {
 			// Upstream splits an empty delimiter into individual bytes.
+			if err := row.reserveExpression(uint64(len(text)) * 16); err != nil {
+				return nil, err
+			}
 			parts := make([]any, 0, len(text))
 			for i := range len(text) {
 				parts = append(parts, text[i:i+1])
 			}
 			return parts, nil
+		}
+		if err := row.reserveExpression(uint64(strings.Count(text, delimiter)+1) * 32); err != nil {
+			return nil, err
 		}
 		parts := strings.Split(text, delimiter)
 		values := make([]any, 0, len(parts))
@@ -252,6 +273,14 @@ func (expr callExpr) eval(row queryRow, params map[string]any) (any, error) {
 		}
 		if search == "" {
 			return text, nil
+		}
+		size := uint64(len(text))
+		count := uint64(strings.Count(text, search))
+		if len(replacement) > len(search) {
+			size += count * uint64(len(replacement)-len(search))
+		}
+		if err := row.reserveExpression(size); err != nil {
+			return nil, err
 		}
 		return strings.ReplaceAll(text, search, replacement), nil
 
@@ -510,6 +539,9 @@ func (expr callExpr) evalASCIIString(upper bool, row queryRow, params map[string
 			return nil, nil
 		}
 		return nil, expr.typeError("a string", args[0])
+	}
+	if err := row.reserveExpression(uint64(len(text)) * 2); err != nil {
+		return nil, err
 	}
 	out := []byte(text)
 	for i, char := range out {

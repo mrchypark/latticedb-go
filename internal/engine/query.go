@@ -293,10 +293,11 @@ type unwindClause struct {
 }
 
 type returnClause struct {
-	CountVar    string
-	CountAlias  string
-	Projections []projection
-	Distinct    bool
+	CountVar      string
+	CountAlias    string
+	CountExported bool
+	Projections   []projection
+	Distinct      bool
 }
 
 type projection struct {
@@ -334,9 +335,10 @@ const (
 )
 
 type queryRow struct {
-	slots []boundValue
-	index map[string]int
-	Order float64
+	budget *queryBudget
+	slots  []boundValue
+	index  map[string]int
+	Order  float64
 }
 
 type queryIterator interface {
@@ -788,7 +790,7 @@ func attachWithPart(plan *queryPlan, text string) error {
 	if text == "" {
 		return errors.New("WITH must be followed by another clause")
 	}
-	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " UNWIND ", " RETURN ")
+	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " UNWIND ", " CREATE ", " RETURN ")
 	keywordIndex := -1
 	if keyword != "" {
 		keywordIndex = findTopLevelToken(text, keyword)
@@ -813,6 +815,14 @@ func attachWithPart(plan *queryPlan, text string) error {
 	clause, err := parseReturnClause(itemsText)
 	if err != nil {
 		return err
+	}
+	slots := map[string]struct{}{}
+	for _, item := range clause.Projections {
+		name := projectionSlotName(item)
+		if _, duplicate := slots[name]; duplicate {
+			return fmt.Errorf("duplicate projection name %q", name)
+		}
+		slots[name] = struct{}{}
 	}
 	if clause.CountAlias == "" && len(clause.Projections) == 0 {
 		return errors.New("WITH items must be non-empty")
@@ -867,7 +877,7 @@ func resolveWithOrderAliases(clause *returnClause, orders []orderClause) []order
 // unreferenceable.
 func withProjectionNames(clause *returnClause) []string {
 	if clause.CountAlias != "" {
-		return []string{clause.CountAlias}
+		return []string{clause.countSlotName()}
 	}
 	names := make([]string, 0, len(clause.Projections))
 	for _, projection := range clause.Projections {
@@ -878,8 +888,14 @@ func withProjectionNames(clause *returnClause) []string {
 	return names
 }
 
-// projectionSlotName is the slot a WITH projection writes into: the exported
-// name when the item exports one, otherwise its display alias for internal use.
+func (clause *returnClause) countSlotName() string {
+	if clause.CountExported {
+		return clause.CountAlias
+	}
+	return "\x00with:" + clause.CountAlias
+}
+
+// projectionSlotName separates exported names from private display labels.
 func projectionSlotName(projection projection) string {
 	if projection.ExplicitAlias && projection.Alias != "" {
 		return projection.Alias
@@ -944,7 +960,10 @@ func parseWithTail(text string) (*queryPlan, error) {
 // part: the alias when it is a usable identifier, and nothing otherwise.
 func withOutputNames(clause *returnClause) []string {
 	if clause.CountAlias != "" {
-		return []string{clause.CountAlias}
+		if clause.CountExported {
+			return []string{clause.CountAlias}
+		}
+		return nil
 	}
 	names := make([]string, 0, len(clause.Projections))
 	for _, projection := range clause.Projections {
@@ -1277,7 +1296,7 @@ func (plan *queryPlan) validateBindings() error {
 			}
 		}
 		roles := make(map[string]bindingRole, len(clause.Projections))
-		if clause.CountAlias != "" {
+		if clause.CountAlias != "" && clause.CountExported {
 			roles[clause.CountAlias] = bindingValue
 		}
 		for _, projection := range clause.Projections {
@@ -1303,10 +1322,18 @@ func (plan *queryPlan) validateBindings() error {
 				continue
 			}
 			role := bindingValue
-			if projection.Kind == projectionValue {
-				if source, ok := bindings[projection.Var]; ok {
+			sourceName := projection.Var
+			preservesEntity := projection.Kind == projectionValue
+			if projection.Kind == projectionAggregate && (projection.Aggregate == aggregateMin || projection.Aggregate == aggregateMax) {
+				if variable, ok := projection.Expr.(variableExpr); ok {
+					sourceName = variable.Name
+					preservesEntity = true
+				}
+			}
+			if preservesEntity {
+				if source, ok := bindings[sourceName]; ok {
 					role = source
-				} else if source, ok := plan.inheritedRoles[projection.Var]; ok {
+				} else if source, ok := plan.inheritedRoles[sourceName]; ok {
 					role = source
 				}
 			}
@@ -3727,9 +3754,10 @@ func parseReturnClause(text string) (*returnClause, error) {
 					return nil, fmt.Errorf("invalid count alias %q", rest)
 				}
 				return &returnClause{
-					CountVar:   countVar,
-					CountAlias: alias,
-					Distinct:   distinct,
+					CountVar:      countVar,
+					CountAlias:    alias,
+					CountExported: true,
+					Distinct:      distinct,
 				}, nil
 			}
 			// A multi-item list falls through to the general projection parser,
@@ -3961,7 +3989,7 @@ func (clause orderClause) value(row queryRow) any {
 		if !ok {
 			return nil
 		}
-		return publicProjectionValue(binding)
+		return orderComparable(binding)
 	}
 	binding, ok := row.get(clause.Var)
 	if !ok {
@@ -3992,7 +4020,24 @@ func bindingIDValue(binding boundValue) any {
 	return value
 }
 
+// orderComparable unwraps entity references without cloning their properties.
+func orderComparable(value any) any {
+	switch value := value.(type) {
+	case boundValue:
+		if value.HasValue {
+			return orderComparable(value.Value)
+		}
+		return bindingIDValue(value)
+	case Node:
+		return int64(value.ID)
+	case Edge:
+		return int64(value.ID)
+	default:
+		return value
+	}
+}
 func compareOrderValues(left, right any) int {
+	left, right = orderComparable(left), orderComparable(right)
 	leftRank, rightRank := orderValueRank(left), orderValueRank(right)
 	if leftRank != rightRank {
 		return cmp.Compare(leftRank, rightRank)
@@ -5374,19 +5419,19 @@ func (clause *returnClause) render(rows []queryRow, params map[string]any, budge
 					if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
 						return QueryResult{}, err
 					}
-					resultRow[projection.Alias] = store.CloneValue(binding.Value)
+					resultRow[projection.Alias] = publicProjectionValue(binding.Value)
 				default:
 					resultRow[projection.Alias] = nil
 				}
 			case projectionExpr:
-				value, err := projection.Expr.eval(row, params)
+				value, err := evalProjectionExpr(projection.Expr, row, params, budget)
 				if err != nil {
 					return QueryResult{}, err
 				}
-				public := publicProjectionValue(value)
-				if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 					return QueryResult{}, err
 				}
+				public := publicProjectionValue(value)
 				resultRow[projection.Alias] = public
 			default:
 				return QueryResult{}, fmt.Errorf("unsupported projection kind %q", projection.Kind)
@@ -5462,19 +5507,19 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 				if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
 					return nil, err
 				}
-				resultRow[projection.Alias] = store.CloneValue(binding.Value)
+				resultRow[projection.Alias] = publicProjectionValue(binding.Value)
 			default:
 				resultRow[projection.Alias] = nil
 			}
 		case projectionExpr:
-			value, err := projection.Expr.eval(row, params)
+			value, err := evalProjectionExpr(projection.Expr, row, params, budget)
 			if err != nil {
 				return nil, err
 			}
-			public := publicProjectionValue(value)
-			if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+			if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 				return nil, err
 			}
+			public := publicProjectionValue(value)
 			resultRow[projection.Alias] = public
 		default:
 			return nil, fmt.Errorf("unsupported projection kind %q", projection.Kind)
@@ -5486,19 +5531,39 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 // publicProjectionValue converts an evaluated expression result into the public
 // value shape used by query result rows, mirroring the bare-binding projection.
 func publicProjectionValue(value any) any {
-	binding, ok := value.(boundValue)
-	if !ok {
-		return store.CloneValue(value)
-	}
-	switch {
-	case binding.Node != nil:
-		return publicNode(binding.Node)
-	case binding.Edge != nil:
-		return publicEdge(binding.Edge)
-	case binding.HasValue:
-		return store.CloneValue(binding.Value)
+	switch value := value.(type) {
+	case boundValue:
+		switch {
+		case value.Node != nil:
+			return publicNode(value.Node)
+		case value.Edge != nil:
+			return publicEdge(value.Edge)
+		case value.HasValue:
+			return publicProjectionValue(value.Value)
+		default:
+			return nil
+		}
+	case []any:
+		result := make([]any, len(value))
+		for i, item := range value {
+			result[i] = publicProjectionValue(item)
+		}
+		return result
+	case map[string]any:
+		result := make(map[string]any, len(value))
+		for key, item := range value {
+			result[key] = publicProjectionValue(item)
+		}
+		return result
+	case Node:
+		value.Labels = slices.Clone(value.Labels)
+		value.Properties = store.ClonePropertyMap(value.Properties)
+		return value
+	case Edge:
+		value.Properties = store.ClonePropertyMap(value.Properties)
+		return value
 	default:
-		return nil
+		return store.CloneValue(value)
 	}
 }
 
@@ -5522,14 +5587,14 @@ func (clause *returnClause) projectionValue(projection projection, row queryRow,
 		}
 		return store.CloneValue(value), nil
 	case projectionExpr:
-		value, err := projection.Expr.eval(row, params)
+		value, err := evalProjectionExpr(projection.Expr, row, params, budget)
 		if err != nil {
 			return nil, err
 		}
-		public := publicProjectionValue(value)
-		if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 			return nil, err
 		}
+		public := publicProjectionValue(value)
 		return public, nil
 	case projectionValue:
 		if !bound {
@@ -5550,7 +5615,7 @@ func (clause *returnClause) projectionValue(projection projection, row queryRow,
 			if err := budget.chargeResult(queryValueBytes(binding.Value)); err != nil {
 				return nil, err
 			}
-			return store.CloneValue(binding.Value), nil
+			return publicProjectionValue(binding.Value), nil
 		}
 		return nil, nil
 	default:
@@ -5625,9 +5690,12 @@ func (clause *returnClause) projectRows(rows []queryRow, plan *queryPlan, params
 // the item list contains any.
 func (clause *returnClause) withRows(rows []queryRow, next *queryPlan, params map[string]any, budget *queryBudget) ([]queryRow, error) {
 	if !clause.hasAggregates() && clause.CountAlias == "" {
+		if err := budget.chargeResult(uint64(len(rows)) * 64); err != nil {
+			return nil, err
+		}
 		projected := make([]queryRow, 0, len(rows))
 		for _, row := range rows {
-			if err := budget.chargeResult(64 + uint64(len(next.slots))*32); err != nil {
+			if err := budget.chargeResult(64 + uint64(len(next.slots))*48); err != nil {
 				return nil, err
 			}
 			nextRow := next.newRow()
@@ -5679,18 +5747,33 @@ func (clause *returnClause) withItemBinding(projection projection, row queryRow,
 		}
 		return boundValue{Value: value, HasValue: true}, nil
 	case projectionExpr:
-		value, err := projection.Expr.eval(row, params)
+		value, err := evalProjectionExpr(projection.Expr, row, params, budget)
 		if err != nil {
 			return boundValue{}, err
 		}
-		public := publicProjectionValue(value)
-		if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 			return boundValue{}, err
 		}
+		public := publicProjectionValue(value)
 		return boundValue{Value: public, HasValue: true}, nil
 	default:
 		return boundValue{}, fmt.Errorf("unsupported WITH item kind %q", projection.Kind)
 	}
+}
+
+// evalProjectionExpr admits expression-owned allocations before materialization.
+func evalProjectionExpr(expr valueExpr, row queryRow, params map[string]any, budget *queryBudget) (any, error) {
+	row.budget = budget
+	return expr.eval(row, params)
+}
+func (row queryRow) reserveExpression(bytes uint64) error {
+	if row.budget == nil {
+		return nil
+	}
+	if err := row.budget.check(1, 0); err != nil {
+		return err
+	}
+	return row.budget.chargeResult(bytes)
 }
 
 // aggregateWithRows groups the input rows by the non-aggregate WITH items.
@@ -5710,11 +5793,11 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 				count++
 			}
 		}
-		if err := budget.chargeResult(64 + uint64(len(next.slots))*32); err != nil {
+		if err := budget.chargeResult(64 + uint64(len(next.slots))*48); err != nil {
 			return nil, err
 		}
 		target := next.newRow()
-		target.set(clause.CountAlias, boundValue{Value: count, HasValue: true})
+		target.set(clause.countSlotName(), boundValue{Value: count, HasValue: true})
 		return []queryRow{target}, nil
 	}
 	var groupKeys []projection
@@ -5739,6 +5822,12 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 	groups := map[string]*withGroup{}
 	var ordered []*withGroup
 	for _, row := range rows {
+		if err := budget.check(1, 0); err != nil {
+			return nil, err
+		}
+		if err := budget.chargeResult(uint64(len(groupKeys)) * 48); err != nil {
+			return nil, err
+		}
 		values := make([]boundValue, 0, len(groupKeys))
 		var keyBuilder strings.Builder
 		for _, projection := range groupKeys {
@@ -5747,20 +5836,20 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 				return nil, err
 			}
 			values = append(values, binding)
-			public := publicProjectionValue(binding)
-			if err := budget.chargeResult(queryValueBytes(public)); err != nil {
+			if err := budget.chargeResult(queryValueBytes(binding)); err != nil {
 				return nil, err
 			}
+			public := publicProjectionValue(binding)
 			if err := writeDistinctValueKey(&keyBuilder, public, budget); err != nil {
 				return nil, err
 			}
 		}
 		key := keyBuilder.String()
-		if err := budget.chargeResult(uint64(len(key))); err != nil {
-			return nil, err
-		}
 		group, ok := groups[key]
 		if !ok {
+			if err := budget.chargeResult(128 + uint64(len(clause.Projections))*96); err != nil {
+				return nil, err
+			}
 			group = newGroup(values)
 			groups[key] = group
 			ordered = append(ordered, group)
@@ -5778,11 +5867,11 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 				}
 				continue
 			}
-			value, err := projection.Expr.eval(row, params)
+			value, err := evalProjectionExpr(projection.Expr, row, params, budget)
 			if err != nil {
 				return nil, err
 			}
-			if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+			if err := budget.chargeResult(queryValueBytes(value) + 16); err != nil {
 				return nil, err
 			}
 			if err := accumulator.add(value, value != nil); err != nil {
@@ -5793,9 +5882,12 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 	if len(ordered) == 0 && len(groupKeys) == 0 {
 		ordered = append(ordered, newGroup(nil))
 	}
+	if err := budget.chargeResult(uint64(len(ordered)) * 64); err != nil {
+		return nil, err
+	}
 	projected := make([]queryRow, 0, len(ordered))
 	for _, group := range ordered {
-		if err := budget.chargeResult(64 + uint64(len(next.slots))*32); err != nil {
+		if err := budget.chargeResult(64 + uint64(len(next.slots))*48); err != nil {
 			return nil, err
 		}
 		nextRow := next.newRow()
@@ -5804,7 +5896,11 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 			if projection.Kind == projectionAggregate {
 				value := group.aggregates[aggregateIndex].result()
 				aggregateIndex++
-				nextRow.set(projectionSlotName(projection), boundValue{Value: value, HasValue: true})
+				binding, ok := value.(boundValue)
+				if !ok {
+					binding = boundValue{Value: value, HasValue: true}
+				}
+				nextRow.set(projectionSlotName(projection), binding)
 				continue
 			}
 			nextRow.set(projectionSlotName(projection), group.values[keyIndex])
@@ -5825,6 +5921,9 @@ func (clause *returnClause) distinctWithRows(rows []queryRow, budget *queryBudge
 			binding, ok := row.get(projectionSlotName(projection))
 			var value any
 			if ok {
+				if err := budget.chargeResult(queryValueBytes(binding)); err != nil {
+					return nil, err
+				}
 				value = publicProjectionValue(binding)
 			}
 			if err := writeDistinctValueKey(&keyBuilder, value, budget); err != nil {
@@ -5832,9 +5931,6 @@ func (clause *returnClause) distinctWithRows(rows []queryRow, budget *queryBudge
 			}
 		}
 		key := keyBuilder.String()
-		if err := budget.chargeResult(uint64(len(key))); err != nil {
-			return nil, err
-		}
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -5904,8 +6000,11 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 				}
 				continue
 			}
-			value, err := projection.Expr.eval(row, params)
+			value, err := evalProjectionExpr(projection.Expr, row, params, budget)
 			if err != nil {
+				return QueryResult{}, err
+			}
+			if err := budget.chargeResult(queryValueBytes(value) + 16); err != nil {
 				return QueryResult{}, err
 			}
 			if err := accumulator.add(value, value != nil); err != nil {
@@ -5929,7 +6028,11 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 		keyIndex, aggregateIndex := 0, 0
 		for _, projection := range clause.Projections {
 			if projection.Kind == projectionAggregate {
-				resultRow[projection.Alias] = group.aggregates[aggregateIndex].result()
+				value := group.aggregates[aggregateIndex].result()
+				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
+					return QueryResult{}, err
+				}
+				resultRow[projection.Alias] = publicProjectionValue(value)
 				aggregateIndex++
 				continue
 			}
@@ -6054,7 +6157,31 @@ func distinctResultRows(columns []string, rows []map[string]any, budget *queryBu
 	return distinct, nil
 }
 
+type distinctKeySize uint64
+
+func (size *distinctKeySize) Write(p []byte) (int, error) {
+	*size += distinctKeySize(len(p))
+	return len(p), nil
+}
+func (size *distinctKeySize) WriteString(p string) (int, error) {
+	*size += distinctKeySize(len(p))
+	return len(p), nil
+}
+
 func writeDistinctValueKey(writer io.Writer, value any, budget *queryBudget) error {
+	if builder, ok := writer.(*strings.Builder); ok {
+		var size distinctKeySize
+		if err := writeDistinctValueKey(&size, value, budget); err != nil {
+			return err
+		}
+		if err := budget.chargeResult(uint64(size)); err != nil {
+			return err
+		}
+		builder.Grow(int(size))
+		// Hide the builder from recursive calls: the complete value is reserved.
+		writer = struct{ io.Writer }{builder}
+	}
+
 	if err := budget.check(1, 0); err != nil {
 		return err
 	}
@@ -6324,6 +6451,22 @@ func distinctValuesEqual(left, right any) bool {
 
 func queryValueBytes(value any) uint64 {
 	switch value := value.(type) {
+	case boundValue:
+		switch {
+		case value.Node != nil:
+			return queryStoredPropertyBytes(value.Node.Properties) + uint64(len(value.Node.Labels))*16
+		case value.Edge != nil:
+			return queryStoredPropertyBytes(value.Edge.Properties)
+		case value.HasValue:
+			return queryValueBytes(value.Value)
+		default:
+			return 8
+		}
+	case Node:
+		return queryPropertyBytes(value.Properties) + uint64(len(value.Labels))*16
+	case Edge:
+		return queryPropertyBytes(value.Properties)
+
 	case nil, bool, int64, float64:
 		return 8
 	case string:
@@ -6345,18 +6488,24 @@ func queryValueBytes(value any) uint64 {
 	}
 }
 
-func (expr literalExpr) eval(_ queryRow, _ map[string]any) (any, error) {
+func (expr literalExpr) eval(row queryRow, _ map[string]any) (any, error) {
+	if err := row.reserveExpression(queryValueBytes(expr.Value)); err != nil {
+		return nil, err
+	}
 	return store.CloneValue(expr.Value), nil
 }
 
 func (expr mapLiteralExpr) eval(row queryRow, params map[string]any) (any, error) {
+	if err := row.reserveExpression(uint64(len(expr.Entries)) * 32); err != nil {
+		return nil, err
+	}
 	out := make(map[string]any, len(expr.Entries))
 	for key, item := range expr.Entries {
 		value, err := item.eval(row, params)
 		if err != nil {
 			return nil, err
 		}
-		normalized, err := store.NormalizeValue(value)
+		normalized, err := store.NormalizeValueWithReserve(value, row.reserveExpression)
 		if err != nil {
 			return nil, err
 		}
@@ -6379,6 +6528,9 @@ func (expr variableExpr) eval(row queryRow, _ map[string]any) (any, error) {
 		return nil, fmt.Errorf("unknown binding %q", expr.Name)
 	}
 	if value.HasValue {
+		if err := row.reserveExpression(queryValueBytes(value.Value)); err != nil {
+			return nil, err
+		}
 		return store.CloneValue(value.Value), nil
 	}
 	return value, nil
@@ -6390,6 +6542,9 @@ func (expr propertyExpr) eval(row queryRow, _ map[string]any) (any, error) {
 		return nil, fmt.Errorf("unknown binding %q", expr.Var)
 	}
 	value, _ := propertyFromBinding(binding, expr.Property)
+	if err := row.reserveExpression(queryValueBytes(value)); err != nil {
+		return nil, err
+	}
 	return store.CloneValue(value), nil
 }
 
