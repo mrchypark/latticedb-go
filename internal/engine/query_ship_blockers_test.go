@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -83,11 +84,21 @@ func TestWithComputedAggregateBudget(t *testing.T) {
 		"MATCH (n:Big) WITH collect(coalesce(n.blob)) AS xs RETURN count(*) AS c",
 		"MATCH (n:Big) WITH properties(n) AS p RETURN count(*) AS c",
 		"WITH range(1, 1000000000) AS xs RETURN count(*) AS c",
+		"MATCH (n:Person) WITH n WHERE n.age IN range(1, 1000000000) RETURN count(*) AS c",
+		"UNWIND range(1, 1000000000) AS x RETURN count(*) AS c",
+		"WITH coalesce({p: 0}) AS n WHERE n.p IN range(0, 1000000) RETURN count(*) AS c",
+		"WITH coalesce(1) AS n UNWIND range(1, 1000000000) AS x RETURN count(*) AS c",
+		"WITH coalesce(1) AS n CREATE (m:BudgetCopy {xs: range(1, 1000000000)}) RETURN count(*) AS c",
+		"MATCH (n:Person) SET n.xs = range(1, 1000000000) RETURN n",
 	} {
 		_, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxBytes: 4096})
 		if !errors.Is(err, ErrResourceLimit) {
 			t.Fatalf("%s: %v", query, err)
 		}
+	}
+	result, err := db.Query("MATCH (n:BudgetCopy) RETURN count(*) AS c", nil)
+	if err != nil || result.Rows[0]["c"] != int64(0) {
+		t.Fatalf("unexpected mutation: %v, %v", result, err)
 	}
 }
 
@@ -119,5 +130,19 @@ func TestWithPayloadRejectedBeforeClone(t *testing.T) {
 		if got := result.AllocedBytesPerOp(); got > 64<<10 {
 			t.Fatalf("%s allocated %d bytes before rejection", query, got)
 		}
+	}
+}
+
+func TestWithExpressionBudgetControls(t *testing.T) {
+	db := openWithDB(t)
+	query := "WITH coalesce({p: 0}) AS n WHERE n.p IN range(0, 3) RETURN count(*) AS c"
+	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxBytes: 4096})
+	if err != nil || result.Rows[0]["c"] != int64(1) {
+		t.Fatalf("bounded expression: %v, %v", result, err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := db.QueryContext(ctx, query, nil, QueryOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation: %v", err)
 	}
 }
