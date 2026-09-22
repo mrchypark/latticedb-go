@@ -76,9 +76,9 @@ LatticeDB supports a small, case-sensitive Cypher subset, not full openCypher or
 | Writes | Node `CREATE`; directed relationship `CREATE` between matched bindings; property and label `SET` / `REMOVE`; map replacement (`SET n = $props`) and merge (`SET n += $props`); `DELETE` / `DETACH DELETE` |
 | Batch input | `UNWIND` over list parameters or expressions, including chained query parts through `WITH` |
 | Search | Vector ranking with `n.embedding <=> $vector`; property-scoped full-text search with `n.text @@ $query`. Search predicates can be combined with `AND`, but cannot occur under `OR` or `NOT`. |
-| Values | Scalar and map literals; parameters also carry lists, bytes, and vectors. Backtick-quoted identifiers support Unicode and spaces. |
+| Values | Scalar, list, and map literals; parameters also carry lists, bytes, and vectors. Backtick-quoted identifiers support Unicode and spaces. |
 
-For example, pass a list as a parameter instead of writing a list literal:
+For example, pass a list as a parameter (list literals such as `["a", "b"]` also work):
 
 ```go
 result, err := db.Query(
@@ -93,7 +93,7 @@ result, err := db.Query(
 Important boundaries:
 
 - No `OPTIONAL MATCH`, `MERGE`, `UNION`, variable-length paths, query comments, or multiple statements. One trailing semicolon is allowed.
-- No list literals, arithmetic expressions, user-defined function calls, or `RETURN *`. Aggregate-level `DISTINCT`, such as `count(DISTINCT n)`, remains unsupported.
+- No arithmetic expressions, user-defined function calls, or `RETURN *`. Aggregate-level `DISTINCT`, such as `count(DISTINCT n)`, remains unsupported.
 - `WITH` exports explicit aliases and plain binding names; dropped names cannot be referenced by later parts. A `WITH` must be followed by another query part. See the [grammar contract](docs/engine_conformance.md) for expression and ordering restrictions.
 - Use spaces around binary predicate and assignment operators: `n.age = 1`, not `n.age=1`. Inequality is `<>`, not `!=`.
 - Within each query part, a `MATCH` has one terminal clause. `SET`, `REMOVE`, and relationship `CREATE` may be followed by `RETURN`; `DELETE` cannot. Top-level `CREATE` creates a node, not an entire path, and cannot be followed by `SET`.

@@ -1,0 +1,6 @@
+e5faec33e9a8ca2c07f05ba32fc3192bec64235c
+v0.8.0
+go version go1.27.1 darwin/arm64
+Darwin arm64
+Apple M3
+25769803776

@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 90
     env:
       GOMAXPROCS: 2
+      ZIG_BENCH_CONFIG: "v1;repo=jeffhajewski/latticedb;host=ubuntu-x86_64;target=native;optimize=ReleaseFast;step=vector-benchmark;args=--scale 100000 --scale-only"
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -29,6 +30,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Validate benchmark provenance
+        run: |
+          python3 scripts/test_zig_benchmark_config.py
+          python3 scripts/test_archived_benchmark.py
       - name: Resolve latest Zig reference
         id: resolve_zig
         env:
@@ -36,7 +41,7 @@ jobs:
         run: |
           set -euo pipefail
           latest_tag=$(gh api --paginate \
-            'repos/mrchypark/latticedb/tags?per_page=100' \
+            'repos/jeffhajewski/latticedb/tags?per_page=100' \
             --jq '.[].name' \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
             | sort -V \
@@ -46,12 +51,12 @@ jobs:
           [[ "$LATTICE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 
           zig_ref=$(gh api \
-            "repos/mrchypark/latticedb/commits/${latest_tag}" \
+            "repos/jeffhajewski/latticedb/commits/${latest_tag}" \
             --jq '.sha')
           [[ "$zig_ref" =~ ^[0-9a-f]{40}$ ]]
 
           zon=$(gh api \
-            "repos/mrchypark/latticedb/contents/build.zig.zon?ref=${latest_tag}" \
+            "repos/jeffhajewski/latticedb/contents/build.zig.zon?ref=${latest_tag}" \
             --jq '.content' \
             | base64 --decode)
           declared_lattice_version=$(printf '%s\n' "$zon" \
@@ -80,7 +85,7 @@ jobs:
             printf 'ZIG_SHA256=%s\n' "$zig_sha256"
           } >> "$GITHUB_ENV"
           printf 'zig_ref=%s\n' "$zig_ref" >> "$GITHUB_OUTPUT"
-          printf 'Resolved mrchypark/latticedb %s (%s) with package %s and minimum Zig %s.\n' \
+          printf 'Resolved jeffhajewski/latticedb %s (%s) with package %s and minimum Zig %s.\n' \
             "$latest_tag" "$zig_ref" "$LATTICE_VERSION" "$zig_version" >> "$GITHUB_STEP_SUMMARY"
       - name: Download previous main result
         env:
@@ -109,7 +114,8 @@ jobs:
             if ! gh run download "$run_id" --name performance-results --dir "$download_dir"; then
               continue
             fi
-            if [[ -f "$download_dir/zig.txt" && -f "$download_dir/zig-revision.txt" && -f "$download_dir/zig-version.txt" && -f "$download_dir/zig-ref.txt" && -f "$download_dir/zig-sha256.txt" && -f "$download_dir/lattice-version.txt" && -f "$download_dir/zig-archive-sha256.txt" && -f "$download_dir/zig-tag.txt" ]] \
+            if [[ -f "$download_dir/zig.txt" && -f "$download_dir/zig-revision.txt" && -f "$download_dir/zig-version.txt" && -f "$download_dir/zig-ref.txt" && -f "$download_dir/zig-sha256.txt" && -f "$download_dir/lattice-version.txt" && -f "$download_dir/zig-archive-sha256.txt" && -f "$download_dir/zig-tag.txt" && -f "$download_dir/zig-bench-config.txt" ]] \
+              && [[ "$(<"$download_dir/zig-bench-config.txt")" == "$ZIG_BENCH_CONFIG" ]] \
               && [[ "$(<"$download_dir/lattice-version.txt")" == "$LATTICE_VERSION" ]] \
               && [[ "$(<"$download_dir/zig-tag.txt")" == "$ZIG_TAG" ]] \
               && [[ "$(<"$download_dir/zig-version.txt")" == "$ZIG_VERSION" ]] \
@@ -118,7 +124,7 @@ jobs:
               && [[ "$(<"$download_dir/zig-revision.txt")" == "$ZIG_REF" ]] \
               && (cd "$download_dir" && sha256sum --check --status zig-sha256.txt) \
               && go run ./scripts/benchcmp.go -validate-zig "$download_dir/zig.txt" >/dev/null 2>&1; then
-              cp "$download_dir"/zig{.txt,-revision.txt,-version.txt,-ref.txt,-sha256.txt} previous/
+              cp "$download_dir"/zig{.txt,-revision.txt,-version.txt,-ref.txt,-sha256.txt,-bench-config.txt} previous/
               printf '%s\n' "$LATTICE_VERSION" > previous/lattice-version.txt
               printf '%s\n' "$ZIG_SHA256" > previous/zig-archive-sha256.txt
               printf '%s\n' "$ZIG_TAG" > previous/zig-tag.txt
@@ -129,7 +135,8 @@ jobs:
       - name: Reuse or prepare Zig reference
         run: |
           mkdir -p results
-          if [[ -f previous/zig.txt && -f previous/zig-revision.txt && -f previous/zig-version.txt && -f previous/lattice-version.txt && -f previous/zig-archive-sha256.txt && -f previous/zig-tag.txt && -f previous/zig-ref.txt && -f previous/zig-sha256.txt ]] \
+          if [[ -f previous/zig.txt && -f previous/zig-revision.txt && -f previous/zig-version.txt && -f previous/lattice-version.txt && -f previous/zig-archive-sha256.txt && -f previous/zig-tag.txt && -f previous/zig-ref.txt && -f previous/zig-sha256.txt && -f previous/zig-bench-config.txt ]] \
+            && [[ "$(<previous/zig-bench-config.txt)" == "$ZIG_BENCH_CONFIG" ]] \
             && [[ "$(<previous/lattice-version.txt)" == "$LATTICE_VERSION" ]] \
             && [[ "$(<previous/zig-version.txt)" == "$ZIG_VERSION" ]] \
             && [[ "$(<previous/zig-archive-sha256.txt)" == "$ZIG_SHA256" ]] \
@@ -147,6 +154,7 @@ jobs:
             cp previous/zig-tag.txt results/zig-tag.txt
             cp previous/zig-ref.txt results/zig-ref.txt
             cp previous/zig-sha256.txt results/zig-sha256.txt
+            cp previous/zig-bench-config.txt results/zig-bench-config.txt
             echo 'ZIG_REUSED=true' >> "$GITHUB_ENV"
           else
             echo 'ZIG_REUSED=false' >> "$GITHUB_ENV"
@@ -166,7 +174,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         if: env.ZIG_REUSED != 'true'
         with:
-          repository: mrchypark/latticedb
+          repository: jeffhajewski/latticedb
           ref: ${{ steps.resolve_zig.outputs.zig_ref }}
           path: zig-reference
           persist-credentials: false
@@ -212,7 +220,7 @@ jobs:
           set -o pipefail
           (
             cd "$GITHUB_WORKSPACE/zig-reference"
-            zig build vector-benchmark -- --scale 100000 --scale-only
+            zig build vector-benchmark -Doptimize=ReleaseFast -- --scale 100000 --scale-only
           ) 2>&1 | tee results/zig.txt
           zig_revision=$(git -C "$GITHUB_WORKSPACE/zig-reference" rev-parse HEAD)
           [[ "$zig_revision" == "$ZIG_REF" ]]
@@ -222,6 +230,7 @@ jobs:
           printf '%s\n' "$ZIG_SHA256" > results/zig-archive-sha256.txt
           printf '%s\n' "$ZIG_TAG" > results/zig-tag.txt
           printf '%s\n' "$ZIG_REF" > results/zig-ref.txt
+          printf '%s\n' "$ZIG_BENCH_CONFIG" > results/zig-bench-config.txt
           (cd results && sha256sum zig.txt > zig-sha256.txt)
 
       - name: Create comparison report
@@ -239,7 +248,7 @@ jobs:
             -current-label "$(cat results/revision.txt)" \
             -previous-label "$(cat previous/revision.txt)" \
             -zig results/zig.txt \
-            -zig-label "mrchypark/latticedb@$(cat results/zig-revision.txt) (Zig $(cat results/zig-version.txt), ReleaseFast; $zig_status)" \
+            -zig-label "jeffhajewski/latticedb@$(cat results/zig-revision.txt) (Zig $(cat results/zig-version.txt), ReleaseFast; $zig_status)" \
             -zig-fresh="$zig_fresh" \
             -output results/report.md
           printf 'Zig reference: %s (Zig %s, ref %s).\n\n' "$zig_status" "$(cat results/zig-version.txt)" "$(cat results/zig-ref.txt)" >> "$GITHUB_STEP_SUMMARY"

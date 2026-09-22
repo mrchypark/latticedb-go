@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "a5f2932fc2770f2ba5cc5fe388b2e90cfa4e00b7404932509917e8ee91fdde78"
+const auditedCypherParserDigest = "470613db094f388149a7916c75cf89d0fbc5c15673ac79c1d06d8354000b6fff"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -290,6 +290,7 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"with starts with filter":          `MATCH (n) WITH n WHERE n.name STARTS WITH 'A' RETURN n.name AS name`,
 		"with three chained":               `MATCH (n) WITH n AS a WITH a AS b WITH b AS c RETURN c.name AS name`,
 		"with order by alias":              `MATCH (n) WITH n.age AS age ORDER BY age DESC LIMIT 1 RETURN age AS age`,
+		"list literal":                     `MATCH (n) WHERE n.kind IN ["a", "b"] RETURN n`,
 		"count with projection list":       `MATCH (n) RETURN count(n), n.name`,
 	}
 	for name, query := range accepted {
@@ -359,7 +360,6 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"unwind binding role conflict": `UNWIND $items AS n MATCH (n) RETURN n`,
 		"vector under or":              `MATCH (n) WHERE n.embedding <=> $vector OR n.active = true RETURN n`,
 		"full text under not":          `MATCH (n) WHERE NOT n.text @@ $query RETURN n`,
-		"list literal":                 `MATCH (n) WHERE n.kind IN ["a", "b"] RETURN n`,
 		"not equals spelling":          `MATCH (n) WHERE n.age != 1 RETURN n`,
 		"invalid binding identifier":   `MATCH (bad-name) RETURN bad-name`,
 		"empty label":                  `CREATE (n:)`,

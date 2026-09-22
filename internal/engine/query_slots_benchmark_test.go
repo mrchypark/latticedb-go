@@ -20,7 +20,11 @@ func benchmarkQueryMultiHopSlots(b *testing.B, nodes int) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer db.Close()
+	b.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			b.Error(err)
+		}
+	})
 	if err := db.Update(func(tx *Tx) error {
 		var previous uint64
 		for range nodes {

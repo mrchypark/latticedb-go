@@ -1,0 +1,12 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go/internal/engine
+cpu: Apple M3
+BenchmarkFTSFuzzyVocabularyPruning/tokens_10000-2         	     158	   1417186 ns/op	     377 B/op	       9 allocs/op
+BenchmarkFTSFuzzyVocabularyPruning/tokens_10000-2         	     175	   1301651 ns/op	     376 B/op	       9 allocs/op
+BenchmarkFTSFuzzyVocabularyPruning/tokens_10000-2         	     174	   1340247 ns/op	     376 B/op	       9 allocs/op
+BenchmarkFTSFuzzyVocabularyPruning/tokens_100000-2        	       6	  49159930 ns/op	     622 B/op	      11 allocs/op
+BenchmarkFTSFuzzyVocabularyPruning/tokens_100000-2        	       6	  34742444 ns/op	     620 B/op	      11 allocs/op
+BenchmarkFTSFuzzyVocabularyPruning/tokens_100000-2        	       6	  39784014 ns/op	     622 B/op	      11 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/engine	2.868s
