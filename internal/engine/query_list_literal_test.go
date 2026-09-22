@@ -16,7 +16,6 @@ func TestQueryListLiterals(t *testing.T) {
 		{`MATCH (n:Person) WITH [n.name, "Bob"] AS names UNWIND names AS v RETURN v ORDER BY v LIMIT 1`, "Ada"},
 		{`MATCH (n:Person) RETURN size([]) AS v`, "0"},
 		{`CREATE (n:List {items: [1, [2], null]}) RETURN n.items AS v`, "[1 [2] <nil>]"},
-		{`MATCH (n:Person) RETURN head([n]) AS v`, ""},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			result, err := db.Query(tc.query, map[string]any{"name": "Ada"})
@@ -26,11 +25,25 @@ func TestQueryListLiterals(t *testing.T) {
 			if len(result.Rows) != 1 {
 				t.Fatalf("rows = %v", result.Rows)
 			}
-			if tc.want != "" && fmt.Sprint(result.Rows[0]["v"]) != tc.want {
+			if fmt.Sprint(result.Rows[0]["v"]) != tc.want {
 				t.Fatalf("got %v, want %s", result.Rows, tc.want)
 			}
 		})
 	}
+	result, err := db.Query(`MATCH (n:Person) RETURN [n, [n]] AS v`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := result.Rows[0]["v"].([]any)
+	first, ok := items[0].(Node)
+	if !ok || first.Properties["name"] != "Ada" {
+		t.Fatalf("public node = %#v", items[0])
+	}
+	nested, ok := items[1].([]any)[0].(Node)
+	if !ok || nested.ID != first.ID {
+		t.Fatalf("nested public node = %#v", items[1])
+	}
+
 	for _, query := range []string{
 		`MATCH (n:Person) RETURN [missing]`,
 		`MATCH (n:Missing) RETURN [[unknown]]`,
