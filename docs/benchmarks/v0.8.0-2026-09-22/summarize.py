@@ -1,6 +1,15 @@
-import collections, csv, json, pathlib, re, statistics
+import collections, csv, hashlib, json, pathlib, re, statistics
 root = pathlib.Path(__file__).parent
 files = ['query.txt','fts.txt','vector-exact.txt','vector-ann.txt','fuzzy-vocabulary.txt']
+# This generator describes one archived measurement, not the current checkout.
+# Reject changed metadata or logs before touching either generated output.
+manifest = json.loads((root/'inputs.sha256.json').read_text())
+inputs = files + ['environment.txt', 'grammar-tests.jsonl']
+if set(manifest) != set(inputs):
+    raise SystemExit('Archived benchmark input manifest is incomplete')
+for name in inputs:
+    if hashlib.sha256((root/name).read_bytes()).hexdigest() != manifest[name]:
+        raise SystemExit(f'Archived benchmark input changed: {name}; refusing to overwrite historical report')
 rows = []
 for file in files:
     source = (root/file).read_text()
@@ -118,14 +127,15 @@ exact는 순환 질의의 Go benchmark 평균, ANN은 고정 100개 질의의 �
 
 ## 재현 및 한계
 
+이 디렉터리는 v0.8.0 당시 측정의 역사적 스냅샷이다. 아래 명령은 보관된 원시 로그를 다시 집계하며 현재 checkout을 측정하지 않는다. 환경·문법 로그·성능 로그의 SHA-256이 보관 manifest와 다르면 출력 파일을 변경하기 전에 거부한다. 새 측정은 별도 디렉터리와 해당 후보의 환경·하네스 설명으로 기록해야 한다. 현재 원본 비교용 실행 명령은 [별도 하네스](../upstream-2026-09-22/run.sh)를 참고한다.
+
 ```sh
-bash docs/benchmarks/v0.8.0-2026-09-22/run.sh
 python3 docs/benchmarks/v0.8.0-2026-09-22/summarize.py
 ```
 
 [중앙값·범위 CSV](summary.csv), [쿼리 원본](query.txt), [FTS 원본](fts.txt), [exact 벡터 원본](vector-exact.txt), [ANN 벡터 원본](vector-ann.txt), [큰 어휘 원본](fuzzy-vocabulary.txt), [환경](environment.txt), [문법 테스트](grammar-tests.jsonl), [추가 하네스](../../../internal/engine/query_language_benchmark_test.go).
 
-합성 데이터·단일 장비·warm read 결과이며 CPU 격리나 주파수 고정은 하지 않았다. 읽기/쓰기 혼합, 다중 사용자, 한국어 실제 문서, 콜드 오픈, 대형 임베딩(768/1536차원), 100만 건 이상은 이번 측정 범위에 포함하지 않는다. 변동이 큰 항목은 원본의 범위를 함께 봐야 한다. 제품 성능 변경은 하지 않았고, 보고서와 벤치마크 하네스는 로컬 작업 파일이다.
+합성 데이터·단일 장비·warm read 결과이며 CPU 격리나 주파수 고정은 하지 않았다. 읽기/쓰기 혼합, 다중 사용자, 한국어 실제 문서, 콜드 오픈, 대형 임베딩(768/1536차원), 100만 건 이상은 이번 측정 범위에 포함하지 않는다. 변동이 큰 항목은 원본의 범위를 함께 봐야 한다. 제품 성능 변경은 하지 않았고, 이 보고서의 엔진·환경·문법·계측 설명은 보관된 측정 시점에 한정된다.
 '''
 fts_scan=by_name['BenchmarkQueryFTSCandidates10K/scan']['ns/op']
 fts_index=by_name['BenchmarkQueryFTSCandidates10K/postings']['ns/op']
