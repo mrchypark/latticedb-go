@@ -49,8 +49,10 @@ vector property per node, the existing global dimensions, and the existing
 global index.
 
 Query vector comparisons use the same explicit descriptor through
-`QueryOptions.VectorNamespace`; the comparison remains exact. Approximate
-search is available through direct `VectorSearch` with an explicit namespace.
+`QueryOptions.VectorNamespace`; comparisons are exact by default.
+`QueryOptions.ApproximateVector` enables HNSW candidates for eligible query
+shapes; see [query search candidates](query-search-candidates.md) for fallback
+rules. Direct `VectorSearch` also supports approximate namespace search.
 Use `RebuildVectorIndexNamespaceContext(ctx, namespace)` to rebuild one derived
 index and `VectorIndexNamespaceStats(namespace)` to inspect it. Entry counts
 and mutation debt describe the selected namespace; fallback, rebuild count,

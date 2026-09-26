@@ -4,7 +4,7 @@ import "slices"
 
 // sortQueryRows checks work and cancellation before each comparison. The private
 // sentinel exits the standard library sort immediately; unrelated panics propagate.
-func sortQueryRows[E any](rows []E, compare func(E, E) int, budget *queryBudget) (err error) {
+func sortQueryRows[E any](rows []E, compare func(E, E) (int, error), budget *queryBudget) (err error) {
 	abort := &struct{ err error }{}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -22,7 +22,12 @@ func sortQueryRows[E any](rows []E, compare func(E, E) int, budget *queryBudget)
 			abort.err = err
 			panic(abort)
 		}
-		return compare(left, right)
+		comparison, err := compare(left, right)
+		if err != nil {
+			abort.err = err
+			panic(abort)
+		}
+		return comparison
 	})
 	return budget.check(0, 0)
 }

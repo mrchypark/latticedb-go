@@ -52,28 +52,35 @@ func compareCanonicalEdges(left, right *store.EdgeRecord) int {
 // O(E*ceil(E/16384)) candidate scans trade throughput for memory. Add a
 // canonical index if export throughput makes this ceiling material.
 func forEachCanonicalEdge(ctx context.Context, graph *store.GraphState, visit func(*store.EdgeRecord) error) error {
-	selected := make(orderedEdgeMaxHeap, 0, min(orderedEdgeBatchSize, graph.Edges.Len()))
+	if graph.PageBase != nil && graph.Edges.Len() == 0 && graph.DeletedEdges.Len() == 0 {
+		return graph.PageBase.VisitCanonicalEdges(ctx, visit)
+	}
+	selected := make(orderedEdgeMaxHeap, 0, orderedEdgeBatchSize)
 	var last *store.EdgeRecord
 	for {
 		selected = selected[:0]
-		for _, edge := range graph.Edges.All() {
+		err := graph.VisitEdges(ctx, func(edge *store.EdgeRecord) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			if last != nil && compareCanonicalEdges(edge, last) <= 0 {
-				continue
+				return nil
 			}
 			if len(selected) < orderedEdgeBatchSize {
 				selected = append(selected, edge)
 				if len(selected) == orderedEdgeBatchSize {
 					heap.Init(&selected)
 				}
-				continue
+				return nil
 			}
 			if compareCanonicalEdges(edge, selected[0]) < 0 {
 				selected[0] = edge
 				heap.Fix(&selected, 0)
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 		if len(selected) == 0 {
 			return nil

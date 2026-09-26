@@ -153,14 +153,14 @@ func cloneVectorNamespace(namespace *VectorNamespace) *VectorNamespace {
 func retainedVectorIndexBytes(graph *store.GraphState, target *VectorNamespace) uint64 {
 	var bytes uint64
 	if target != nil {
-		bytes = saturatingAdd(bytes, estimateVectorIndexBytes(uint64(graph.VectorIndex.Nodes.Len()), graph.VectorDimensions))
+		bytes = saturatingAdd(bytes, estimateVectorIndexBytesForM(uint64(graph.VectorIndex.Nodes.Len()), graph.VectorDimensions, graph.VectorIndexM))
 		bytes = saturatingAdd(bytes, saturatingMul(uint64(graph.VectorTombstones.Len()), uint64(graph.VectorDimensions)*4))
 	}
 	for namespace, state := range graph.VectorNamespaces {
 		if target != nil && namespace == *target {
 			continue
 		}
-		bytes = saturatingAdd(bytes, estimateVectorIndexBytes(uint64(state.Index.Nodes.Len()), namespace.Dimensions))
+		bytes = saturatingAdd(bytes, estimateVectorIndexBytesForM(uint64(state.Index.Nodes.Len()), namespace.Dimensions, graph.VectorIndexM))
 		bytes = saturatingAdd(bytes, saturatingMul(uint64(state.Tombstones.Len()), uint64(namespace.Dimensions)*4))
 	}
 	return bytes

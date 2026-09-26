@@ -15,7 +15,7 @@ func ValidateExportDestination(files DatabaseFiles, includeDirectory bool, outpu
 	if err != nil {
 		return err
 	}
-	owned := []string{files.State, files.WAL, files.WALBase, files.IDs, files.State + ".lock", files.State + ".layout"}
+	owned := []string{files.State + ".pages", files.State + ".pages.layout", files.State, files.WAL, files.WALBase, files.IDs, files.State + ".lock", files.State + ".layout"}
 	if includeDirectory {
 		owned = append(owned, files.Directory)
 	}

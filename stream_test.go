@@ -14,7 +14,8 @@ import (
 
 func TestLargePropertyChangefeedUsesBoundedSummaries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "large-changefeed.ltdb")
-	db, err := Open(path, OpenOptions{Create: true})
+	archive := t.TempDir()
+	db, err := Open(path, OpenOptions{Create: true, BackupDirectory: archive})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,12 +32,22 @@ func TestLargePropertyChangefeedUsesBoundedSummaries(t *testing.T) {
 	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(nodeID, "payload", newValue) }); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(filepath.Join(path, "wal.log"))
+	entries, err := os.ReadDir(archive)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() >= 4<<20 {
-		t.Fatalf("large property change WAL = %d bytes", info.Size())
+	var deltaBytes int64
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".wal") {
+			info, err := entry.Info()
+			if err != nil {
+				t.Fatal(err)
+			}
+			deltaBytes += info.Size()
+		}
+	}
+	if deltaBytes >= 4<<20 {
+		t.Fatalf("large property incremental frames = %d bytes", deltaBytes)
 	}
 	changes, err := db.Changes(0, 10, 0)
 	if err != nil {
@@ -182,9 +193,9 @@ func assertBoundedPropertyChange(t *testing.T, record StreamRecord, nodeID uint6
 	}
 }
 
-func TestStreamChangefeedWALStaysBoundedAcrossCheckpoints(t *testing.T) {
+func TestStreamChangefeedPageStorageStaysBoundedAcrossCheckpoints(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bounded-stream-wal.ltdb")
-	db, err := Open(path, OpenOptions{Create: true, WALCheckpointThresholdBytes: 8 << 10})
+	db, err := Open(path, OpenOptions{Create: true, ChangefeedMaxBytes: 8 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,14 +223,14 @@ func TestStreamChangefeedWALStaysBoundedAcrossCheckpoints(t *testing.T) {
 	for value := int64(1); value <= 200; value++ {
 		updateWithCheckpointRetry(t, db, func(tx *Tx) error { return tx.SetProperty(nodeID, "value", value) })
 	}
-	info, err := os.Stat(filepath.Join(path, "wal.log"))
+	info, err := os.Stat(filepath.Join(path, "state.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() > 16<<10 {
-		t.Fatalf("WAL grew to %d bytes", info.Size())
+	if info.Size() > 4<<20 {
+		t.Fatalf("bounded page database grew to %d bytes", info.Size())
 	}
-	t.Logf("WAL after 200 graph commits: %d bytes", info.Size())
+	t.Logf("page database after 200 graph commits: %d bytes", info.Size())
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +250,7 @@ func TestStreamChangefeedWALStaysBoundedAcrossCheckpoints(t *testing.T) {
 		t.Fatalf("recovered offset = %d, %v, %v", offset, ok, err)
 	}
 	changes, err := db.Changes(0, 300, 0)
-	if err != nil || len(changes) != 201 || !hasStreamChange(changes, "node.property_set", nodeID, "value") {
+	if err != nil || len(changes) == 0 || len(changes) >= 201 || changes[len(changes)-1].Sequence != 201 || !hasStreamChange(changes, "node.property_set", nodeID, "value") {
 		t.Fatalf("recovered changes = %d, %v", len(changes), err)
 	}
 }

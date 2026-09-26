@@ -352,8 +352,8 @@ func TestLoadGraphStateReplaysWALBaseChain(t *testing.T) {
 			}
 		}
 		decodedBytes := uint64(len(stateData) - stateHeaderSize)
-		decodedBytes += uint64(len(base) - 3*walHeaderSize)
-		decodedBytes += uint64(len(activeData) - 2*walHeaderSize)
+		decodedBytes += uint64(len(base) - 3*legacyWALHeaderSize)
+		decodedBytes += uint64(len(activeData) - 2*legacyWALHeaderSize)
 		return files, decodedBytes, 8
 	}
 
@@ -744,6 +744,7 @@ func TestWALRejectsOversizedDeclaredLengthWithoutAllocation(t *testing.T) {
 	binary.BigEndian.PutUint16(header[8:10], walVersion)
 	binary.BigEndian.PutUint16(header[10:12], walHeaderSize)
 	binary.BigEndian.PutUint64(header[20:28], maxWALFrameBytes+1)
+	binary.BigEndian.PutUint32(header[walHeaderChecksumAt:walHeaderSize], crc32.ChecksumIEEE(header[:walHeaderChecksumAt]))
 	if err := os.WriteFile(walFilePath(path), header, 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -416,9 +416,15 @@ const (
 )
 
 type GraphState struct {
+	DeletedFTS       PagedMap[bool]
+	PageBase         *PageGraph
+	DeletedNodes     PagedMap[bool]
+	DeletedEdges     PagedMap[bool]
 	DatabaseID       string
 	VectorDimensions uint16
-	SnapshotBytes    uint64
+	// VectorIndexM is transient derived-index configuration supplied at open.
+	VectorIndexM  uint16
+	SnapshotBytes uint64
 	// AppMetadata is shared by shallow clones; writers must Fork before mutation.
 	AppMetadata      *AppMetadata
 	Nodes            PagedMap[*NodeRecord]
@@ -646,6 +652,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 	cloned := NewGraphState()
 	cloned.DatabaseID = graph.DatabaseID
 	cloned.VectorDimensions = graph.VectorDimensions
+	cloned.VectorIndexM = graph.VectorIndexM
 	cloned.SnapshotBytes = graph.SnapshotBytes
 	cloned.AppMetadata = CloneAppMetadata(graph.AppMetadata)
 	cloned.DerivedIndexWork = graph.DerivedIndexWork
@@ -733,8 +740,13 @@ func CloneGraphState(graph *GraphState) *GraphState {
 
 func CloneGraphStateShallow(graph *GraphState) *GraphState {
 	return &GraphState{
+		PageBase:                 graph.PageBase,
+		DeletedFTS:               graph.DeletedFTS.Fork(),
+		DeletedNodes:             graph.DeletedNodes.Fork(),
+		DeletedEdges:             graph.DeletedEdges.Fork(),
 		DatabaseID:               graph.DatabaseID,
 		VectorDimensions:         graph.VectorDimensions,
+		VectorIndexM:             graph.VectorIndexM,
 		SnapshotBytes:            graph.SnapshotBytes,
 		AppMetadata:              graph.AppMetadata,
 		Nodes:                    graph.Nodes.Fork(),

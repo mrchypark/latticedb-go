@@ -453,7 +453,11 @@ func (tx *Tx) appendChangefeed() error {
 	for _, id := range mapKeys(tx.changes.upsertEdges) {
 		tx.appendEdgeChanges(tx.base.Edges.Get(id), tx.graph.Edges.Get(id))
 	}
-	if through, trimmed := tx.graph.Streams.TrimToBytes(changeStreamName, tx.db.changefeedMaxBytes); trimmed {
+	through, trimmed, err := tx.graph.Streams.TrimToBytesContext(context.Background(), changeStreamName, tx.db.changefeedMaxBytes)
+	if err != nil {
+		return err
+	}
+	if trimmed {
 		tx.recordStreamOperation(store.StreamOperation{Type: "trim", Stream: changeStreamName, Sequence: through})
 	}
 	return nil

@@ -34,14 +34,12 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 	}
 	queryVector := vector
 	capacity := limit
-	if !opts.Exact && !disableIndex && graph.VectorIndex.Nodes.Len() > 0 {
+	exactFallbackUsed := graph.PageBase != nil && !opts.Exact && !disableIndex
+	if graph.PageBase == nil && !opts.Exact && !disableIndex && graph.VectorIndex.Nodes.Len() > 0 {
 		capacity = min(limit, graph.VectorLiveCount)
-	} else if nodeCount := uint64(graph.Nodes.Len()); capacity > nodeCount {
-		capacity = nodeCount
 	}
 	results := make([]VectorSearchResult, 0, int(capacity))
-	exactFallbackUsed := false
-	if !opts.Exact && !disableIndex && graph.VectorIndex.Nodes.Len() > 0 {
+	if graph.PageBase == nil && !opts.Exact && !disableIndex && graph.VectorIndex.Nodes.Len() > 0 {
 		entry := graph.VectorIndex.EntryID
 		for level := graph.VectorIndex.MaxLevel; level > 0; level-- {
 			var err error
@@ -104,16 +102,13 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 	}
 	exact := vectorCandidateHeap{items: candidateStorage, max: true, exact: true}
 	cutoff := math.Inf(1)
-	for _, node := range graph.Nodes.All() {
+	if err := graph.VisitNodes(budget.ctx, func(node *store.NodeRecord) error {
 		vectorValue, ok := selectedVector(graph, node)
 		if !ok {
-			if err := budget.add(1); err != nil {
-				return nil, false, err
-			}
-			continue
+			return budget.add(1)
 		}
 		if err := budget.add(uint64(len(queryVector))); err != nil {
-			return nil, false, err
+			return err
 		}
 		var distance float64
 		var err error
@@ -123,15 +118,15 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 			distance, err = search.SquaredVectorDistanceContext(budget.ctx, vectorValue, queryVector)
 		}
 		if err != nil {
-			return nil, false, err
+			return err
 		}
 		if distance > cutoff || capacity == 0 {
-			continue
+			return nil
 		}
 		candidate := vectorCandidate{id: node.ID, distance: distance}
 		if len(exact.items) == int(capacity) {
 			if compareExactVectorCandidate(candidate, exact.items[0]) >= 0 {
-				continue
+				return nil
 			}
 			exact.pop()
 		}
@@ -144,6 +139,9 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 				cutoff = exact.items[0].distance * 4
 			}
 		}
+		return nil
+	}); err != nil {
+		return nil, false, err
 	}
 	if err := budget.check(); err != nil {
 		return nil, false, err

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
 	"github.com/mrchypark/latticedb-go/internal/search"
 )
 
@@ -100,7 +102,10 @@ const (
 	stateMagic             = "LATTICEDB"
 	idsMagic               = "LATTICEIDS"
 	storageVersion         = 2
-	walHeaderSize          = 64
+	walHeaderSize          = 68
+	legacyWALHeaderSize    = 64
+	walHeaderChecksumAt    = 64
+	walHeaderPrefixSize    = 12
 	walDatabaseIDAt        = 32
 	maxWALFrameBytes       = 1 << 30
 	maxStateFileBytes      = 1 << 30
@@ -109,13 +114,15 @@ const (
 	stateVersion           = 5
 	jsonStateVersion       = 4
 	legacyStateVersion     = 3
-	walVersion             = 4
+	walVersion             = 5
+	binaryWALVersion       = 4
 	jsonWALVersion         = 3
 	legacyWALVersion       = 2
 	maxAppMetadataKeyBytes = 1<<16 - 1
 )
 
-var walMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '4', 0}
+var walMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '5', 0}
+var binaryWALMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '4', 0}
 var jsonWALMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '3', 0}
 var legacyWALMagic = [8]byte{'L', 'D', 'B', 'W', 'A', 'L', '2', 0}
 var stateBinaryMagic = [8]byte{'L', 'D', 'B', 'S', 'T', 'A', 'T', '5'}
@@ -126,6 +133,7 @@ type WALWriter struct {
 	encodeValue   walPayload
 	encodeDelta   persistedDelta
 	encodeBuffer  bytes.Buffer
+	encodeHeader  [walHeaderSize]byte
 	file          *os.File
 	tailSize      atomic.Int64
 	fullSync      bool
@@ -213,15 +221,17 @@ func (writer *WALWriter) append(databaseID string, commitID uint64, payload []by
 	if writer == nil || writer.file == nil {
 		return errors.New("WAL writer is closed")
 	}
-	header, err := encodeWALHeader(databaseID, commitID, payload)
-	if err != nil {
+	if err := validateWALPayloadSize(len(payload)); err != nil {
+		return err
+	}
+	if err := encodeWALHeaderFieldsInto(&writer.encodeHeader, databaseID, commitID, uint64(len(payload)), crc32.ChecksumIEEE(payload)); err != nil {
 		return err
 	}
 	offset, err := writer.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return fmt.Errorf("locate WAL writer: %w", err)
 	}
-	if full, err := writer.write(header[:]); err != nil {
+	if full, err := writer.write(writer.encodeHeader[:]); err != nil {
 		if full {
 			return fmt.Errorf("%w: write WAL header: %w", ErrCommitOutcomeUnknown, err)
 		}
@@ -236,7 +246,7 @@ func (writer *WALWriter) append(databaseID string, commitID uint64, payload []by
 	if err := writer.sync(); err != nil {
 		return fmt.Errorf("%w: sync WAL: %w", ErrCommitOutcomeUnknown, err)
 	}
-	writer.tailSize.Add(int64(len(header) + len(payload)))
+	writer.tailSize.Add(int64(len(writer.encodeHeader) + len(payload)))
 	return nil
 }
 
@@ -622,6 +632,14 @@ func CreateCheckpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nex
 }
 
 func checkpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, noReplace bool) error {
+	return checkpointGraphStateFilesContext(context.Background(), files, graph, nextNodeID, nextEdgeID, commitID, noReplace)
+}
+
+func checkpointGraphStateFilesContext(ctx context.Context, files DatabaseFiles, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64, noReplace bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
 		return fmt.Errorf("create db directory: %w", err)
 	}
@@ -637,7 +655,7 @@ func checkpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeI
 	defer os.Remove(payloadPath)
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateBinary(io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateBinary(contextWriter{ctx: ctx, Writer: io.MultiWriter(payload, checksum)}, graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	if _, err := payload.Seek(0, io.SeekStart); err != nil {
@@ -664,12 +682,15 @@ func checkpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeI
 		_ = temp.Close()
 		return err
 	}
-	if _, err := io.Copy(temp, payload); err != nil {
+	if _, err := io.Copy(contextWriter{ctx: ctx, Writer: temp}, &contextReader{ctx: ctx, reader: payload}); err != nil {
 		_ = temp.Close()
 		return err
 	}
 	if err := syncAndClose(temp); err != nil {
 		return fmt.Errorf("write temp state: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if noReplace {
 		if err := os.Link(tempPath, files.State); err != nil {
@@ -862,11 +883,12 @@ func WALFilesHaveCheckpointMarker(files DatabaseFiles) (bool, error) {
 		return false, err
 	}
 	defer file.Close()
-	var header [walHeaderSize]byte
-	if _, err := io.ReadFull(file, header[:]); err != nil {
+	var headerBuffer [walHeaderSize]byte
+	header, err := readWALHeader(file, &headerBuffer)
+	if err != nil {
 		return false, err
 	}
-	if !validWALHeader(header[:]) {
+	if !validWALHeader(header) {
 		return false, errors.New("invalid WAL header")
 	}
 	payloadLength := binary.BigEndian.Uint64(header[20:28])
@@ -881,7 +903,7 @@ func WALFilesHaveCheckpointMarker(files DatabaseFiles) (bool, error) {
 		return false, errors.New("WAL checksum mismatch")
 	}
 	var wrapper walPayload
-	if err := decodeWALPayloadBytes(context.Background(), header[:], payload, maxWALFrameBytes, &wrapper); err != nil {
+	if err := decodeWALPayloadBytes(context.Background(), header, payload, maxWALFrameBytes, &wrapper); err != nil {
 		return false, err
 	}
 	return wrapper.Kind == "checkpoint", nil
@@ -1798,6 +1820,17 @@ func syncDirectory(path string) error {
 
 func SimulateCrash(dbPath string) error {
 	files := DirectoryDatabaseFiles(dbPath)
+	// Page commits have no disposable checkpoint: the page file is authoritative.
+	// Actual crash recovery is exercised with a subprocess exiting without Close.
+	for _, path := range []string{files.State, files.State + ".pages"} {
+		page, err := pagestore.IsFile(path)
+		if err != nil {
+			return err
+		}
+		if page {
+			return nil
+		}
+	}
 	if err := os.Remove(files.State); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove state checkpoint: %w", err)
 	}
@@ -1962,7 +1995,7 @@ func encodeStateHeader(databaseID string, commitID uint64, payloadLength uint64,
 	if err := validateDatabaseID(databaseID); err != nil {
 		return [stateHeaderSize]byte{}, err
 	}
-	if payloadLength > maxStateFileBytes-stateHeaderSize {
+	if payloadLength > uint64(math.MaxInt64)-stateHeaderSize {
 		return [stateHeaderSize]byte{}, errors.New("state payload exceeds size limit")
 	}
 	var header [stateHeaderSize]byte
@@ -2027,7 +2060,7 @@ func loadLatestWALSnapshotFilesContextWithBaseAndRecoveryBudgetAndAppendReady(ct
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, false, fmt.Errorf("rewind wal: %w", err)
 	}
-	if magic == walMagic || magic == jsonWALMagic || magic == legacyWALMagic {
+	if magic == walMagic || magic == binaryWALMagic || magic == jsonWALMagic || magic == legacyWALMagic {
 		state, ready, err := loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx, file, maxCanonicalBytes, base, budget)
 		return state, ready && magic == walMagic, err
 	}
@@ -2190,14 +2223,15 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 	}
 	var accumulator *walAccumulator
 	currentFormat := true
-	var header [walHeaderSize]byte
+	var headerBuffer [walHeaderSize]byte
 	var wrapper walPayload
 	payloadReader := bufio.NewReaderSize(nil, 4096)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
 		}
-		if _, err := io.ReadFull(file, header[:]); err != nil {
+		header, err := readWALHeader(file, &headerBuffer)
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
@@ -2213,10 +2247,10 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 			}
 			return nil, false, fmt.Errorf("read wal header: %w", err)
 		}
-		if !validWALHeader(header[:]) {
+		if !validWALHeader(header) {
 			return nil, false, errors.New("invalid WAL frame header")
 		}
-		if !validCurrentWALHeader(header[:]) {
+		if !validCurrentWALHeader(header) {
 			currentFormat = false
 		}
 		payloadLength := binary.BigEndian.Uint64(header[20:28])
@@ -2246,7 +2280,7 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 
 		wrapper = walPayload{}
 		var payload []byte
-		if binary.BigEndian.Uint16(header[8:10]) == walVersion {
+		if isBinaryWALHeader(header) {
 			limited := &io.LimitedReader{R: &contextReader{ctx: ctx, reader: file}, N: int64(payloadLength)}
 			checksum := crc32.NewIEEE()
 			payloadReader.Reset(io.TeeReader(limited, checksum))
@@ -2309,7 +2343,7 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 			wrapper = walPayload{Kind: "snapshot", Snapshot: &snapshot}
 		}
 		commitID := binary.BigEndian.Uint64(header[12:20])
-		databaseID := string(header[walDatabaseIDAt:walHeaderSize])
+		databaseID := string(header[walDatabaseIDAt:legacyWALHeaderSize])
 		switch wrapper.Kind {
 		case "snapshot":
 			if wrapper.Snapshot == nil || wrapper.Snapshot.CommitID != commitID || wrapper.Snapshot.DatabaseID != databaseID {
@@ -3235,22 +3269,31 @@ func EstimateSnapshotBytes(graph *GraphState) (uint64, error) {
 	for key, value := range graph.AppMetadata.All() {
 		size = snapshotAdd(size, appMetadataSnapshotBytes(key, value))
 	}
-	for _, node := range graph.Nodes.All() {
-		recordSize, err := nodeSnapshotBytes(node)
+	if err := graph.VisitNodes(context.Background(), func(record *NodeRecord) error {
+		recordSize, err := nodeSnapshotBytes(record)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		size = snapshotAdd(size, recordSize)
+		return nil
+	}); err != nil {
+		return 0, err
 	}
-	for _, edge := range graph.Edges.All() {
-		recordSize, err := edgeSnapshotBytes(edge)
+	if err := graph.VisitEdges(context.Background(), func(record *EdgeRecord) error {
+		recordSize, err := edgeSnapshotBytes(record)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		size = snapshotAdd(size, recordSize)
+		return nil
+	}); err != nil {
+		return 0, err
 	}
-	for nodeID, record := range graph.FTS.All() {
-		size = snapshotAdd(size, ftsSnapshotBytes(nodeID, record.Text))
+	if err := graph.VisitFTS(context.Background(), func(id uint64, record *FTSRecord) error {
+		size = snapshotAdd(size, ftsSnapshotBytes(id, record.Text))
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 	for definition := range graph.NodeProperties.Definitions() {
 		size = snapshotAdd(size, propertyIndexSnapshotBytes(definition))
@@ -3853,34 +3896,76 @@ func encodeWALHeader(databaseID string, commitID uint64, payload []byte) ([walHe
 }
 
 func encodeWALHeaderFields(databaseID string, commitID uint64, payloadLength uint64, checksum uint32) ([walHeaderSize]byte, error) {
+	var header [walHeaderSize]byte
+	err := encodeWALHeaderFieldsInto(&header, databaseID, commitID, payloadLength, checksum)
+	return header, err
+}
+
+func encodeWALHeaderFieldsInto(header *[walHeaderSize]byte, databaseID string, commitID uint64, payloadLength uint64, checksum uint32) error {
 	if err := validateDatabaseID(databaseID); err != nil {
-		return [walHeaderSize]byte{}, err
+		return err
 	}
 	if payloadLength > maxWALFrameBytes {
-		return [walHeaderSize]byte{}, errors.New("WAL frame exceeds size limit")
+		return errors.New("WAL frame exceeds size limit")
 	}
-	var header [walHeaderSize]byte
 	copy(header[:8], walMagic[:])
 	binary.BigEndian.PutUint16(header[8:10], walVersion)
 	binary.BigEndian.PutUint16(header[10:12], walHeaderSize)
 	binary.BigEndian.PutUint64(header[12:20], commitID)
 	binary.BigEndian.PutUint64(header[20:28], payloadLength)
 	binary.BigEndian.PutUint32(header[28:32], checksum)
-	copy(header[walDatabaseIDAt:walHeaderSize], databaseID)
-	return header, nil
+	copy(header[walDatabaseIDAt:legacyWALHeaderSize], databaseID)
+	binary.BigEndian.PutUint32(header[walHeaderChecksumAt:walHeaderSize], crc32.ChecksumIEEE(header[:walHeaderChecksumAt]))
+	return nil
 }
 
 func validCurrentWALHeader(header []byte) bool {
-	return len(header) >= walHeaderSize && string(header[:8]) == string(walMagic[:]) && binary.BigEndian.Uint16(header[8:10]) == walVersion && binary.BigEndian.Uint16(header[10:12]) == walHeaderSize
+	return len(header) >= walHeaderSize && string(header[:8]) == string(walMagic[:]) && binary.BigEndian.Uint16(header[8:10]) == walVersion && binary.BigEndian.Uint16(header[10:12]) == walHeaderSize && binary.BigEndian.Uint32(header[walHeaderChecksumAt:walHeaderSize]) == crc32.ChecksumIEEE(header[:walHeaderChecksumAt])
 }
 
 func validWALHeader(header []byte) bool {
-	if len(header) < walHeaderSize || binary.BigEndian.Uint16(header[10:12]) != walHeaderSize {
+	if len(header) < walHeaderPrefixSize {
 		return false
 	}
 	magic := string(header[:8])
 	version := binary.BigEndian.Uint16(header[8:10])
-	return magic == string(walMagic[:]) && version == walVersion || magic == string(jsonWALMagic[:]) && version == jsonWALVersion || magic == string(legacyWALMagic[:]) && version == legacyWALVersion
+	return validCurrentWALHeader(header) || len(header) >= legacyWALHeaderSize && binary.BigEndian.Uint16(header[10:12]) == legacyWALHeaderSize && (magic == string(binaryWALMagic[:]) && version == binaryWALVersion || magic == string(jsonWALMagic[:]) && version == jsonWALVersion || magic == string(legacyWALMagic[:]) && version == legacyWALVersion)
+}
+
+func walHeaderLength(prefix []byte) int {
+	if len(prefix) < walHeaderPrefixSize {
+		return 0
+	}
+	magic := string(prefix[:8])
+	version := binary.BigEndian.Uint16(prefix[8:10])
+	headerSize := binary.BigEndian.Uint16(prefix[10:12])
+	if magic == string(walMagic[:]) && version == walVersion && headerSize == walHeaderSize {
+		return walHeaderSize
+	}
+	if headerSize == legacyWALHeaderSize && (magic == string(binaryWALMagic[:]) && version == binaryWALVersion || magic == string(jsonWALMagic[:]) && version == jsonWALVersion || magic == string(legacyWALMagic[:]) && version == legacyWALVersion) {
+		return legacyWALHeaderSize
+	}
+	return 0
+}
+
+func readWALHeader(input io.Reader, buffer *[walHeaderSize]byte) ([]byte, error) {
+	prefix := buffer[:walHeaderPrefixSize]
+	if _, err := io.ReadFull(input, prefix); err != nil {
+		return nil, err
+	}
+	headerSize := walHeaderLength(prefix)
+	if headerSize == 0 {
+		headerSize = legacyWALHeaderSize
+	}
+	header := buffer[:headerSize]
+	if _, err := io.ReadFull(input, header[walHeaderPrefixSize:]); err != nil {
+		return nil, err
+	}
+	return header, nil
+}
+
+func isBinaryWALHeader(header []byte) bool {
+	return len(header) >= walHeaderPrefixSize && (string(header[:8]) == string(walMagic[:]) && binary.BigEndian.Uint16(header[8:10]) == walVersion || string(header[:8]) == string(binaryWALMagic[:]) && binary.BigEndian.Uint16(header[8:10]) == binaryWALVersion)
 }
 
 func validateWALPayloadSize(size int) error {

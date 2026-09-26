@@ -73,7 +73,7 @@ func (snapshot *Snapshot) Backup(path string) error {
 	if err != nil {
 		return err
 	}
-	for _, source := range []string{snapshot.files.Directory, snapshot.files.State, snapshot.files.WAL, snapshot.files.WALBase, snapshot.files.IDs, snapshot.files.State + ".lock", snapshot.files.State + ".layout"} {
+	for _, source := range []string{snapshot.files.State + ".pages", snapshot.files.State + ".pages.layout", snapshot.files.Directory, snapshot.files.State, snapshot.files.WAL, snapshot.files.WALBase, snapshot.files.IDs, snapshot.files.State + ".lock", snapshot.files.State + ".layout"} {
 		canonicalSource, err := canonicalSnapshotPath(source)
 		if err != nil {
 			return err
@@ -83,12 +83,13 @@ func (snapshot *Snapshot) Backup(path string) error {
 		}
 	}
 	targetFiles := store.FlatDatabaseFiles(target)
-	for _, sidecar := range []string{targetFiles.State, targetFiles.WAL, targetFiles.WALBase, targetFiles.IDs, target + ".layout"} {
-		if _, err := os.Lstat(sidecar); err == nil {
-			return fmt.Errorf("%w: backup destination already exists", ErrInvalidArgument)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
+	lock, err := acquireFlatDestinationLock(target)
+	if err != nil {
+		return err
+	}
+	defer lock.close()
+	if err := checkFlatDestinationAvailable(target); err != nil {
+		return err
 	}
 	if err := store.CreateCheckpointGraphStateFiles(targetFiles, snapshot.graph, snapshot.nextNodeID, snapshot.nextEdgeID, snapshot.commitID); err != nil {
 		if errors.Is(err, os.ErrExist) {
