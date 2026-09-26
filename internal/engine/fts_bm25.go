@@ -92,13 +92,13 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 				return nil
 			}
 		}
-		capacity := min(limit, uint64(tx.graph.FTS.Len()))
+		capacity := limit
 		results = make([]FTSSearchResult, 0, int(capacity))
 		averageLength := float64(0)
 		if documentCount != 0 {
 			averageLength = float64(totalLength) / float64(documentCount)
 		}
-		for nodeID, record := range tx.graph.FTS.All() {
+		err := tx.graph.VisitFTS(ctx, func(nodeID uint64, record *store.FTSRecord) error {
 			tokens, tokenBytes, err := ftsRecordTokens(ctx, record, opts.Analyzer, budget)
 			if err != nil {
 				return err
@@ -120,6 +120,10 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 					return pushErr
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 		return sortFTSResultsBudget(results, budget)
 	})
@@ -132,18 +136,18 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 func ftsBM25CorpusStats(ctx context.Context, graph *store.GraphState, terms []string, opts FTSSearchOptions, budget *directSearchBudget) (uint64, uint64, []uint64, error) {
 	frequencies := make([]uint64, len(terms))
 	var documentCount, totalLength uint64
-	for _, record := range graph.FTS.All() {
+	err := graph.VisitFTS(ctx, func(_ uint64, record *store.FTSRecord) error {
 		if err := budget.add(1); err != nil {
-			return 0, 0, nil, err
+			return err
 		}
 		tokens, tokenBytes, err := ftsRecordTokens(ctx, record, opts.Analyzer, budget)
 		if err != nil {
-			return 0, 0, nil, err
+			return err
 		}
 		matches, matchBytes, err := ftsTermFrequencies(tokens, terms, opts, budget)
 		budget.releaseBytes(tokenBytes)
 		if err != nil {
-			return 0, 0, nil, err
+			return err
 		}
 		for index, count := range matches {
 			if count != 0 {
@@ -153,6 +157,10 @@ func ftsBM25CorpusStats(ctx context.Context, graph *store.GraphState, terms []st
 		budget.releaseBytes(matchBytes)
 		totalLength = saturatingAdd(totalLength, uint64(len(tokens)))
 		documentCount++
+		return nil
+	})
+	if err != nil {
+		return 0, 0, nil, err
 	}
 	return documentCount, totalLength, frequencies, budget.check()
 }

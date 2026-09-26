@@ -292,7 +292,7 @@ func TestBackupArchiveCapturesEachCommitAndKeepsSameGenerationStable(t *testing.
 func archiveCheckpointNames(entries []os.DirEntry) []string {
 	var names []string
 	for _, entry := range entries {
-		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".ltdb" {
+		if !entry.IsDir() && (filepath.Ext(entry.Name()) == ".ltdb" || filepath.Ext(entry.Name()) == ".wal") {
 			names = append(names, entry.Name())
 		}
 	}
@@ -327,6 +327,9 @@ func TestRestoreBackupRejectsTamperedFilenameDigest(t *testing.T) {
 	}
 	name := points[1]
 	start := len("commit-") + 20 + 1
+	if filepath.Ext(name) == ".wal" {
+		start += 20 + 1
+	}
 	// Keep the filename syntactically valid, but move the newest point beyond
 	// the cutoff without updating its metadata checksum. Older commit 0 exists.
 	tampered := name[:start] + "09000000000000000000" + name[start+20:]

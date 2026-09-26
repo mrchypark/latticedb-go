@@ -1,10 +1,11 @@
 package store
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"hash"
+	"io"
 	"iter"
 	"maps"
 	"math"
@@ -32,6 +33,9 @@ type propertyIndexData struct {
 
 type PropertyIndexes struct {
 	definitions map[PropertyIndexDefinition]propertyIndexData
+	page        *pagePropertyBackend
+	added       map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting
+	removed     map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting
 	rootCloned  bool
 	cloned      map[PropertyIndexDefinition]struct{}
 }
@@ -43,7 +47,22 @@ func NewPropertyIndexes() PropertyIndexes {
 // Fork creates a writable child of an immutable source generation, matching
 // PagedMap and ShardMap: keep the source unchanged while the child is in use.
 func (indexes PropertyIndexes) Fork() PropertyIndexes {
-	return PropertyIndexes{definitions: indexes.definitions}
+	return PropertyIndexes{definitions: indexes.definitions, page: indexes.page, added: forkPropertyDeltas(indexes.added), removed: forkPropertyDeltas(indexes.removed)}
+}
+
+func forkPropertyDeltas(source map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting) map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting {
+	if source == nil {
+		return nil
+	}
+	clone := make(map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting, len(source))
+	for definition, values := range source {
+		copyValues := make(map[propertyValueKey]propertyPosting, len(values))
+		for key, posting := range values {
+			copyValues[key] = forkPropertyPosting(posting)
+		}
+		clone[definition] = copyValues
+	}
+	return clone
 }
 
 func (indexes PropertyIndexes) Has(definition PropertyIndexDefinition) bool {
@@ -99,6 +118,9 @@ func (indexes *PropertyIndexes) Create(definition PropertyIndexDefinition) bool 
 	}
 	indexes.cloneRoot()
 	indexes.definitions[definition] = propertyIndexData{values: NewShardMap[map[propertyValueKey]propertyPosting]()}
+	if indexes.page != nil {
+		return true
+	}
 	indexes.cloned[definition] = struct{}{}
 	return true
 }
@@ -109,6 +131,8 @@ func (indexes *PropertyIndexes) Drop(definition PropertyIndexDefinition) bool {
 	}
 	indexes.cloneRoot()
 	delete(indexes.definitions, definition)
+	delete(indexes.added, definition)
+	delete(indexes.removed, definition)
 	delete(indexes.cloned, definition)
 	return true
 }
@@ -120,6 +144,17 @@ func (indexes *PropertyIndexes) Add(definition PropertyIndexDefinition, value an
 	}
 	data, ok := indexes.writableDefinition(definition)
 	if !ok {
+		return nil
+	}
+	if indexes.page != nil {
+		if indexes.removed == nil {
+			indexes.removed = map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting{}
+		}
+		if indexes.added == nil {
+			indexes.added = map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting{}
+		}
+		indexes.changeDelta(indexes.removed, definition, key, id, false)
+		indexes.changeDelta(indexes.added, definition, key, id, true)
 		return nil
 	}
 	hashed := hashPropertyValueKey(key)
@@ -142,6 +177,17 @@ func (indexes *PropertyIndexes) Remove(definition PropertyIndexDefinition, value
 	}
 	data, ok := indexes.definitions[definition]
 	if !ok {
+		return nil
+	}
+	if indexes.page != nil {
+		if indexes.added == nil {
+			indexes.added = map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting{}
+		}
+		if indexes.removed == nil {
+			indexes.removed = map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting{}
+		}
+		indexes.changeDelta(indexes.added, definition, key, id, false)
+		indexes.changeDelta(indexes.removed, definition, key, id, true)
 		return nil
 	}
 	hashed := hashPropertyValueKey(key)
@@ -180,6 +226,9 @@ func (indexes PropertyIndexes) Lookup(definition PropertyIndexDefinition, value 
 	if err != nil {
 		return nil, true, err
 	}
+	if indexes.page != nil {
+		return indexes.page.lookup(definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key))
+	}
 	list := data.values.Get(hashPropertyValueKey(key))[key]
 	ids := make([]uint64, 0, list.len())
 	for id := range list.all() {
@@ -197,6 +246,9 @@ func (indexes PropertyIndexes) Visit(definition PropertyIndexDefinition, value a
 	key, err := makePropertyValueKey(value)
 	if err != nil {
 		return true, err
+	}
+	if indexes.page != nil {
+		return indexes.page.visit(definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), visit)
 	}
 	for id := range data.values.Get(hashPropertyValueKey(key))[key].all() {
 		if !visit(id) {
@@ -216,6 +268,11 @@ func (indexes PropertyIndexes) Cardinality(definition PropertyIndexDefinition, v
 	if err != nil {
 		return 0, true, err
 	}
+	if indexes.page != nil {
+		count := 0
+		_, err := indexes.page.visit(definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), func(uint64) bool { count++; return true })
+		return count, true, err
+	}
 	return data.values.Get(hashPropertyValueKey(key))[key].len(), true, nil
 }
 
@@ -230,6 +287,17 @@ func (indexes PropertyIndexes) LookupLimit(definition PropertyIndexDefinition, v
 	key, err := makePropertyValueKey(value)
 	if err != nil {
 		return nil, true, err
+	}
+	if indexes.page != nil {
+		ids := make([]uint64, 0)
+		if limit == 0 {
+			return ids, true, nil
+		}
+		_, err := indexes.page.visit(definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), func(id uint64) bool {
+			ids = append(ids, id)
+			return uint(len(ids)) < limit
+		})
+		return ids, true, err
 	}
 	if limit == 0 {
 		return nil, true, nil
@@ -249,8 +317,32 @@ func (indexes PropertyIndexes) LookupLimit(definition PropertyIndexDefinition, v
 	return ids, true, nil
 }
 
+func (indexes *PropertyIndexes) changeDelta(root map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting, definition PropertyIndexDefinition, key propertyValueKey, id uint64, add bool) {
+	if root[definition] == nil {
+		root[definition] = map[propertyValueKey]propertyPosting{}
+	}
+	posting := root[definition][key]
+	if add {
+		posting.add(id)
+	} else {
+		posting.remove(id)
+	}
+	root[definition][key] = posting
+}
+
+func (indexes PropertyIndexes) deltaPosting(root map[PropertyIndexDefinition]map[propertyValueKey]propertyPosting, definition PropertyIndexDefinition, key propertyValueKey) propertyPosting {
+	return root[definition][key]
+}
+
 func PropertyValuesEqual(left, right any) bool {
 	return reflect.DeepEqual(left, right)
+}
+
+func propertyIndexValuesEqual(left, right any) bool {
+	var leftEncoding, rightEncoding bytes.Buffer
+	return writePropertyValueHash(&leftEncoding, left) == nil &&
+		writePropertyValueHash(&rightEncoding, right) == nil &&
+		bytes.Equal(leftEncoding.Bytes(), rightEncoding.Bytes())
 }
 
 func EstimatePropertyIndexValueBytes(value any) uint64 {
@@ -259,6 +351,9 @@ func EstimatePropertyIndexValueBytes(value any) uint64 {
 
 func (indexes *PropertyIndexes) cloneRoot() {
 	if indexes.rootCloned {
+		if indexes.cloned == nil {
+			indexes.cloned = map[PropertyIndexDefinition]struct{}{}
+		}
 		return
 	}
 	indexes.definitions = maps.Clone(indexes.definitions)
@@ -672,7 +767,7 @@ func propertyKind(value any) uint8 {
 	}
 }
 
-func writePropertyValueHash(hasher hash.Hash, value any) error {
+func writePropertyValueHash(hasher io.Writer, value any) error {
 	var number [8]byte
 	switch typed := value.(type) {
 	case nil:

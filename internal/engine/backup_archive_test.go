@@ -1,12 +1,52 @@
 package engine
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestBackupSegmentFilenameRoundTripAndLength(t *testing.T) {
+	var digest, previous [sha256.Size]byte
+	if _, err := rand.Read(digest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rand.Read(previous[:]); err != nil {
+		t.Fatal(err)
+	}
+	metadata := BackupMetadata{CommitID: ^uint64(0), CapturedAt: time.Unix(0, int64(^uint64(0)>>1))}
+	name := backupSegmentFilename(^uint64(0)-1, metadata, digest, previous)
+	if len(name) > 255 {
+		t.Fatalf("backup segment filename is %d bytes, exceeds filesystem limit", len(name))
+	}
+	parsed, err := parseBackupSegment(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.start != ^uint64(0)-1 || parsed.metadata != metadata || parsed.digest != digest || parsed.previous != previous {
+		t.Fatalf("segment round trip = %+v", parsed)
+	}
+}
+
+func TestWriteArchiveHeadPreservesUnrecognizedFile(t *testing.T) {
+	directory := t.TempDir()
+	headPath := filepath.Join(directory, backupHeadFile)
+	if err := os.WriteFile(headPath, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entry := backupEntry{metadata: BackupMetadata{CommitID: 2, CapturedAt: time.Now()}, path: filepath.Join(directory, "commit-entry")}
+	if err := writeArchiveHead(directory, entry); err == nil {
+		t.Fatal("unrecognized head file was replaced")
+	}
+	data, err := os.ReadFile(headPath)
+	if err != nil || string(data) != "keep" {
+		t.Fatalf("unrecognized head changed: %q, %v", data, err)
+	}
+}
 
 func TestBackupArchiveCaptureClockSurvivesReopen(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "source"), OpenOptions{Create: true, BackupDirectory: filepath.Join(t.TempDir(), "archive")})
@@ -48,7 +88,7 @@ func archivePoints(t *testing.T, directory string) []os.DirEntry {
 	}
 	var points []os.DirEntry
 	for _, entry := range entries {
-		if !entry.IsDir() && len(entry.Name()) > len(backupPrefix)+len(backupSuffix) && entry.Name()[:len(backupPrefix)] == backupPrefix && filepath.Ext(entry.Name()) == backupSuffix {
+		if !entry.IsDir() && len(entry.Name()) > len(backupPrefix)+len(backupSuffix) && entry.Name()[:len(backupPrefix)] == backupPrefix && (filepath.Ext(entry.Name()) == backupSuffix || filepath.Ext(entry.Name()) == backupSegmentSuffix) {
 			points = append(points, entry)
 		}
 	}

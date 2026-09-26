@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
 	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
@@ -73,10 +74,11 @@ func Export(dbPath string, format ExportFormat, outputPath string) ([]byte, erro
 	if err := validateDirectoryExportDestination(dbPath, outputPath); err != nil {
 		return nil, err
 	}
-	graph, _, _, _, err := store.LoadGraphState(dbPath)
+	graph, closeGraph, err := loadExportGraph(dbPath)
 	if err != nil {
 		return nil, err
 	}
+	defer closeGraph()
 
 	return ExportGraph(graph, format, outputPath)
 }
@@ -161,10 +163,11 @@ func ExportGraphFileContextWithOptions(ctx context.Context, graph *store.GraphSt
 }
 
 func Dump(dbPath string) ([]byte, error) {
-	graph, _, _, _, err := store.LoadGraphState(dbPath)
+	graph, closeGraph, err := loadExportGraph(dbPath)
 	if err != nil {
 		return nil, err
 	}
+	defer closeGraph()
 	return DumpGraph(graph)
 }
 
@@ -211,7 +214,7 @@ func dumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.
 	}
 	first := true
 	index := 0
-	for _, node := range graph.Nodes.Ordered() {
+	if err := graph.VisitNodes(ctx, func(node *store.NodeRecord) error {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -235,6 +238,9 @@ func dumpGraphContextTo(ctx context.Context, graph *store.GraphState, output io.
 		if err := writeBytes(output, data); err != nil {
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := writeString(output, `],"edges":[`); err != nil {
 		return err
@@ -333,7 +339,7 @@ func exportJSONLContextWithOptions(ctx context.Context, graph *store.GraphState,
 func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output io.Writer) error {
 	output = contextOutputWriter{ctx: ctx, output: output}
 	index := 0
-	for _, node := range graph.Nodes.Ordered() {
+	if err := graph.VisitNodes(ctx, func(node *store.NodeRecord) error {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -356,9 +362,12 @@ func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output i
 		if err := writeBytes(output, append(line, '\n')); err != nil {
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	index = 0
-	for _, edge := range graph.Edges.Ordered() {
+	if err := graph.VisitEdges(ctx, func(edge *store.EdgeRecord) error {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -383,6 +392,9 @@ func exportJSONLContextTo(ctx context.Context, graph *store.GraphState, output i
 		if err := writeBytes(output, append(line, '\n')); err != nil {
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -481,7 +493,7 @@ func exportDOTContextTo(ctx context.Context, graph *store.GraphState, output io.
 		return err
 	}
 	index := 0
-	for _, node := range graph.Nodes.Ordered() {
+	if err := graph.VisitNodes(ctx, func(node *store.NodeRecord) error {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -495,9 +507,12 @@ func exportDOTContextTo(ctx context.Context, graph *store.GraphState, output io.
 		if _, err := fmt.Fprintf(output, "  n%d [label=%q];\n", node.ID, label); err != nil {
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	index = 0
-	for _, edge := range graph.Edges.Ordered() {
+	if err := graph.VisitEdges(ctx, func(edge *store.EdgeRecord) error {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -507,6 +522,9 @@ func exportDOTContextTo(ctx context.Context, graph *store.GraphState, output io.
 		if _, err := fmt.Fprintf(output, "  n%d -> n%d [label=%q];\n", edge.SourceID, edge.TargetID, edge.Type); err != nil {
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	return writeString(output, "}\n")
 }
@@ -561,8 +579,14 @@ func (opts ExportOptions) checkRecords(graph *store.GraphState) error {
 	if opts.MaxRecords == 0 {
 		return nil
 	}
-	nodes := uint64(graph.Nodes.Len())
-	edges := uint64(graph.Edges.Len())
+	nodes, err := graph.NodeCount()
+	if err != nil {
+		return err
+	}
+	edges, err := graph.EdgeCount()
+	if err != nil {
+		return err
+	}
 	if nodes > opts.MaxRecords || edges > opts.MaxRecords-nodes {
 		return ErrOutputLimit
 	}
@@ -685,7 +709,7 @@ func writeNodesCSVContextWithBudget(ctx context.Context, graph *store.GraphState
 		return err
 	}
 	index := 0
-	for _, node := range graph.Nodes.Ordered() {
+	if err := graph.VisitNodes(ctx, func(node *store.NodeRecord) error {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -711,6 +735,9 @@ func writeNodesCSVContextWithBudget(ctx context.Context, graph *store.GraphState
 		}); err != nil {
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	return finishCSVOutput(file, writer, tempPath, path)
 }
@@ -733,7 +760,7 @@ func writeEdgesCSVContextWithBudget(ctx context.Context, graph *store.GraphState
 		return err
 	}
 	index := 0
-	for _, edge := range graph.Edges.Ordered() {
+	if err := graph.VisitEdges(ctx, func(edge *store.EdgeRecord) error {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -757,6 +784,9 @@ func writeEdgesCSVContextWithBudget(ctx context.Context, graph *store.GraphState
 		}); err != nil {
 			return err
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	return finishCSVOutput(file, writer, tempPath, path)
 }
@@ -867,4 +897,42 @@ func syncOutputDirectory(path string) error {
 		return err
 	}
 	return directory.Close()
+}
+
+func loadExportGraph(path string) (*store.GraphState, func() error, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	files := store.DirectoryDatabaseFiles(path)
+	if !info.IsDir() {
+		files = store.FlatDatabaseFiles(path)
+	}
+	for _, candidate := range []string{files.State + ".pages", files.State} {
+		found, err := pagestore.IsFile(candidate)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !found {
+			continue
+		}
+		db, err := pagestore.Open(candidate, pagestore.Options{ReadOnly: true})
+		if err != nil {
+			return nil, nil, err
+		}
+		tx, err := db.Begin(false)
+		if err != nil {
+			_ = db.Close()
+			return nil, nil, err
+		}
+		closeGraph := func() error { return errors.Join(tx.Rollback(), db.Close()) }
+		graph, _, err := (&store.PageGraph{Tx: tx}).LoadGraph(context.Background())
+		if err != nil {
+			_ = closeGraph()
+			return nil, nil, err
+		}
+		return graph, closeGraph, nil
+	}
+	graph, _, _, _, err := store.LoadGraphState(path)
+	return graph, func() error { return nil }, err
 }

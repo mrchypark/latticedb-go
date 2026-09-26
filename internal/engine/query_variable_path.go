@@ -25,8 +25,12 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 		}
 	}()
 	maxHops := pattern.MaxHops
-	if maxHops < 0 || maxHops > tx.graph.Edges.Len() {
-		maxHops = tx.graph.Edges.Len()
+	edgeCount, err := tx.graph.EdgeCount()
+	if err != nil {
+		return nil, err
+	}
+	if maxHops < 0 || uint64(maxHops) > edgeCount {
+		maxHops = int(min(edgeCount, uint64(^uint(0)>>1)))
 	}
 	left, leftBound := boundNode(row, pattern.Left.Var)
 	right, rightBound := boundNode(row, pattern.Right.Var)
@@ -92,7 +96,10 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 				if err := budget.check(1, len(rows)); err != nil {
 					return err
 				}
-				edge := tx.graph.Edges.Get(edgeID)
+				edge, err := tx.graph.ReadEdge(edgeID)
+				if err != nil {
+					return err
+				}
 				if edge == nil || (pattern.EdgeType != "" && edge.Type != pattern.EdgeType) {
 					return nil
 				}
@@ -135,23 +142,23 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 				return nil
 			}
 			if reverse {
-				if err := variablePathEdges(tx.graph.Incoming.Get(state.node.ID), tx, state.node, false, false, push, budget); err != nil {
+				if err := variablePathEdges(tx, state.node, false, false, push, budget); err != nil {
 					budget.releaseTemporary(state.bytes)
 					return err
 				}
 			} else {
-				if err := variablePathEdges(tx.graph.Outgoing.Get(state.node.ID), tx, state.node, true, false, push, budget); err != nil {
+				if err := variablePathEdges(tx, state.node, true, false, push, budget); err != nil {
 					budget.releaseTemporary(state.bytes)
 					return err
 				}
 			}
 			if pattern.Undirected {
 				if reverse {
-					if err := variablePathEdges(tx.graph.Outgoing.Get(state.node.ID), tx, state.node, true, true, push, budget); err != nil {
+					if err := variablePathEdges(tx, state.node, true, true, push, budget); err != nil {
 						budget.releaseTemporary(state.bytes)
 						return err
 					}
-				} else if err := variablePathEdges(tx.graph.Incoming.Get(state.node.ID), tx, state.node, false, true, push, budget); err != nil {
+				} else if err := variablePathEdges(tx, state.node, false, true, push, budget); err != nil {
 					budget.releaseTemporary(state.bytes)
 					return err
 				}
@@ -174,10 +181,10 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 		success = true
 		return rows, nil
 	}
-	for _, node := range tx.graph.Nodes.All() {
-		if err := start(node, false); err != nil {
-			return nil, err
-		}
+	if err := tx.graph.VisitNodes(budget.ctx, func(node *store.NodeRecord) error {
+		return start(node, false)
+	}); err != nil {
+		return nil, err
 	}
 	success = true
 	return rows, nil
@@ -188,7 +195,10 @@ func (pattern edgePattern) variablePropertiesMatch(row queryRow, params map[stri
 		if err := budget.check(1, 0); err != nil {
 			return false, err
 		}
-		edge := tx.graph.Edges.Get(edgeID)
+		edge, err := tx.graph.ReadEdge(edgeID)
+		if err != nil {
+			return false, err
+		}
 		if edge == nil {
 			return false, nil
 		}
@@ -239,7 +249,11 @@ func (pattern edgePattern) variableEdgeBinding(tx *Tx, row queryRow, budget *que
 			budget.releaseTemporary(bytes)
 			return nil, 0, false, fmt.Errorf("binding %q must contain edges", pattern.EdgeVar)
 		}
-		edge := tx.graph.Edges.Get(edgeValue.Edge.ID)
+		edge, err := tx.graph.ReadEdge(edgeValue.Edge.ID)
+		if err != nil {
+			budget.releaseTemporary(bytes)
+			return nil, 0, false, err
+		}
 		if edge == nil || edge.Type != edgeValue.Edge.Type || pattern.EdgeType != "" && edge.Type != pattern.EdgeType {
 			budget.releaseTemporary(bytes)
 			return nil, 0, false, fmt.Errorf("binding %q contains an invalid edge", pattern.EdgeVar)
@@ -258,37 +272,46 @@ func (pattern edgePattern) variableEdgeBinding(tx *Tx, row queryRow, budget *que
 	return ids, bytes, true, nil
 }
 
-func variablePathEdges(ids *store.EdgeList, tx *Tx, node *store.NodeRecord, outgoing, skipSelf bool, visit func(uint64, *store.NodeRecord) error, budget *queryBudget) error {
-	for edgeID := range ids.All() {
+func variablePathEdges(tx *Tx, node *store.NodeRecord, outgoing, skipSelf bool, visit func(uint64, *store.NodeRecord) error, budget *queryBudget) error {
+	visitEdge := func(edgeID uint64) error {
 		if err := budget.check(1, 0); err != nil {
 			return err
 		}
-		edge := tx.graph.Edges.Get(edgeID)
+		edge, err := tx.graph.ReadEdge(edgeID)
+		if err != nil {
+			return err
+		}
 		if edge == nil {
-			continue
+			return nil
 		}
 		if skipSelf && edge.SourceID == edge.TargetID {
-			continue
+			return nil
 		}
-		var next *store.NodeRecord
+		var nextID uint64
 		if outgoing {
 			if edge.SourceID != node.ID {
-				continue
+				return nil
 			}
-			next = tx.graph.Nodes.Get(edge.TargetID)
+			nextID = edge.TargetID
 		} else {
 			if edge.TargetID != node.ID {
-				continue
+				return nil
 			}
-			next = tx.graph.Nodes.Get(edge.SourceID)
+			nextID = edge.SourceID
+		}
+		next, err := tx.graph.ReadNode(nextID)
+		if err != nil {
+			return err
 		}
 		if next != nil {
-			if err := visit(edgeID, next); err != nil {
-				return err
-			}
+			return visit(edgeID, next)
 		}
+		return nil
 	}
-	return nil
+	if outgoing {
+		return tx.graph.VisitOutgoing(budget.ctx, node.ID, visitEdge)
+	}
+	return tx.graph.VisitIncoming(budget.ctx, node.ID, visitEdge)
 }
 
 func variablePathContains(edges []uint64, edgeID uint64, budget *queryBudget, rows int) (bool, error) {
@@ -356,7 +379,16 @@ func (pattern edgePattern) appendVariableRow(tx *Tx, row queryRow, params map[st
 					budget.releaseTemporary(bytes)
 					return nil, err
 				}
-				values[index] = boundValue{Edge: tx.graph.Edges.Get(edgeID)}
+				edge, err := tx.graph.ReadEdge(edgeID)
+				if err != nil {
+					budget.releaseTemporary(bytes)
+					return nil, err
+				}
+				if edge == nil {
+					budget.releaseTemporary(bytes)
+					return nil, fmt.Errorf("variable path edge %d disappeared during query", edgeID)
+				}
+				values[index] = boundValue{Edge: edge}
 			}
 			nextRow.set(pattern.EdgeVar, boundValue{Value: values, HasValue: true})
 		}

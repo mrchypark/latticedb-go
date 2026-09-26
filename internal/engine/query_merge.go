@@ -308,7 +308,11 @@ func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *
 		if err != nil {
 			return err
 		}
-		row.set(name, boundValue{Node: tx.graph.Nodes.Get(node.ID)})
+		record, err := tx.graph.ReadNode(node.ID)
+		if err != nil {
+			return err
+		}
+		row.set(name, boundValue{Node: record})
 	}
 	for _, item := range patterns {
 		pattern, ok := item.(edgePattern)
@@ -338,7 +342,11 @@ func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *
 		if err != nil {
 			return err
 		}
-		row.set(pattern.EdgeVar, boundValue{Edge: tx.graph.Edges.Get(edge.ID)})
+		record, err := tx.graph.ReadEdge(edge.ID)
+		if err != nil {
+			return err
+		}
+		row.set(pattern.EdgeVar, boundValue{Edge: record})
 	}
 	return nil
 }

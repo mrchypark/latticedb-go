@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"math"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
 	"github.com/mrchypark/latticedb-go/internal/search"
 	"github.com/mrchypark/latticedb-go/internal/store"
 )
@@ -73,6 +75,7 @@ const defaultDerivedBuildMaxLogicalBytes = 16 << 30
 const maxTrackedPropertyKeys = 64
 
 type OpenOptions struct {
+	PageStorage                       bool
 	Create                            bool
 	ReadOnly                          bool
 	DisableLock                       bool
@@ -218,6 +221,9 @@ type FTSSearchResult struct {
 }
 
 type DB struct {
+	pageCleanupErr                    error
+	pages                             *pagestore.DB
+	pageTemporary                     string
 	batchMu                           sync.Mutex
 	batchPending                      []*batchRequest
 	batchRunning                      bool
@@ -479,7 +485,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	if opts.WALCheckpointThresholdBytes == 0 {
 		opts.WALCheckpointThresholdBytes = defaultWALCheckpointThresholdBytes
 	}
-	if opts.MaxDatabaseSnapshotBytes == 0 {
+	if opts.MaxDatabaseSnapshotBytes == 0 && !opts.PageStorage {
 		opts.MaxDatabaseSnapshotBytes = defaultMaxDatabaseSnapshotBytes
 	}
 	if opts.RecoveryMaxDecodedBytes == 0 {
@@ -492,7 +498,10 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		opts.RecoveryMaxWork = defaultRecoveryMaxWork
 	}
 	if opts.ChangefeedMaxBytes == 0 {
-		opts.ChangefeedMaxBytes = min(defaultChangefeedMaxBytes, max(uint64(1), opts.MaxDatabaseSnapshotBytes/8))
+		opts.ChangefeedMaxBytes = defaultChangefeedMaxBytes
+		if opts.MaxDatabaseSnapshotBytes != 0 {
+			opts.ChangefeedMaxBytes = min(defaultChangefeedMaxBytes, max(uint64(1), opts.MaxDatabaseSnapshotBytes/8))
+		}
 	}
 	if opts.VectorIndexBuildMaxWork == 0 {
 		opts.VectorIndexBuildMaxWork = defaultVectorBuildMaxWork
@@ -527,6 +536,9 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	files := store.DirectoryDatabaseFiles(path)
 	if flat {
 		files = store.FlatDatabaseFiles(path)
+	}
+	if opts.PageStorage {
+		return openPageDB(ctx, path, files, lock, opts)
 	}
 	if !opts.ReadOnly && !opts.DisableLock {
 		if err := store.CleanupDatabaseTempFiles(files, !flat); err != nil {
@@ -1261,6 +1273,17 @@ func (db *DB) closeWithWriterHeld() error {
 	db.notifyAllStreamsLocked()
 	db.mu.Unlock()
 
+	if db.pages != nil {
+		err := errors.Join(db.pageCleanupErr, db.graph.PageBase.Tx.Rollback())
+		err = errors.Join(err, db.pages.Close(), db.backupArchive.close(), db.pathLock.close())
+		if db.pageTemporary != "" {
+			err = errors.Join(err, os.RemoveAll(db.pageTemporary))
+		}
+		if db.temporary {
+			err = errors.Join(err, os.RemoveAll(db.path))
+		}
+		return err
+	}
 	db.stopCheckpointWorker()
 	db.clearCheckpointState()
 	db.clearAdjacencyCompactor()
@@ -1417,6 +1440,9 @@ func (db *DB) Checkpoint() error {
 		db.writeMu.Unlock()
 		db.requestBackgroundCheckpoint()
 	}()
+	if db.pages != nil {
+		return db.checkpointPages(context.Background())
+	}
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
@@ -1460,6 +1486,9 @@ func (db *DB) CheckpointContext(ctx context.Context) error {
 		db.writeMu.Unlock()
 		db.requestBackgroundCheckpoint()
 	}()
+	if db.pages != nil {
+		return db.checkpointPages(ctx)
+	}
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
@@ -1762,6 +1791,9 @@ func (lease *GenerationLease) Release() {
 	if retention != nil {
 		retention.refs--
 		if retention.refs == 0 {
+			if lease.graph.PageBase != nil && lease.graph != db.graph {
+				db.pageCleanupErr = errors.Join(db.pageCleanupErr, lease.graph.PageBase.Tx.Rollback())
+			}
 			delete(db.generationLeases, lease.graph)
 			db.retainedGenerationLogicalBytes -= retention.logicalBytes
 			db.removeGenerationRetentionLocked(retention)
@@ -2110,7 +2142,7 @@ func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearch
 	if err := validateFTSSearchScoring(opts); err != nil {
 		return nil, err
 	}
-	if opts.Scoring == FTSScoringBM25 || opts.Analyzer == FTSAnalyzerEnglishPorter {
+	if db.pages != nil || opts.Scoring == FTSScoringBM25 || opts.Analyzer == FTSAnalyzerEnglishPorter {
 		return db.ftsSearchBM25Context(ctx, query, opts)
 	}
 	limit := uint64(opts.Limit)
@@ -2614,6 +2646,25 @@ func (db *DB) createPropertyIndexContext(ctx context.Context, node bool, scope, 
 		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 	definition := store.PropertyIndexDefinition{Scope: scope, Property: property}
+	if db.pages != nil {
+		work, logicalBytes := propertyIndexDefinitionCost(definition)
+		if work > db.derivedIndexBuildMaxWork || logicalBytes > db.derivedIndexBuildMaxLogicalBytes {
+			return fmt.Errorf("%w: property index definition exceeds budget", ErrResourceLimit)
+		}
+		return db.UpdateContext(ctx, func(tx *Tx) error {
+			indexes := &tx.graph.EdgeProperties
+			changes := tx.changes.createEdgeIndexes
+			if node {
+				indexes = &tx.graph.NodeProperties
+				changes = tx.changes.createNodeIndexes
+			}
+			if !indexes.Create(definition) {
+				return fmt.Errorf("%w: property index already exists", ErrAlreadyExists)
+			}
+			changes[definition] = struct{}{}
+			return nil
+		})
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -2926,7 +2977,7 @@ func (db *DB) VectorIndexStats() (VectorIndexStats, error) {
 	if db.closed {
 		return VectorIndexStats{}, ErrDatabaseClosed
 	}
-	return vectorIndexStats(db.graph, db.vectorExactFallbacks.Load(), db.vectorRebuilds.Load(), db.vectorRebuildNanos.Load()), nil
+	return vectorIndexStats(db.graph, db.vectorExactFallbacks.Load(), db.vectorRebuilds.Load(), db.vectorRebuildNanos.Load())
 }
 
 func (db *DB) VectorIndexNamespaceStats(namespace VectorNamespace) (VectorIndexStats, error) {
@@ -2939,11 +2990,24 @@ func (db *DB) VectorIndexNamespaceStats(namespace VectorNamespace) (VectorIndexS
 	if err != nil {
 		return VectorIndexStats{}, err
 	}
-	return vectorIndexStats(vectorNamespaceFacade(db.graph, *resolved), db.vectorExactFallbacks.Load(), db.vectorRebuilds.Load(), db.vectorRebuildNanos.Load()), nil
+	return vectorIndexStats(vectorNamespaceFacade(db.graph, *resolved), db.vectorExactFallbacks.Load(), db.vectorRebuilds.Load(), db.vectorRebuildNanos.Load())
 }
 
-func vectorIndexStats(graph *store.GraphState, fallbacks, rebuilds, nanos uint64) VectorIndexStats {
+func vectorIndexStats(graph *store.GraphState, fallbacks, rebuilds, nanos uint64) (VectorIndexStats, error) {
 	live := graph.VectorLiveCount
+	indexEntries := uint64(graph.VectorIndex.Nodes.Len())
+	if graph.PageBase != nil {
+		live = 0
+		indexEntries = 0
+		if err := graph.VisitNodes(context.Background(), func(node *store.NodeRecord) error {
+			if _, ok := selectedVector(graph, node); ok {
+				live++
+			}
+			return nil
+		}); err != nil {
+			return VectorIndexStats{}, err
+		}
+	}
 	threshold := uint64(vectorRebuildThreshold(graph))
 	debt := uint64(graph.VectorTombstones.Len()) + graph.VectorMutations
 	remaining := uint64(0)
@@ -2955,7 +3019,7 @@ func vectorIndexStats(graph *store.GraphState, fallbacks, rebuilds, nanos uint64
 	if tombstoneBytes <= 64<<20 {
 		tombstoneRemaining = (64 << 20) + 1 - tombstoneBytes
 	}
-	return VectorIndexStats{LiveEntries: live, IndexEntries: uint64(graph.VectorIndex.Nodes.Len()), Tombstones: uint64(graph.VectorTombstones.Len()), TombstoneBytes: tombstoneBytes, TombstoneBytesUntilRebuild: tombstoneRemaining, MutationDebt: graph.VectorMutations, RebuildThreshold: threshold, DebtUntilRebuild: remaining, EstimatedBuildLogicalBytes: estimateVectorBuildLogicalBytes(graph, live), ExactFallbacks: fallbacks, Rebuilds: rebuilds, RebuildNanoseconds: nanos}
+	return VectorIndexStats{LiveEntries: live, IndexEntries: indexEntries, Tombstones: uint64(graph.VectorTombstones.Len()), TombstoneBytes: tombstoneBytes, TombstoneBytesUntilRebuild: tombstoneRemaining, MutationDebt: graph.VectorMutations, RebuildThreshold: threshold, DebtUntilRebuild: remaining, EstimatedBuildLogicalBytes: estimateVectorBuildLogicalBytes(graph, live), ExactFallbacks: fallbacks, Rebuilds: rebuilds, RebuildNanoseconds: nanos}, nil
 }
 
 func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
@@ -2984,6 +3048,10 @@ func (db *DB) rebuildVectorIndexTargetContext(ctx context.Context, namespace *Ve
 		if db.closed {
 			db.mu.Unlock()
 			return ErrDatabaseClosed
+		}
+		if db.pages != nil {
+			db.mu.Unlock()
+			return fmt.Errorf("%w: vector index rebuild is unavailable for page storage", ErrUnsupportedOption)
 		}
 		if !db.enableVector || db.disableVectorIndex {
 			db.mu.Unlock()
@@ -3333,6 +3401,9 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 			return err
 		}
 	}
+	if tx.db.pages != nil {
+		return tx.commitPages(ctx)
+	}
 	if tx.db.enableVector {
 		for id := range tx.changes.upsertNodes {
 			if err := validateNodeVectors(tx.graph.VectorDimensions, tx.graph.Nodes.Get(id)); err != nil {
@@ -3434,6 +3505,14 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		return fmt.Errorf("%w: database snapshot requires %d bytes, limit is %d", ErrResourceLimit, snapshotBytes, tx.db.maxDatabaseSnapshotBytes)
 	}
 	tx.graph.SnapshotBytes = snapshotBytes
+	var archiveStart int64
+	if archive != nil {
+		var tailErr error
+		archiveStart, tailErr = wal.TailSize()
+		if tailErr != nil {
+			return tailErr
+		}
+	}
 	var err error
 	if tx.base == nil {
 		err = wal.AppendSnapshot(tx.graph, nextNodeID, nextEdgeID, nextCommitID)
@@ -3449,7 +3528,15 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		return err
 	}
 	if archive != nil {
-		if _, err := archive.captureAt(tx.db.timeNow(), tx.graph, nextNodeID, nextEdgeID, nextCommitID, tx.db.maxDatabaseSnapshotBytes); err != nil {
+		copyCommit := func(output io.Writer) (bool, error) {
+			end, err := wal.TailSize()
+			if err != nil {
+				return false, err
+			}
+			err = wal.CopyCommittedWALRangeTo(output, archiveStart, end, tx.graph.DatabaseID, nextCommitID-1, nextCommitID)
+			return err == nil, err
+		}
+		if _, err := archive.captureAt(tx.db.timeNow(), tx.graph, nextNodeID, nextEdgeID, nextCommitID, tx.db.maxDatabaseSnapshotBytes, copyCommit); err != nil {
 			tx.db.mu.Lock()
 			tx.db.recoveryRequired = true
 			tx.db.mu.Unlock()
@@ -3674,16 +3761,37 @@ func (tx *Tx) deleteNodeWithBudget(nodeID uint64, budget *queryBudget) error {
 	if err := validateEntityID(nodeID); err != nil {
 		return err
 	}
-	if node := tx.graph.Nodes.Get(nodeID); node != nil {
+	node, err := tx.graph.ReadNode(nodeID)
+	if err != nil {
+		return err
+	}
+	existed, err := idExists(tx.base, nodeID, true)
+	if err != nil {
+		return err
+	}
+	oldFTS, err := tx.graph.ReadFTS(nodeID)
+	if err != nil {
+		return err
+	}
+	var baseFTS *store.FTSRecord
+	if tx.base != nil {
+		baseFTS, err = tx.base.ReadFTS(nodeID)
+		if err != nil {
+			return err
+		}
+	}
+	if node != nil {
 		for _, label := range node.Labels {
 			tx.graph.Labels.Remove(label, nodeID)
 		}
 	}
 	tx.ensureNodesWritable(nodeID)
 	tx.graph.Nodes.Delete(nodeID)
-	tx.markDelete(&tx.changes.upsertNodes, &tx.changes.deleteNodes, idExists(tx.base, nodeID, true), nodeID)
-	if record := tx.graph.FTS.Get(nodeID); record != nil {
-		for _, token := range record.Tokens {
+	tx.graph.DeletedNodes.CloneShardOnce(nodeID)
+	tx.graph.DeletedNodes.Set(nodeID, true)
+	tx.markDelete(&tx.changes.upsertNodes, &tx.changes.deleteNodes, existed, nodeID)
+	if oldFTS != nil {
+		for _, token := range oldFTS.Tokens {
 			if budget != nil {
 				if err := budget.check(1, 0); err != nil {
 					return err
@@ -3693,22 +3801,29 @@ func (tx *Tx) deleteNodeWithBudget(nodeID uint64, budget *queryBudget) error {
 		}
 		tx.ensureFTSWritable(nodeID)
 		tx.graph.FTS.Delete(nodeID)
-		tx.markDelete(&tx.changes.upsertFTS, &tx.changes.deleteFTS, tx.base != nil && tx.base.FTS.Get(nodeID) != nil, nodeID)
+		tx.graph.DeletedFTS.CloneShardOnce(nodeID)
+		tx.graph.DeletedFTS.Set(nodeID, true)
+		tx.markDelete(&tx.changes.upsertFTS, &tx.changes.deleteFTS, baseFTS != nil, nodeID)
 	}
 	edges := make(map[uint64]struct{})
-	for _, adjacency := range []*store.EdgeList{tx.graph.Outgoing.Get(nodeID), tx.graph.Incoming.Get(nodeID)} {
-		for chunk := range adjacency.Chunks() {
-			for _, edgeID := range chunk {
-				if budget != nil {
-					if err := budget.check(1, 0); err != nil {
-						return err
-					}
-				}
-				if !adjacency.IsRemoved(edgeID) {
-					edges[edgeID] = struct{}{}
-				}
+	visit := func(edgeID uint64) error {
+		if budget != nil {
+			if err := budget.check(1, 0); err != nil {
+				return err
 			}
 		}
+		edges[edgeID] = struct{}{}
+		return nil
+	}
+	ctx := context.Background()
+	if budget != nil && budget.ctx != nil {
+		ctx = budget.ctx
+	}
+	if err := tx.graph.VisitOutgoing(ctx, nodeID, visit); err != nil {
+		return err
+	}
+	if err := tx.graph.VisitIncoming(ctx, nodeID, visit); err != nil {
+		return err
 	}
 	if err := tx.deleteEdgesBatchWithBudget(edges, budget); err != nil {
 		return err
@@ -3727,7 +3842,8 @@ func (tx *Tx) NodeExists(nodeID uint64) (bool, error) {
 	if err := validateEntityID(nodeID); err != nil {
 		return false, err
 	}
-	return tx.graph.Nodes.Get(nodeID) != nil, nil
+	node, err := tx.graph.ReadNode(nodeID)
+	return node != nil, err
 }
 
 func (tx *Tx) GetNode(nodeID uint64) (*Node, error) {
@@ -3745,7 +3861,10 @@ func (tx *Tx) GetNodeValue(nodeID uint64) (Node, bool, error) {
 	if err := validateEntityID(nodeID); err != nil {
 		return Node{}, false, err
 	}
-	node := tx.graph.Nodes.Get(nodeID)
+	node, err := tx.graph.ReadNode(nodeID)
+	if err != nil {
+		return Node{}, false, err
+	}
 	if node == nil {
 		return Node{}, false, nil
 	}
@@ -3813,7 +3932,11 @@ func (tx *Tx) FindNodesByLabelProperty(label, property string, value any, limit 
 	}
 	if tx.changes != nil {
 		for id := range tx.changes.upsertNodes {
-			if nodeMatchesPropertyIndex(tx.graph.Nodes.Get(id), definition, normalized) {
+			node, err := tx.graph.ReadNode(id)
+			if err != nil {
+				return nil, err
+			}
+			if nodeMatchesPropertyIndex(node, definition, normalized) {
 				results = insertPropertyIndexID(results, id, limit)
 			}
 		}
@@ -3829,26 +3952,36 @@ func (tx *Tx) findNodePropertyIndex(definition store.PropertyIndexDefinition, va
 		}
 		results := ids[:0]
 		for _, id := range ids {
-			if nodeMatchesPropertyIndex(tx.graph.Nodes.Get(id), definition, value) {
+			node, err := tx.graph.ReadNode(id)
+			if err != nil {
+				return nil, true, err
+			}
+			if nodeMatchesPropertyIndex(node, definition, value) {
 				results = append(results, id)
 			}
 		}
 		return results, true, nil
-	}
-	if tx.changes == nil {
-		return tx.graph.NodeProperties.LookupLimit(definition, value, limit)
 	}
 	capacity := 64
 	if limit < uint(capacity) {
 		capacity = int(limit)
 	}
 	results := make([]uint64, 0, capacity)
+	var readErr error
 	exists, err := tx.graph.NodeProperties.Visit(definition, value, func(id uint64) bool {
-		if nodeMatchesPropertyIndex(tx.graph.Nodes.Get(id), definition, value) {
+		node, err := tx.graph.ReadNode(id)
+		if err != nil {
+			readErr = err
+			return false
+		}
+		if nodeMatchesPropertyIndex(node, definition, value) {
 			results = insertPropertyIndexID(results, id, limit)
 		}
 		return true
 	})
+	if readErr != nil {
+		return nil, exists, readErr
+	}
 	return results, exists, err
 }
 
@@ -3969,13 +4102,19 @@ func (tx *Tx) FTSIndexContext(ctx context.Context, nodeID uint64, text string) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if old := tx.graph.FTS.Get(nodeID); old != nil {
+	old, err := tx.graph.ReadFTS(nodeID)
+	if err != nil {
+		return err
+	}
+	if old != nil {
 		for _, token := range old.Tokens {
 			tx.graph.FTSTokens.Remove(token, nodeID)
 		}
 	}
 	tx.ensureFTSWritable(nodeID)
 	tx.graph.FTS.Set(nodeID, &store.FTSRecord{Text: text, Tokens: tokens})
+	tx.graph.DeletedFTS.CloneShardOnce(nodeID)
+	tx.graph.DeletedFTS.Delete(nodeID)
 	for _, token := range tokens {
 		tx.graph.FTSTokens.Add(token, nodeID)
 	}
@@ -4057,7 +4196,11 @@ func (tx *Tx) FindEdgesByTypeProperty(edgeType, property string, value any, limi
 	}
 	if tx.changes != nil {
 		for id := range tx.changes.upsertEdges {
-			if edgeMatchesPropertyIndex(tx.graph.Edges.Get(id), definition, normalized) {
+			edge, err := tx.graph.ReadEdge(id)
+			if err != nil {
+				return nil, err
+			}
+			if edgeMatchesPropertyIndex(edge, definition, normalized) {
 				results = insertPropertyIndexID(results, id, limit)
 			}
 		}
@@ -4073,26 +4216,36 @@ func (tx *Tx) findEdgePropertyIndex(definition store.PropertyIndexDefinition, va
 		}
 		results := ids[:0]
 		for _, id := range ids {
-			if edgeMatchesPropertyIndex(tx.graph.Edges.Get(id), definition, value) {
+			edge, err := tx.graph.ReadEdge(id)
+			if err != nil {
+				return nil, true, err
+			}
+			if edgeMatchesPropertyIndex(edge, definition, value) {
 				results = append(results, id)
 			}
 		}
 		return results, true, nil
-	}
-	if tx.changes == nil {
-		return tx.graph.EdgeProperties.LookupLimit(definition, value, limit)
 	}
 	capacity := 64
 	if limit < uint(capacity) {
 		capacity = int(limit)
 	}
 	results := make([]uint64, 0, capacity)
+	var readErr error
 	exists, err := tx.graph.EdgeProperties.Visit(definition, value, func(id uint64) bool {
-		if edgeMatchesPropertyIndex(tx.graph.Edges.Get(id), definition, value) {
+		edge, err := tx.graph.ReadEdge(id)
+		if err != nil {
+			readErr = err
+			return false
+		}
+		if edgeMatchesPropertyIndex(edge, definition, value) {
 			results = insertPropertyIndexID(results, id, limit)
 		}
 		return true
 	})
+	if readErr != nil {
+		return nil, exists, readErr
+	}
 	return results, exists, err
 }
 
@@ -4161,20 +4314,19 @@ func (tx *Tx) GetOutgoingEdges(nodeID uint64) ([]Edge, error) {
 	if _, err := tx.requireNode(nodeID); err != nil {
 		return nil, err
 	}
-	outgoing := tx.graph.Outgoing.Get(nodeID)
-	results := make([]Edge, 0, outgoing.Len())
-	if outgoing.IsInline() {
-		for _, edgeID := range outgoing.InlineIDs() {
-			results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+	results := make([]Edge, 0, tx.graph.Outgoing.Get(nodeID).Len())
+	err := tx.graph.VisitOutgoing(context.Background(), nodeID, func(edgeID uint64) error {
+		edge, err := tx.graph.ReadEdge(edgeID)
+		if err != nil {
+			return err
 		}
-		return results, nil
-	}
-	for chunk := range outgoing.Chunks() {
-		for _, edgeID := range chunk {
-			if !outgoing.IsRemoved(edgeID) {
-				results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
-			}
+		if edge != nil {
+			results = append(results, publicEdge(edge))
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -4183,20 +4335,19 @@ func (tx *Tx) GetIncomingEdges(nodeID uint64) ([]Edge, error) {
 	if _, err := tx.requireNode(nodeID); err != nil {
 		return nil, err
 	}
-	incoming := tx.graph.Incoming.Get(nodeID)
-	results := make([]Edge, 0, incoming.Len())
-	if incoming.IsInline() {
-		for _, edgeID := range incoming.InlineIDs() {
-			results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
+	results := make([]Edge, 0, tx.graph.Incoming.Get(nodeID).Len())
+	err := tx.graph.VisitIncoming(context.Background(), nodeID, func(edgeID uint64) error {
+		edge, err := tx.graph.ReadEdge(edgeID)
+		if err != nil {
+			return err
 		}
-		return results, nil
-	}
-	for chunk := range incoming.Chunks() {
-		for _, edgeID := range chunk {
-			if !incoming.IsRemoved(edgeID) {
-				results = append(results, publicEdge(tx.graph.Edges.Get(edgeID)))
-			}
+		if edge != nil {
+			results = append(results, publicEdge(edge))
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -4205,14 +4356,14 @@ func (tx *Tx) GetOutgoingEdgesByType(nodeID uint64, edgeType string, limit uint)
 	if _, err := tx.requireNode(nodeID); err != nil {
 		return nil, err
 	}
-	return tx.edgesByType(tx.graph.Outgoing.Get(nodeID), edgeType, limit), nil
+	return tx.edgesByTypeView(nodeID, true, edgeType, limit)
 }
 
 func (tx *Tx) GetIncomingEdgesByType(nodeID uint64, edgeType string, limit uint) ([]Edge, error) {
 	if _, err := tx.requireNode(nodeID); err != nil {
 		return nil, err
 	}
-	return tx.edgesByType(tx.graph.Incoming.Get(nodeID), edgeType, limit), nil
+	return tx.edgesByTypeView(nodeID, false, edgeType, limit)
 }
 
 func (tx *Tx) edgesByType(edgeIDs *store.EdgeList, edgeType string, limit uint) []Edge {
@@ -4227,7 +4378,7 @@ func (tx *Tx) edgesByType(edgeIDs *store.EdgeList, edgeType string, limit uint) 
 				continue
 			}
 			edge := tx.graph.Edges.Get(edgeID)
-			if edge.Type == edgeType {
+			if edge != nil && edge.Type == edgeType {
 				results = append(results, publicEdge(edge))
 				if limit != 0 && uint(len(results)) == limit {
 					return results
@@ -4238,17 +4389,62 @@ func (tx *Tx) edgesByType(edgeIDs *store.EdgeList, edgeType string, limit uint) 
 	return results
 }
 
-func (tx *Tx) deleteEdge(edgeID uint64) {
-	edge := tx.graph.Edges.Get(edgeID)
+func (tx *Tx) edgesByTypeView(nodeID uint64, outgoing bool, edgeType string, limit uint) ([]Edge, error) {
+	capacity := tx.graph.EdgeTypes.Len(edgeType)
+	if outgoing {
+		capacity = min(tx.graph.Outgoing.Get(nodeID).Len(), capacity)
+	} else {
+		capacity = min(tx.graph.Incoming.Get(nodeID).Len(), capacity)
+	}
+	if limit != 0 && limit < uint(capacity) {
+		capacity = int(limit)
+	}
+	results := make([]Edge, 0, capacity)
+	visit := func(edgeID uint64) error {
+		edge, err := tx.graph.ReadEdge(edgeID)
+		if err != nil {
+			return err
+		}
+		if edge != nil && edge.Type == edgeType {
+			results = append(results, publicEdge(edge))
+			if limit != 0 && uint(len(results)) == limit {
+				return io.EOF
+			}
+		}
+		return nil
+	}
+	var err error
+	if outgoing {
+		err = tx.graph.VisitOutgoing(context.Background(), nodeID, visit)
+	} else {
+		err = tx.graph.VisitIncoming(context.Background(), nodeID, visit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func (tx *Tx) deleteEdge(edgeID uint64) error {
+	edge, err := tx.graph.ReadEdge(edgeID)
+	if err != nil {
+		return err
+	}
 	if edge == nil {
-		return
+		return nil
+	}
+	existed, err := idExists(tx.base, edgeID, false)
+	if err != nil {
+		return err
 	}
 	tx.ensureEdgesWritable(edgeID)
 	tx.ensureOutgoingWritable(edge.SourceID)
 	tx.ensureIncomingWritable(edge.TargetID)
 	tx.graph.Edges.Delete(edgeID)
+	tx.graph.DeletedEdges.CloneShardOnce(edgeID)
+	tx.graph.DeletedEdges.Set(edgeID, true)
 	tx.graph.EdgeTypes.Remove(edge.Type, edgeID)
-	tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, tx.base != nil && tx.base.Edges.Get(edgeID) != nil, edgeID)
+	tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, existed, edgeID)
 	outgoing := tx.graph.Outgoing.Get(edge.SourceID).RemoveKnown(edgeID)
 	if outgoing.Len() == 0 {
 		tx.graph.Outgoing.Delete(edge.SourceID)
@@ -4261,10 +4457,7 @@ func (tx *Tx) deleteEdge(edgeID uint64) {
 	} else {
 		tx.graph.Incoming.Set(edge.TargetID, incoming)
 	}
-}
-
-func (tx *Tx) deleteEdgesBatch(edgeIDs map[uint64]struct{}) {
-	_ = tx.deleteEdgesBatchWithBudget(edgeIDs, nil)
+	return nil
 }
 
 func (tx *Tx) deleteEdgesBatchWithBudget(edgeIDs map[uint64]struct{}, budget *queryBudget) error {
@@ -4276,14 +4469,23 @@ func (tx *Tx) deleteEdgesBatchWithBudget(edgeIDs map[uint64]struct{}, budget *qu
 				return err
 			}
 		}
-		edge := tx.graph.Edges.Get(edgeID)
+		edge, err := tx.graph.ReadEdge(edgeID)
+		if err != nil {
+			return err
+		}
 		if edge == nil {
 			continue
 		}
+		existed, err := idExists(tx.base, edgeID, false)
+		if err != nil {
+			return err
+		}
 		tx.ensureEdgesWritable(edgeID)
 		tx.graph.Edges.Delete(edgeID)
+		tx.graph.DeletedEdges.CloneShardOnce(edgeID)
+		tx.graph.DeletedEdges.Set(edgeID, true)
 		tx.graph.EdgeTypes.Remove(edge.Type, edgeID)
-		tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, tx.base != nil && tx.base.Edges.Get(edgeID) != nil, edgeID)
+		tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, existed, edgeID)
 		outgoing[edge.SourceID] = append(outgoing[edge.SourceID], edgeID)
 		incoming[edge.TargetID] = append(incoming[edge.TargetID], edgeID)
 	}
@@ -4338,7 +4540,10 @@ func (tx *Tx) requireNode(nodeID uint64) (*store.NodeRecord, error) {
 	if err := validateEntityID(nodeID); err != nil {
 		return nil, err
 	}
-	node := tx.graph.Nodes.Get(nodeID)
+	node, err := tx.graph.ReadNode(nodeID)
+	if err != nil {
+		return nil, err
+	}
 	if node == nil {
 		return nil, fmt.Errorf("node %d not found", nodeID)
 	}
@@ -4352,7 +4557,10 @@ func (tx *Tx) requireEdge(edgeID uint64) (*store.EdgeRecord, error) {
 	if err := validateEntityID(edgeID); err != nil {
 		return nil, err
 	}
-	edge := tx.graph.Edges.Get(edgeID)
+	edge, err := tx.graph.ReadEdge(edgeID)
+	if err != nil {
+		return nil, err
+	}
 	if edge == nil {
 		return nil, fmt.Errorf("edge %d not found", edgeID)
 	}
@@ -4371,7 +4579,7 @@ func (tx *Tx) writableNode(nodeID uint64, propertiesOnly bool) (*store.NodeRecor
 	if err != nil {
 		return nil, err
 	}
-	if tx.base != nil && node == tx.base.Nodes.Get(nodeID) {
+	if tx.graph.Nodes.Get(nodeID) == nil || tx.base != nil && tx.graph.Nodes.Get(nodeID) == tx.base.Nodes.Get(nodeID) {
 		node = &store.NodeRecord{
 			ID:         node.ID,
 			Labels:     slices.Clone(node.Labels),
@@ -4392,7 +4600,7 @@ func (tx *Tx) writableEdge(edgeID uint64, propertiesOnly bool) (*store.EdgeRecor
 	if err != nil {
 		return nil, err
 	}
-	if tx.base != nil && edge == tx.base.Edges.Get(edgeID) {
+	if tx.graph.Edges.Get(edgeID) == nil || tx.base != nil && tx.graph.Edges.Get(edgeID) == tx.base.Edges.Get(edgeID) {
 		edge = &store.EdgeRecord{
 			ID:         edge.ID,
 			SourceID:   edge.SourceID,
@@ -4455,14 +4663,16 @@ func (tx *Tx) markDelete(upserts *map[uint64]struct{}, deletes *map[uint64]struc
 	(*deletes)[id] = struct{}{}
 }
 
-func idExists(base *store.GraphState, id uint64, node bool) bool {
+func idExists(base *store.GraphState, id uint64, node bool) (bool, error) {
 	if base == nil {
-		return false
+		return false, nil
 	}
 	if node {
-		return base.Nodes.Get(id) != nil
+		record, err := base.ReadNode(id)
+		return record != nil, err
 	}
-	return base.Edges.Get(id) != nil
+	record, err := base.ReadEdge(id)
+	return record != nil, err
 }
 
 func mapKeys(values map[uint64]struct{}) []uint64 {
@@ -4494,12 +4704,15 @@ func propertyKeyDeltas(upserts map[uint64]struct{}, tracked map[uint64][]string)
 	return tracked
 }
 
-func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struct{}, node bool) {
+func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struct{}, node bool, originalExists map[uint64]bool) {
 	if tx.changes == nil || changes == nil {
 		return
 	}
 	for id := range upserts {
-		if !idExists(tx.base, id, node) {
+		if tx.base == nil {
+			continue
+		}
+		if tx.base.PageBase == nil && !originalExists[id] {
 			continue
 		}
 		var child map[uint64][]string
@@ -4547,7 +4760,7 @@ func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struc
 }
 
 func (tx *Tx) trackNodeProperty(id uint64, key string) {
-	if tx.changes == nil || !idExists(tx.base, id, true) {
+	if tx.changes == nil || tx.base == nil || tx.base.PageBase == nil && tx.base.Nodes.Get(id) == nil {
 		return
 	}
 	if tx.changes.nodePropertyKeys == nil {
@@ -4568,7 +4781,7 @@ func (tx *Tx) trackNodeProperty(id uint64, key string) {
 }
 
 func (tx *Tx) trackEdgeProperty(id uint64, key string) {
-	if tx.changes == nil || !idExists(tx.base, id, false) {
+	if tx.changes == nil || tx.base == nil || tx.base.PageBase == nil && tx.base.Edges.Get(id) == nil {
 		return
 	}
 	if tx.changes.edgePropertyKeys == nil {
@@ -4589,7 +4802,7 @@ func (tx *Tx) trackEdgeProperty(id uint64, key string) {
 }
 
 func (tx *Tx) markNodePropertyFallback(id uint64) {
-	if tx.changes == nil || !idExists(tx.base, id, true) {
+	if tx.changes == nil || tx.base == nil || tx.base.PageBase == nil && tx.base.Nodes.Get(id) == nil {
 		return
 	}
 	if tx.changes.nodePropertyKeys == nil {
@@ -4599,7 +4812,7 @@ func (tx *Tx) markNodePropertyFallback(id uint64) {
 }
 
 func (tx *Tx) markEdgePropertyFallback(id uint64) {
-	if tx.changes == nil || !idExists(tx.base, id, false) {
+	if tx.changes == nil || tx.base == nil || tx.base.PageBase == nil && tx.base.Edges.Get(id) == nil {
 		return
 	}
 	if tx.changes.edgePropertyKeys == nil {

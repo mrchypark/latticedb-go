@@ -1,5 +1,16 @@
 # Binary storage format
 
+Public `Open` now always uses the page backend. A new directory database stores
+bbolt pages at `state.json`; the `LDBSTAT5` and `LDBWAL5` formats below describe
+legacy native files used for migration and the binary checkpoint interchange
+path, not the ordinary runtime store.
+
+When a legacy v5 state/WAL database has no page sidecar, `Open` imports it into
+a staged `state.json.pages` file and publishes that file after validation. The
+source state and WAL remain untouched. A read-only open without a page sidecar
+uses a private temporary directory for the import. Subsequent opens use the
+published page sidecar. New databases use `state.json` directly for bbolt.
+
 State files use a 64-byte header. WAL v5 frames use a 68-byte header followed
 by a streaming binary payload. The WAL header carries magic, version, payload
 length, a payload CRC-32 IEEE checksum, and a header CRC-32 IEEE checksum.
@@ -39,64 +50,77 @@ actual decoded byte counts or process heap pressure.
 
 ## Migration and compatibility
 
-| File | Current | Read-only legacy |
+| Input format | Current binary version | Older binary versions |
 |------|---------|-----------------|
-| State | `LDBSTAT5` v5 | v4 `LDBSTAT4`, v3 `LDBSTAT3` |
-| WAL | `LDBWAL5` v5 | v4 `LDBWAL4`, v3 `LDBWAL3`, v2 `LDBWAL2` |
+| State checkpoint | `LDBSTAT5` v5 | v4 `LDBSTAT4`, v3 `LDBSTAT3` |
+| WAL segment | `LDBWAL5` v5 | v4 `LDBWAL4`, v3 `LDBWAL3`, v2 `LDBWAL2` |
 
 State v3/v4 and WAL v2/v3 payloads deserialize through the JSON path. WAL v4
-is a legacy binary payload format. Checkpoints write the new state format; all
-legacy WALs migrate to a full v5 binary base before appending. Binary format is
-**not** readable by pre-v5 state or pre-v4 WAL readers; v5 WAL frames are not
-readable by earlier WAL readers. No downgrade safety net. Write always emits
-the current version.
+is a legacy binary payload format. The page importer accepts the v5 checkpoint
+and supported WAL history for automatic migration; do not infer that every
+older binary version is automatically migrated by public `Open`. Binary format
+is **not** readable by pre-v5 state or pre-v4 WAL readers; v5 WAL frames are
+not readable by earlier WAL readers. No downgrade safety net. Binary
+serialization continues to emit the current version.
 
 ## Opt-in backup archive
 
-`OpenOptions.BackupDirectory` captures the recovered generation at open and
-stores a standalone full checkpoint for each successful commit. A successful
-commit means both WAL and archive publication completed durably. An archive
-failure after WAL durability returns `ErrCommitOutcomeUnknown` and fences the
-handle; rollback/close must preserve the WAL for recovery. Reopen without that
-archive, or with a new archive, when the source has advanced beyond its head.
+`OpenOptions.BackupDirectory` captures a full base at open, then stores the exact
+committed WAL frame for each successful transaction. A successful commit means
+both the page transaction and archive publication completed durably. Records,
+commit history, and the pending archive frame share one atomic page transaction.
+An archive failure after page durability returns `ErrCommitOutcomeUnknown` and
+fences the handle; reopen uses the durable outbox to finish publication.
 
-Each point uses create-only publication. Its filename binds the commit ID,
-capture timestamp, and content SHA-256 with a metadata checksum. Restore checks
-selector metadata before choosing a point, then validates the selected file,
-owner/database ID, canonical snapshot limit, and checkpoint integrity. A damaged
-selected point is an error, not a reason to silently choose an older commit.
-These checks detect corruption; they are not authentication against an attacker
-who can rewrite the entire archive.
+Bases and WAL segments use create-only publication. Each segment binds its commit
+range, capture timestamp, SHA-256 and predecessor digest. Restore validates the
+selected dependency chain and restored commit/history before installing a new
+page database without overwriting an existing database. Missing or corrupt required
+objects are errors, never a reason to silently choose an older commit. These
+checks detect corruption, not an attacker who can rewrite the whole archive.
+Legacy standalone full-checkpoint archives remain readable.
 
-`RestoreBackup` publishes to a new path without overwriting an existing database.
 `CommitID` selects an exact recorded commit (a pointer permits commit 0); `Before`
-selects the latest recorded capture at or before that time. The selectors are
-mutually exclusive; omitting both selects the latest point. Returned metadata
-reports the selected commit and capture time. Timestamps increase monotonically
-across restart and backward clock movement. They describe capture time, not an
-exact historical transaction timestamp; no point exists before the first capture.
+selects a recorded capture at or before that time. The selectors are mutually
+exclusive; omitting both selects the latest point. Returned metadata reports the
+selected commit and capture time. Timestamps increase monotonically across
+restart and backward clock movement. Capture time is not an exact historical
+transaction timestamp; no point exists before the first capture. Independent
+resume bases include a checksummed coverage-gap start time. A `Before` selector
+inside that interval fails rather than silently returning the previous point.
 
-The archive is locked to one source path/database identity. On reopen, its head
-must match the recovered source's committed content and allocation counters may
-only have advanced. Same-generation reopen preserves the point and its timestamp.
-A source ahead of or behind the archive is rejected: use a new archive after a
-disabled-backup period or an outcome-unknown commit that has no matching point.
-Restored databases use a different path and must use their own new archive.
+The archive is locked to one source path/database identity. Reopening at the
+same commit verifies its contents and allocation counters and preserves its
+capture timestamp. A source behind the archive or a conflicting state at the same
+commit is rejected. When the source has advanced beyond the archive, a new full
+base records its current state independently. Older recovery points remain intact;
+missing intermediate commits are not fabricated. WAL v5 has no persistent history
+hash or original commit timestamp, so replaying retained frames to an equal final
+state cannot prove historical ancestry. This version therefore does not claim
+historical catch-up across an unarchived interval. Restored databases use their
+own archive.
 
-This is full-snapshot recovery: every captured commit writes the whole database
-synchronously. Storage grows with the number and size of retained points; there
-is no automatic retention or incremental WAL shipping. Archive exhaustion stops
-successful commits. Keep the archive in a separate storage failure domain when
-protection against losing the source device is required. `ponytail:` retain the
-native checkpoint format until measured storage or write latency justifies an
-incremental archive format.
+Normal commit I/O scales with the committed WAL frame rather than the full DB.
+Page archives carry immutable source-history proofs. Restore streams the base
+and replays deltas into an unpublished page database, preserving that history.
+Legacy archives without proofs retain their existing recovery path. There is
+no automatic retention. A recovery point requires its base and all predecessor segments, so
+deleting individual files can invalidate later points. Archive exhaustion stops
+successful commits. Use a separate storage failure domain when protection against
+losing the source device is required.
 
 ## Public API
 
 `Serialize` emits the current binary checkpoint and `Deserialize` reads
 supported versions. Public JSON and CSV exports retain their existing formats.
+The public file-backed `Open` path stores new databases as bbolt pages and
+imports a serialized/legacy checkpoint when opening it as a file path.
 
 ## Benchmarks
+
+The following measurements describe the earlier binary/resident-engine
+candidate. They are historical format and allocation benchmarks, not
+performance measurements of the current page-backed public `Open` path.
 
 Baseline `1fa1f72` vs candidate, Apple M3, medians of 3.
 

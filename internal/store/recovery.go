@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
 	"github.com/mrchypark/latticedb-go/internal/search"
 )
 
@@ -630,6 +632,14 @@ func CreateCheckpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nex
 }
 
 func checkpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, noReplace bool) error {
+	return checkpointGraphStateFilesContext(context.Background(), files, graph, nextNodeID, nextEdgeID, commitID, noReplace)
+}
+
+func checkpointGraphStateFilesContext(ctx context.Context, files DatabaseFiles, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64, noReplace bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
 		return fmt.Errorf("create db directory: %w", err)
 	}
@@ -645,7 +655,7 @@ func checkpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeI
 	defer os.Remove(payloadPath)
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateBinary(io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateBinary(contextWriter{ctx: ctx, Writer: io.MultiWriter(payload, checksum)}, graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	if _, err := payload.Seek(0, io.SeekStart); err != nil {
@@ -672,12 +682,15 @@ func checkpointGraphStateFiles(files DatabaseFiles, graph *GraphState, nextNodeI
 		_ = temp.Close()
 		return err
 	}
-	if _, err := io.Copy(temp, payload); err != nil {
+	if _, err := io.Copy(contextWriter{ctx: ctx, Writer: temp}, &contextReader{ctx: ctx, reader: payload}); err != nil {
 		_ = temp.Close()
 		return err
 	}
 	if err := syncAndClose(temp); err != nil {
 		return fmt.Errorf("write temp state: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if noReplace {
 		if err := os.Link(tempPath, files.State); err != nil {
@@ -1807,6 +1820,17 @@ func syncDirectory(path string) error {
 
 func SimulateCrash(dbPath string) error {
 	files := DirectoryDatabaseFiles(dbPath)
+	// Page commits have no disposable checkpoint: the page file is authoritative.
+	// Actual crash recovery is exercised with a subprocess exiting without Close.
+	for _, path := range []string{files.State, files.State + ".pages"} {
+		page, err := pagestore.IsFile(path)
+		if err != nil {
+			return err
+		}
+		if page {
+			return nil
+		}
+	}
 	if err := os.Remove(files.State); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove state checkpoint: %w", err)
 	}
@@ -1971,7 +1995,7 @@ func encodeStateHeader(databaseID string, commitID uint64, payloadLength uint64,
 	if err := validateDatabaseID(databaseID); err != nil {
 		return [stateHeaderSize]byte{}, err
 	}
-	if payloadLength > maxStateFileBytes-stateHeaderSize {
+	if payloadLength > uint64(math.MaxInt64)-stateHeaderSize {
 		return [stateHeaderSize]byte{}, errors.New("state payload exceeds size limit")
 	}
 	var header [stateHeaderSize]byte
@@ -3245,22 +3269,31 @@ func EstimateSnapshotBytes(graph *GraphState) (uint64, error) {
 	for key, value := range graph.AppMetadata.All() {
 		size = snapshotAdd(size, appMetadataSnapshotBytes(key, value))
 	}
-	for _, node := range graph.Nodes.All() {
-		recordSize, err := nodeSnapshotBytes(node)
+	if err := graph.VisitNodes(context.Background(), func(record *NodeRecord) error {
+		recordSize, err := nodeSnapshotBytes(record)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		size = snapshotAdd(size, recordSize)
+		return nil
+	}); err != nil {
+		return 0, err
 	}
-	for _, edge := range graph.Edges.All() {
-		recordSize, err := edgeSnapshotBytes(edge)
+	if err := graph.VisitEdges(context.Background(), func(record *EdgeRecord) error {
+		recordSize, err := edgeSnapshotBytes(record)
 		if err != nil {
-			return 0, err
+			return err
 		}
 		size = snapshotAdd(size, recordSize)
+		return nil
+	}); err != nil {
+		return 0, err
 	}
-	for nodeID, record := range graph.FTS.All() {
-		size = snapshotAdd(size, ftsSnapshotBytes(nodeID, record.Text))
+	if err := graph.VisitFTS(context.Background(), func(id uint64, record *FTSRecord) error {
+		size = snapshotAdd(size, ftsSnapshotBytes(id, record.Text))
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 	for definition := range graph.NodeProperties.Definitions() {
 		size = snapshotAdd(size, propertyIndexSnapshotBytes(definition))
