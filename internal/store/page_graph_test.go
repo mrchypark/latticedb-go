@@ -7,6 +7,8 @@ import (
 	"io"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strconv"
 	"testing"
 )
 
@@ -273,5 +275,99 @@ func TestPageGraphUpdatesSkipUnchangedPostings(t *testing.T) {
 	}
 	if !reflect.DeepEqual(canonicalIDs, []uint64{10, 11}) {
 		t.Fatalf("canonical edge order = %v, want [10 11] after source change", canonicalIDs)
+	}
+}
+
+func TestPageGraphPropertyUpdateWithManyLabels(t *testing.T) {
+	const labelCount = 32768
+	path := filepath.Join(t.TempDir(), "many-labels.pages")
+	labels := make([]string, labelCount)
+	for i := range labels {
+		labels[i] = "label-" + strconv.Itoa(i)
+	}
+	db, err := pagestore.Open(path, pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := &PageGraph{Tx: write}
+	if err := page.PutNode(&NodeRecord{ID: 1, Labels: labels, Properties: PropertiesFromMap(map[string]any{"version": int64(1)})}); err != nil {
+		t.Fatal(err)
+	}
+	updated := &NodeRecord{ID: 1, Labels: labels, Properties: PropertiesFromMap(map[string]any{"version": int64(2)})}
+	encoded, err := encodePageNode(updated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := write.BufferedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := page.PutNode(updated); err != nil {
+		t.Fatal(err)
+	}
+	after, err := write.BufferedBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := after-before, uint64(len(pageID(updated.ID))+len(encoded)); got != want {
+		t.Fatalf("property-only update staged %d bytes, want record-only %d", got, want)
+	}
+	reordered := slices.Clone(labels)
+	slices.Reverse(reordered)
+	if err := page.PutNode(&NodeRecord{ID: 1, Labels: reordered, Properties: updated.Properties}); err != nil {
+		t.Fatal(err)
+	}
+	if err := write.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = pagestore.Open(path, pagestore.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	read, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Rollback()
+	page = &PageGraph{Tx: read}
+	node, err := page.GetNode(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node == nil || !slices.Equal(node.Labels, reordered) {
+		t.Fatal("reopened node did not preserve reordered labels")
+	}
+	if version, ok := node.Properties.Lookup("version"); !ok || version != int64(2) {
+		t.Fatalf("reopened property version = %v, present %v", version, ok)
+	}
+	expected := make(map[string]struct{}, labelCount)
+	for _, label := range reordered {
+		expected[string(pageStringID(label, node.ID))] = struct{}{}
+	}
+	count := 0
+	if err := read.Scan(context.Background(), pageLabels, nil, nil, func(key, value []byte) error {
+		if _, ok := expected[string(key)]; !ok {
+			return errors.New("unexpected label posting after reorder")
+		}
+		if len(value) != 0 {
+			return errors.New("label posting value is not empty")
+		}
+		delete(expected, string(key))
+		count++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != labelCount || len(expected) != 0 {
+		t.Fatalf("reopened label postings = %d, missing %d; want %d", count, len(expected), labelCount)
 	}
 }
