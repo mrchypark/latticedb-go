@@ -36,7 +36,21 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 		return nil, statErr
 	}
 	if fresh {
-		if _, e := os.Stat(files.State); e == nil {
+		_, stateErr := os.Stat(files.State)
+		if stateErr != nil && !errors.Is(stateErr, os.ErrNotExist) {
+			_ = lock.close()
+			return nil, stateErr
+		}
+		hasRecoveryEvidence := stateErr == nil
+		for _, evidence := range []string{files.WALBase, files.WAL} {
+			if _, e := os.Stat(evidence); e == nil {
+				hasRecoveryEvidence = true
+			} else if !errors.Is(e, os.ErrNotExist) {
+				_ = lock.close()
+				return nil, e
+			}
+		}
+		if hasRecoveryEvidence {
 			if opts.ReadOnly {
 				temporary, err = os.MkdirTemp("", "latticedb-page-read-*")
 				if err != nil {
@@ -50,9 +64,6 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 				return nil, pageStorageOpenError(err)
 			}
 			fresh = false
-		} else if !errors.Is(e, os.ErrNotExist) {
-			_ = lock.close()
-			return nil, e
 		}
 	}
 	if fresh && (!opts.Create || opts.ReadOnly) {
@@ -133,8 +144,29 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 			return nil, e
 		}
 	}
-	if opts.VectorDimensions != 0 && opts.VectorDimensions != catalog.VectorDimensions {
+	if opts.VectorDimensions != 0 && catalog.VectorDimensions != 0 && opts.VectorDimensions != catalog.VectorDimensions {
 		return nil, fmt.Errorf("vector dimensions do not match stored dimensions")
+	}
+	dimensionsChanged := opts.EnableVector && catalog.VectorDimensions == 0
+	if dimensionsChanged {
+		dimensions := opts.VectorDimensions
+		if dimensions == 0 {
+			dimensions = 128
+		}
+		catalog.VectorDimensions = dimensions
+		catalog.ArchiveBasePending = true
+		graph.VectorDimensions = dimensions
+	}
+	if opts.EnableVector || graph.VectorDimensions != 0 {
+		var vectorErr error
+		if graph.PageBase != nil {
+			vectorErr = validatePageGraphVectorsContext(ctx, graph.PageBase, graph.VectorDimensions)
+		} else {
+			vectorErr = validateGraphVectorsContext(ctx, graph)
+		}
+		if vectorErr != nil {
+			return nil, vectorErr
+		}
 	}
 	graph.VectorIndexM = effectiveVectorIndexM(opts.VectorM)
 	namespaces, e := normalizeVectorNamespaces(opts.VectorNamespaces, graph.VectorDimensions)
@@ -162,6 +194,41 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 	if err != nil {
 		return nil, err
 	}
+	if dimensionsChanged && !opts.ReadOnly {
+		_ = read.Rollback()
+		read = nil
+		write, e := pages.Begin(true)
+		if e != nil {
+			return nil, e
+		}
+		if catalog.CommitID == ^uint64(0) {
+			_ = write.Rollback()
+			return nil, errors.New("commit id space exhausted")
+		}
+		catalog.VectorDimensions = graph.VectorDimensions
+		if e = (&store.PageGraph{Tx: write}).PutCatalog(catalog); e != nil {
+			_ = write.Rollback()
+			return nil, e
+		}
+		catalog, _, e = (&store.PageGraph{Tx: write}).PageCommit(ctx, graph, max(catalog.NextNodeID, reservedNode), max(catalog.NextEdgeID, reservedEdge), catalog.CommitID+1, store.GraphDelta{}, opts.BackupDirectory != "")
+		if e == nil {
+			e = write.Commit()
+		}
+		if e != nil {
+			_ = write.Rollback()
+			return nil, e
+		}
+		read, e = pages.Begin(false)
+		if e != nil {
+			return nil, e
+		}
+		graph, catalog, err = (&store.PageGraph{Tx: read}).LoadGraph(ctx)
+		if err != nil {
+			return nil, err
+		}
+		graph.VectorIndexM = effectiveVectorIndexM(opts.VectorM)
+		graph.VectorNamespaces = emptyVectorNamespaceStates(namespaces)
+	}
 	db := &DB{
 		path: path, files: files, graph: graph, pages: pages, pathLock: lock, pageTemporary: temporary,
 		nextNodeID: max(catalog.NextNodeID, reservedNode), nextEdgeID: max(catalog.NextEdgeID, reservedEdge),
@@ -183,13 +250,70 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 		if e != nil {
 			return nil, e
 		}
-		if _, e = archive.capturePage(ctx, db.timeNow(), graph, db.nextNodeID, db.nextEdgeID, db.commitID); e != nil {
+		if catalog.ArchiveBasePending {
+			_, e = archive.capturePage(ctx, db.timeNow(), graph, db.nextNodeID, db.nextEdgeID, db.commitID)
+			if e == nil {
+				e = clearPageArchiveBasePending(pages, &read, &graph, &catalog, opts.VectorM, namespaces)
+				if e == nil {
+					db.graph = graph
+					db.commitID = catalog.CommitID
+				}
+			}
+		} else {
+			_, e = archive.capturePage(ctx, db.timeNow(), graph, db.nextNodeID, db.nextEdgeID, db.commitID)
+		}
+		if e != nil {
 			_ = archive.close()
 			return nil, e
 		}
 		db.backupArchive = archive
 	}
 	return db, nil
+}
+
+func validatePageGraphVectorsContext(ctx context.Context, page *store.PageGraph, dimensions uint16) error {
+	return page.VisitNodes(ctx, func(node *store.NodeRecord) error {
+		return validateNodeVectors(dimensions, node)
+	})
+}
+
+func clearPageArchiveBasePending(pages *pagestore.DB, read **pagestore.Tx, graph **store.GraphState, catalog *store.PageCatalog, vectorM uint16, namespaces []VectorNamespace) error {
+	if *read != nil {
+		if err := (*read).Rollback(); err != nil {
+			return err
+		}
+		*read = nil
+	}
+	write, err := pages.Begin(true)
+	if err != nil {
+		return err
+	}
+	page := &store.PageGraph{Tx: write}
+	current, err := page.Catalog()
+	if err == nil && current.ArchiveBasePending {
+		current.ArchiveBasePending = false
+		err = page.PutCatalog(current)
+	}
+	if err == nil {
+		err = write.Commit()
+	}
+	if err != nil {
+		_ = write.Rollback()
+		return err
+	}
+	*read, err = pages.Begin(false)
+	if err != nil {
+		return err
+	}
+	*graph, *catalog, err = (&store.PageGraph{Tx: *read}).LoadGraph(context.Background())
+	if err != nil {
+		_ = (*read).Rollback()
+		*read = nil
+		return err
+	}
+	(*graph).VectorIndexM = effectiveVectorIndexM(vectorM)
+	(*graph).VectorNamespaces = emptyVectorNamespaceStates(namespaces)
+	return nil
 }
 
 func (tx *Tx) commitPages(ctx context.Context) error {

@@ -71,12 +71,12 @@ func (page *PageGraph) PageCommit(ctx context.Context, graph *GraphState, nextNo
 		}
 	}
 	for _, id := range delta.DeleteFTS {
-		if err := page.PutFTS(id, nil); err != nil {
+		if err := page.PutFTSContext(ctx, id, nil); err != nil {
 			return catalog, nil, err
 		}
 	}
 	for _, id := range delta.UpsertFTS {
-		if err := page.PutFTS(id, graph.FTS.Get(id)); err != nil {
+		if err := page.PutFTSContext(ctx, id, graph.FTS.Get(id)); err != nil {
 			return catalog, nil, err
 		}
 	}

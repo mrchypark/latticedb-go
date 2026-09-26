@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -239,6 +240,26 @@ func (indexes PropertyIndexes) Lookup(definition PropertyIndexDefinition, value 
 
 // Visit calls visit for each posting without materializing the posting list.
 func (indexes PropertyIndexes) Visit(definition PropertyIndexDefinition, value any, visit func(uint64) bool) (bool, error) {
+	return indexes.VisitContext(context.Background(), definition, value, nil, func(id uint64) error {
+		if visit(id) {
+			return nil
+		}
+		return io.EOF
+	})
+}
+
+// VisitContext visits a posting with cancellation, optional per-posting work
+// charging, and error-bearing callbacks. Returning io.EOF stops normally.
+func (indexes PropertyIndexes) VisitContext(ctx context.Context, definition PropertyIndexDefinition, value any, charge func() error, visit func(uint64) error) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if visit == nil {
+		return false, errors.New("store: nil property-index visitor")
+	}
 	data, ok := indexes.definitions[definition]
 	if !ok {
 		return false, nil
@@ -248,18 +269,42 @@ func (indexes PropertyIndexes) Visit(definition PropertyIndexDefinition, value a
 		return true, err
 	}
 	if indexes.page != nil {
-		return indexes.page.visit(definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), visit)
+		return true, indexes.page.visit(ctx, definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), charge, visit)
 	}
 	for id := range data.values.Get(hashPropertyValueKey(key))[key].all() {
-		if !visit(id) {
-			break
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		if charge != nil {
+			if err := charge(); err != nil {
+				return true, err
+			}
+		}
+		if err := visit(id); err != nil {
+			if err == io.EOF {
+				return true, nil
+			}
+			return true, err
 		}
 	}
 	return true, nil
 }
 
-// Cardinality returns the number of IDs in a value posting without allocating.
+// Cardinality returns the number of IDs without materializing the posting list.
 func (indexes PropertyIndexes) Cardinality(definition PropertyIndexDefinition, value any) (int, bool, error) {
+	return indexes.CardinalityContext(context.Background(), definition, value, nil)
+}
+
+// CardinalityContext counts without materializing IDs. Page-backed reads stream
+// records; charge runs for each base and added overlay posting. Resident
+// cardinality remains an O(1) length lookup.
+func (indexes PropertyIndexes) CardinalityContext(ctx context.Context, definition PropertyIndexDefinition, value any, charge func() error) (int, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, true, err
+	}
 	data, ok := indexes.definitions[definition]
 	if !ok {
 		return 0, false, nil
@@ -270,7 +315,10 @@ func (indexes PropertyIndexes) Cardinality(definition PropertyIndexDefinition, v
 	}
 	if indexes.page != nil {
 		count := 0
-		_, err := indexes.page.visit(definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), func(uint64) bool { count++; return true })
+		err := indexes.page.visit(ctx, definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), charge, func(uint64) error {
+			count++
+			return nil
+		})
 		return count, true, err
 	}
 	return data.values.Get(hashPropertyValueKey(key))[key].len(), true, nil
@@ -293,9 +341,12 @@ func (indexes PropertyIndexes) LookupLimit(definition PropertyIndexDefinition, v
 		if limit == 0 {
 			return ids, true, nil
 		}
-		_, err := indexes.page.visit(definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), func(id uint64) bool {
+		err := indexes.page.visit(context.Background(), definition, value, key, indexes.deltaPosting(indexes.added, definition, key), indexes.deltaPosting(indexes.removed, definition, key), nil, func(id uint64) error {
 			ids = append(ids, id)
-			return uint(len(ids)) < limit
+			if uint(len(ids)) >= limit {
+				return io.EOF
+			}
+			return nil
 		})
 		return ids, true, err
 	}

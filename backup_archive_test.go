@@ -3,8 +3,10 @@ package latticedb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -417,5 +419,162 @@ func TestRestoreBackupEnforcesSnapshotLimitAndDoesNotFallback(t *testing.T) {
 	}
 	if _, err := RestoreBackup(context.Background(), archive, filepath.Join(t.TempDir(), "corrupt"), BackupRestoreOptions{}); err == nil {
 		t.Fatal("restore fell back to an older checkpoint after selected checkpoint corruption")
+	}
+}
+
+func TestRestoreBackupPreservesPropertiesOnNewPageEntities(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Tx) error
+		verify string
+	}{
+		{
+			name: "create node then set property",
+			mutate: func(tx *Tx) error {
+				node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}})
+				if err != nil {
+					return err
+				}
+				return tx.SetProperty(node.ID, "k", int64(7))
+			},
+			verify: "MATCH (n:Item) WHERE n.k = 7 RETURN n",
+		},
+		{
+			name: "create edge then set property",
+			mutate: func(tx *Tx) error {
+				source, err := tx.CreateNode(CreateNodeOptions{})
+				if err != nil {
+					return err
+				}
+				target, err := tx.CreateNode(CreateNodeOptions{})
+				if err != nil {
+					return err
+				}
+				edge, err := tx.CreateEdge(source.ID, target.ID, "LINK", CreateEdgeOptions{})
+				if err != nil {
+					return err
+				}
+				return tx.SetEdgeProperty(edge.ID, "k", int64(7))
+			},
+			verify: "MATCH ()-[e:LINK]->() WHERE e.k = 7 RETURN e",
+		},
+		{
+			name: "merge on create set",
+			mutate: func(tx *Tx) error {
+				_, err := tx.Query("MERGE (n:MergeItem {identity: 'one'}) ON CREATE SET n.k = 7 RETURN n", nil)
+				return err
+			},
+			verify: "MATCH (n:MergeItem) WHERE n.k = 7 RETURN n",
+		},
+		{
+			name: "created parent then query update",
+			mutate: func(tx *Tx) error {
+				node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"UpdatedItem"}})
+				if err != nil {
+					return err
+				}
+				_, err = tx.Query("MATCH (n:UpdatedItem) WHERE id(n) = $id SET n.k = 7", map[string]any{"id": int64(node.ID)})
+				return err
+			},
+			verify: "MATCH (n:UpdatedItem) WHERE n.k = 7 RETURN n",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			archive := filepath.Join(t.TempDir(), "archive")
+			db, err := Open(filepath.Join(t.TempDir(), "source"), OpenOptions{Create: true, BackupDirectory: archive})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(test.mutate); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			destination := filepath.Join(t.TempDir(), "restored")
+			if _, err := RestoreBackup(context.Background(), archive, destination, BackupRestoreOptions{}); err != nil {
+				t.Fatalf("restore after successful commit: %v", err)
+			}
+			restored, err := Open(destination, OpenOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restored.Close()
+			result, err := restored.Query(test.verify, nil)
+			if err != nil || len(result.Rows) != 1 {
+				t.Fatalf("restored query %q: rows=%v err=%v", test.verify, result.Rows, err)
+			}
+		})
+	}
+}
+
+func TestRestoreBackupKeepsExistingEntityPropertyPatchSmall(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "archive")
+	db, err := Open(filepath.Join(t.TempDir(), "source"), OpenOptions{Create: true, BackupDirectory: archive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nodeID uint64
+	if err := db.Update(func(tx *Tx) error {
+		node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]Value{"blob": strings.Repeat("x", 512<<10), "counter": int64(0)}})
+		if err != nil {
+			return err
+		}
+		nodeID = node.ID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(nodeID, "counter", int64(1)) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latestSegment := ""
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".wal") && entry.Name() > latestSegment {
+			latestSegment = entry.Name()
+		}
+	}
+	if latestSegment == "" {
+		t.Fatal("backup archive has no WAL segment for property update")
+	}
+	info, err := os.Stat(filepath.Join(archive, latestSegment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() >= 64<<10 {
+		t.Fatalf("existing-node property patch segment is %d bytes; want less than 64 KiB", info.Size())
+	}
+
+	destination := filepath.Join(t.TempDir(), "restored")
+	if _, err := RestoreBackup(context.Background(), archive, destination, BackupRestoreOptions{}); err != nil {
+		t.Fatalf("restore existing-node property patch: %v", err)
+	}
+	restored, err := Open(destination, OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if err := restored.View(func(tx *Tx) error {
+		value, found, err := tx.GetProperty(nodeID, "counter")
+		if err != nil {
+			return err
+		}
+		if !found || value != int64(1) {
+			return fmt.Errorf("restored counter = %v, found=%v", value, found)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

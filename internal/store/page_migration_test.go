@@ -295,6 +295,133 @@ func TestWALSnapshotReplaysThroughStreamingCheckpointScanner(t *testing.T) {
 	}
 }
 
+func TestMigrateToPagesBootstrapsFromWALSnapshotWithoutCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	files := DirectoryDatabaseFiles(filepath.Join(dir, "native"))
+	state := checkpointScanFixture()
+	state.CommitID = 18
+	state.NextNodeID = 1
+	state.Nodes[0].ID = 9
+	state.Edges[0].SourceID = 9
+	state.FTS[0].NodeID = 9
+	if err := os.MkdirAll(files.Directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := RewriteWALSnapshotFiles(files, graphStateFromPersisted(state), 1, state.NextEdgeID, state.CommitID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(files.WAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "recovered.pages")
+	if err := MigrateToPages(context.Background(), files, target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(files.State); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("migration created or changed source checkpoint: %v", err)
+	}
+	after, err := os.ReadFile(files.WAL)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("migration changed source WAL: read error=%v equal=%v", err, bytes.Equal(before, after))
+	}
+	db, err := pagestore.Open(target, pagestore.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := &PageGraph{Tx: tx}
+	catalog, err := page.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog.CommitID != state.CommitID || catalog.NextNodeID != 10 {
+		t.Fatalf("recovered catalog commit/next-node = %d/%d", catalog.CommitID, catalog.NextNodeID)
+	}
+	if node, err := page.GetNode(9); err != nil || node == nil {
+		t.Fatalf("snapshot node 9 = %#v, error=%v", node, err)
+	}
+	_ = tx.Rollback()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func graphStateFromPersisted(state persistedState) *GraphState {
+	graph := NewGraphState()
+	graph.DatabaseID = state.DatabaseID
+	graph.VectorDimensions = state.VectorDimensions
+	for _, node := range state.Nodes {
+		props, _ := decodePropertyStorage(node.Properties)
+		graph.Nodes.Set(node.ID, &NodeRecord{ID: node.ID, Labels: node.Labels, Properties: props})
+	}
+	for _, edge := range state.Edges {
+		props, _ := decodePropertyStorage(edge.Properties)
+		graph.Edges.Set(edge.ID, &EdgeRecord{ID: edge.ID, SourceID: edge.SourceID, TargetID: edge.TargetID, Type: edge.Type, Properties: props})
+	}
+	for _, fts := range state.FTS {
+		graph.FTS.Set(fts.NodeID, &FTSRecord{Text: fts.Text})
+	}
+	return graph
+}
+
+func TestImportPageCheckpointRepairsObservedIDHighWater(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		id       uint64
+		want     uint64
+		edge     bool
+		wantEdge uint64
+	}{
+		{name: "node ordinary", id: 9, want: 10},
+		{name: "node exhausted", id: MaxEntityID, want: EntityIDExhausted},
+		{name: "edge ordinary", id: 9, edge: true, wantEdge: 10},
+		{name: "edge exhausted", id: MaxEntityID, edge: true, wantEdge: EntityIDExhausted},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := checkpointScanFixture()
+			if test.edge {
+				state.NextEdgeID = 1
+				state.Edges[0].ID = test.id
+			} else {
+				state.NextNodeID = 1
+				state.Nodes[0].ID = test.id
+				state.Edges[0].SourceID = test.id
+				state.FTS[0].NodeID = test.id
+			}
+			path := filepath.Join(t.TempDir(), "repaired.pages")
+			if err := ImportPageCheckpoint(context.Background(), bytes.NewReader(checkpointScanFixtureBytes(t, state)), path); err != nil {
+				t.Fatal(err)
+			}
+			db, err := pagestore.Open(path, pagestore.Options{ReadOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := db.Begin(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			catalog, err := (&PageGraph{Tx: tx}).Catalog()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.edge && catalog.NextEdgeID != test.wantEdge {
+				t.Fatalf("next edge ID = %d, want %d", catalog.NextEdgeID, test.wantEdge)
+			}
+			if !test.edge && catalog.NextNodeID != test.want {
+				t.Fatalf("next node ID = %d, want %d", catalog.NextNodeID, test.want)
+			}
+			_ = tx.Rollback()
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestRestorePageBackupRequiresRequestedCommit(t *testing.T) {
 	dir := t.TempDir()
 	base := filepath.Join(dir, "base")

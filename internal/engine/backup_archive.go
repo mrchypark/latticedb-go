@@ -1042,12 +1042,8 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 		return BackupMetadata{}, err
 	}
 	defer lock.close()
-	for _, path := range []string{destination, destination + "-wal", destination + "-wal.base", destination + "-ids", destination + ".layout", destination + ".pages", destination + ".pages.layout"} {
-		if _, err := os.Lstat(path); err == nil {
-			return BackupMetadata{}, fmt.Errorf("%w: restore destination already exists", ErrInvalidArgument)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return BackupMetadata{}, err
-		}
+	if err := checkFlatDestinationAvailable(destination); err != nil {
+		return BackupMetadata{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return BackupMetadata{}, err
@@ -1067,6 +1063,18 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 		return BackupMetadata{}, err
 	}
 	return selected, nil
+}
+
+func checkFlatDestinationAvailable(destination string) error {
+	files := store.FlatDatabaseFiles(destination)
+	for _, path := range []string{files.State, files.WAL, files.WALBase, files.IDs, destination + ".layout", destination + ".pages", destination + ".pages.layout"} {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("%w: database destination already exists", ErrInvalidArgument)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 func readBackupOwner(directory string) (backupOwner, error) {

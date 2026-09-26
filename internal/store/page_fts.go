@@ -5,10 +5,21 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+
 	"github.com/mrchypark/latticedb-go/internal/search"
 )
 
 func (page *PageGraph) PutFTS(id uint64, record *FTSRecord) error {
+	return page.PutFTSContext(context.Background(), id, record)
+}
+
+func (page *PageGraph) PutFTSContext(ctx context.Context, id uint64, record *FTSRecord) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := ValidateEntityID(id); err != nil {
 		return err
 	}
@@ -19,6 +30,9 @@ func (page *PageGraph) PutFTS(id uint64, record *FTSRecord) error {
 	if record == nil {
 		if old == nil {
 			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		if err := page.changeCount("fts", false); err != nil {
 			return err
@@ -35,8 +49,17 @@ func (page *PageGraph) PutFTS(id uint64, record *FTSRecord) error {
 	if err := ValidateFTSText(record.Text); err != nil {
 		return err
 	}
+	if _, err := page.TokenizeFTSContext(ctx, id, record.Text, page.recordLimit()); err != nil {
+		if errors.Is(err, search.ErrTokenizationLimit) {
+			return fmt.Errorf("%w: FTS tokenization exceeds page decode limit", ErrLoadResourceLimit)
+		}
+		return err
+	}
 	data, err := encodePageRecord(4, func(e *binaryEncoder) { e.fts(persistedFTS{NodeID: id, Text: record.Text}) })
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if old == nil {
@@ -46,6 +69,30 @@ func (page *PageGraph) PutFTS(id uint64, record *FTSRecord) error {
 	}
 	return page.Tx.Put("fts", pageID(id), data)
 }
+
+// TokenizeFTSContext applies both the caller's indexing budget and this page
+// transaction's record limits, keeping admission consistent with PutFTS and decodeFTS.
+func (page *PageGraph) TokenizeFTSContext(ctx context.Context, id uint64, text string, maxLogicalBytes uint64) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if page.ftsRecordSize(id, text) > page.recordLimit() {
+		return nil, ErrLoadResourceLimit
+	}
+	return search.TokenizeContextWithLimit(ctx, text, min(maxLogicalBytes, page.recordLimit()))
+}
+
+func (page *PageGraph) ftsRecordSize(id uint64, text string) uint64 {
+	var scratch [binary.MaxVarintLen64]byte
+	size := uint64(6) // page-record header
+	size += uint64(binary.PutUvarint(scratch[:], id))
+	size += uint64(binary.PutUvarint(scratch[:], uint64(len(text))))
+	return size + uint64(len(text))
+}
+
 func (page *PageGraph) decodeFTS(id uint64, data []byte) (*FTSRecord, error) {
 	d, err := decodePageRecord(data, 4, page.recordLimit())
 	if err != nil {
@@ -58,7 +105,7 @@ func (page *PageGraph) decodeFTS(id uint64, data []byte) (*FTSRecord, error) {
 	if record.NodeID != id {
 		return nil, errors.New("FTS page key mismatch")
 	}
-	tokens, err := search.TokenizeContextWithLimit(context.Background(), record.Text, page.recordLimit())
+	tokens, err := page.TokenizeFTSContext(context.Background(), id, record.Text, page.recordLimit())
 	if err != nil {
 		return nil, err
 	}

@@ -24,14 +24,14 @@ const pageMigrationBufferedBytes = 8 << 20
 // ImportPageCheckpoint streams one binary v5 checkpoint into a privately
 // staged page database and publishes it at pagePath only after validation.
 func ImportPageCheckpoint(ctx context.Context, input io.Reader, pagePath string) error {
-	return importPageFiles(ctx, input, nil, pagePath, 0, 0, false, false, false, nil, nil, nil)
+	return importPageFiles(ctx, input, nil, pagePath, 0, 0, false, false, false, nil, nil, nil, false)
 }
 
 // ImportPageCheckpointWithWAL is the shared streaming importer used by restore
 // and native-store migration. maxBytes, when nonzero, bounds total checkpoint
 // plus WAL input bytes. expectedCommitID, when nonzero, must match the result.
 func ImportPageCheckpointWithWAL(ctx context.Context, input io.Reader, segments []string, pagePath string, expectedCommitID, maxBytes uint64) error {
-	return importPageFiles(ctx, input, segments, pagePath, expectedCommitID, maxBytes, true, expectedCommitID != 0, false, nil, nil, nil)
+	return importPageFiles(ctx, input, segments, pagePath, expectedCommitID, maxBytes, true, expectedCommitID != 0, false, nil, nil, nil, false)
 }
 
 // MigrateToPages copies the current native checkpoint and its WAL prefix into
@@ -44,11 +44,6 @@ func MigrateToPages(ctx context.Context, files DatabaseFiles, pagePath string, l
 	if len(limits) == 1 {
 		recovery = &recoveryBudget{limits: limits[0]}
 	}
-	file, err := os.Open(files.State)
-	if err != nil {
-		return fmt.Errorf("open migration checkpoint: %w", err)
-	}
-	defer file.Close()
 	segments := make([]string, 0, 2)
 	for _, path := range []string{files.WALBase, files.WAL} {
 		if _, err := os.Stat(path); err == nil {
@@ -57,11 +52,26 @@ func MigrateToPages(ctx context.Context, files DatabaseFiles, pagePath string, l
 			return err
 		}
 	}
+	file, err := os.Open(files.State)
+	bootstrap := false
+	if errors.Is(err, os.ErrNotExist) {
+		if len(segments) == 0 {
+			return os.ErrNotExist
+		}
+		bootstrap = true
+	} else if err != nil {
+		return fmt.Errorf("open migration checkpoint: %w", err)
+	}
+	var checkpoint io.Reader
+	if file != nil {
+		defer file.Close()
+		checkpoint = file
+	}
 	var reservation *DatabaseFiles
 	if files.IDs != "" {
 		reservation = &files
 	}
-	return importPageFiles(ctx, file, segments, pagePath, 0, 0, true, false, false, reservation, nil, recovery)
+	return importPageFiles(ctx, checkpoint, segments, pagePath, 0, 0, true, false, false, reservation, nil, recovery, bootstrap)
 }
 
 // RestorePageBackup installs a checkpoint and ordered WAL segments using the
@@ -76,17 +86,17 @@ func RestorePageBackup(ctx context.Context, basePath string, segments []string, 
 		return fmt.Errorf("open backup checkpoint: %w", err)
 	}
 	defer base.Close()
-	return importPageFiles(ctx, base, segments, pagePath, commitID, maxBytes, true, true, true, nil, histories, nil)
+	return importPageFiles(ctx, base, segments, pagePath, commitID, maxBytes, true, true, true, nil, histories, nil, false)
 }
 
-func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []string, target string, expectedCommitID, maxBytes uint64, replay, verifyCommit, strictReplay bool, reservation *DatabaseFiles, histories [][32]byte, recovery *recoveryBudget) (result error) {
+func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []string, target string, expectedCommitID, maxBytes uint64, replay, verifyCommit, strictReplay bool, reservation *DatabaseFiles, histories [][32]byte, recovery *recoveryBudget, bootstrap bool) (result error) {
 	if ctx == nil {
 		return errors.New("nil page import context")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if target == "" || checkpoint == nil {
+	if target == "" || (checkpoint == nil && !bootstrap) {
 		return errors.New("page import requires checkpoint input and target path")
 	}
 	var segmentBytes uint64
@@ -132,7 +142,7 @@ func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []strin
 		return err
 	}
 	closed := false
-	importer := &pageImporter{ctx: ctx, db: db, recovery: recovery}
+	importer := &pageImporter{ctx: ctx, db: db, recovery: recovery, bootstrap: bootstrap}
 	defer func() {
 		if !closed {
 			if importer.tx != nil {
@@ -144,24 +154,26 @@ func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []strin
 			}
 		}
 	}()
-	checkpointHash := sha256.New()
-	boundedInput := io.Reader(checkpoint)
-	var checkpointLimit *migrationBudgetReader
-	if maxBytes != 0 {
-		checkpointLimit = &migrationBudgetReader{reader: checkpoint, remaining: checkpointBudget}
-		boundedInput = checkpointLimit
-	}
-	header, _, err := importer.scanCheckpoint(io.TeeReader(boundedInput, checkpointHash), checkpointScanUnlimited(), true)
-	if err != nil {
-		return fmt.Errorf("import checkpoint: %w", err)
-	}
-	if err := importer.finishCheckpoint(header, checkpointHash.Sum(nil)); err != nil {
-		return err
-	}
-	if len(histories) == 2 {
-		if err := importer.setHistory(histories[0], header.CommitID); err != nil {
+	if checkpoint != nil {
+		checkpointHash := sha256.New()
+		var boundedInput io.Reader = checkpoint
+		if maxBytes != 0 {
+			boundedInput = &migrationBudgetReader{reader: checkpoint, remaining: checkpointBudget}
+		}
+		header, _, err := importer.scanCheckpoint(io.TeeReader(boundedInput, checkpointHash), checkpointScanUnlimited(), true)
+		if err != nil {
+			return fmt.Errorf("import checkpoint: %w", err)
+		}
+		if err := importer.finishCheckpoint(header, checkpointHash.Sum(nil)); err != nil {
 			return err
 		}
+		if len(histories) == 2 {
+			if err := importer.setHistory(histories[0], header.CommitID); err != nil {
+				return err
+			}
+		}
+	} else if !bootstrap {
+		return errors.New("missing migration checkpoint")
 	}
 	if replay {
 		var segmentLimit *migrationBudgetReader
@@ -220,6 +232,8 @@ func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []strin
 	if err != nil {
 		return err
 	}
+	finalCatalog.NextNodeID = max(finalCatalog.NextNodeID, nextObservedID(importer.maxNodeID))
+	finalCatalog.NextEdgeID = max(finalCatalog.NextEdgeID, nextObservedID(importer.maxEdgeID))
 	write, err := db.Begin(true)
 	if err != nil {
 		return err
@@ -324,16 +338,19 @@ func checkpointScanUnlimited() CheckpointScanLimits {
 }
 
 type pageImporter struct {
-	ctx        context.Context
-	db         *pagestore.DB
-	tx         *pagestore.Tx
-	graph      *PageGraph
-	entries    int
-	batchBytes uint64
-	catalog    PageCatalog
-	streamName string
-	streamNext uint64
-	recovery   *recoveryBudget
+	ctx                  context.Context
+	db                   *pagestore.DB
+	tx                   *pagestore.Tx
+	graph                *PageGraph
+	entries              int
+	batchBytes           uint64
+	catalog              PageCatalog
+	streamName           string
+	streamNext           uint64
+	recovery             *recoveryBudget
+	bootstrap            bool
+	initialized          bool
+	maxNodeID, maxEdgeID uint64
 }
 
 func (p *pageImporter) begin() error {
@@ -434,6 +451,7 @@ func (p *pageImporter) scanCheckpoint(input io.Reader, limits CheckpointScanLimi
 	if err := p.clear(); err != nil {
 		return CheckpointScanHeader{}, CheckpointScanCounts{}, err
 	}
+	p.maxNodeID, p.maxEdgeID = 0, 0
 	visitor := CheckpointScanVisitor{
 		Header: func(h CheckpointScanHeader) error {
 			if err := p.begin(); err != nil {
@@ -475,6 +493,7 @@ func (p *pageImporter) scanCheckpoint(input io.Reader, limits CheckpointScanLimi
 			if err := p.graph.PutNode(&NodeRecord{ID: record.ID, Labels: record.Labels, Properties: props}); err != nil {
 				return err
 			}
+			p.maxNodeID = max(p.maxNodeID, record.ID)
 			size, err := nodeSnapshotBytes(&NodeRecord{ID: record.ID, Labels: record.Labels, Properties: props})
 			if err != nil {
 				return err
@@ -497,6 +516,7 @@ func (p *pageImporter) scanCheckpoint(input io.Reader, limits CheckpointScanLimi
 			if err := p.graph.PutEdge(&EdgeRecord{ID: record.ID, SourceID: record.SourceID, TargetID: record.TargetID, Type: record.Type, Properties: props}); err != nil {
 				return err
 			}
+			p.maxEdgeID = max(p.maxEdgeID, record.ID)
 			size, err := edgeSnapshotBytes(&EdgeRecord{ID: record.ID, SourceID: record.SourceID, TargetID: record.TargetID, Type: record.Type, Properties: props})
 			if err != nil {
 				return err
@@ -514,7 +534,7 @@ func (p *pageImporter) scanCheckpoint(input io.Reader, limits CheckpointScanLimi
 			if old != nil {
 				return fmt.Errorf("duplicate checkpoint FTS record %d", record.NodeID)
 			}
-			if err := p.graph.PutFTS(record.NodeID, &FTSRecord{Text: record.Text}); err != nil {
+			if err := p.graph.PutFTSContext(p.ctx, record.NodeID, &FTSRecord{Text: record.Text}); err != nil {
 				return err
 			}
 			return p.batch(uint64(len(record.Text)) + 64)
@@ -824,13 +844,26 @@ func (p *pageImporter) finishCheckpoint(header CheckpointScanHeader, checkpointH
 		return err
 	}
 	copy(p.catalog.History[:], checkpointHash)
+	p.catalog.NextNodeID = max(p.catalog.NextNodeID, nextObservedID(p.maxNodeID))
+	p.catalog.NextEdgeID = max(p.catalog.NextEdgeID, nextObservedID(p.maxEdgeID))
 	if err := p.graph.PutCatalog(p.catalog); err != nil {
 		return err
 	}
 	if err := p.tx.Put("commit-history", pageID(header.CommitID), p.catalog.History[:]); err != nil {
 		return err
 	}
-	return p.closeBatch()
+	if err := p.closeBatch(); err != nil {
+		return err
+	}
+	p.initialized = true
+	return nil
+}
+
+func nextObservedID(maxID uint64) uint64 {
+	if maxID == 0 {
+		return 1
+	}
+	return maxID + 1
 }
 
 func (p *pageImporter) replaySegment(path string, strict bool, budget *migrationBudgetReader) error {
@@ -910,17 +943,23 @@ func (p *pageImporter) replaySegment(path string, strict bool, budget *migration
 			return err
 		}
 		commitID := binary.BigEndian.Uint64(header[12:20])
-		catalog, err := p.catalogNow()
-		if err != nil {
-			return err
-		}
-		if databaseID != catalog.DatabaseID {
-			return errors.New("WAL database ID mismatch")
-		}
-		covered := commitID <= catalog.CommitID
 		var tag [1]byte
 		if _, err := io.ReadFull(reader, tag[:]); err != nil {
 			return incompleteWALResult(err, strict)
+		}
+		var catalog PageCatalog
+		covered := false
+		if p.initialized {
+			catalog, err = p.catalogNow()
+			if err != nil {
+				return err
+			}
+			if databaseID != catalog.DatabaseID {
+				return errors.New("WAL database ID mismatch")
+			}
+			covered = commitID <= catalog.CommitID
+		} else if !p.bootstrap || tag[0] != binaryWALSnapshot {
+			return errors.New("WAL recovery without a checkpoint requires an initial snapshot")
 		}
 		frameCRC := crc32.NewIEEE()
 		_, _ = frameCRC.Write(tag[:])
@@ -973,7 +1012,7 @@ func (p *pageImporter) replaySegment(path string, strict bool, budget *migration
 			}
 			continue
 		}
-		if commitID != catalog.CommitID+1 {
+		if p.initialized && commitID != catalog.CommitID+1 {
 			if snapshotFile != nil {
 				_ = snapshotFile.Close()
 				_ = os.Remove(snapshotFile.Name())
@@ -1042,9 +1081,14 @@ func (p *pageImporter) catalogNow() (PageCatalog, error) {
 }
 
 func (p *pageImporter) importSnapshotFile(payload *os.File, length uint64, checksum uint32, databaseID string, commitID uint64, frameHeader, tag []byte) error {
-	previous, err := p.catalogNow()
-	if err != nil {
-		return err
+	var previous PageCatalog
+	var err error
+	hadPrevious := p.initialized
+	if hadPrevious {
+		previous, err = p.catalogNow()
+		if err != nil {
+			return err
+		}
 	}
 	if _, err := payload.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -1069,9 +1113,11 @@ func (p *pageImporter) importSnapshotFile(payload *os.File, length uint64, check
 	if err := p.begin(); err != nil {
 		return err
 	}
-	p.catalog.History = previous.History
-	if err := p.graph.PutCatalog(p.catalog); err != nil {
-		return err
+	if hadPrevious {
+		p.catalog.History = previous.History
+		if err := p.graph.PutCatalog(p.catalog); err != nil {
+			return err
+		}
 	}
 	if err := p.closeBatch(); err != nil {
 		return err
@@ -1242,6 +1288,7 @@ func (p *pageImporter) applyDelta(delta persistedDelta, frameHeader, framePayloa
 		if err := g.PutNode(&NodeRecord{ID: node.ID, Labels: node.Labels, Properties: props}); err != nil {
 			return err
 		}
+		p.maxNodeID = max(p.maxNodeID, node.ID)
 	}
 	for _, edge := range delta.UpsertEdges {
 		props, err := decodePropertyStorage(edge.Properties)
@@ -1251,6 +1298,7 @@ func (p *pageImporter) applyDelta(delta persistedDelta, frameHeader, framePayloa
 		if err := g.PutEdge(&EdgeRecord{ID: edge.ID, SourceID: edge.SourceID, TargetID: edge.TargetID, Type: edge.Type, Properties: props}); err != nil {
 			return err
 		}
+		p.maxEdgeID = max(p.maxEdgeID, edge.ID)
 	}
 	for _, change := range delta.NodePropertyChanges {
 		node, err := g.GetNode(change.ID)
@@ -1284,7 +1332,7 @@ func (p *pageImporter) applyDelta(delta persistedDelta, frameHeader, framePayloa
 		if old == nil {
 			return fmt.Errorf("delete missing FTS record %d", id)
 		}
-		if err := g.PutFTS(id, nil); err != nil {
+		if err := g.PutFTSContext(p.ctx, id, nil); err != nil {
 			return err
 		}
 	}
@@ -1311,7 +1359,7 @@ func (p *pageImporter) applyDelta(delta persistedDelta, frameHeader, framePayloa
 		}
 	}
 	for _, record := range delta.UpsertFTS {
-		if err := g.PutFTS(record.NodeID, &FTSRecord{Text: record.Text}); err != nil {
+		if err := g.PutFTSContext(p.ctx, record.NodeID, &FTSRecord{Text: record.Text}); err != nil {
 			return err
 		}
 	}

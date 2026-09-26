@@ -76,6 +76,21 @@ func (archive *backupArchive) capturePage(ctx context.Context, now time.Time, gr
 	if archivedSourceHistory != archive.headSourceHistory {
 		return BackupMetadata{}, errors.New("backup archive source ancestry differs from page database")
 	}
+	if catalog.ArchiveBasePending {
+		matched, err := archiveHasMatchingPageBase(ctx, archive, catalog)
+		if err != nil {
+			return BackupMetadata{}, err
+		}
+		if matched {
+			archive.ready = true
+			return archive.head, nil
+		}
+		metadata, err := archive.publishBase(now, graph, nextNodeID, nextEdgeID, commitID, identity)
+		if err == nil {
+			archive.ready = true
+		}
+		return metadata, err
+	}
 	if commitID == archive.head.CommitID {
 		if catalog.History != archive.headSourceHistory {
 			return BackupMetadata{}, errors.New("backup archive source ancestry differs at the current commit")
@@ -119,6 +134,37 @@ func (archive *backupArchive) capturePage(ctx context.Context, now time.Time, gr
 	}
 	archive.ready = true
 	return metadata, nil
+}
+
+func archiveHasMatchingPageBase(ctx context.Context, archive *backupArchive, catalog store.PageCatalog) (bool, error) {
+	if archive == nil || archive.headPath == "" || archive.head.CommitID != catalog.CommitID || !archive.hasHeadSourceHistory || archive.headSourceHistory != catalog.History {
+		return false, nil
+	}
+	var entry *backupEntry
+	for i := range archive.entries {
+		if archive.entries[i].path == archive.headPath {
+			entry = &archive.entries[i]
+			break
+		}
+	}
+	if entry == nil || entry.segment {
+		return false, nil
+	}
+	file, err := os.Open(archive.headPath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	var header store.CheckpointScanHeader
+	limits := store.CheckpointScanLimits{MaxPayloadBytes: uint64(^uint64(0) >> 1), MaxEntries: ^uint64(0)}
+	_, _, err = store.ScanCheckpointV5(ctx, file, limits, store.CheckpointScanVisitor{Header: func(value store.CheckpointScanHeader) error {
+		header = value
+		return nil
+	}})
+	if err != nil {
+		return false, err
+	}
+	return header.DatabaseID == catalog.DatabaseID && header.CommitID == catalog.CommitID && header.VectorDimensions == catalog.VectorDimensions, nil
 }
 
 func validatePageArchiveFile(ctx context.Context, path string, metadata BackupMetadata, databaseID string) error {

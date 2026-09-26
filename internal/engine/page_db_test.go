@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/mrchypark/latticedb-go/internal/store"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
+
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
+	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
 func TestPageDBCommitReopenAndRollback(t *testing.T) {
@@ -88,6 +92,193 @@ func TestPageDBCommitReopenAndRollback(t *testing.T) {
 	if err != nil || edges != 0 {
 		t.Fatalf("edges %d %v", edges, err)
 	}
+}
+
+func TestPageOpenRecoversWALSnapshotWithoutCheckpointForCreateModes(t *testing.T) {
+	for _, create := range []bool{false, true} {
+		t.Run(fmt.Sprintf("create=%v", create), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "native")
+			files := store.DirectoryDatabaseFiles(path)
+			if err := os.MkdirAll(files.Directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			graph := store.NewGraphState()
+			if err := store.EnsureDatabaseID(graph); err != nil {
+				t.Fatal(err)
+			}
+			graph.Nodes.Set(7, &store.NodeRecord{ID: 7, Labels: []string{"Recovered"}})
+			if err := store.RewriteWALSnapshotFiles(files, graph, 8, 1, 4); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(files.WAL, files.WALBase); err != nil {
+				t.Fatal(err)
+			}
+			db, err := Open(path, OpenOptions{PageStorage: true, Create: create})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.View(func(tx *Tx) error {
+				node, err := tx.GetNode(7)
+				if err != nil {
+					return err
+				}
+				if node == nil {
+					return errors.New("WAL-only snapshot node missing")
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(files.State); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("WAL-only recovery created native checkpoint: %v", err)
+			}
+		})
+	}
+}
+
+func TestPageVectorDimensionsEnablePersistAndBackupRestore(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "page-db")
+	archive := filepath.Join(root, "archive")
+	db, err := Open(path, OpenOptions{Create: true, PageStorage: true, BackupDirectory: archive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 2, VectorNamespaces: []VectorNamespace{{}}}); err == nil {
+		t.Fatal("invalid vector namespace was accepted")
+	}
+	db, err = Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.vectorDimensions != 2 {
+		t.Fatalf("enabled dimensions = %d, want 2", db.vectorDimensions)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files := store.DirectoryDatabaseFiles(path)
+	pagePath := files.State
+	pages, err := pagestore.Open(pagePath, pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := pages.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph, catalog, err := (&store.PageGraph{Tx: read}).LoadGraph(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup, err := openBackupArchive(archive, files.State, catalog.DatabaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backup.publishBase(time.Now(), graph, catalog.NextNodeID, catalog.NextEdgeID, catalog.CommitID, backupSourceHistory{databaseID: catalog.DatabaseID, history: catalog.History}); err != nil {
+		t.Fatal(err)
+	}
+	if err := backup.close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = read.Rollback()
+	if err := pages.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 2, BackupDirectory: archive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.vectorDimensions != 2 {
+		t.Fatalf("reopened enabled dimensions = %d, want 2", db.vectorDimensions)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(root, "restored")
+	if _, err := RestoreBackup(context.Background(), archive, destination, BackupRestoreOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(destination, OpenOptions{PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.vectorDimensions != 2 {
+		t.Fatalf("restored dimensions = %d, want 2", restored.vectorDimensions)
+	}
+	if err := restored.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 3}); err == nil {
+		t.Fatal("reopen accepted conflicting vector dimensions")
+	}
+
+	defaultPath := filepath.Join(root, "default-dimensions")
+	defaultDB, err := Open(defaultPath, OpenOptions{Create: true, PageStorage: true, EnableVector: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultDB.vectorDimensions != 128 {
+		t.Fatalf("default dimensions = %d, want 128", defaultDB.vectorDimensions)
+	}
+	if err := defaultDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defaultDB, err = Open(defaultPath, OpenOptions{PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultDB.vectorDimensions != 128 {
+		t.Fatalf("reopened default dimensions = %d, want 128", defaultDB.vectorDimensions)
+	}
+	_ = defaultDB.Close()
+}
+
+func TestPageVectorEnableRejectsExistingWrongLengthBeforePersisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page-db")
+	db, err := Open(path, OpenOptions{Create: true, PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pagePath := store.DirectoryDatabaseFiles(path).State
+	pages, err := pagestore.Open(pagePath, pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write, err := pages.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := &store.PageGraph{Tx: write}
+	if err := page.PutNode(&store.NodeRecord{ID: 1, Properties: store.PropertiesFromMap(map[string]any{"embedding": []float32{1, 2, 3}})}); err != nil {
+		t.Fatal(err)
+	}
+	if err := write.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pages.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 2}); err == nil {
+		t.Fatal("invalid existing vector was accepted")
+	}
+	db, err = Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 3})
+	if err != nil {
+		t.Fatalf("failed open partially persisted dimension 2: %v", err)
+	}
+	if db.vectorDimensions != 3 {
+		t.Fatalf("configured dimensions = %d, want 3", db.vectorDimensions)
+	}
+	_ = db.Close()
 }
 
 // TestPageDBMemoryCheck is run by the Linux cgroup check with an explicit

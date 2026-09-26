@@ -23,6 +23,27 @@ type pagePropertyBackend struct {
 	node  bool
 }
 
+type pagePropertyIndexBuildBudgetKey struct{}
+
+// WithPagePropertyIndexBuildBudget lets the transaction owner account for the
+// work and logical bytes consumed while a page-backed property index is built.
+func WithPagePropertyIndexBuildBudget(ctx context.Context, charge func(work, logicalBytes uint64) error) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, pagePropertyIndexBuildBudgetKey{}, charge)
+}
+
+func chargePagePropertyIndexBuild(ctx context.Context, work, logicalBytes uint64) error {
+	if ctx == nil {
+		return nil
+	}
+	if charge, _ := ctx.Value(pagePropertyIndexBuildBudgetKey{}).(func(uint64, uint64) error); charge != nil {
+		return charge(work, logicalBytes)
+	}
+	return nil
+}
+
 func (graph *PageGraph) LoadPropertyIndexes(ctx context.Context, node bool) (PropertyIndexes, error) {
 	indexes := NewPropertyIndexes()
 	indexes.page = &pagePropertyBackend{graph: graph, node: node}
@@ -66,10 +87,17 @@ func (graph *PageGraph) CreatePropertyIndex(ctx context.Context, node bool, defi
 	}
 	backend := pagePropertyBackend{graph: graph, node: node}
 	visit := func(properties Properties, scopes []string, id uint64) error {
+		if err := chargePagePropertyIndexBuild(ctx, 1, 0); err != nil {
+			return err
+		}
 		if !propertyIndexMatches(definition, scopes, properties) {
 			return nil
 		}
 		value, _ := properties.Lookup(definition.Property)
+		valueBytes := EstimatePropertyIndexValueBytes(value)
+		if err := chargePagePropertyIndexBuild(ctx, max(uint64(1), valueBytes), valueBytes+192); err != nil {
+			return err
+		}
 		return backend.put(definition, value, id)
 	}
 	if node {
@@ -173,31 +201,55 @@ func (graph *PageGraph) updatePagePropertyIndexes(node bool, old, next any) erro
 	return nil
 }
 
-func (backend pagePropertyBackend) visit(definition PropertyIndexDefinition, value any, key propertyValueKey, added, removed propertyPosting, visit func(uint64) bool) (bool, error) {
+func (backend pagePropertyBackend) visit(ctx context.Context, definition PropertyIndexDefinition, value any, key propertyValueKey, added, removed propertyPosting, charge func() error, visit func(uint64) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	_, bucket := pagePropertyBuckets(backend.node)
 	prefix := pagePropertyPostingPrefix(definition, key)
 	nextAdded, stopAdded := iter.Pull(added.all())
 	defer stopAdded()
-	addID, hasAdded := nextAdded()
+	var addID uint64
+	var hasAdded bool
+	pullAdded := func() error {
+		addID, hasAdded = nextAdded()
+		if hasAdded && charge != nil {
+			return charge()
+		}
+		return nil
+	}
+	if err := pullAdded(); err != nil {
+		return err
+	}
 	stopped := false
-	emit := func(id uint64) (bool, error) {
+	emit := func(id uint64) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if removed.has(id) {
-			return true, nil
+			return nil
 		}
 		valid, err := backend.matches(id, definition, value, key)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if !valid {
-			return true, nil
+			return nil
 		}
-		if !visit(id) {
-			stopped = true
-			return false, nil
+		if err := visit(id); err != nil {
+			if err == io.EOF {
+				stopped = true
+			}
+			return err
 		}
-		return true, nil
+		return nil
 	}
-	err := backend.graph.Tx.Scan(context.Background(), bucket, prefix, pagePrefixEnd(prefix), func(rowKey, rowValue []byte) error {
+	err := backend.graph.Tx.Scan(ctx, bucket, prefix, pagePrefixEnd(prefix), func(rowKey, rowValue []byte) error {
+		if charge != nil {
+			if err := charge(); err != nil {
+				return err
+			}
+		}
 		rowDefinition, rowProperty, err := decodePagePropertyPosting(rowValue)
 		if err != nil {
 			return err
@@ -213,44 +265,43 @@ func (backend pagePropertyBackend) visit(definition PropertyIndexDefinition, val
 			return err
 		}
 		for hasAdded && addID < id {
-			continued, err := emit(addID)
-			if err != nil {
+			if err := emit(addID); err != nil {
+				if err == io.EOF {
+					return io.EOF
+				}
 				return err
 			}
-			if !continued {
-				return io.EOF
+			if err := pullAdded(); err != nil {
+				return err
 			}
-			addID, hasAdded = nextAdded()
 		}
 		if hasAdded && addID == id {
-			addID, hasAdded = nextAdded()
+			if err := pullAdded(); err != nil {
+				return err
+			}
 		}
-		continued, err := emit(id)
-		if err != nil {
-			return err
-		}
-		if !continued {
-			return io.EOF
-		}
-		return nil
+		return emit(id)
 	})
 	if err != nil {
-		return true, err
+		if err != io.EOF {
+			return err
+		}
 	}
 	if stopped {
-		return true, nil
+		return nil
 	}
 	for hasAdded {
-		continued, err := emit(addID)
-		if err != nil {
-			return true, err
+		if err := emit(addID); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
 		}
-		if !continued {
-			break
+		if err := pullAdded(); err != nil {
+			return err
 		}
-		addID, hasAdded = nextAdded()
 	}
-	return true, nil
+	return nil
 }
 
 func (backend pagePropertyBackend) matches(id uint64, definition PropertyIndexDefinition, value any, key propertyValueKey) (bool, error) {
@@ -288,7 +339,10 @@ func (backend pagePropertyBackend) matches(id uint64, definition PropertyIndexDe
 
 func (backend pagePropertyBackend) lookup(definition PropertyIndexDefinition, value any, key propertyValueKey, added, removed propertyPosting) ([]uint64, bool, error) {
 	ids := make([]uint64, 0)
-	_, err := backend.visit(definition, value, key, added, removed, func(id uint64) bool { ids = append(ids, id); return true })
+	err := backend.visit(context.Background(), definition, value, key, added, removed, nil, func(id uint64) error {
+		ids = append(ids, id)
+		return nil
+	})
 	return ids, true, err
 }
 

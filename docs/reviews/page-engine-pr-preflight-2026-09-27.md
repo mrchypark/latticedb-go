@@ -16,3 +16,5 @@ Scope: PR #220 page-engine/incremental-backup candidate, together with the earli
 | Cleanup and concurrent access | Shared bbolt read transaction race | Per-transaction synchronization, owned scan values, rollback/close error propagation; race suite passes | fixed |
 
 Local root normal/race/vet, conformance normal/race, and CI concurrency regressions (20 repetitions) pass. Native Linux constrained-memory execution passes. No physical power-loss or long-soak claim. Independent review and remote CI remain a separate merge-readiness gate.
+
+The initial independent Pro review found nine further defects. See [the findings and repair ledger](page-engine-pro-review-2026-09-27.md); the preflight checks above were not a clean independent-review verdict.

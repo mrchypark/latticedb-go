@@ -351,6 +351,7 @@ func TestPageBackupRejectsEqualCommitWithDivergentHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	catalog.History = sha256.Sum256([]byte("same state, different ancestry"))
+	catalog.ArchiveBasePending = true
 	if err := page.PutCatalog(catalog); err != nil {
 		t.Fatal(err)
 	}

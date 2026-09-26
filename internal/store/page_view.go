@@ -214,11 +214,60 @@ func (graph *GraphState) VisitLabel(ctx context.Context, label string, visit fun
 	return visitOverlay(ctx, &selected, &graph.DeletedNodes, base, visit)
 }
 func (graph *GraphState) LabelCount(label string) (uint64, error) {
+	return graph.LabelCountContext(context.Background(), label, nil)
+}
+
+// LabelCountContext counts a label posting with cancellation and optional
+// bounded-work charging. Resident maps answer in O(1); page-backed maps stream.
+func (graph *GraphState) LabelCountContext(ctx context.Context, label string, charge func() error) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if graph.PageBase == nil {
 		return uint64(graph.Labels.Len(label)), nil
 	}
 	var count uint64
-	err := graph.VisitLabel(context.Background(), label, func(uint64) error { count++; return nil })
+	err := graph.PageBase.VisitLabel(ctx, label, func(id uint64) error {
+		if charge != nil {
+			if err := charge(); err != nil {
+				return err
+			}
+		}
+		if graph.DeletedNodes.Get(id) {
+			return nil
+		}
+		if record := graph.Nodes.Get(id); record != nil && !slices.Contains(record.Labels, label) {
+			return nil
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for id, record := range graph.Nodes.Ordered() {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if charge != nil {
+			if err := charge(); err != nil {
+				return 0, err
+			}
+		}
+		if graph.DeletedNodes.Get(id) || !slices.Contains(record.Labels, label) {
+			continue
+		}
+		base, err := graph.PageBase.GetNode(id)
+		if err != nil {
+			return 0, err
+		}
+		if base == nil || !slices.Contains(base.Labels, label) {
+			count++
+		}
+	}
 	return count, err
 }
 
@@ -257,11 +306,61 @@ func (graph *GraphState) VisitEdgeType(ctx context.Context, kind string, visit f
 	return visitOverlay(ctx, &selected, &graph.DeletedEdges, base, visit)
 }
 func (graph *GraphState) EdgeTypeCount(kind string) (uint64, error) {
+	return graph.EdgeTypeCountContext(context.Background(), kind, nil)
+}
+
+// EdgeTypeCountContext counts an edge-type posting with cancellation and
+// optional bounded-work charging. Resident maps answer in O(1); page-backed
+// maps stream their posting list.
+func (graph *GraphState) EdgeTypeCountContext(ctx context.Context, kind string, charge func() error) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if graph.PageBase == nil {
 		return uint64(graph.EdgeTypes.Len(kind)), nil
 	}
 	var count uint64
-	err := graph.VisitEdgeType(context.Background(), kind, func(uint64) error { count++; return nil })
+	err := graph.PageBase.VisitEdgeType(ctx, kind, func(id uint64) error {
+		if charge != nil {
+			if err := charge(); err != nil {
+				return err
+			}
+		}
+		if graph.DeletedEdges.Get(id) {
+			return nil
+		}
+		if record := graph.Edges.Get(id); record != nil && record.Type != kind {
+			return nil
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for id, record := range graph.Edges.Ordered() {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if charge != nil {
+			if err := charge(); err != nil {
+				return 0, err
+			}
+		}
+		if graph.DeletedEdges.Get(id) || record.Type != kind {
+			continue
+		}
+		base, err := graph.PageBase.GetEdge(id)
+		if err != nil {
+			return 0, err
+		}
+		if base == nil || base.Type != kind {
+			count++
+		}
+	}
 	return count, err
 }
 
@@ -306,9 +405,77 @@ func (graph *GraphState) VisitOutgoing(ctx context.Context, nodeID uint64, visit
 	return visitOverlay(ctx, &selected, &graph.DeletedEdges, base, visit)
 }
 func (graph *GraphState) OutgoingCount(nodeID uint64) (uint64, error) {
+	return graph.OutgoingCountContext(context.Background(), nodeID, nil)
+}
+
+// OutgoingCountContext streams the adjacency posting with cancellation and
+// optional per-posting work charging.
+func (graph *GraphState) OutgoingCountContext(ctx context.Context, nodeID uint64, charge func() error) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var count uint64
-	err := graph.VisitOutgoing(context.Background(), nodeID, func(uint64) error { count++; return nil })
-	return count, err
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if graph.PageBase == nil {
+		list := graph.Outgoing.Get(nodeID)
+		for chunk := range list.Chunks() {
+			for _, id := range chunk {
+				if err := ctx.Err(); err != nil {
+					return 0, err
+				}
+				if charge != nil {
+					if err := charge(); err != nil {
+						return 0, err
+					}
+				}
+				if !list.IsRemoved(id) {
+					count++
+				}
+			}
+		}
+		return count, nil
+	}
+	err := graph.PageBase.VisitOutgoing(ctx, nodeID, func(id uint64) error {
+		if charge != nil {
+			if err := charge(); err != nil {
+				return err
+			}
+		}
+		if graph.DeletedEdges.Get(id) {
+			return nil
+		}
+		if edge := graph.Edges.Get(id); edge != nil && edge.SourceID != nodeID {
+			return nil
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for id, edge := range graph.Edges.Ordered() {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if charge != nil {
+			if err := charge(); err != nil {
+				return 0, err
+			}
+		}
+		if graph.DeletedEdges.Get(id) || edge.SourceID != nodeID {
+			continue
+		}
+		base, err := graph.PageBase.GetEdge(id)
+		if err != nil {
+			return 0, err
+		}
+		if base == nil || base.SourceID != nodeID {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (graph *GraphState) VisitIncoming(ctx context.Context, nodeID uint64, visit func(uint64) error) error {
@@ -352,7 +519,75 @@ func (graph *GraphState) VisitIncoming(ctx context.Context, nodeID uint64, visit
 	return visitOverlay(ctx, &selected, &graph.DeletedEdges, base, visit)
 }
 func (graph *GraphState) IncomingCount(nodeID uint64) (uint64, error) {
+	return graph.IncomingCountContext(context.Background(), nodeID, nil)
+}
+
+// IncomingCountContext streams the adjacency posting with cancellation and
+// optional per-posting work charging.
+func (graph *GraphState) IncomingCountContext(ctx context.Context, nodeID uint64, charge func() error) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var count uint64
-	err := graph.VisitIncoming(context.Background(), nodeID, func(uint64) error { count++; return nil })
-	return count, err
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if graph.PageBase == nil {
+		list := graph.Incoming.Get(nodeID)
+		for chunk := range list.Chunks() {
+			for _, id := range chunk {
+				if err := ctx.Err(); err != nil {
+					return 0, err
+				}
+				if charge != nil {
+					if err := charge(); err != nil {
+						return 0, err
+					}
+				}
+				if !list.IsRemoved(id) {
+					count++
+				}
+			}
+		}
+		return count, nil
+	}
+	err := graph.PageBase.VisitIncoming(ctx, nodeID, func(id uint64) error {
+		if charge != nil {
+			if err := charge(); err != nil {
+				return err
+			}
+		}
+		if graph.DeletedEdges.Get(id) {
+			return nil
+		}
+		if edge := graph.Edges.Get(id); edge != nil && edge.TargetID != nodeID {
+			return nil
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for id, edge := range graph.Edges.Ordered() {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if charge != nil {
+			if err := charge(); err != nil {
+				return 0, err
+			}
+		}
+		if graph.DeletedEdges.Get(id) || edge.TargetID != nodeID {
+			continue
+		}
+		base, err := graph.PageBase.GetEdge(id)
+		if err != nil {
+			return 0, err
+		}
+		if base == nil || base.TargetID != nodeID {
+			count++
+		}
+	}
+	return count, nil
 }

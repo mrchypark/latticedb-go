@@ -2647,11 +2647,25 @@ func (db *DB) createPropertyIndexContext(ctx context.Context, node bool, scope, 
 	}
 	definition := store.PropertyIndexDefinition{Scope: scope, Property: property}
 	if db.pages != nil {
-		work, logicalBytes := propertyIndexDefinitionCost(definition)
-		if work > db.derivedIndexBuildMaxWork || logicalBytes > db.derivedIndexBuildMaxLogicalBytes {
-			return fmt.Errorf("%w: property index definition exceeds budget", ErrResourceLimit)
+		var buildGraph *store.GraphState
+		var buildWork, buildBytes uint64
+		charge := func(work, logicalBytes uint64) error {
+			if buildGraph == nil {
+				return errors.New("page property index build budget is not attached to a transaction")
+			}
+			usedWork := saturatingAdd(buildGraph.DerivedIndexWork, buildWork)
+			usedBytes := saturatingAdd(buildGraph.DerivedIndexLogicalBytes, buildBytes)
+			if work > db.derivedIndexBuildMaxWork || logicalBytes > db.derivedIndexBuildMaxLogicalBytes ||
+				usedWork > db.derivedIndexBuildMaxWork-work || usedBytes > db.derivedIndexBuildMaxLogicalBytes-logicalBytes {
+				return fmt.Errorf("%w: property index build exceeds derived-index budget", ErrResourceLimit)
+			}
+			buildWork = saturatingAdd(buildWork, work)
+			buildBytes = saturatingAdd(buildBytes, logicalBytes)
+			return nil
 		}
+		ctx = store.WithPagePropertyIndexBuildBudget(ctx, charge)
 		return db.UpdateContext(ctx, func(tx *Tx) error {
+			buildGraph = tx.graph
 			indexes := &tx.graph.EdgeProperties
 			changes := tx.changes.createEdgeIndexes
 			if node {
@@ -2660,6 +2674,10 @@ func (db *DB) createPropertyIndexContext(ctx context.Context, node bool, scope, 
 			}
 			if !indexes.Create(definition) {
 				return fmt.Errorf("%w: property index already exists", ErrAlreadyExists)
+			}
+			work, logicalBytes := propertyIndexDefinitionCost(definition)
+			if err := charge(work, logicalBytes); err != nil {
+				return err
 			}
 			changes[definition] = struct{}{}
 			return nil
@@ -4085,10 +4103,19 @@ func (tx *Tx) FTSIndexContext(ctx context.Context, nodeID uint64, text string) e
 	if _, err := tx.requireNode(nodeID); err != nil {
 		return err
 	}
-	tokens, err := search.TokenizeContextWithLimit(ctx, text, tx.db.derivedIndexBuildMaxLogicalBytes)
+	var tokens []string
+	var err error
+	if tx.db.pages != nil {
+		if tx.graph.PageBase == nil {
+			return errors.New("page-backed FTS transaction has no page graph")
+		}
+		tokens, err = tx.graph.PageBase.TokenizeFTSContext(ctx, nodeID, text, tx.db.derivedIndexBuildMaxLogicalBytes)
+	} else {
+		tokens, err = search.TokenizeContextWithLimit(ctx, text, tx.db.derivedIndexBuildMaxLogicalBytes)
+	}
 	if err != nil {
-		if errors.Is(err, search.ErrTokenizationLimit) {
-			return fmt.Errorf("%w: FTS tokenization exceeds derived-index build budget", ErrResourceLimit)
+		if errors.Is(err, search.ErrTokenizationLimit) || errors.Is(err, store.ErrLoadResourceLimit) {
+			return fmt.Errorf("%w: FTS text exceeds derived-index or page record budget", ErrResourceLimit)
 		}
 		return err
 	}
@@ -4712,7 +4739,7 @@ func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struc
 		if tx.base == nil {
 			continue
 		}
-		if tx.base.PageBase == nil && !originalExists[id] {
+		if !originalExists[id] {
 			continue
 		}
 		var child map[uint64][]string
@@ -4760,7 +4787,14 @@ func (tx *Tx) mergePropertyTracking(changes *txChanges, upserts map[uint64]struc
 }
 
 func (tx *Tx) trackNodeProperty(id uint64, key string) {
-	if tx.changes == nil || tx.base == nil || tx.base.PageBase == nil && tx.base.Nodes.Get(id) == nil {
+	if tx.changes == nil || tx.base == nil {
+		return
+	}
+	if tx.base.PageBase == nil {
+		if tx.base.Nodes.Get(id) == nil {
+			return
+		}
+	} else if node, err := tx.base.ReadNode(id); err != nil || node == nil {
 		return
 	}
 	if tx.changes.nodePropertyKeys == nil {
@@ -4781,7 +4815,14 @@ func (tx *Tx) trackNodeProperty(id uint64, key string) {
 }
 
 func (tx *Tx) trackEdgeProperty(id uint64, key string) {
-	if tx.changes == nil || tx.base == nil || tx.base.PageBase == nil && tx.base.Edges.Get(id) == nil {
+	if tx.changes == nil || tx.base == nil {
+		return
+	}
+	if tx.base.PageBase == nil {
+		if tx.base.Edges.Get(id) == nil {
+			return
+		}
+	} else if edge, err := tx.base.ReadEdge(id); err != nil || edge == nil {
 		return
 	}
 	if tx.changes.edgePropertyKeys == nil {

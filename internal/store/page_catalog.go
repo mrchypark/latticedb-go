@@ -18,6 +18,7 @@ type PageCatalog struct {
 	CommitID, NextNodeID, NextEdgeID uint64
 	Nodes, Edges                     uint64
 	History                          [32]byte
+	ArchiveBasePending               bool
 }
 
 func (graph *PageGraph) Catalog() (PageCatalog, error) {
@@ -53,6 +54,13 @@ func (graph *PageGraph) Catalog() (PageCatalog, error) {
 		return result, errors.New("invalid page history identity")
 	}
 	copy(result.History[:], history)
+	if d.remaining != 0 {
+		pending, err := d.ReadByte()
+		if err != nil || pending > 1 {
+			return result, errors.New("invalid page archive-base marker")
+		}
+		result.ArchiveBasePending = pending == 1
+	}
 	if err := d.finish(); err != nil {
 		return result, fmt.Errorf("decode page catalog: %w", err)
 	}
@@ -84,6 +92,11 @@ func (graph *PageGraph) PutCatalog(c PageCatalog) error {
 		e.u(c.Edges)
 		e.u(max(c.SnapshotBytes, 4096))
 		e.bytes(c.History[:])
+		if c.ArchiveBasePending {
+			e.tag(1)
+		} else {
+			e.tag(0)
+		}
 	})
 	if err != nil {
 		return err
