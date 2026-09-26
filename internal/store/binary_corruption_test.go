@@ -11,7 +11,8 @@ import (
 )
 
 func TestReadWALHeaderReusesBufferAcrossFormats(t *testing.T) {
-	header, err := encodeWALHeader(strings.Repeat("a", 32), 1, []byte{1})
+	databaseID := strings.Repeat("a", 32)
+	header, err := encodeWALHeader(databaseID, 1, []byte{1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,6 +34,15 @@ func TestReadWALHeaderReusesBufferAcrossFormats(t *testing.T) {
 	})
 	if allocations != 0 {
 		t.Fatalf("reading into a reusable header buffer allocated %g times", allocations)
+	}
+	payloadChecksum := binary.BigEndian.Uint32(header[28:32])
+	allocations = testing.AllocsPerRun(100, func() {
+		if err := encodeWALHeaderFieldsInto(&buffer, databaseID, 1, 1, payloadChecksum); err != nil || !bytes.Equal(buffer[:], header[:]) {
+			t.Fatalf("reused encoded header = %x, %v", buffer, err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("encoding into a reusable header buffer allocated %g times", allocations)
 	}
 }
 

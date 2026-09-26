@@ -219,11 +219,12 @@ func (writer *WALWriter) append(databaseID string, commitID uint64, payload []by
 	if writer == nil || writer.file == nil {
 		return errors.New("WAL writer is closed")
 	}
-	header, err := encodeWALHeader(databaseID, commitID, payload)
-	if err != nil {
+	if err := validateWALPayloadSize(len(payload)); err != nil {
 		return err
 	}
-	writer.encodeHeader = header
+	if err := encodeWALHeaderFieldsInto(&writer.encodeHeader, databaseID, commitID, uint64(len(payload)), crc32.ChecksumIEEE(payload)); err != nil {
+		return err
+	}
 	offset, err := writer.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return fmt.Errorf("locate WAL writer: %w", err)
@@ -243,7 +244,7 @@ func (writer *WALWriter) append(databaseID string, commitID uint64, payload []by
 	if err := writer.sync(); err != nil {
 		return fmt.Errorf("%w: sync WAL: %w", ErrCommitOutcomeUnknown, err)
 	}
-	writer.tailSize.Add(int64(len(header) + len(payload)))
+	writer.tailSize.Add(int64(len(writer.encodeHeader) + len(payload)))
 	return nil
 }
 
@@ -3862,13 +3863,18 @@ func encodeWALHeader(databaseID string, commitID uint64, payload []byte) ([walHe
 }
 
 func encodeWALHeaderFields(databaseID string, commitID uint64, payloadLength uint64, checksum uint32) ([walHeaderSize]byte, error) {
+	var header [walHeaderSize]byte
+	err := encodeWALHeaderFieldsInto(&header, databaseID, commitID, payloadLength, checksum)
+	return header, err
+}
+
+func encodeWALHeaderFieldsInto(header *[walHeaderSize]byte, databaseID string, commitID uint64, payloadLength uint64, checksum uint32) error {
 	if err := validateDatabaseID(databaseID); err != nil {
-		return [walHeaderSize]byte{}, err
+		return err
 	}
 	if payloadLength > maxWALFrameBytes {
-		return [walHeaderSize]byte{}, errors.New("WAL frame exceeds size limit")
+		return errors.New("WAL frame exceeds size limit")
 	}
-	var header [walHeaderSize]byte
 	copy(header[:8], walMagic[:])
 	binary.BigEndian.PutUint16(header[8:10], walVersion)
 	binary.BigEndian.PutUint16(header[10:12], walHeaderSize)
@@ -3877,7 +3883,7 @@ func encodeWALHeaderFields(databaseID string, commitID uint64, payloadLength uin
 	binary.BigEndian.PutUint32(header[28:32], checksum)
 	copy(header[walDatabaseIDAt:legacyWALHeaderSize], databaseID)
 	binary.BigEndian.PutUint32(header[walHeaderChecksumAt:walHeaderSize], crc32.ChecksumIEEE(header[:walHeaderChecksumAt]))
-	return header, nil
+	return nil
 }
 
 func validCurrentWALHeader(header []byte) bool {
