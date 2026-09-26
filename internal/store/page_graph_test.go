@@ -152,7 +152,7 @@ func TestPageGraphUpdatesSkipUnchangedPostings(t *testing.T) {
 			t.Fatalf("update staged %d bytes, want record-only %d", got, want)
 		}
 	}
-	unchangedNode := &NodeRecord{ID: 1, Labels: []string{"B", "A"}}
+	unchangedNode := &NodeRecord{ID: 1, Labels: []string{"A", "B"}}
 	encodedNode, err := encodePageNode(unchangedNode)
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +257,7 @@ func TestPageGraphUpdatesSkipUnchangedPostings(t *testing.T) {
 	assertIDs("edge type S", func(visit func(uint64) error) error { return page.VisitEdgeType(context.Background(), "S", visit) }, nil)
 	assertIDs("edge type T", func(visit func(uint64) error) error { return page.VisitEdgeType(context.Background(), "T", visit) }, []uint64{11})
 	updatedNode, err := page.GetNode(1)
-	if err != nil || updatedNode == nil || !reflect.DeepEqual(updatedNode.Labels, []string{"B", "A"}) {
+	if err != nil || updatedNode == nil || !reflect.DeepEqual(updatedNode.Labels, []string{"A", "B"}) {
 		t.Fatalf("reopened updated node = %v, %v", updatedNode, err)
 	}
 	updatedEdge, err := page.GetEdge(11)

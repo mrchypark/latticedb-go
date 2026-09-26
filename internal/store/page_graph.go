@@ -139,12 +139,11 @@ func (graph *PageGraph) PutNode(node *NodeRecord) error {
 	if err != nil {
 		return err
 	}
-	if old != nil {
+	labelsChanged := old == nil || !slices.Equal(old.Labels, node.Labels)
+	if labelsChanged && old != nil {
 		for _, label := range old.Labels {
-			if !slices.Contains(node.Labels, label) {
-				if err := graph.Tx.Delete(pageLabels, pageStringID(label, node.ID)); err != nil {
-					return err
-				}
+			if err := graph.Tx.Delete(pageLabels, pageStringID(label, node.ID)); err != nil {
+				return err
 			}
 		}
 	}
@@ -159,12 +158,11 @@ func (graph *PageGraph) PutNode(node *NodeRecord) error {
 	if err := graph.Tx.Put(pageNodes, pageID(node.ID), data); err != nil {
 		return err
 	}
-	for _, label := range node.Labels {
-		if old != nil && slices.Contains(old.Labels, label) {
-			continue
-		}
-		if err := graph.Tx.Put(pageLabels, pageStringID(label, node.ID), []byte{}); err != nil {
-			return err
+	if labelsChanged {
+		for _, label := range node.Labels {
+			if err := graph.Tx.Put(pageLabels, pageStringID(label, node.ID), []byte{}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
