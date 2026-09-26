@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -150,6 +151,11 @@ func TestPageVectorDimensionsEnablePersistAndBackupRestore(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	archiveHeadPath := filepath.Join(archive, backupHeadFile)
+	initialArchiveHead, err := os.ReadFile(archiveHeadPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 2, VectorNamespaces: []VectorNamespace{{}}}); err == nil {
 		t.Fatal("invalid vector namespace was accepted")
 	}
@@ -177,6 +183,9 @@ func TestPageVectorDimensionsEnablePersistAndBackupRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !catalog.ArchiveBasePending {
+		t.Fatal("vector configuration did not leave a pending archive base")
+	}
 	backup, err := openBackupArchive(archive, files.State, catalog.DatabaseID)
 	if err != nil {
 		t.Fatal(err)
@@ -191,12 +200,35 @@ func TestPageVectorDimensionsEnablePersistAndBackupRestore(t *testing.T) {
 	if err := pages.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Model a crash after publishing the configuration base but before the
+	// durable archive head anchor was advanced.
+	if err := os.WriteFile(archiveHeadPath, initialArchiveHead, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	db, err = Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 2, BackupDirectory: archive})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if db.vectorDimensions != 2 {
 		t.Fatalf("reopened enabled dimensions = %d, want 2", db.vectorDimensions)
+	}
+	currentCatalog, err := db.graph.PageBase.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentCatalog.ArchiveBasePending {
+		t.Fatal("public Open returned before clearing the published base marker")
+	}
+	currentHeadBytes, err := os.ReadFile(archiveHeadPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var currentHead backupHead
+	if err := json.Unmarshal(currentHeadBytes, &currentHead); err != nil {
+		t.Fatal(err)
+	}
+	if currentHead.CommitID != currentCatalog.CommitID {
+		t.Fatalf("public Open left archive head at commit %d; catalog is at %d", currentHead.CommitID, currentCatalog.CommitID)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -279,6 +311,79 @@ func TestPageVectorEnableRejectsExistingWrongLengthBeforePersisting(t *testing.T
 		t.Fatalf("configured dimensions = %d, want 3", db.vectorDimensions)
 	}
 	_ = db.Close()
+}
+
+func TestPageVectorConfigurationHistoryDiffersForCopiedDatabase(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	db, err := Open(source, OpenOptions{Create: true, PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var histories [2][32]byte
+	for i, dimensions := range []uint16{2, 3} {
+		path := filepath.Join(root, fmt.Sprintf("copy-%d", dimensions))
+		if err := copyClosedPageDatabase(source, path); err != nil {
+			t.Fatal(err)
+		}
+		db, err := Open(path, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: dimensions})
+		if err != nil {
+			t.Fatalf("open copied DB with %d dimensions: %v", dimensions, err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		pages, err := pagestore.Open(store.DirectoryDatabaseFiles(path).State, pagestore.Options{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		read, err := pages.Begin(false)
+		if err != nil {
+			_ = pages.Close()
+			t.Fatal(err)
+		}
+		_, catalog, err := (&store.PageGraph{Tx: read}).LoadGraph(context.Background())
+		rollbackErr := read.Rollback()
+		closeErr := pages.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rollbackErr != nil {
+			t.Fatal(rollbackErr)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if catalog.VectorDimensions != dimensions || catalog.CommitID != 1 {
+			t.Fatalf("copied DB catalog = dimensions %d, commit %d; want %d, 1", catalog.VectorDimensions, catalog.CommitID, dimensions)
+		}
+		histories[i] = catalog.History
+	}
+	if histories[0] == histories[1] {
+		t.Fatal("different vector configuration transitions produced the same source history")
+	}
+}
+
+func copyClosedPageDatabase(source, destination string) error {
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		return err
+	}
+	for _, suffix := range []string{"", ".layout"} {
+		from := store.DirectoryDatabaseFiles(source).State + suffix
+		data, err := os.ReadFile(from)
+		if err != nil {
+			return err
+		}
+		to := store.DirectoryDatabaseFiles(destination).State + suffix
+		if err := os.WriteFile(to, data, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // TestPageDBMemoryCheck is run by the Linux cgroup check with an explicit

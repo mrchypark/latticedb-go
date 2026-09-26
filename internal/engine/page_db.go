@@ -205,12 +205,7 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 			_ = write.Rollback()
 			return nil, errors.New("commit id space exhausted")
 		}
-		catalog.VectorDimensions = graph.VectorDimensions
-		if e = (&store.PageGraph{Tx: write}).PutCatalog(catalog); e != nil {
-			_ = write.Rollback()
-			return nil, e
-		}
-		catalog, _, e = (&store.PageGraph{Tx: write}).PageCommit(ctx, graph, max(catalog.NextNodeID, reservedNode), max(catalog.NextEdgeID, reservedEdge), catalog.CommitID+1, store.GraphDelta{}, opts.BackupDirectory != "")
+		catalog, e = (&store.PageGraph{Tx: write}).PageCommitVectorConfiguration(ctx, graph, max(catalog.NextNodeID, reservedNode), max(catalog.NextEdgeID, reservedEdge), catalog.CommitID+1, graph.VectorDimensions)
 		if e == nil {
 			e = write.Commit()
 		}

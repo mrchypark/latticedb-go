@@ -3,12 +3,26 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 )
 
 // PageCommit applies one logical transaction inside the caller's single page
 // write transaction. The caller must roll back after any error.
 func (page *PageGraph) PageCommit(ctx context.Context, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64, delta GraphDelta, archive bool) (PageCatalog, []byte, error) {
+	return page.pageCommit(ctx, graph, nextNodeID, nextEdgeID, commitID, delta, archive, nil)
+}
+
+// PageCommitVectorConfiguration records a vector-dimension transition as a
+// logical commit. The transition is bound into source history but is not
+// represented as a replayable graph delta; ArchiveBasePending requires a full
+// archive base before the archive can advance past this commit.
+func (page *PageGraph) PageCommitVectorConfiguration(ctx context.Context, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64, dimensions uint16) (PageCatalog, error) {
+	catalog, _, err := page.pageCommit(ctx, graph, nextNodeID, nextEdgeID, commitID, GraphDelta{}, false, &dimensions)
+	return catalog, err
+}
+
+func (page *PageGraph) pageCommit(ctx context.Context, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64, delta GraphDelta, archive bool, vectorDimensions *uint16) (PageCatalog, []byte, error) {
 	catalog, err := page.Catalog()
 	if err != nil {
 		return catalog, nil, err
@@ -109,10 +123,19 @@ func (page *PageGraph) PageCommit(ctx context.Context, graph *GraphState, nextNo
 	if err := page.ApplyStreamOperations(ctx, delta.StreamOperations); err != nil {
 		return catalog, nil, err
 	}
-	hash := sha256.New()
-	hash.Write(catalog.History[:])
-	hash.Write(frame)
-	copy(catalog.History[:], hash.Sum(nil))
+	if vectorDimensions != nil {
+		if *vectorDimensions == catalog.VectorDimensions {
+			return catalog, nil, fmt.Errorf("vector configuration transition has no change")
+		}
+		catalog.History = pageVectorConfigurationHistory(catalog.History, commitID, catalog.VectorDimensions, *vectorDimensions, frame)
+		catalog.VectorDimensions = *vectorDimensions
+		catalog.ArchiveBasePending = true
+	} else {
+		hash := sha256.New()
+		hash.Write(catalog.History[:])
+		hash.Write(frame)
+		copy(catalog.History[:], hash.Sum(nil))
+	}
 	catalog.SnapshotBytes = graph.SnapshotBytes
 	catalog.CommitID = commitID
 	catalog.NextNodeID = nextNodeID
@@ -133,4 +156,21 @@ func (page *PageGraph) PageCommit(ctx context.Context, graph *GraphState, nextNo
 		}
 	}
 	return catalog, frame, ctx.Err()
+}
+
+func pageVectorConfigurationHistory(previous [sha256.Size]byte, commitID uint64, oldDimensions, newDimensions uint16, frame []byte) [sha256.Size]byte {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("latticedb/page/vector-dimensions/v1\x00"))
+	_, _ = hash.Write(previous[:])
+	var encoded [12]byte
+	binary.BigEndian.PutUint64(encoded[:8], commitID)
+	binary.BigEndian.PutUint16(encoded[8:10], oldDimensions)
+	binary.BigEndian.PutUint16(encoded[10:12], newDimensions)
+	_, _ = hash.Write(encoded[:])
+	// The frame also commits the allocator high-water marks persisted alongside
+	// this configuration transition.
+	_, _ = hash.Write(frame)
+	var result [sha256.Size]byte
+	copy(result[:], hash.Sum(nil))
+	return result
 }

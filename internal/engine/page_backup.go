@@ -82,8 +82,14 @@ func (archive *backupArchive) capturePage(ctx context.Context, now time.Time, gr
 			return BackupMetadata{}, err
 		}
 		if matched {
+			if err := archive.anchorPageHead(); err != nil {
+				return BackupMetadata{}, err
+			}
 			archive.ready = true
 			return archive.head, nil
+		}
+		if archive.head.CommitID == commitID {
+			return BackupMetadata{}, fmt.Errorf("backup archive already contains a different page base for commit %d", commitID)
 		}
 		metadata, err := archive.publishBase(now, graph, nextNodeID, nextEdgeID, commitID, identity)
 		if err == nil {

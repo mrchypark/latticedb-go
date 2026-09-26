@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -88,6 +89,272 @@ func (fixture pageBackupFixture) readGraph(t *testing.T) (*pagestore.Tx, *store.
 		t.Fatal(err)
 	}
 	return read, graph
+}
+
+func (fixture pageBackupFixture) setPendingDimensions(t *testing.T, dimensions uint16) {
+	t.Helper()
+	write, err := fixture.db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := &store.PageGraph{Tx: write}
+	catalog, err := page.Catalog()
+	if err != nil {
+		_ = write.Rollback()
+		t.Fatal(err)
+	}
+	catalog.VectorDimensions = dimensions
+	catalog.ArchiveBasePending = true
+	if err := page.PutCatalog(catalog); err != nil {
+		_ = write.Rollback()
+		t.Fatal(err)
+	}
+	if err := write.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func snapshotArchiveFiles(t *testing.T, directory string) map[string][]byte {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[entry.Name()] = data
+	}
+	return files
+}
+
+func assertArchiveFilesEqual(t *testing.T, before, after map[string][]byte) {
+	t.Helper()
+	if len(before) != len(after) {
+		t.Fatalf("archive file count changed: before=%d after=%d", len(before), len(after))
+	}
+	for name, data := range before {
+		if !bytes.Equal(data, after[name]) {
+			t.Fatalf("archive file %q changed", name)
+		}
+	}
+}
+
+func TestPageBackupPublicConfigForkPreservesExistingArchive(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	archivePath := filepath.Join(root, "archive")
+	db, err := Open(source, OpenOptions{Create: true, PageStorage: true, BackupDirectory: archivePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	files := store.DirectoryDatabaseFiles(source)
+	originalState, err := os.ReadFile(files.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(source, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 2, BackupDirectory: archivePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	archiveBefore := snapshotArchiveFiles(t, archivePath)
+	if err := os.WriteFile(files.State, originalState, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fork, err := Open(source, OpenOptions{PageStorage: true, EnableVector: true, VectorDimensions: 3, BackupDirectory: archivePath})
+	if err == nil {
+		_ = fork.Close()
+		t.Fatal("accepted a same-database configuration fork with divergent vector dimensions")
+	}
+	assertArchiveFilesEqual(t, archiveBefore, snapshotArchiveFiles(t, archivePath))
+	destination := filepath.Join(root, "restored")
+	if _, err := RestoreBackup(context.Background(), archivePath, destination, BackupRestoreOptions{}); err != nil {
+		t.Fatalf("rejected configuration fork damaged archived recovery points: %v", err)
+	}
+}
+
+func TestPageBackupRejectsConflictingSameCommitBaseWithoutChangingArchive(t *testing.T) {
+	fixture := newPageBackupFixture(t)
+	read, graph := fixture.readGraph(t)
+	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.capturePage(context.Background(), time.Unix(300, 0), graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := read.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.setPendingDimensions(t, 2)
+	read, graph = fixture.readGraph(t)
+	defer read.Rollback()
+	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.close()
+	before := snapshotArchiveFiles(t, fixture.archivePath)
+	if _, err := archive.capturePage(context.Background(), time.Unix(301, 0), graph, 1, 1, 0); err == nil {
+		t.Fatal("accepted a conflicting page base at an occupied commit")
+	}
+	after := snapshotArchiveFiles(t, fixture.archivePath)
+	assertArchiveFilesEqual(t, before, after)
+}
+
+func prepareInterruptedPendingBase(t *testing.T, fixture pageBackupFixture) ([]byte, string) {
+	t.Helper()
+	read, graph := fixture.readGraph(t)
+	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.capturePage(context.Background(), time.Unix(400, 0), graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	oldHead, err := os.ReadFile(filepath.Join(fixture.archivePath, backupHeadFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := read.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	fixture.commitNode(t, 1, 1)
+	fixture.setPendingDimensions(t, 2)
+	read, graph = fixture.readGraph(t)
+	page := graph.PageBase
+	catalog, err := page.Catalog()
+	if err != nil {
+		_ = read.Rollback()
+		t.Fatal(err)
+	}
+	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	if err != nil {
+		_ = read.Rollback()
+		t.Fatal(err)
+	}
+	metadata, err := archive.publishBase(time.Unix(401, 0), graph, catalog.NextNodeID, catalog.NextEdgeID, catalog.CommitID, backupSourceHistory{databaseID: catalog.DatabaseID, history: catalog.History})
+	closeErr := archive.close()
+	rollbackErr := read.Rollback()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if rollbackErr != nil {
+		t.Fatal(rollbackErr)
+	}
+	entries, err := readArchiveEntries(context.Background(), fixture.archivePath, fixture.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.metadata.CommitID == metadata.CommitID && entry.metadata.CapturedAt == metadata.CapturedAt {
+			return oldHead, entry.path
+		}
+	}
+	t.Fatalf("published pending base at commit %d not found", metadata.CommitID)
+	return nil, ""
+}
+
+func TestPageBackupRepairsPendingBaseAnchorAfterCrash(t *testing.T) {
+	for _, crashState := range []string{"stale", "missing"} {
+		t.Run(crashState, func(t *testing.T) {
+			fixture := newPageBackupFixture(t)
+			oldHead, newBasePath := prepareInterruptedPendingBase(t, fixture)
+			anchorPath := filepath.Join(fixture.archivePath, backupHeadFile)
+			if crashState == "stale" {
+				if err := os.WriteFile(anchorPath, oldHead, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Remove(anchorPath); err != nil {
+				t.Fatal(err)
+			}
+
+			read, graph := fixture.readGraph(t)
+			defer read.Rollback()
+			archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer archive.close()
+			metadata, err := archive.capturePage(context.Background(), time.Unix(402, 0), graph, 2, 2, 1)
+			if err != nil || metadata.CommitID != 1 {
+				t.Fatalf("pending-base resume = %+v, %v", metadata, err)
+			}
+			data, err := os.ReadFile(anchorPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var anchor backupHead
+			if err := json.Unmarshal(data, &anchor); err != nil || anchor.Entry != filepath.Base(newBasePath) || anchor.CommitID != 1 {
+				t.Fatalf("repaired anchor = %+v, %v", anchor, err)
+			}
+			if !archive.ready {
+				t.Fatal("archive was not marked ready after anchor repair")
+			}
+			if err := os.Remove(newBasePath); err != nil {
+				t.Fatal(err)
+			}
+			destination := filepath.Join(t.TempDir(), "must-not-fall-back")
+			if _, err := RestoreBackup(context.Background(), fixture.archivePath, destination, BackupRestoreOptions{}); err == nil {
+				t.Fatal("restore fell back to an older checkpoint after repaired base was lost")
+			}
+		})
+	}
+}
+
+func TestPageBackupAnchorFailureKeepsPendingArchiveUnready(t *testing.T) {
+	fixture := newPageBackupFixture(t)
+	prepareInterruptedPendingBase(t, fixture)
+	read, graph := fixture.readGraph(t)
+	defer read.Rollback()
+	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.close()
+	anchorPath := filepath.Join(fixture.archivePath, backupHeadFile)
+	if err := os.Remove(anchorPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(anchorPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.capturePage(context.Background(), time.Unix(402, 0), graph, 2, 2, 1); err == nil {
+		t.Fatal("capture succeeded when head anchoring failed")
+	}
+	if archive.ready {
+		t.Fatal("archive marked ready after head anchoring failed")
+	}
+	catalog, err := graph.PageBase.Catalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !catalog.ArchiveBasePending {
+		t.Fatal("failed anchoring cleared the pending-base catalog marker")
+	}
 }
 
 func TestPageBackupResumesOutboxAndRepairsEntryBeforeHeadCrash(t *testing.T) {

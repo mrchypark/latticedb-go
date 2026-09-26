@@ -14,7 +14,7 @@ The reviewer received the complete source archive and PR diff, verified 108 post
 | R4 | P2 | Snapshot backup destination checks omit page sidecars | Fixed; shared destination check and valid stale-sidecar preservation tests pass |
 | R5 | P2 | Page posting/cardinality scans bypass query work and cancellation limits | Fixed; raw-posting work charges, cancellation, label/type/degree, and LIMIT regressions pass |
 | R6 | P2 | Page property-index construction omits configured build budgets | Fixed; node/edge work and byte exhaustion roll back definitions and postings |
-| R7 | P2 | Reopening a non-vector database cannot initialize requested/default vector dimensions | Fixed; validate before atomic configuration commit; durable base marker resumes publication without bypassing archive ancestry checks |
+| R7 | P2 | Reopening a non-vector database cannot initialize requested/default vector dimensions | Original initialization repaired; follow-up found R7a/R7b below |
 | R8 | P2 | Variable-path delimiter parsing misreads asterisks inside quoted identifiers | Fixed; quote-aware delimiter scan, grammar matrix, and audited parser digest updated |
 | R9 | P2 | Streaming migration accepts allocation counters below existing entity IDs | Fixed; checkpoint/WAL observed IDs repair allocation counters, including exhaustion |
 
@@ -31,4 +31,15 @@ At `b46e321`, all six Linux/macOS/Windows test jobs passed. The concurrent-reade
 
 The memory-engine callback regression is fixed: local final measurements are 83,298–83,306 B/op and 616 allocs/op, versus the 83,231 B/op and 616 allocs/op baseline. Current-head CI remains authoritative for the gates. Local profiling attributes much of the public page-engine cost to record decoding and bbolt durable page updates; local and CI measurements are different platforms and must not be mixed as a baseline. No gate thresholds or required checks have been relaxed. This review does not establish merge readiness.
 
-Final-candidate root normal/race, conformance normal/race, and vet validation are in progress. A focused Pro re-review of the repairs is pending.
+At `470c753`, local root normal/race, conformance normal/race, vet, and final focused query normal/race checks passed. All six OS CI test jobs passed. The constrained-memory check passed again in 171.41 seconds (1,418,768,384-byte DB, 256 MiB/no swap, exit 0, OOM false). The memory-engine gate passed at exactly 83,231 B/op and 616 allocs/op. Public page-engine allocation gates remained red.
+
+## Focused Pro review of 470c753
+
+The reviewer marked R1–R6, R8, and R9 resolved, but identified two P1 defects in R7's configuration/backup recovery path:
+
+- **R7a:** Empty configuration delta frames give different vector-dimension transitions the same source history. A same-commit conflicting base can be published before the late head replacement rejects it, damaging the existing archive. Bind the configuration transition into history and reject occupied-commit conflicts before publication.
+- **R7b:** Recognizing an already-published pending base returns success without repairing its durable head anchor. Anchor successfully before clearing the pending marker; test stale/missing anchors and missing-tip detection after recovery.
+
+Both repairs are implemented. Configuration commits atomically hash the previous history, commit ID, old/new dimensions, and encoded allocator frame under a separate domain; occupied-commit conflicts are rejected before publication. Pending-base resume repairs the durable head before reporting success. Regression coverage includes copied-source configuration forks, byte-for-byte archive preservation, stale/missing anchors, anchoring failure, and missing-tip rejection. The two reviewer-supplied public-API reproductions also pass independently against the actual bbolt backend through a Go overlay. The reviewer could not obtain the required toolchain for its own compatibility harness; no clean merge verdict has yet been issued.
+
+The R7a/R7b repair candidate passes root normal/race/vet and conformance normal/race suites. The cross-platform anchor-failure fixture additionally passes a focused race run. A focused Pro closure check is pending for these two repairs; performance-gate policy remains unchanged.
