@@ -1,0 +1,11 @@
+goos: linux
+goarch: amd64
+BenchmarkReadRequests/query-2            	   31947	      3462 ns/op	    2440 B/op	      47 allocs/op
+BenchmarkReadRequests/query-2            	   33708	      3501 ns/op	    2440 B/op	      47 allocs/op
+BenchmarkReadRequests/query-2            	   33072	      3514 ns/op	    2440 B/op	      47 allocs/op
+BenchmarkReadRequests/write_commit-2     	     312	    541621 ns/op	   87039 B/op	     664 allocs/op
+BenchmarkReadRequests/write_commit-2     	     164	    929849 ns/op	   88478 B/op	     676 allocs/op
+BenchmarkReadRequests/write_commit-2     	     319	    460151 ns/op	   88179 B/op	     680 allocs/op
+BenchmarkSingleRecordCommitScaling/nodes_100000/direct-2         	     327	    397457 ns/op	   88566 B/op	     558 allocs/op
+BenchmarkSingleRecordCommitScaling/nodes_100000/direct-2         	     402	    605025 ns/op	   90567 B/op	     567 allocs/op
+BenchmarkSingleRecordCommitScaling/nodes_100000/direct-2         	     375	    456760 ns/op	   88496 B/op	     581 allocs/op

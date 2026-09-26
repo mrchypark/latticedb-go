@@ -1,0 +1,11 @@
+File: lattice-write.test
+Type: alloc_space
+Time: 2026-09-27 02:27:08 KST
+Active filters:
+   focus=BenchmarkReadRequests.func6
+Showing nodes accounting for 42.17MB, 67.27% of 62.69MB total
+Showing top 3 nodes out of 91
+      flat  flat%   sum%        cum   cum%
+   21.25MB 33.89% 33.89%    21.25MB 33.89%  go.etcd.io/bbolt/internal/common.ReadInodeFromPage
+   13.81MB 22.04% 55.93%    13.81MB 22.04%  go.etcd.io/bbolt.(*node).put
+    7.11MB 11.34% 67.27%     7.11MB 11.34%  go.etcd.io/bbolt.(*Tx).writeMeta

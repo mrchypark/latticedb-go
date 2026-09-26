@@ -245,6 +245,8 @@ jobs:
           go run ./scripts/benchcmp.go \
             -current results/current.txt \
             -previous previous/current.txt \
+            -disk-baseline docs/benchmarks/page-engine-2026-09-27/baseline.txt \
+            -disk-baseline-label "page engine f3518b7 (CI 36258284773)" \
             -current-label "$(cat results/revision.txt)" \
             -previous-label "$(cat previous/revision.txt)" \
             -zig results/zig.txt \
@@ -259,9 +261,12 @@ jobs:
           go run ./scripts/benchcmp.go \
             -current results/current.txt \
             -previous previous/current.txt \
+            -disk-baseline docs/benchmarks/page-engine-2026-09-27/baseline.txt \
+            -disk-baseline-label "page engine f3518b7 (CI 36258284773)" \
             -check
 
       - name: Upload performance report
+        if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: performance-results

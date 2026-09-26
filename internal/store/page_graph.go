@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/mrchypark/latticedb-go/internal/pagestore"
 )
@@ -140,8 +141,10 @@ func (graph *PageGraph) PutNode(node *NodeRecord) error {
 	}
 	if old != nil {
 		for _, label := range old.Labels {
-			if err := graph.Tx.Delete(pageLabels, pageStringID(label, node.ID)); err != nil {
-				return err
+			if !slices.Contains(node.Labels, label) {
+				if err := graph.Tx.Delete(pageLabels, pageStringID(label, node.ID)); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -157,6 +160,9 @@ func (graph *PageGraph) PutNode(node *NodeRecord) error {
 		return err
 	}
 	for _, label := range node.Labels {
+		if old != nil && slices.Contains(old.Labels, label) {
+			continue
+		}
 		if err := graph.Tx.Put(pageLabels, pageStringID(label, node.ID), []byte{}); err != nil {
 			return err
 		}
@@ -185,8 +191,25 @@ func (graph *PageGraph) PutEdge(edge *EdgeRecord) error {
 		return err
 	}
 	if old != nil {
-		if err := graph.removeEdgePostings(old); err != nil {
-			return err
+		if old.SourceID != edge.SourceID {
+			if err := graph.Tx.Delete(pageOutgoing, pagePair(old.SourceID, edge.ID)); err != nil {
+				return err
+			}
+		}
+		if old.TargetID != edge.TargetID {
+			if err := graph.Tx.Delete(pageIncoming, pagePair(old.TargetID, edge.ID)); err != nil {
+				return err
+			}
+		}
+		if old.Type != edge.Type {
+			if err := graph.Tx.Delete(pageEdgeTypes, pageStringID(old.Type, edge.ID)); err != nil {
+				return err
+			}
+		}
+		if old.SourceID != edge.SourceID || old.TargetID != edge.TargetID || old.Type != edge.Type {
+			if err := graph.Tx.Delete("edge-order", pageCanonicalEdgeKey(old)); err != nil {
+				return err
+			}
 		}
 	}
 	if err := graph.UpdateEdgePropertyIndexes(old, edge); err != nil {
@@ -200,11 +223,23 @@ func (graph *PageGraph) PutEdge(edge *EdgeRecord) error {
 	if err := graph.Tx.Put(pageEdges, pageID(edge.ID), data); err != nil {
 		return err
 	}
-	for _, item := range []struct {
-		bucket string
-		key    []byte
-	}{{pageOutgoing, pagePair(edge.SourceID, edge.ID)}, {pageIncoming, pagePair(edge.TargetID, edge.ID)}, {pageEdgeTypes, pageStringID(edge.Type, edge.ID)}, {"edge-order", pageCanonicalEdgeKey(edge)}} {
-		if err := graph.Tx.Put(item.bucket, item.key, []byte{}); err != nil {
+	if old == nil || old.SourceID != edge.SourceID {
+		if err := graph.Tx.Put(pageOutgoing, pagePair(edge.SourceID, edge.ID), []byte{}); err != nil {
+			return err
+		}
+	}
+	if old == nil || old.TargetID != edge.TargetID {
+		if err := graph.Tx.Put(pageIncoming, pagePair(edge.TargetID, edge.ID), []byte{}); err != nil {
+			return err
+		}
+	}
+	if old == nil || old.Type != edge.Type {
+		if err := graph.Tx.Put(pageEdgeTypes, pageStringID(edge.Type, edge.ID), []byte{}); err != nil {
+			return err
+		}
+	}
+	if old == nil || old.SourceID != edge.SourceID || old.TargetID != edge.TargetID || old.Type != edge.Type {
+		if err := graph.Tx.Put("edge-order", pageCanonicalEdgeKey(edge), []byte{}); err != nil {
 			return err
 		}
 	}

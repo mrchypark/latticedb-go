@@ -152,12 +152,16 @@ func (tx *Tx) Put(bucket string, key, value []byte) error {
 	if !tx.writable {
 		return ErrReadOnly
 	}
-	b, err := tx.tx.CreateBucketIfNotExists([]byte(bucket))
-	if err != nil {
-		return fmt.Errorf("pagestore: create bucket %q: %w", bucket, err)
+	b := tx.tx.Bucket([]byte(bucket))
+	if b == nil {
+		var err error
+		b, err = tx.tx.CreateBucketIfNotExists([]byte(bucket))
+		if err != nil {
+			return fmt.Errorf("pagestore: create bucket %q: %w", bucket, err)
+		}
 	}
-	keyCopy, valueCopy := bytes.Clone(key), bytes.Clone(value)
-	if err := b.Put(keyCopy, valueCopy); err != nil {
+	// bbolt copies the key itself, but retains the value until commit.
+	if err := b.Put(key, bytes.Clone(value)); err != nil {
 		return fmt.Errorf("pagestore: put in bucket %q: %w", bucket, err)
 	}
 	if int64(len(key))+int64(len(value)) > int64(^uint64(0)>>1)-tx.writeBytes {

@@ -30,6 +30,20 @@ type performanceGate struct {
 	maxAbsoluteRise float64
 }
 
+type diskBaselineInput struct {
+	metrics result
+	source  string
+	label   string
+}
+
+var diskBaselineBenchmarks = []string{
+	"BenchmarkReadRequests/query",
+	"BenchmarkReadRequests/write_commit",
+	"BenchmarkSingleRecordCommitScaling/nodes_100000/direct",
+}
+
+var diskBaselineUnits = []string{"ns/op", "B/op", "allocs/op"}
+
 // Keep blocking gates to stable graph-core metrics. Most latency remains
 // informational because shared-runner noise makes it unsuitable as a blocker;
 // WAL loading is especially sensitive to filesystem/cache variance.
@@ -194,6 +208,28 @@ func checkGates(current, previous result, stderr io.Writer) error {
 	return fmt.Errorf("performance gates failed:\n- %s", strings.Join(failures, "\n- "))
 }
 
+func validateDiskBaseline(metrics result) error {
+	for _, benchmark := range diskBaselineBenchmarks {
+		for _, unit := range diskBaselineUnits {
+			if _, ok := value(metrics[benchmark], unit); !ok {
+				return fmt.Errorf("disk baseline %s missing or invalid %s", benchmark, unit)
+			}
+		}
+	}
+	return nil
+}
+
+func withDiskBaseline(previous, disk result) result {
+	comparison := make(result, len(previous)+len(diskBaselineBenchmarks))
+	for benchmark, metrics := range previous {
+		comparison[benchmark] = metrics
+	}
+	for _, benchmark := range diskBaselineBenchmarks {
+		comparison[benchmark] = disk[benchmark]
+	}
+	return comparison
+}
+
 func otherMetrics(current, previous map[string][]float64) string {
 	units := make([]string, 0, len(current))
 	for unit := range current {
@@ -255,7 +291,7 @@ func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel st
 	}
 }
 
-func writeReport(w io.Writer, current, previous result, currentLabel, previousLabel string, zig *zigResult, zigLabel string, zigFresh bool) {
+func writeReport(w io.Writer, current, previous result, currentLabel, previousLabel string, zig *zigResult, zigLabel string, zigFresh bool, diskBaseline ...diskBaselineInput) {
 	names := make([]string, 0, len(current))
 	for name := range current {
 		names = append(names, name)
@@ -264,6 +300,15 @@ func writeReport(w io.Writer, current, previous result, currentLabel, previousLa
 
 	fmt.Fprintln(w, "# Performance benchmark report")
 	fmt.Fprintf(w, "\nCurrent: `%s`  \nPrevious: `%s`\n", currentLabel, previousLabel)
+	if len(diskBaseline) != 0 {
+		label := diskBaseline[0].label
+		if label == "" {
+			label = diskBaseline[0].source
+		}
+		fmt.Fprintf(w, "Disk baseline for `%s`, `%s`, and `%s`: `%s` (input `%s`); all other rows use the previous benchmark input.\n",
+			diskBaselineBenchmarks[0], diskBaselineBenchmarks[1], diskBaselineBenchmarks[2], label, diskBaseline[0].source)
+		previous = withDiskBaseline(previous, diskBaseline[0].metrics)
+	}
 	fmt.Fprintln(w, "\nValues are medians of the samples shown in each row; sample counts are current / previous. Δ is current versus previous; ns/op is informational because shared-runner latency is noisy, while graph-core B/op and allocs/op remain enforced (including multi-hop). WAL recovery latency is informational; its allocation and byte metrics remain gated.")
 	if zig != nil {
 		writeZigComparison(w, current, zig, zigLabel, zigFresh)
@@ -324,9 +369,15 @@ func main() {
 	zigLabel := flag.String("zig-label", "Zig reference", "Zig revision label")
 	validateGoPath := flag.String("validate-go", "", "validate Go benchmark output")
 	validateZigPath := flag.String("validate-zig", "", "validate Zig vector benchmark output")
+	diskBaselinePath := flag.String("disk-baseline", "", "optional disk benchmark baseline output for the three public disk metrics")
+	diskBaselineLabel := flag.String("disk-baseline-label", "", "label for the disk baseline source in the report")
 	checkPath := flag.Bool("check", false, "enforce stable performance gates")
 	zigFresh := flag.Bool("zig-fresh", false, "whether Zig reference was freshly measured in this run")
 	flag.Parse()
+	if *diskBaselinePath == "" && *diskBaselineLabel != "" {
+		fmt.Fprintln(os.Stderr, "-disk-baseline-label requires -disk-baseline")
+		os.Exit(1)
+	}
 	if *validateGoPath != "" {
 		benchmarks, err := read(*validateGoPath)
 		if err != nil {
@@ -364,6 +415,20 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		if *diskBaselinePath != "" {
+			disk, err := read(*diskBaselinePath)
+			if err == nil {
+				err = validateDiskBaseline(disk)
+			}
+			if err == nil {
+				err = validateDiskBaseline(current)
+			}
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			previous = withDiskBaseline(previous, disk)
+		}
 		if err := checkGates(current, previous, os.Stderr); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -380,6 +445,21 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	var diskBaseline []diskBaselineInput
+	if *diskBaselinePath != "" {
+		disk, err := read(*diskBaselinePath)
+		if err == nil {
+			err = validateDiskBaseline(disk)
+		}
+		if err == nil {
+			err = validateDiskBaseline(current)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		diskBaseline = append(diskBaseline, diskBaselineInput{metrics: disk, source: *diskBaselinePath, label: *diskBaselineLabel})
 	}
 	var zig *zigResult
 	if *zigPath != "" {
@@ -401,5 +481,5 @@ func main() {
 		os.Exit(1)
 	}
 	defer output.Close()
-	writeReport(output, current, previous, *currentLabel, *previousLabel, zig, *zigLabel, *zigFresh)
+	writeReport(output, current, previous, *currentLabel, *previousLabel, zig, *zigLabel, *zigFresh, diskBaseline...)
 }
