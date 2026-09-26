@@ -598,7 +598,7 @@ func TestVectorBuildBudgetAndCancellation(t *testing.T) {
 	if err := rebuildVectorIndexBudget(context.Background(), graph, ^uint64(0), ^uint64(0)); err != nil {
 		t.Fatal(err)
 	}
-	newOnly := estimateVectorIndexBytes(2, graph.VectorDimensions) + 128<<10
+	newOnly := estimateVectorIndexBytes(2, graph.VectorDimensions) + vectorBuildScratchBytesForM(graph.VectorIndexM)
 	if err := rebuildVectorIndexBudget(context.Background(), graph, ^uint64(0), newOnly); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("old+new logical byte budget error = %v", err)
 	}
@@ -985,7 +985,7 @@ func TestVectorRebuildDeltaReservationsRespectLimits(t *testing.T) {
 	}
 
 	budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: estimateVectorIndexBytes(1, 2), annVisitedLimit: ^uint64(0)}
-	if _, _, err := reserveVectorRebuildDelta(budget, 2, true, 0); !errors.Is(err, ErrResourceLimit) {
+	if _, _, err := reserveVectorRebuildDelta(budget, 2, 0, true, 0); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("replay reservation error = %v", err)
 	}
 	budget = &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: 7, annVisitedLimit: ^uint64(0)}

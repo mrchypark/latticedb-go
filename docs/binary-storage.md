@@ -1,19 +1,21 @@
 # Binary storage format
 
-State files and WAL frames use a 64-byte header followed by a streaming
-binary payload.  The header carries magic, version, payload length, and
-a CRC-32 IEEE checksum. File recovery decodes through a TeeReader that
-computes CRC incrementally and verifies it before accepting the payload.
+State files use a 64-byte header. WAL v5 frames use a 68-byte header followed
+by a streaming binary payload. The WAL header carries magic, version, payload
+length, a payload CRC-32 IEEE checksum, and a header CRC-32 IEEE checksum.
+Recovery verifies the v5 header checksum before trusting the payload length,
+then decodes through a TeeReader that computes and verifies the payload CRC.
 The in-memory Deserialize API verifies CRC before structural decoding.
 
-## Header layout (64 bytes)
+## Header layout
 
-Bytes 0–7: magic.  8–9: payload version uint16 BE.  10–11: header size
-(uint16, always 64).  12–19: commit ID uint64 BE.  20–27: payload byte
-length uint64 BE.  28–31: CRC-32 IEEE of payload.  32–63: database ID,
-exactly 32 hex ASCII bytes.
+State and WAL v2–v4 headers are 64 bytes: 0–7 magic, 8–9 payload version
+uint16 BE, 10–11 header size uint16 BE, 12–19 commit ID uint64 BE, 20–27
+payload length uint64 BE, 28–31 payload CRC-32 IEEE, and 32–63 database ID
+(exactly 32 hex ASCII bytes). WAL v5 appends bytes 64–67: CRC-32 IEEE of
+bytes 0–63. It is checked before any use of the payload length.
 
-**State** magic `LDBSTAT5` v5.  **WAL** magic `LDBWAL4` v4.
+**State** magic `LDBSTAT5` v5. **WAL** magic `LDBWAL5` v5.
 
 ## Payload encoding
 
@@ -40,11 +42,54 @@ actual decoded byte counts or process heap pressure.
 | File | Current | Read-only legacy |
 |------|---------|-----------------|
 | State | `LDBSTAT5` v5 | v4 `LDBSTAT4`, v3 `LDBSTAT3` |
-| WAL | `LDBWAL4` v4 | v3 `LDBWAL3`, v2 `LDBWAL2` |
+| WAL | `LDBWAL5` v5 | v4 `LDBWAL4`, v3 `LDBWAL3`, v2 `LDBWAL2` |
 
-Legacy payloads deserialize through the JSON path. Checkpoints write the
-new state format; legacy WALs migrate to a full binary base before appending.  Binary format is **not** readable by pre-v5 state or pre-v4
-WAL readers; no downgrade safety net.  Write always emits current version.
+State v3/v4 and WAL v2/v3 payloads deserialize through the JSON path. WAL v4
+is a legacy binary payload format. Checkpoints write the new state format; all
+legacy WALs migrate to a full v5 binary base before appending. Binary format is
+**not** readable by pre-v5 state or pre-v4 WAL readers; v5 WAL frames are not
+readable by earlier WAL readers. No downgrade safety net. Write always emits
+the current version.
+
+## Opt-in backup archive
+
+`OpenOptions.BackupDirectory` captures the recovered generation at open and
+stores a standalone full checkpoint for each successful commit. A successful
+commit means both WAL and archive publication completed durably. An archive
+failure after WAL durability returns `ErrCommitOutcomeUnknown` and fences the
+handle; rollback/close must preserve the WAL for recovery. Reopen without that
+archive, or with a new archive, when the source has advanced beyond its head.
+
+Each point uses create-only publication. Its filename binds the commit ID,
+capture timestamp, and content SHA-256 with a metadata checksum. Restore checks
+selector metadata before choosing a point, then validates the selected file,
+owner/database ID, canonical snapshot limit, and checkpoint integrity. A damaged
+selected point is an error, not a reason to silently choose an older commit.
+These checks detect corruption; they are not authentication against an attacker
+who can rewrite the entire archive.
+
+`RestoreBackup` publishes to a new path without overwriting an existing database.
+`CommitID` selects an exact recorded commit (a pointer permits commit 0); `Before`
+selects the latest recorded capture at or before that time. The selectors are
+mutually exclusive; omitting both selects the latest point. Returned metadata
+reports the selected commit and capture time. Timestamps increase monotonically
+across restart and backward clock movement. They describe capture time, not an
+exact historical transaction timestamp; no point exists before the first capture.
+
+The archive is locked to one source path/database identity. On reopen, its head
+must match the recovered source's committed content and allocation counters may
+only have advanced. Same-generation reopen preserves the point and its timestamp.
+A source ahead of or behind the archive is rejected: use a new archive after a
+disabled-backup period or an outcome-unknown commit that has no matching point.
+Restored databases use a different path and must use their own new archive.
+
+This is full-snapshot recovery: every captured commit writes the whole database
+synchronously. Storage grows with the number and size of retained points; there
+is no automatic retention or incremental WAL shipping. Archive exhaustion stops
+successful commits. Keep the archive in a separate storage failure domain when
+protection against losing the source device is required. `ponytail:` retain the
+native checkpoint format until measured storage or write latency justifies an
+incremental archive format.
 
 ## Public API
 

@@ -10,12 +10,25 @@ type Value = any
 
 type DurabilityMode uint8
 type VectorIndexMode uint8
+type FTSScoring = engine.FTSScoring
+type FTSAnalyzer = engine.FTSAnalyzer
 
 // VectorMetric identifies the distance metric used by a vector namespace.
 // L2 is currently the only supported metric.
 type VectorMetric = engine.VectorMetric
 
 const VectorMetricL2 VectorMetric = engine.VectorMetricL2
+
+const (
+	// FTSScoringFrequency preserves the legacy direct-search term-frequency ranking.
+	FTSScoringFrequency FTSScoring = engine.FTSScoringFrequency
+	// FTSScoringBM25 opts direct FTSSearch into BM25 ranking.
+	FTSScoringBM25 FTSScoring = engine.FTSScoringBM25
+	// FTSAnalyzerStandard preserves stored-token direct-search analysis.
+	FTSAnalyzerStandard FTSAnalyzer = engine.FTSAnalyzerStandard
+	// FTSAnalyzerEnglishPorter opts direct FTSSearch into English Porter analysis.
+	FTSAnalyzerEnglishPorter FTSAnalyzer = engine.FTSAnalyzerEnglishPorter
+)
 
 // VectorNamespace identifies one derived vector index and its eligible nodes.
 // Namespace definitions are supplied when opening a database and are not
@@ -67,12 +80,18 @@ type OpenOptions struct {
 	EnableVector         bool
 	DisableLock          bool
 	VectorIndexMode      VectorIndexMode
-	VectorDimensions     uint16
-	VectorNamespaces     []VectorNamespace
+	// VectorM controls the HNSW upper-level degree (2..64). Zero selects 16.
+	VectorM          uint16
+	VectorDimensions uint16
+	VectorNamespaces []VectorNamespace
 	// FTSProperties configures complete top-level node-string property postings
 	// for this open. It is separate from manual FTS indexing.
-	FTSProperties               []string
-	Durability                  DurabilityMode
+	FTSProperties []string
+	Durability    DurabilityMode
+	// BackupDirectory enables immutable full-checkpoint archive snapshots. It is
+	// opt-in, requires writable locking, and writes a complete checkpoint for each
+	// successful commit. An archive failure after WAL durability requires recovery.
+	BackupDirectory             string
 	WALCheckpointThresholdBytes uint64
 	// ChangefeedMaxBytes bounds retained automatic change records. Zero uses the
 	// smaller of 64 MiB and one eighth of MaxDatabaseSnapshotBytes.
@@ -99,6 +118,22 @@ type OpenOptions struct {
 	// MaxRetainedGenerationLogicalBytes bounds distinct pinned generations by
 	// their canonical snapshot bytes, not process RSS. Zero leaves admission unbounded.
 	MaxRetainedGenerationLogicalBytes uint64
+}
+
+// BackupRestoreOptions selects an archived checkpoint. CommitID and Before
+// are mutually exclusive; a nil CommitID and zero Before restores the latest.
+// Use a pointer to select commit 0.
+// Before selects recorded capture time, not historical transaction time.
+type BackupRestoreOptions struct {
+	CommitID                 *uint64
+	Before                   time.Time
+	MaxDatabaseSnapshotBytes uint64
+}
+
+// BackupMetadata identifies an immutable archived checkpoint.
+type BackupMetadata struct {
+	CommitID   uint64
+	CapturedAt time.Time
 }
 
 type CreateNodeOptions struct {
@@ -173,6 +208,10 @@ type FTSSearchOptions struct {
 	MinTermLength uint32
 	MaxWork       uint64
 	MaxBytes      uint64
+	// Scoring selects direct FTSSearch ranking. Zero preserves frequency scoring.
+	Scoring FTSScoring
+	// Analyzer selects direct FTSSearch analysis. Zero preserves stored tokens.
+	Analyzer FTSAnalyzer
 }
 
 // StreamReadOptions limits records and their logical size. Zero MaxBytes

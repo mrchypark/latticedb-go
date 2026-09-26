@@ -31,6 +31,7 @@ type queryPlan struct {
 	createNode     *createNodeClause
 	setClauses     []*setClause
 	createClause   *createClause
+	mergeClause    *mergeClause
 	removeClause   *removeClause
 	deleteClause   *deleteClause
 	returnClause   *returnClause
@@ -184,13 +185,16 @@ type nodePattern struct {
 }
 
 type edgePattern struct {
-	Left          nodePattern
-	EdgeVar       string
-	EdgeType      string
-	Properties    map[string]any
-	PropertyExprs map[string]valueExpr
-	Right         nodePattern
-	Undirected    bool
+	Left           nodePattern
+	EdgeVar        string
+	EdgeType       string
+	Properties     map[string]any
+	PropertyExprs  map[string]valueExpr
+	Right          nodePattern
+	Undirected     bool
+	VariableLength bool
+	MinHops        int
+	MaxHops        int // -1 uses the number of live edges as the relationship-simple bound.
 }
 
 type whereClause struct {
@@ -308,6 +312,7 @@ type projection struct {
 	Expr      valueExpr
 	Aggregate aggregateKind
 	CountAll  bool
+	Distinct  bool
 	// ExplicitAlias records whether the item carried an AS alias, which decides
 	// whether its name crosses a WITH boundary.
 	ExplicitAlias bool
@@ -545,6 +550,9 @@ func (it *patternQueryIterator) apply(row queryRow) ([]queryRow, error) {
 		}
 	}
 	if edge, ok := it.pattern.(edgePattern); ok {
+		if edge.VariableLength {
+			return edge.applyVariable(it.tx, row, it.params, it.budget)
+		}
 		if edgeIDs, found, err := it.plan.indexedEdgeIDs(it.tx, edge, it.params, it.budget); err != nil {
 			return nil, err
 		} else if found {
@@ -642,7 +650,9 @@ func (plan *queryPlan) collectTopKRows(it queryIterator, skip, limit int, budget
 			return nil, err
 		}
 	}
-	if err := sortQueryRows(candidates, plan.compareOrderedQueryRows, budget); err != nil {
+	if err := sortQueryRows(candidates, func(left, right orderedQueryRow) (int, error) {
+		return plan.compareOrderedQueryRowsWithBudget(left, right, budget)
+	}, budget); err != nil {
 		return nil, err
 	}
 	if err := budget.check(0, 0); err != nil {
@@ -664,7 +674,7 @@ func (plan *queryPlan) pushTopKRow(heap []orderedQueryRow, row orderedQueryRow, 
 		if err := budget.check(1, 0); err != nil {
 			return 0, err
 		}
-		return plan.compareOrderedQueryRows(left, right), nil
+		return plan.compareOrderedQueryRowsWithBudget(left, right, budget)
 	}
 	if len(heap) < limit {
 		heap = append(heap, row)
@@ -794,8 +804,14 @@ func parseQueryText(query string) (*queryPlan, error) {
 		plan, err = parseMatchQuery(head)
 	case strings.HasPrefix(head, "CREATE "):
 		plan, err = parseCreateQuery(head)
+	case strings.HasPrefix(head, "MERGE "):
+		plan = &queryPlan{}
+		err = parseMergeTail(plan, strings.TrimSpace(strings.TrimPrefix(head, "MERGE ")))
 	case strings.HasPrefix(head, "UNWIND "):
 		plan, err = parseUnwindQueryPart(head, hasWith)
+	case strings.HasPrefix(head, "RETURN "):
+		plan = &queryPlan{}
+		err = parsePlanReturn(plan, strings.TrimSpace(strings.TrimPrefix(head, "RETURN ")))
 	default:
 		return nil, fmt.Errorf("unsupported query %q", head)
 	}
@@ -816,7 +832,7 @@ func attachWithPart(plan *queryPlan, text string) error {
 	if text == "" {
 		return errors.New("WITH must be followed by another clause")
 	}
-	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " UNWIND ", " CREATE ", " RETURN ")
+	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " UNWIND ", " CREATE ", " MERGE ", " RETURN ")
 	keywordIndex := -1
 	if keyword != "" {
 		keywordIndex = findTopLevelToken(text, keyword)
@@ -1159,10 +1175,14 @@ func (plan *queryPlan) validateBindings() error {
 				return err
 			}
 		case edgePattern:
+			edgeRole := bindingEdge
+			if pattern.VariableLength {
+				edgeRole = bindingValue
+			}
 			for _, item := range []struct {
 				name string
 				role bindingRole
-			}{{pattern.Left.Var, bindingNode}, {pattern.EdgeVar, bindingEdge}, {pattern.Right.Var, bindingNode}} {
+			}{{pattern.Left.Var, bindingNode}, {pattern.EdgeVar, edgeRole}, {pattern.Right.Var, bindingNode}} {
 				if err := bind(item.name, item.role); err != nil {
 					return err
 				}
@@ -1223,7 +1243,17 @@ func (plan *queryPlan) validateBindings() error {
 			return err
 		}
 	}
-	for _, clause := range plan.setClauses {
+	if plan.mergeClause != nil {
+		if err := plan.mergeClause.validate(bind, requireExpr); err != nil {
+			return err
+		}
+	}
+	assignments := plan.setClauses
+	if plan.mergeClause != nil {
+		assignments = append(slices.Clone(assignments), plan.mergeClause.OnCreate...)
+		assignments = append(assignments, plan.mergeClause.OnMatch...)
+	}
+	for _, clause := range assignments {
 		roles := []bindingRole{bindingNode, bindingEdge}
 		if clause.Kind == setLabel {
 			roles = []bindingRole{bindingNode}
@@ -1425,6 +1455,8 @@ func valueExprBindings(expr valueExpr) []string {
 			names = append(names, valueExprBindings(arg)...)
 		}
 		return names
+	case arithmeticExpr:
+		return append(valueExprBindings(expr.Left), valueExprBindings(expr.Right)...)
 	default:
 		panic("unsupported value expression")
 	}
@@ -1432,7 +1464,7 @@ func valueExprBindings(expr valueExpr) []string {
 
 func parseMatchQuery(query string) (*queryPlan, error) {
 	rest := strings.TrimSpace(strings.TrimPrefix(query, "MATCH "))
-	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " RETURN ", " SET ", " CREATE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
+	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
 	patterns, err := parseMatchPatterns(matchText)
 	if err != nil {
 		return nil, err
@@ -1443,7 +1475,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 
 	switch nextKeyword {
 	case " WHERE ":
-		whereText, whereNext, afterWhere := splitOnNextClause(tail, " RETURN ", " SET ", " CREATE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
+		whereText, whereNext, afterWhere := splitOnNextClause(tail, " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
 		predicate, err := parseWherePredicate(whereText)
 		if err != nil {
 			return nil, err
@@ -1460,12 +1492,16 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 		}
 		nextKeyword = whereNext
 		tail = afterWhere
-	case " RETURN ", " SET ", " CREATE ", " REMOVE ", " DETACH DELETE ", " DELETE ", "":
+	case " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ", "":
 	default:
 		return nil, fmt.Errorf("unsupported clause after MATCH: %q", nextKeyword)
 	}
 
 	switch nextKeyword {
+	case " MERGE ":
+		if err := parseMergeTail(plan, tail); err != nil {
+			return nil, err
+		}
 	case " RETURN ":
 		if err := parsePlanReturn(plan, tail); err != nil {
 			return nil, err
@@ -1537,7 +1573,7 @@ func parseUnwindQueryPart(query string, allowNoTerminal bool) (*queryPlan, error
 		return nil, err
 	}
 
-	varText, nextKeyword, afterVar := splitOnNextClause(tail, " MATCH ", " CREATE ", " RETURN ")
+	varText, nextKeyword, afterVar := splitOnNextClause(tail, " MATCH ", " CREATE ", " MERGE ", " RETURN ")
 	varName, err := parseQueryIdentifier(varText)
 	if err != nil {
 		return nil, fmt.Errorf("invalid UNWIND binding %q", query)
@@ -1548,6 +1584,9 @@ func parseUnwindQueryPart(query string, allowNoTerminal bool) (*queryPlan, error
 		plan, err = parseMatchQuery("MATCH " + afterVar)
 	case " CREATE ":
 		plan, err = parseCreateQuery("CREATE " + afterVar)
+	case " MERGE ":
+		plan = &queryPlan{}
+		err = parseMergeTail(plan, afterVar)
 	case " RETURN ":
 		plan = &queryPlan{}
 		err = parsePlanReturn(plan, afterVar)
@@ -1599,7 +1638,7 @@ func (plan *queryPlan) mutates() bool {
 // mutatesLocally reports whether this part alone writes, which the per-part
 // execution fast paths need.
 func (plan *queryPlan) mutatesLocally() bool {
-	return plan.createNode != nil || len(plan.setClauses) != 0 || plan.createClause != nil || plan.removeClause != nil || plan.deleteClause != nil
+	return plan.createNode != nil || len(plan.setClauses) != 0 || plan.createClause != nil || plan.mergeClause != nil || plan.removeClause != nil || plan.deleteClause != nil
 }
 
 func parsePlanReturn(plan *queryPlan, text string) error {
@@ -1768,6 +1807,14 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 	}
 	defer func() { budget.releaseRows(len(rows)) }()
 
+	if plan.mergeClause != nil {
+		nextRows, err := plan.mergeClause.apply(tx, rows, params, budget)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		budget.releaseRows(len(rows))
+		rows = nextRows
+	}
 	if plan.createNode != nil {
 		nextRows, err := plan.createNode.apply(tx, rows, params, budget)
 		if err != nil {
@@ -1827,7 +1874,9 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		return plan.returnClause.renderAggregates(rows, params, plan.orderClauses, skip, aggregateLimit, budget)
 	}
 	if len(plan.orderClauses) != 0 {
-		if err := sortQueryRows(rows, plan.compareOrderedRows, budget); err != nil {
+		if err := sortQueryRows(rows, func(left, right queryRow) (int, error) {
+			return plan.compareOrderedRowsWithBudget(left, right, budget)
+		}, budget); err != nil {
 			return QueryResult{}, err
 		}
 	}
@@ -2043,7 +2092,7 @@ func (plan *queryPlan) orderedConnectedPathPatterns(tx *Tx, patterns []matchPatt
 			return nil, false, err
 		}
 		edge, ok := item.(edgePattern)
-		if !ok || !addNode(edge.Left) || !addNode(edge.Right) {
+		if !ok || edge.VariableLength || !addNode(edge.Left) || !addNode(edge.Right) {
 			return nil, false, nil
 		}
 		estimate, err := plan.patternCardinalityWithBudget(tx, edge, params, budget)
@@ -2295,6 +2344,13 @@ func missingValueExprParam(expr valueExpr, params map[string]any, budget *queryB
 	case mapLiteralExpr:
 		for _, entry := range expr.Entries {
 			missing, err := missingValueExprParam(entry, params, budget)
+			if err != nil || missing {
+				return missing, err
+			}
+		}
+	case arithmeticExpr:
+		for _, operand := range []valueExpr{expr.Left, expr.Right} {
+			missing, err := missingValueExprParam(operand, params, budget)
 			if err != nil || missing {
 				return missing, err
 			}
@@ -3206,6 +3262,9 @@ func patternPropertyClauses(patterns []matchPattern) []*whereClause {
 		case edgePattern:
 			appendNode(pattern.Left)
 			appendNode(pattern.Right)
+			if pattern.VariableLength {
+				continue
+			}
 			keys := make([]string, 0, len(pattern.PropertyExprs))
 			for key := range pattern.PropertyExprs {
 				keys = append(keys, key)
@@ -3373,6 +3432,17 @@ func parseEdgeBody(text string) (edgePattern, error) {
 	}
 
 	pattern := edgePattern{PropertyExprs: propertyExprs}
+	if star := strings.IndexByte(prefix, '*'); star >= 0 {
+		if strings.IndexByte(prefix[star+1:], '*') >= 0 {
+			return edgePattern{}, fmt.Errorf("invalid variable-length edge %q", text)
+		}
+		minHops, maxHops, err := parseVariableHops(strings.TrimSpace(prefix[star+1:]))
+		if err != nil {
+			return edgePattern{}, err
+		}
+		pattern.VariableLength, pattern.MinHops, pattern.MaxHops = true, minHops, maxHops
+		prefix = strings.TrimSpace(prefix[:star])
+	}
 	if left, right, ok := splitOperator(prefix, ":"); ok {
 		varText, typeText := strings.TrimSpace(left), strings.TrimSpace(right)
 		var err error
@@ -3397,6 +3467,53 @@ func parseEdgeBody(text string) (edgePattern, error) {
 		}
 	}
 	return pattern, nil
+}
+
+func parseVariableHops(text string) (int, int, error) {
+	parse := func(value string) (int, error) {
+		if value == "" {
+			return 0, errors.New("invalid variable-length edge")
+		}
+		for _, char := range value {
+			if char < '0' || char > '9' {
+				return 0, fmt.Errorf("invalid variable-length edge %q", text)
+			}
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return 0, fmt.Errorf("invalid variable-length edge %q", text)
+		}
+		return n, nil
+	}
+	if text == "" {
+		return 1, -1, nil
+	}
+	if !strings.Contains(text, "..") {
+		n, err := parse(text)
+		return n, n, err
+	}
+	if strings.Count(text, "..") != 1 {
+		return 0, 0, fmt.Errorf("invalid variable-length edge %q", text)
+	}
+	parts := strings.Split(text, "..")
+	minHops, maxHops := 1, -1
+	var err error
+	if parts[0] != "" {
+		minHops, err = parse(parts[0])
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if parts[1] != "" {
+		maxHops, err = parse(parts[1])
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if maxHops >= 0 && minHops > maxHops {
+		return 0, 0, fmt.Errorf("invalid variable-length edge %q", text)
+	}
+	return minHops, maxHops, nil
 }
 
 func parseWherePredicate(text string) (wherePredicate, error) {
@@ -3867,11 +3984,6 @@ func parseReturnClause(text string) (*returnClause, error) {
 			if exprErr != nil {
 				return nil, fmt.Errorf("invalid RETURN projection %q: %w", exprText, exprErr)
 			}
-			switch expr.(type) {
-			case callExpr, listLiteralExpr:
-			default:
-				return nil, fmt.Errorf("invalid RETURN projection %q", exprText)
-			}
 			projections = append(projections, projection{
 				Kind:          projectionExpr,
 				Expr:          expr,
@@ -3907,6 +4019,13 @@ func parseAggregateProjection(text string) (projection, bool, error) {
 		return projection{}, false, nil
 	}
 	inner := strings.TrimSpace(text[open+1 : len(text)-1])
+	distinct := strings.HasPrefix(inner, "DISTINCT ")
+	if distinct {
+		inner = strings.TrimSpace(strings.TrimPrefix(inner, "DISTINCT "))
+		if inner == "*" {
+			return projection{}, false, fmt.Errorf("DISTINCT * is not valid for %s", name)
+		}
+	}
 	if kind == aggregateCount && inner == "*" {
 		return projection{Kind: projectionAggregate, Aggregate: kind, CountAll: true}, true, nil
 	}
@@ -3914,7 +4033,7 @@ func parseAggregateProjection(text string) (projection, bool, error) {
 	if err != nil {
 		return projection{}, false, fmt.Errorf("invalid %s argument %q: %w", name, inner, err)
 	}
-	return projection{Kind: projectionAggregate, Aggregate: kind, Expr: expr}, true, nil
+	return projection{Kind: projectionAggregate, Aggregate: kind, Expr: expr, Distinct: distinct}, true, nil
 }
 
 // hasAggregates reports whether any projection folds rows into an aggregate.
@@ -4602,14 +4721,14 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 	}
 
 	if clause.Kind == whereVector || clause.Kind == whereFTS {
-		if err := sortQueryRows(filtered, func(a queryRow, b queryRow) int {
+		if err := sortQueryRows(filtered, func(a queryRow, b queryRow) (int, error) {
 			if a.Order < b.Order {
-				return -1
+				return -1, nil
 			}
 			if a.Order > b.Order {
-				return 1
+				return 1, nil
 			}
-			return compareRowBindings(a, b)
+			return compareRowBindingsWithBudget(a, b, budget)
 		}, budget); err != nil {
 			return nil, err
 		}
@@ -5749,18 +5868,21 @@ func (clause *returnClause) projectRows(rows []queryRow, plan *queryPlan, params
 		}
 	}
 	if len(plan.withOrder) != 0 {
-		if err := sortQueryRows(projected, func(left, right queryRow) int {
+		if err := sortQueryRows(projected, func(left, right queryRow) (int, error) {
 			for _, order := range plan.withOrder {
-				comparison := compareOrderValues(order.value(left), order.value(right))
+				comparison, err := compareOrderValuesWithBudget(order.value(left), order.value(right), budget)
+				if err != nil {
+					return 0, err
+				}
 				if comparison == 0 {
 					continue
 				}
 				if order.Desc {
-					return -comparison
+					return -comparison, nil
 				}
-				return comparison
+				return comparison, nil
 			}
-			return 0
+			return 0, nil
 		}, budget); err != nil {
 			return nil, err
 		}
@@ -5914,13 +6036,20 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 		group := &withGroup{values: values}
 		for _, projection := range clause.Projections {
 			if projection.Kind == projectionAggregate {
-				group.aggregates = append(group.aggregates, newAggregateAccumulator(projection.Aggregate))
+				group.aggregates = append(group.aggregates, newAggregateAccumulator(projection.Aggregate, projection.Distinct))
 			}
 		}
 		return group
 	}
 	groups := map[string]*withGroup{}
 	var ordered []*withGroup
+	defer func() {
+		for _, group := range ordered {
+			for _, aggregate := range group.aggregates {
+				aggregate.releaseDistinct(budget)
+			}
+		}
+	}()
 	for _, row := range rows {
 		if err := budget.check(1, 0); err != nil {
 			return nil, err
@@ -6057,13 +6186,20 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 		group := &aggregateGroup{keys: keys}
 		for _, projection := range clause.Projections {
 			if projection.Kind == projectionAggregate {
-				group.aggregates = append(group.aggregates, newAggregateAccumulator(projection.Aggregate))
+				group.aggregates = append(group.aggregates, newAggregateAccumulator(projection.Aggregate, projection.Distinct))
 			}
 		}
 		return group
 	}
 	groups := map[string]*aggregateGroup{}
 	var ordered []*aggregateGroup
+	defer func() {
+		for _, group := range ordered {
+			for _, aggregate := range group.aggregates {
+				aggregate.releaseDistinct(budget)
+			}
+		}
+	}()
 	for _, row := range rows {
 		if err := budget.check(1, 0); err != nil {
 			return QueryResult{}, err
@@ -6151,18 +6287,21 @@ func (clause *returnClause) renderAggregates(rows []queryRow, params map[string]
 				return QueryResult{}, errors.New("ORDER BY expressions must be projected when aggregating")
 			}
 		}
-		if err := sortQueryRows(rowsOut, func(left, right map[string]any) int {
+		if err := sortQueryRows(rowsOut, func(left, right map[string]any) (int, error) {
 			for _, order := range orders {
-				comparison := compareOrderValues(left[order.Alias], right[order.Alias])
+				comparison, err := compareOrderValuesWithBudget(left[order.Alias], right[order.Alias], budget)
+				if err != nil {
+					return 0, err
+				}
 				if comparison == 0 {
 					continue
 				}
 				if order.Desc {
-					return -comparison
+					return -comparison, nil
 				}
-				return comparison
+				return comparison, nil
 			}
-			return 0
+			return 0, nil
 		}, budget); err != nil {
 			return QueryResult{}, err
 		}
@@ -6676,6 +6815,14 @@ func (expr propertyExpr) eval(row queryRow, _ map[string]any, budget *queryBudge
 
 func parseValueExpr(text string) (valueExpr, error) {
 	text = strings.TrimSpace(text)
+	if number, ok := parseQueryNumber(text); ok {
+		return literalExpr{Value: number}, nil
+	}
+	if expr, ok, err := parseArithmeticExpr(text); err != nil {
+		return nil, err
+	} else if ok {
+		return expr, nil
+	}
 	switch {
 	case text == "":
 		return nil, errors.New("value expression must be non-empty")
@@ -6728,9 +6875,6 @@ func parseValueExpr(text string) (valueExpr, error) {
 			return nil, err
 		} else if ok {
 			return call, nil
-		}
-		if number, ok := parseQueryNumber(text); ok {
-			return literalExpr{Value: number}, nil
 		}
 		if name, property, err := parsePropertyAccess(text); err == nil {
 			return propertyExpr{Var: name, Property: property}, nil

@@ -14,12 +14,48 @@ import (
 
 const (
 	vectorIndexM              = 16
-	vectorIndexM0             = 32
+	defaultVectorIndexM       = vectorIndexM
+	minVectorIndexM           = 2
+	maxVectorIndexM           = 64
+	maxVectorIndexM0          = maxVectorIndexM * 2
 	vectorIndexConstructionEF = 200
 	vectorIndexSearchEF       = 64
 	vectorIndexMaxLevel       = 16
 	vectorBuildScratchBytes   = 128 << 10
 )
+
+func validateVectorIndexM(m uint16) error {
+	if m != 0 && (m < minVectorIndexM || m > maxVectorIndexM) {
+		return fmt.Errorf("%w: VectorM must be between %d and %d", ErrInvalidArgument, minVectorIndexM, maxVectorIndexM)
+	}
+	return nil
+}
+
+func effectiveVectorIndexM(m uint16) uint16 {
+	if m == 0 {
+		return defaultVectorIndexM
+	}
+	return m
+}
+
+func configuredVectorIndexM(graph *store.GraphState) int {
+	return int(effectiveVectorIndexM(graph.VectorIndexM))
+}
+
+func vectorIndexMaxNeighbors(graph *store.GraphState, level int) int {
+	m := configuredVectorIndexM(graph)
+	if level == 0 {
+		return m * 2
+	}
+	return m
+}
+
+func vectorBuildScratchBytesForM(m uint16) uint64 {
+	// The initial visited map is provisioned for construction EF times M. Its
+	// conservative per-entry reservation covers map buckets and candidate state.
+	visitedBytes := saturatingMul(uint64(vectorIndexConstructionEF)*uint64(effectiveVectorIndexM(m)), 80)
+	return max(uint64(vectorBuildScratchBytes), visitedBytes)
+}
 
 type vectorCandidate struct {
 	id       uint64
@@ -187,17 +223,18 @@ func rebuildVectorIndexWithBudget(ctx context.Context, graph *store.GraphState, 
 	target.VectorIndex = store.NewVectorIndex()
 	target.VectorTombstones = store.NewPagedMap[[]float32]()
 	target.VectorMutations = 0
-	scratch := &vectorSearchScratch{visited: make(map[uint64]struct{}, vectorIndexConstructionEF*vectorIndexM)}
+	scratch := &vectorSearchScratch{visited: make(map[uint64]struct{}, vectorIndexConstructionEF*configuredVectorIndexM(target))}
+	scratchBytes := vectorBuildScratchBytesForM(target.VectorIndexM)
 	ids := make([]uint64, 0, target.Nodes.Len())
 	for id := range target.Nodes.All() {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
 	budget.bytes += estimatedBytes
-	if budget.bytes > budget.maxBytes || budget.maxBytes-budget.bytes+vectorBuildScratchBytes < 80 {
+	if budget.bytes > budget.maxBytes || budget.maxBytes-budget.bytes+scratchBytes < 80 {
 		return fmt.Errorf("%w: vector index build scratch exceeds budget", ErrResourceLimit)
 	}
-	budget.annVisitedLimit = (budget.maxBytes - (budget.bytes - vectorBuildScratchBytes)) / 80
+	budget.annVisitedLimit = (budget.maxBytes - (budget.bytes - scratchBytes)) / 80
 	for index, id := range ids {
 		if index&255 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -215,7 +252,7 @@ func rebuildVectorIndexWithBudget(ctx context.Context, graph *store.GraphState, 
 	graph.VectorTombstones = target.VectorTombstones
 	graph.VectorLiveCount = live
 	graph.VectorMutations = 0
-	budget.releaseBytes(vectorBuildScratchBytes)
+	budget.releaseBytes(scratchBytes)
 	return nil
 }
 
@@ -268,10 +305,7 @@ func insertVectorIndexVectorBudget(graph *store.GraphState, id uint64, vector []
 		}
 	}
 	for l := min(level, graph.VectorIndex.MaxLevel); l >= 0; l-- {
-		maxNeighbors := vectorIndexM
-		if l == 0 {
-			maxNeighbors = vectorIndexM0
-		}
+		maxNeighbors := vectorIndexMaxNeighbors(graph, l)
 		var candidates []vectorCandidate
 		if budget == nil {
 			candidates = vectorSearchLayerScratch(graph, vector, entry, l, vectorIndexConstructionEF, id, scratch)
@@ -346,7 +380,7 @@ func connectVectorNeighbor(graph *store.GraphState, id, neighbor uint64, neighbo
 	if !ok {
 		return nil
 	}
-	var storage [vectorIndexM0 + 1]vectorCandidate
+	var storage [maxVectorIndexM0 + 1]vectorCandidate
 	candidates := storage[:0]
 	for _, candidateID := range copyNode.Neighbors[level] {
 		candidateVector, exists := vectorForNode(graph, candidateID)
@@ -798,16 +832,23 @@ func (tx *Tx) applyVectorLiveCountChanges() {
 }
 
 func estimateVectorIndexBytes(live uint64, dimensions uint16) uint64 {
-	// 4 KiB covers the hard max-level node, all capped neighbor arrays, and map metadata.
-	return saturatingMul(live, saturatingAdd(4096, uint64(dimensions)*4))
+	return estimateVectorIndexBytesForM(live, dimensions, defaultVectorIndexM)
+}
+
+func estimateVectorIndexBytesForM(live uint64, dimensions uint16, m uint16) uint64 {
+	// Reserve every capped neighbor slot through the maximum level plus node and
+	// map metadata. The 4 KiB default preserves the prior M=16 estimate.
+	neighborBytes := uint64((vectorIndexMaxLevel+2)*int(effectiveVectorIndexM(m))) * 8
+	metadataBytes := max(uint64(4096), saturatingAdd(512, neighborBytes))
+	return saturatingMul(live, saturatingAdd(metadataBytes, uint64(dimensions)*4))
 }
 
 func estimateVectorBuildLogicalBytes(graph *store.GraphState, live uint64) uint64 {
-	newBytes := estimateVectorIndexBytes(live, graph.VectorDimensions)
-	oldBytes := estimateVectorIndexBytes(uint64(graph.VectorIndex.Nodes.Len()), graph.VectorDimensions)
+	newBytes := estimateVectorIndexBytesForM(live, graph.VectorDimensions, graph.VectorIndexM)
+	oldBytes := estimateVectorIndexBytesForM(uint64(graph.VectorIndex.Nodes.Len()), graph.VectorDimensions, graph.VectorIndexM)
 	tombstoneBytes := saturatingMul(uint64(graph.VectorTombstones.Len()), uint64(graph.VectorDimensions)*4)
 	idsBytes := saturatingMul(uint64(graph.Nodes.Len()), 8)
-	return saturatingAdd(saturatingAdd(newBytes, oldBytes), saturatingAdd(tombstoneBytes, saturatingAdd(idsBytes, vectorBuildScratchBytes)))
+	return saturatingAdd(saturatingAdd(newBytes, oldBytes), saturatingAdd(tombstoneBytes, saturatingAdd(idsBytes, vectorBuildScratchBytesForM(graph.VectorIndexM))))
 }
 
 func vectorRebuildThreshold(graph *store.GraphState) int {
@@ -842,10 +883,7 @@ func validateVectorIndexContext(ctx context.Context, graph *store.GraphState) er
 			return fmt.Errorf("vector node %d has no live or tombstone vector", id)
 		}
 		for level, neighbors := range node.Neighbors {
-			maxNeighbors := vectorIndexM
-			if level == 0 {
-				maxNeighbors = vectorIndexM0
-			}
+			maxNeighbors := vectorIndexMaxNeighbors(graph, level)
 			if len(neighbors) > maxNeighbors {
 				return fmt.Errorf("vector node %d level %d exceeds degree cap", id, level)
 			}
@@ -880,8 +918,8 @@ func vectorLevel(id uint64) int {
 }
 
 func selectVectorNeighborsHeuristic(graph *store.GraphState, candidates []vectorCandidate, limit int, overrideID uint64, overrideVector []float32, budget *directSearchBudget) ([]vectorCandidate, error) {
-	var selected [vectorIndexM0]vectorCandidate
-	var selectedVectors [vectorIndexM0][]float32
+	var selected [maxVectorIndexM0]vectorCandidate
+	var selectedVectors [maxVectorIndexM0][]float32
 	var rejected [vectorIndexConstructionEF]vectorCandidate
 	selectedCount, rejectedCount := 0, 0
 	for _, candidate := range candidates {

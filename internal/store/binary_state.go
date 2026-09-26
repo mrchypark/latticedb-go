@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -219,7 +218,7 @@ func decodeBinaryStatePayload(input io.Reader, length, maxBytes uint64) (*persis
 }
 
 func decodeWALPayloadBytes(ctx context.Context, header, payload []byte, maxBytes uint64, out *walPayload) error {
-	if binary.BigEndian.Uint16(header[8:10]) != walVersion {
+	if !isBinaryWALHeader(header) {
 		return unmarshalContext(ctx, payload, out)
 	}
 	decoded, err := decodeBinaryWALPayload(&contextReader{ctx: ctx, reader: bytes.NewReader(payload)}, uint64(len(payload)), maxBytes)

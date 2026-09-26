@@ -59,6 +59,7 @@ func vectorCacheFingerprint(graph *store.GraphState, keys []VectorNamespace, vie
 	writeString := func(value string) { s.put(uint64(len(value))); _, _ = io.WriteString(h, value) }
 	writeString(graph.DatabaseID)
 	s.put(uint64(graph.VectorDimensions))
+	s.put(uint64(effectiveVectorIndexM(graph.VectorIndexM)))
 	s.put(uint64(len(keys)))
 	for _, key := range keys {
 		writeString(key.Scope)
@@ -203,7 +204,7 @@ func decodeVectorCache(ctx context.Context, r io.Reader, graph *store.GraphState
 		}
 		// Unlike a rebuild, cached IDs and levels are untrusted. Admit sparse
 		// radix pages and the second tombstone map before allocating either.
-		logicalBytes := saturatingAdd(estimateVectorIndexBytes(count, graph.VectorDimensions), saturatingMul(count, 2048))
+		logicalBytes := saturatingAdd(estimateVectorIndexBytesForM(count, graph.VectorDimensions, graph.VectorIndexM), saturatingMul(count, 2048))
 		logicalBytes = saturatingAdd(logicalBytes, saturatingMul(count-live, 4096))
 		if err := budget.reserveBytes(logicalBytes); err != nil {
 			return err
@@ -241,10 +242,7 @@ func decodeVectorCache(ctx context.Context, r io.Reader, graph *store.GraphState
 			}
 			for j := range node.Neighbors {
 				n := s.get()
-				cap := uint64(vectorIndexM)
-				if j == 0 {
-					cap = vectorIndexM0
-				}
+				cap := uint64(vectorIndexMaxNeighbors(view, j))
 				if n > cap {
 					return errVectorCache
 				}

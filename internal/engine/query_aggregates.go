@@ -47,7 +47,10 @@ func aggregateKindFor(name string) (aggregateKind, bool) {
 
 // aggregateAccumulator folds values into a single aggregate result.
 type aggregateAccumulator struct {
-	kind aggregateKind
+	kind         aggregateKind
+	distinct     bool
+	distinctSeen map[string]struct{}
+	seenBytes    uint64
 	// count is the number of counted rows for aggregateCount and the divisor
 	// for aggregateAvg. Upstream shares one counter the same way.
 	count int64
@@ -58,8 +61,83 @@ type aggregateAccumulator struct {
 	items   []any
 }
 
-func newAggregateAccumulator(kind aggregateKind) *aggregateAccumulator {
-	return &aggregateAccumulator{kind: kind}
+func newAggregateAccumulator(kind aggregateKind, distinct ...bool) *aggregateAccumulator {
+	a := &aggregateAccumulator{kind: kind}
+	if len(distinct) != 0 && distinct[0] {
+		a.distinct = true
+		a.distinctSeen = make(map[string]struct{})
+	}
+	return a
+}
+
+// accept reports whether value has not appeared in this aggregate. Its key uses
+// the same canonical encoding as grouping and query DISTINCT.
+func (a *aggregateAccumulator) accept(value any, budget *queryBudget) (bool, error) {
+	if !a.distinct {
+		return true, nil
+	}
+	keyValue := value
+	if materialize, err := aggregateDistinctNeedsPublicValue(value, budget); err != nil {
+		return false, err
+	} else if materialize {
+		bytes := queryValueBytes(value)
+		if err := budget.chargeTemporary(bytes); err != nil {
+			return false, err
+		}
+		defer budget.releaseTemporary(bytes)
+		keyValue = publicProjectionValue(value)
+	}
+	before := budget.bytes
+	var key strings.Builder
+	if err := writeDistinctValueKey(&key, keyValue, budget); err != nil {
+		return false, err
+	}
+	encoded := key.String()
+	if _, ok := a.distinctSeen[encoded]; ok {
+		budget.releaseTemporary(uint64(budget.bytes - before))
+		return false, nil
+	}
+	const entryBytes = 16
+	if err := budget.chargeResult(entryBytes); err != nil {
+		return false, err
+	}
+	a.distinctSeen[encoded] = struct{}{}
+	a.seenBytes += uint64(budget.bytes - before)
+	return true, nil
+}
+
+// aggregateDistinctNeedsPublicValue avoids cloning ordinary aggregate values.
+// The key writer already understands public values, but graph bindings need
+// their public representation before it can encode them.
+func aggregateDistinctNeedsPublicValue(value any, budget *queryBudget) (bool, error) {
+	if err := budget.check(1, 0); err != nil {
+		return false, err
+	}
+	switch value := value.(type) {
+	case boundValue:
+		return true, nil
+	case []any:
+		for _, item := range value {
+			needsPublic, err := aggregateDistinctNeedsPublicValue(item, budget)
+			if err != nil || needsPublic {
+				return needsPublic, err
+			}
+		}
+	case map[string]any:
+		for _, item := range value {
+			needsPublic, err := aggregateDistinctNeedsPublicValue(item, budget)
+			if err != nil || needsPublic {
+				return needsPublic, err
+			}
+		}
+	}
+	return false, nil
+}
+
+func (a *aggregateAccumulator) releaseDistinct(budget *queryBudget) {
+	budget.releaseTemporary(a.seenBytes)
+	a.seenBytes = 0
+	a.distinctSeen = nil
 }
 
 // add folds one input value. present is false when the row has no value for the
@@ -165,8 +243,12 @@ func compareAggregateValues(left, right any) (int, bool) {
 func (a *aggregateAccumulator) addExpr(expr valueExpr, row queryRow, params map[string]any, budget *queryBudget) error {
 	before := budget.bytes
 	value, err := evalQueryExpr(expr, row, params, budget)
-	defer budget.releaseTemporary(uint64(budget.bytes - before))
 	if err != nil {
+		return err
+	}
+	defer budget.releaseTemporary(uint64(budget.bytes - before))
+	accepted, err := a.accept(value, budget)
+	if err != nil || !accepted {
 		return err
 	}
 	// The defer above captures only expression scratch, before retained charges.

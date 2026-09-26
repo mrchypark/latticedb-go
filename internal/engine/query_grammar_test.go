@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "470613db094f388149a7916c75cf89d0fbc5c15673ac79c1d06d8354000b6fff"
+const auditedCypherParserDigest = "2e43247798c8745188ebfeb12b68b8a169ea183dd490507a8e9eee48d32a0f79"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -75,26 +75,40 @@ func TestMarkdownGrammarBlockPreservesLineEndings(t *testing.T) {
 func cypherParserDigest(t *testing.T) string {
 	t.Helper()
 	set := token.NewFileSet()
-	file, err := parser.ParseFile(set, "query.go", nil, parser.SkipObjectResolution)
+	paths, err := filepath.Glob("query*.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	byName := make(map[string][]*ast.FuncDecl)
-	for _, declaration := range file.Decls {
-		if function, ok := declaration.(*ast.FuncDecl); ok {
-			byName[function.Name.Name] = append(byName[function.Name.Name], function)
+	sort.Strings(paths)
+	type parserFunction struct {
+		file string
+		decl *ast.FuncDecl
+	}
+	byName := make(map[string][]parserFunction)
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(set, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, declaration := range file.Decls {
+			if function, ok := declaration.(*ast.FuncDecl); ok {
+				byName[function.Name.Name] = append(byName[function.Name.Name], parserFunction{file: path, decl: function})
+			}
 		}
 	}
-	reachable := make(map[*ast.FuncDecl]bool)
-	queue := append([]*ast.FuncDecl(nil), byName["parseQuery"]...)
+	reachable := make(map[*ast.FuncDecl]parserFunction)
+	queue := append([]parserFunction(nil), byName["parseQuery"]...)
 	for len(queue) != 0 {
 		function := queue[0]
 		queue = queue[1:]
-		if reachable[function] {
+		if _, ok := reachable[function.decl]; ok {
 			continue
 		}
-		reachable[function] = true
-		ast.Inspect(function.Body, func(node ast.Node) bool {
+		reachable[function.decl] = function
+		ast.Inspect(function.decl.Body, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
 				return true
@@ -110,14 +124,19 @@ func cypherParserDigest(t *testing.T) string {
 			return true
 		})
 	}
-	functions := make([]*ast.FuncDecl, 0, len(reachable))
-	for function := range reachable {
+	functions := make([]parserFunction, 0, len(reachable))
+	for _, function := range reachable {
 		functions = append(functions, function)
 	}
-	sort.Slice(functions, func(i, j int) bool { return functions[i].Pos() < functions[j].Pos() })
+	sort.Slice(functions, func(i, j int) bool {
+		if functions[i].file != functions[j].file {
+			return functions[i].file < functions[j].file
+		}
+		return functions[i].decl.Pos() < functions[j].decl.Pos()
+	})
 	var source bytes.Buffer
 	for _, function := range functions {
-		if err := format.Node(&source, set, function); err != nil {
+		if err := format.Node(&source, set, function.decl); err != nil {
 			t.Fatal(err)
 		}
 		source.WriteByte('\n')
@@ -158,140 +177,151 @@ func TestQueryGrammarASTShape(t *testing.T) {
 
 func TestQueryGrammarMatrix(t *testing.T) {
 	accepted := map[string]string{
-		"with create":                      "MATCH (n) WITH n.name AS name CREATE (m:Copy {name: name}) RETURN m",
-		"create anonymous node":            `CREATE ()`,
-		"create labeled node":              `CREATE (n:Person:Employee)`,
-		"create node properties":           `CREATE (n:Person {name: "Alice", age: -1, ratio: 1.5, active: true, disabled: false, note: null, copy: $name, nested: {team: 'graph'}}) RETURN id(n) AS id`,
-		"match anonymous node":             `MATCH ()`,
-		"match without terminal":           `MATCH (n)`,
-		"match labeled node":               `MATCH (n:Person:Employee) RETURN count(n)`,
-		"match literal properties":         `MATCH (n:Person {name: 'Alice', active: true}) RETURN n.name AS name`,
-		"match parameter properties":       `MATCH ({name: $name}) RETURN count(*) AS count`,
-		"match multiple patterns":          `MATCH (a:Person), (b:Person) WHERE a.name = $a AND b.name = $b RETURN a.name AS source, b.name AS target`,
-		"match typed edge":                 `MATCH (:Person)-[:KNOWS]->(:Person) RETURN count(*) AS count`,
-		"match bound edge":                 `MATCH (a)-[r:KNOWS]->(b) RETURN id(a) AS source, id(r) AS edge, id(b) AS target`,
-		"match untyped edge":               `MATCH (a)-[r]->(b) RETURN count(r) AS count`,
-		"match endpoint properties":        `MATCH (:Person {name: $from})-[:KNOWS]->(:Person {name: $to}) RETURN count(*) AS count`,
-		"match incoming edge":              `MATCH (a)<-[r:KNOWS]-(b) RETURN a, r, b`,
-		"match undirected edge":            `MATCH (a)-[r:KNOWS]-(b) RETURN a, r, b`,
-		"match edge properties":            `MATCH (a)-[r:KNOWS {since: $since}]->(b) RETURN id(r)`,
-		"match anonymous edge property":    `MATCH (a)-[:KNOWS {since: 2024}]->(b) RETURN b`,
-		"match chained path":               `MATCH (a)-[:KNOWS]->(b)-[:WORKS_WITH]->(c) RETURN c`,
-		"match chained directions":         `MATCH (a)<-[:KNOWS]-(b)-[:WORKS_WITH]-(c) RETURN a, b, c`,
-		"match node property expression":   `MATCH (source), (copy {name: source.name}) RETURN copy`,
-		"match edge property expression":   `MATCH (source), (a)-[r:KNOWS {since: source.since}]->(b) RETURN r`,
-		"where string equality":            `MATCH (n) WHERE n.name = "Alice" RETURN n.name`,
-		"where single quoted equality":     `MATCH (n) WHERE n.name = 'Alice' RETURN n.name`,
-		"where parameter equality":         `MATCH (n) WHERE n.name = $name RETURN n.name`,
-		"where numeric equality":           `MATCH (n) WHERE n.score = -1.5 RETURN n.score`,
-		"where scientific float":           `MATCH (n) WHERE n.score = 1e3 RETURN n.score`,
-		"where leading plus integer":       `MATCH (n) WHERE n.score = +1 RETURN n.score`,
-		"where leading dot float":          `MATCH (n) WHERE n.score = .5 RETURN n.score`,
-		"where boolean equality":           `MATCH (n) WHERE n.active = true RETURN n.active`,
-		"where null equality":              `MATCH (n) WHERE n.note = null RETURN n.note`,
-		"where binding id":                 `MATCH (n) WHERE id(n) = $id RETURN id(n) AS id`,
-		"where is null":                    `MATCH (n) WHERE n.note IS NULL RETURN count(n) AS count`,
-		"where is not null":                `MATCH (n) WHERE n.name IS NOT NULL RETURN count(n) AS count`,
-		"where vector search":              `MATCH (n) WHERE n.embedding <=> $vector RETURN n.name LIMIT 1`,
-		"where full text search":           `MATCH (n) WHERE n.text @@ "graph" RETURN n.name LIMIT 1`,
-		"where conjunction":                `MATCH (n) WHERE n.active = true AND n.name IS NOT NULL RETURN n.name`,
-		"where comparisons":                `MATCH (n) WHERE n.age <> 1 AND n.age >= 2 AND n.age <= 3 AND n.age > 1 AND n.age < 4 RETURN n`,
-		"where disjunction":                `MATCH (n) WHERE n.active = true OR n.admin = true RETURN n`,
-		"where not and parentheses":        `MATCH (n) WHERE NOT (n.active = true OR n.age < 18) RETURN n`,
-		"where in parameter":               `MATCH (n) WHERE n.kind IN $kinds RETURN n`,
-		"where string predicates":          `MATCH (n) WHERE n.name STARTS WITH "A" OR n.name ENDS WITH $suffix OR n.name CONTAINS "mid" RETURN n`,
-		"where property comparison":        `MATCH (n) WHERE n.min <= n.value RETURN n`,
-		"where without terminal":           `MATCH (n) WHERE n.active = true`,
-		"where then set":                   `MATCH (n) WHERE n.active = true SET n.checked = true`,
-		"where then create edge":           `MATCH (a), (b) WHERE a.active = true CREATE (a)-[:KNOWS]->(b)`,
-		"where then remove":                `MATCH (n) WHERE n.active = true REMOVE n.active`,
-		"where then delete":                `MATCH (n) WHERE n.active = true DELETE n`,
-		"where then detach delete":         `MATCH (n) WHERE n.active = true DETACH DELETE n`,
-		"where in property expression":     `MATCH (n), (m) WHERE n.kind IN m.allowed RETURN n`,
-		"where string property expression": `MATCH (n), (m) WHERE n.name STARTS WITH m.prefix RETURN n`,
-		"where id property expression":     `MATCH (n), (m) WHERE id(n) = m.nodeID RETURN n`,
-		"return count star":                `MATCH (n) RETURN count(*)`,
-		"return count binding":             `MATCH (n) RETURN count(n) AS count`,
-		"return binding":                   `MATCH (n) RETURN n AS node`,
-		"return property":                  `MATCH (n) RETURN n.name`,
-		"return binding id":                `MATCH (n) RETURN id(n) AS id`,
-		"return multiple projections":      `MATCH (n) RETURN id(n) AS id, n.name AS name`,
-		"return distinct":                  `MATCH (n) RETURN DISTINCT n.name AS name ORDER BY name`,
-		"return distinct count":            `MATCH (n) RETURN DISTINCT count(*) AS count`,
-		"return distinct projections":      `MATCH (n) RETURN DISTINCT n.name AS name, n.kind AS kind ORDER BY name`,
-		"order by property":                `MATCH (n) RETURN n.name ORDER BY n.name ASC`,
-		"order by binding id":              `MATCH (n) RETURN id(n) ORDER BY id(n) DESC`,
-		"order by multiple expressions":    `MATCH (n) RETURN id(n), n.name ORDER BY n.name ASC, id(n) DESC LIMIT 2`,
-		"order by return alias":            `MATCH (n) RETURN n.name AS name ORDER BY name`,
-		"order by binding":                 `MATCH (n) RETURN n ORDER BY n`,
-		"limit zero":                       `MATCH (n) RETURN n.name LIMIT 0`,
-		"parameterized limit":              `MATCH (n) RETURN n.name LIMIT $limit`,
-		"skip and limit":                   `MATCH (n) RETURN n.name SKIP $skip LIMIT $limit`,
-		"skip without limit":               `MATCH (n) RETURN n.name SKIP 1`,
-		"set property":                     `MATCH (n) SET n.name = $name`,
-		"set property from property":       `MATCH (n) SET n.copy = n.name`,
-		"set property null":                `MATCH (n) SET n.name = null`,
-		"replace properties":               `MATCH (n) SET n = {name: $name}`,
-		"merge properties":                 `MATCH (n) SET n += $properties`,
-		"replace properties from property": `MATCH (n), (source) SET n = source.properties`,
-		"merge properties from property":   `MATCH (n), (source) SET n += source.properties`,
-		"multiple set items":               `MATCH (n) SET n.a = 1, n.b = 2`,
-		"set then return":                  `MATCH (n) SET n.name = $name RETURN n.name AS name`,
-		"set label":                        `MATCH (n) SET n:Active RETURN n`,
-		"create edge":                      `MATCH (a), (b) CREATE (a)-[:KNOWS {since: 2024}]->(b)`,
-		"edge property expression":         `MATCH (a), (b) CREATE (a)-[:KNOWS {weight: b.weight}]->(b)`,
-		"create edge then return":          `MATCH (a), (b) CREATE (a)-[r:KNOWS]->(b) RETURN id(r) AS id`,
-		"create incoming edge":             `MATCH (a), (b) CREATE (a)<-[r:KNOWS]-(b) RETURN id(r) AS id`,
-		"remove property":                  `MATCH (n) REMOVE n.name`,
-		"remove then return":               `MATCH (n) REMOVE n.name RETURN n.name AS name`,
-		"remove label":                     `MATCH (n) REMOVE n:Employee`,
-		"remove multiple items":            `MATCH (n) REMOVE n.name, n:Employee`,
-		"delete node":                      `MATCH (n) DELETE n`,
-		"delete edge and nodes":            `MATCH (a)-[r]->(b) DELETE r, a, b`,
-		"detach delete node":               `MATCH (n) DETACH DELETE n`,
-		"unwind parameter":                 `UNWIND $items AS item RETURN item AS value`,
-		"unwind count":                     `UNWIND $items AS item RETURN count(item) AS count`,
-		"unwind order and limit":           `UNWIND $items AS item RETURN item ORDER BY item DESC LIMIT 2`,
-		"unwind create":                    `UNWIND $items AS item CREATE (n:Item {id: item.id}) RETURN n.id`,
-		"unwind create without return":     `UNWIND $items AS item CREATE (n:Item {id: item.id})`,
-		"unwind match return":              `UNWIND $ids AS wanted MATCH (n:Item {id: wanted}) RETURN n.id`,
-		"unwind match without terminal":    `UNWIND $ids AS wanted MATCH (n:Item {id: wanted})`,
-		"unwind match mutation":            `UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted SET n.active = true RETURN n.id`,
-		"unwind match create edge":         `UNWIND $ids AS wanted MATCH (a:Item), (b:Item) WHERE a.id = wanted CREATE (a)-[:LINK]->(b)`,
-		"unwind match remove":              `UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted REMOVE n.active`,
-		"unwind match delete":              `UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted DELETE n`,
-		"unwind match detach delete":       `UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted DETACH DELETE n`,
-		"quoted structural characters":     `MATCH (n {text: 'a,b) RETURN value AND more'}) RETURN n.text`,
-		"escaped double quoted string":     `MATCH (n {text: "a\"b"}) RETURN n.text`,
-		"nested map value":                 `CREATE (n {meta: {team: "graph", nested: {active: true}}})`,
-		"trailing semicolon":               `MATCH (n) RETURN n;`,
-		"multiline whitespace":             "MATCH\t(n)\nWHERE n.name = 'A  B'\r\nRETURN n.name;",
-		"keyword identifier":               `MATCH (RETURN) RETURN RETURN`,
-		"function projection":              `MATCH (n:Person) RETURN toLower(n.name) AS lowered`,
-		"function and binding projection":  `MATCH (n:Person) RETURN n.name AS name, size(n.name) AS width`,
-		"function in where comparison":     `MATCH (n:Person) WHERE n.name = toLower($name) RETURN n.name`,
-		"function in set clause":           `MATCH (n:Person) SET n.slug = toLower(n.name) RETURN n.slug AS slug`,
-		"function in create properties":    `CREATE (n:Tag {name: toLower("Mixed")}) RETURN n.name AS name`,
-		"nested function call":             `MATCH (n:Person) RETURN size(split(n.name, "a")) AS parts`,
-		"function over unwind value":       `UNWIND $items AS item RETURN size(item.name) AS width`,
-		"count property expression":        `MATCH (n) RETURN count(n.name) AS count`,
-		"aggregate with group key":         `MATCH (n:Person) RETURN n.team AS team, count(*) AS total`,
-		"aggregate sum with order":         `MATCH (n:Person) RETURN n.team AS team, sum(n.age) AS total ORDER BY total DESC LIMIT 1`,
-		"aggregate collect":                `MATCH (n:Person) RETURN collect(n.name) AS names`,
-		"aggregate min max":                `MATCH (n:Person) RETURN min(n.age) AS low, max(n.age) AS high`,
-		"function with count projection":   `MATCH (n:Person) RETURN toLower(n.name) AS lowered, count(*) AS total`,
-		"with passthrough":                 `MATCH (n) WITH n MATCH (n) RETURN count(*) AS count`,
-		"with alias filter":                `MATCH (n) WITH n AS m WHERE m.age >= 30 RETURN m.name AS name`,
-		"with aggregate":                   `MATCH (n) WITH n.team AS team, count(*) AS total RETURN team AS team, total AS total`,
-		"with ordered limit":               `MATCH (n) WITH n ORDER BY n.age DESC LIMIT 2 MATCH (n) RETURN n.name AS name`,
-		"with chained":                     `MATCH (n) WITH n AS m WITH m AS k RETURN k.name AS name`,
-		"with distinct":                    `MATCH (n) WITH DISTINCT n.team AS team RETURN team AS team`,
-		"with after unwind":                `UNWIND $ids AS id WITH id AS value RETURN value AS value`,
-		"with starts with filter":          `MATCH (n) WITH n WHERE n.name STARTS WITH 'A' RETURN n.name AS name`,
-		"with three chained":               `MATCH (n) WITH n AS a WITH a AS b WITH b AS c RETURN c.name AS name`,
-		"with order by alias":              `MATCH (n) WITH n.age AS age ORDER BY age DESC LIMIT 1 RETURN age AS age`,
-		"list literal":                     `MATCH (n) WHERE n.kind IN ["a", "b"] RETURN n`,
-		"count with projection list":       `MATCH (n) RETURN count(n), n.name`,
+		"with create":                          "MATCH (n) WITH n.name AS name CREATE (m:Copy {name: name}) RETURN m",
+		"create anonymous node":                `CREATE ()`,
+		"create labeled node":                  `CREATE (n:Person:Employee)`,
+		"create node properties":               `CREATE (n:Person {name: "Alice", age: -1, ratio: 1.5, active: true, disabled: false, note: null, copy: $name, nested: {team: 'graph'}}) RETURN id(n) AS id`,
+		"match anonymous node":                 `MATCH ()`,
+		"match without terminal":               `MATCH (n)`,
+		"match labeled node":                   `MATCH (n:Person:Employee) RETURN count(n)`,
+		"match literal properties":             `MATCH (n:Person {name: 'Alice', active: true}) RETURN n.name AS name`,
+		"match parameter properties":           `MATCH ({name: $name}) RETURN count(*) AS count`,
+		"match multiple patterns":              `MATCH (a:Person), (b:Person) WHERE a.name = $a AND b.name = $b RETURN a.name AS source, b.name AS target`,
+		"match typed edge":                     `MATCH (:Person)-[:KNOWS]->(:Person) RETURN count(*) AS count`,
+		"match bound edge":                     `MATCH (a)-[r:KNOWS]->(b) RETURN id(a) AS source, id(r) AS edge, id(b) AS target`,
+		"match untyped edge":                   `MATCH (a)-[r]->(b) RETURN count(r) AS count`,
+		"match endpoint properties":            `MATCH (:Person {name: $from})-[:KNOWS]->(:Person {name: $to}) RETURN count(*) AS count`,
+		"match incoming edge":                  `MATCH (a)<-[r:KNOWS]-(b) RETURN a, r, b`,
+		"match undirected edge":                `MATCH (a)-[r:KNOWS]-(b) RETURN a, r, b`,
+		"match edge properties":                `MATCH (a)-[r:KNOWS {since: $since}]->(b) RETURN id(r)`,
+		"match anonymous edge property":        `MATCH (a)-[:KNOWS {since: 2024}]->(b) RETURN b`,
+		"match chained path":                   `MATCH (a)-[:KNOWS]->(b)-[:WORKS_WITH]->(c) RETURN c`,
+		"match variable hops":                  `MATCH (a)-[r:KNOWS*0..3]->(b) RETURN r`,
+		"match chained directions":             `MATCH (a)<-[:KNOWS]-(b)-[:WORKS_WITH]-(c) RETURN a, b, c`,
+		"match node property expression":       `MATCH (source), (copy {name: source.name}) RETURN copy`,
+		"match edge property expression":       `MATCH (source), (a)-[r:KNOWS {since: source.since}]->(b) RETURN r`,
+		"where string equality":                `MATCH (n) WHERE n.name = "Alice" RETURN n.name`,
+		"where single quoted equality":         `MATCH (n) WHERE n.name = 'Alice' RETURN n.name`,
+		"where parameter equality":             `MATCH (n) WHERE n.name = $name RETURN n.name`,
+		"where numeric equality":               `MATCH (n) WHERE n.score = -1.5 RETURN n.score`,
+		"where scientific float":               `MATCH (n) WHERE n.score = 1e3 RETURN n.score`,
+		"where leading plus integer":           `MATCH (n) WHERE n.score = +1 RETURN n.score`,
+		"where leading dot float":              `MATCH (n) WHERE n.score = .5 RETURN n.score`,
+		"where boolean equality":               `MATCH (n) WHERE n.active = true RETURN n.active`,
+		"where null equality":                  `MATCH (n) WHERE n.note = null RETURN n.note`,
+		"where binding id":                     `MATCH (n) WHERE id(n) = $id RETURN id(n) AS id`,
+		"where is null":                        `MATCH (n) WHERE n.note IS NULL RETURN count(n) AS count`,
+		"where is not null":                    `MATCH (n) WHERE n.name IS NOT NULL RETURN count(n) AS count`,
+		"where vector search":                  `MATCH (n) WHERE n.embedding <=> $vector RETURN n.name LIMIT 1`,
+		"where full text search":               `MATCH (n) WHERE n.text @@ "graph" RETURN n.name LIMIT 1`,
+		"where conjunction":                    `MATCH (n) WHERE n.active = true AND n.name IS NOT NULL RETURN n.name`,
+		"where comparisons":                    `MATCH (n) WHERE n.age <> 1 AND n.age >= 2 AND n.age <= 3 AND n.age > 1 AND n.age < 4 RETURN n`,
+		"where disjunction":                    `MATCH (n) WHERE n.active = true OR n.admin = true RETURN n`,
+		"where not and parentheses":            `MATCH (n) WHERE NOT (n.active = true OR n.age < 18) RETURN n`,
+		"where in parameter":                   `MATCH (n) WHERE n.kind IN $kinds RETURN n`,
+		"where string predicates":              `MATCH (n) WHERE n.name STARTS WITH "A" OR n.name ENDS WITH $suffix OR n.name CONTAINS "mid" RETURN n`,
+		"where property comparison":            `MATCH (n) WHERE n.min <= n.value RETURN n`,
+		"where without terminal":               `MATCH (n) WHERE n.active = true`,
+		"where then set":                       `MATCH (n) WHERE n.active = true SET n.checked = true`,
+		"where then create edge":               `MATCH (a), (b) WHERE a.active = true CREATE (a)-[:KNOWS]->(b)`,
+		"where then remove":                    `MATCH (n) WHERE n.active = true REMOVE n.active`,
+		"where then delete":                    `MATCH (n) WHERE n.active = true DELETE n`,
+		"where then detach delete":             `MATCH (n) WHERE n.active = true DETACH DELETE n`,
+		"where in property expression":         `MATCH (n), (m) WHERE n.kind IN m.allowed RETURN n`,
+		"where string property expression":     `MATCH (n), (m) WHERE n.name STARTS WITH m.prefix RETURN n`,
+		"where id property expression":         `MATCH (n), (m) WHERE id(n) = m.nodeID RETURN n`,
+		"return count star":                    `MATCH (n) RETURN count(*)`,
+		"return literal":                       `RETURN 1 AS value`,
+		"return arithmetic":                    `MATCH (n) RETURN n.age + 1 AS age`,
+		"return compact identifier arithmetic": `MATCH (n) RETURN n.age-1 AS age`,
+		"return scientific arithmetic":         `MATCH (n) RETURN 1e-3+n.age AS age`,
+		"return count binding":                 `MATCH (n) RETURN count(n) AS count`,
+		"return binding":                       `MATCH (n) RETURN n AS node`,
+		"return property":                      `MATCH (n) RETURN n.name`,
+		"return binding id":                    `MATCH (n) RETURN id(n) AS id`,
+		"return multiple projections":          `MATCH (n) RETURN id(n) AS id, n.name AS name`,
+		"return distinct":                      `MATCH (n) RETURN DISTINCT n.name AS name ORDER BY name`,
+		"return distinct count":                `MATCH (n) RETURN DISTINCT count(*) AS count`,
+		"return distinct projections":          `MATCH (n) RETURN DISTINCT n.name AS name, n.kind AS kind ORDER BY name`,
+		"return distinct aggregate":            `MATCH (n) RETURN count(DISTINCT n.name) AS count`,
+		"order by property":                    `MATCH (n) RETURN n.name ORDER BY n.name ASC`,
+		"order by binding id":                  `MATCH (n) RETURN id(n) ORDER BY id(n) DESC`,
+		"order by multiple expressions":        `MATCH (n) RETURN id(n), n.name ORDER BY n.name ASC, id(n) DESC LIMIT 2`,
+		"order by return alias":                `MATCH (n) RETURN n.name AS name ORDER BY name`,
+		"order by binding":                     `MATCH (n) RETURN n ORDER BY n`,
+		"limit zero":                           `MATCH (n) RETURN n.name LIMIT 0`,
+		"parameterized limit":                  `MATCH (n) RETURN n.name LIMIT $limit`,
+		"skip and limit":                       `MATCH (n) RETURN n.name SKIP $skip LIMIT $limit`,
+		"skip without limit":                   `MATCH (n) RETURN n.name SKIP 1`,
+		"set property":                         `MATCH (n) SET n.name = $name`,
+		"set property from property":           `MATCH (n) SET n.copy = n.name`,
+		"set property null":                    `MATCH (n) SET n.name = null`,
+		"replace properties":                   `MATCH (n) SET n = {name: $name}`,
+		"merge properties":                     `MATCH (n) SET n += $properties`,
+		"replace properties from property":     `MATCH (n), (source) SET n = source.properties`,
+		"merge properties from property":       `MATCH (n), (source) SET n += source.properties`,
+		"multiple set items":                   `MATCH (n) SET n.a = 1, n.b = 2`,
+		"set then return":                      `MATCH (n) SET n.name = $name RETURN n.name AS name`,
+		"set label":                            `MATCH (n) SET n:Active RETURN n`,
+		"merge node actions":                   `MERGE (n:Person {name: $name}) ON CREATE SET n.created = true ON MATCH SET n.visits = n.visits + 1 SET n.active = true RETURN n`,
+		"merge path":                           `MERGE (a:Person {name: $a})-[r:KNOWS]->(b:Person {name: $b}) RETURN r`,
+		"match merge":                          `MATCH (n:Person) MERGE (n)-[:KNOWS]->(m:Person {name: $name}) RETURN m`,
+		"unwind merge":                         `UNWIND $names AS name MERGE (n:Person {name: name}) RETURN n`,
+		"with merge":                           `MATCH (n) WITH n.name AS name MERGE (m:Person {name: name}) RETURN m`,
+		"create edge":                          `MATCH (a), (b) CREATE (a)-[:KNOWS {since: 2024}]->(b)`,
+		"edge property expression":             `MATCH (a), (b) CREATE (a)-[:KNOWS {weight: b.weight}]->(b)`,
+		"create edge then return":              `MATCH (a), (b) CREATE (a)-[r:KNOWS]->(b) RETURN id(r) AS id`,
+		"create incoming edge":                 `MATCH (a), (b) CREATE (a)<-[r:KNOWS]-(b) RETURN id(r) AS id`,
+		"remove property":                      `MATCH (n) REMOVE n.name`,
+		"remove then return":                   `MATCH (n) REMOVE n.name RETURN n.name AS name`,
+		"remove label":                         `MATCH (n) REMOVE n:Employee`,
+		"remove multiple items":                `MATCH (n) REMOVE n.name, n:Employee`,
+		"delete node":                          `MATCH (n) DELETE n`,
+		"delete edge and nodes":                `MATCH (a)-[r]->(b) DELETE r, a, b`,
+		"detach delete node":                   `MATCH (n) DETACH DELETE n`,
+		"unwind parameter":                     `UNWIND $items AS item RETURN item AS value`,
+		"unwind count":                         `UNWIND $items AS item RETURN count(item) AS count`,
+		"unwind order and limit":               `UNWIND $items AS item RETURN item ORDER BY item DESC LIMIT 2`,
+		"unwind create":                        `UNWIND $items AS item CREATE (n:Item {id: item.id}) RETURN n.id`,
+		"unwind create without return":         `UNWIND $items AS item CREATE (n:Item {id: item.id})`,
+		"unwind match return":                  `UNWIND $ids AS wanted MATCH (n:Item {id: wanted}) RETURN n.id`,
+		"unwind match without terminal":        `UNWIND $ids AS wanted MATCH (n:Item {id: wanted})`,
+		"unwind match mutation":                `UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted SET n.active = true RETURN n.id`,
+		"unwind match create edge":             `UNWIND $ids AS wanted MATCH (a:Item), (b:Item) WHERE a.id = wanted CREATE (a)-[:LINK]->(b)`,
+		"unwind match remove":                  `UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted REMOVE n.active`,
+		"unwind match delete":                  `UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted DELETE n`,
+		"unwind match detach delete":           `UNWIND $ids AS wanted MATCH (n:Item) WHERE n.id = wanted DETACH DELETE n`,
+		"quoted structural characters":         `MATCH (n {text: 'a,b) RETURN value AND more'}) RETURN n.text`,
+		"escaped double quoted string":         `MATCH (n {text: "a\"b"}) RETURN n.text`,
+		"nested map value":                     `CREATE (n {meta: {team: "graph", nested: {active: true}}})`,
+		"trailing semicolon":                   `MATCH (n) RETURN n;`,
+		"multiline whitespace":                 "MATCH\t(n)\nWHERE n.name = 'A  B'\r\nRETURN n.name;",
+		"keyword identifier":                   `MATCH (RETURN) RETURN RETURN`,
+		"function projection":                  `MATCH (n:Person) RETURN toLower(n.name) AS lowered`,
+		"function and binding projection":      `MATCH (n:Person) RETURN n.name AS name, size(n.name) AS width`,
+		"function in where comparison":         `MATCH (n:Person) WHERE n.name = toLower($name) RETURN n.name`,
+		"function in set clause":               `MATCH (n:Person) SET n.slug = toLower(n.name) RETURN n.slug AS slug`,
+		"function in create properties":        `CREATE (n:Tag {name: toLower("Mixed")}) RETURN n.name AS name`,
+		"nested function call":                 `MATCH (n:Person) RETURN size(split(n.name, "a")) AS parts`,
+		"function over unwind value":           `UNWIND $items AS item RETURN size(item.name) AS width`,
+		"count property expression":            `MATCH (n) RETURN count(n.name) AS count`,
+		"aggregate with group key":             `MATCH (n:Person) RETURN n.team AS team, count(*) AS total`,
+		"aggregate sum with order":             `MATCH (n:Person) RETURN n.team AS team, sum(n.age) AS total ORDER BY total DESC LIMIT 1`,
+		"aggregate collect":                    `MATCH (n:Person) RETURN collect(n.name) AS names`,
+		"aggregate min max":                    `MATCH (n:Person) RETURN min(n.age) AS low, max(n.age) AS high`,
+		"function with count projection":       `MATCH (n:Person) RETURN toLower(n.name) AS lowered, count(*) AS total`,
+		"with passthrough":                     `MATCH (n) WITH n MATCH (n) RETURN count(*) AS count`,
+		"with alias filter":                    `MATCH (n) WITH n AS m WHERE m.age >= 30 RETURN m.name AS name`,
+		"with aggregate":                       `MATCH (n) WITH n.team AS team, count(*) AS total RETURN team AS team, total AS total`,
+		"with ordered limit":                   `MATCH (n) WITH n ORDER BY n.age DESC LIMIT 2 MATCH (n) RETURN n.name AS name`,
+		"with chained":                         `MATCH (n) WITH n AS m WITH m AS k RETURN k.name AS name`,
+		"with distinct":                        `MATCH (n) WITH DISTINCT n.team AS team RETURN team AS team`,
+		"with after unwind":                    `UNWIND $ids AS id WITH id AS value RETURN value AS value`,
+		"with starts with filter":              `MATCH (n) WITH n WHERE n.name STARTS WITH 'A' RETURN n.name AS name`,
+		"with three chained":                   `MATCH (n) WITH n AS a WITH a AS b WITH b AS c RETURN c.name AS name`,
+		"with order by alias":                  `MATCH (n) WITH n.age AS age ORDER BY age DESC LIMIT 1 RETURN age AS age`,
+		"list literal":                         `MATCH (n) WHERE n.kind IN ["a", "b"] RETURN n`,
+		"count with projection list":           `MATCH (n) RETURN count(n), n.name`,
 	}
 	for name, query := range accepted {
 		t.Run("accept/"+name, func(t *testing.T) {
@@ -305,15 +335,12 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"private count display":        "MATCH (n) WITH count(*) RETURN `count(*)`",
 		"decoded duplicate with":       "MATCH (a), (b) WITH a AS b, `b` RETURN b",
 		"empty query":                  ``,
-		"unsupported root":             `RETURN 1`,
 		"lowercase keyword":            `match (n) RETURN n`,
 		"optional match":               `OPTIONAL MATCH (n) RETURN n`,
-		"merge":                        `MERGE (n:Person)`,
 		"missing match pattern":        `MATCH`,
 		"empty where":                  `MATCH (n) WHERE`,
 		"dangling boolean predicate":   `MATCH (n) WHERE n.active = true AND RETURN n`,
 		"unterminated node":            `MATCH (n RETURN n`,
-		"variable length edge":         `MATCH (a)-[:KNOWS*1..3]->(b) RETURN b`,
 		"empty edge type":              `MATCH (a)-[:]->(b) RETURN b`,
 		"compound top level create":    `CREATE (a)-[:KNOWS]->(b)`,
 		"unknown function":             `MATCH (n:Person) RETURN nope(n.name) AS value`,
@@ -345,7 +372,6 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"duplicate return alias":       `MATCH (n) RETURN id(n) AS value, n.name AS value`,
 		"distinct hidden order":        `MATCH (n) RETURN DISTINCT n.name ORDER BY id(n)`,
 		"empty distinct return":        `MATCH (n) RETURN DISTINCT`,
-		"literal return":               `MATCH (n) RETURN 1`,
 		"negative limit":               `MATCH (n) RETURN n LIMIT -1`,
 		"negative skip":                `MATCH (n) RETURN n SKIP -1`,
 		"skip after limit":             `MATCH (n) RETURN n LIMIT 1 SKIP 1`,

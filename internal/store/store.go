@@ -418,6 +418,8 @@ const (
 type GraphState struct {
 	DatabaseID       string
 	VectorDimensions uint16
+	// VectorIndexM is transient derived-index configuration supplied at open.
+	VectorIndexM     uint16
 	SnapshotBytes    uint64
 	// AppMetadata is shared by shallow clones; writers must Fork before mutation.
 	AppMetadata      *AppMetadata
@@ -646,6 +648,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
 	cloned := NewGraphState()
 	cloned.DatabaseID = graph.DatabaseID
 	cloned.VectorDimensions = graph.VectorDimensions
+	cloned.VectorIndexM = graph.VectorIndexM
 	cloned.SnapshotBytes = graph.SnapshotBytes
 	cloned.AppMetadata = CloneAppMetadata(graph.AppMetadata)
 	cloned.DerivedIndexWork = graph.DerivedIndexWork
@@ -735,6 +738,7 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
 	return &GraphState{
 		DatabaseID:               graph.DatabaseID,
 		VectorDimensions:         graph.VectorDimensions,
+		VectorIndexM:             graph.VectorIndexM,
 		SnapshotBytes:            graph.SnapshotBytes,
 		AppMetadata:              graph.AppMetadata,
 		Nodes:                    graph.Nodes.Fork(),

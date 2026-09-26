@@ -80,10 +80,12 @@ type OpenOptions struct {
 	PageSize                          uint32
 	EnableVector                      bool
 	VectorIndexMode                   VectorIndexMode
+	VectorM                           uint16
 	VectorDimensions                  uint16
 	VectorNamespaces                  []VectorNamespace
 	FTSProperties                     []string
 	Durability                        DurabilityMode
+	BackupDirectory                   string
 	WALCheckpointThresholdBytes       uint64
 	ChangefeedMaxBytes                uint64
 	MaxDatabaseSnapshotBytes          uint64
@@ -180,6 +182,8 @@ type FTSSearchOptions struct {
 	MinTermLength uint32
 	MaxWork       uint64
 	MaxBytes      uint64
+	Scoring       FTSScoring
+	Analyzer      FTSAnalyzer
 }
 
 type QueryCacheStats struct {
@@ -306,6 +310,7 @@ type DB struct {
 	checkpointPrepared                *store.PreparedCheckpoint
 	checkpointInFlight                atomic.Bool
 	pathLock                          *pathLock
+	backupArchive                     *backupArchive
 	wal                               *store.WALWriter
 	temporary                         bool
 	streamNotify                      map[string]*streamSubscription
@@ -462,8 +467,14 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	if opts.Durability != DurabilityStandard && opts.Durability != DurabilityFull {
 		return nil, fmt.Errorf("invalid durability mode %d", opts.Durability)
 	}
+	if opts.BackupDirectory != "" && opts.DisableLock {
+		return nil, fmt.Errorf("%w: BackupDirectory requires database locking", ErrInvalidArgument)
+	}
 	if opts.VectorIndexMode != VectorIndexExactOnly && opts.VectorIndexMode != VectorIndexHNSWSynchronous {
 		return nil, fmt.Errorf("invalid vector index mode %d", opts.VectorIndexMode)
+	}
+	if err := validateVectorIndexM(opts.VectorM); err != nil {
+		return nil, err
 	}
 	if opts.WALCheckpointThresholdBytes == 0 {
 		opts.WALCheckpointThresholdBytes = defaultWALCheckpointThresholdBytes
@@ -596,6 +607,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 			graph.VectorDimensions = 128
 		}
 	}
+	graph.VectorIndexM = effectiveVectorIndexM(opts.VectorM)
 	effectiveEnableVector := opts.EnableVector || graph.VectorDimensions != 0
 	if len(opts.VectorNamespaces) != 0 && !effectiveEnableVector {
 		_ = lock.close()
@@ -729,6 +741,30 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		pathLock:                          lock,
 		wal:                               wal,
 		streamNotify:                      map[string]*streamSubscription{},
+	}
+	if opts.BackupDirectory != "" {
+		if opts.ReadOnly {
+			if wal != nil {
+				_ = wal.Close()
+			}
+			_ = lock.close()
+			return nil, fmt.Errorf("%w: BackupDirectory requires a writable open", ErrInvalidArgument)
+		}
+		archive, archiveErr := openBackupArchive(opts.BackupDirectory, files.State, graph.DatabaseID)
+		if archiveErr == nil {
+			_, archiveErr = archive.captureAt(db.timeNow(), graph, nextNodeID, nextEdgeID, commitID, db.maxDatabaseSnapshotBytes)
+		}
+		if archiveErr != nil {
+			if archive != nil {
+				_ = archive.close()
+			}
+			if wal != nil {
+				_ = wal.Close()
+			}
+			_ = lock.close()
+			return nil, archiveErr
+		}
+		db.backupArchive = archive
 	}
 	db.checkpointAttemptCond.L = &db.checkpointWorkerMu
 	if !db.readOnly {
@@ -1256,6 +1292,7 @@ func (db *DB) closeWithWriterHeld() error {
 			closeErr = err
 		}
 	}
+	closeErr = errors.Join(closeErr, db.backupArchive.close())
 	closeErr = errors.Join(closeErr, db.pathLock.close())
 	if db.temporary {
 		closeErr = errors.Join(closeErr, os.RemoveAll(db.path))
@@ -2070,6 +2107,12 @@ func (db *DB) FTSSearch(query string, opts FTSSearchOptions) ([]FTSSearchResult,
 }
 
 func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearchOptions) ([]FTSSearchResult, error) {
+	if err := validateFTSSearchScoring(opts); err != nil {
+		return nil, err
+	}
+	if opts.Scoring == FTSScoringBM25 || opts.Analyzer == FTSAnalyzerEnglishPorter {
+		return db.ftsSearchBM25Context(ctx, query, opts)
+	}
 	limit := uint64(opts.Limit)
 	if limit == 0 {
 		limit = 10
@@ -3051,7 +3094,7 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 					state.replayBytes -= tombstoneBytes
 					delete(state.tombstoneBytes, delta.id)
 				}
-				scratchBytes, persistentBytes, err := reserveVectorRebuildDelta(budget, state.dimensions, state.graph.VectorIndex.Nodes.Get(delta.id) == nil, state.logBytes)
+				scratchBytes, persistentBytes, err := reserveVectorRebuildDelta(budget, state.dimensions, state.graph.VectorIndexM, state.graph.VectorIndex.Nodes.Get(delta.id) == nil, state.logBytes)
 				if err == nil {
 					state.replayBytes = saturatingAdd(state.replayBytes, persistentBytes)
 				}
@@ -3133,10 +3176,10 @@ func (db *DB) runVectorRebuild(ctx context.Context, state *vectorRebuildState) e
 	}
 }
 
-func reserveVectorRebuildDelta(budget *directSearchBudget, dimensions uint16, newEntry bool, logBytes uint64) (uint64, uint64, error) {
+func reserveVectorRebuildDelta(budget *directSearchBudget, dimensions, m uint16, newEntry bool, logBytes uint64) (uint64, uint64, error) {
 	persistentBytes := uint64(0)
 	if newEntry {
-		persistentBytes = estimateVectorIndexBytes(1, dimensions)
+		persistentBytes = estimateVectorIndexBytesForM(1, dimensions, m)
 		if err := reserveVectorRebuildPersistent(budget, persistentBytes, logBytes); err != nil {
 			return 0, 0, err
 		}
@@ -3144,7 +3187,7 @@ func reserveVectorRebuildDelta(budget *directSearchBudget, dimensions uint16, ne
 	if budget.bytes > budget.maxBytes || logBytes > budget.maxBytes-budget.bytes {
 		return 0, 0, fmt.Errorf("%w: vector rebuild scratch exceeds budget", ErrResourceLimit)
 	}
-	scratchBytes := min(vectorBuildScratchBytes, budget.maxBytes-budget.bytes-logBytes)
+	scratchBytes := min(vectorBuildScratchBytesForM(m), budget.maxBytes-budget.bytes-logBytes)
 	if scratchBytes < 80 {
 		return 0, 0, fmt.Errorf("%w: vector rebuild scratch exceeds budget", ErrResourceLimit)
 	}
@@ -3339,7 +3382,7 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		return errors.New("commit id space exhausted")
 	}
 	nextCommitID := tx.db.commitID + 1
-	nextNodeID, nextEdgeID, wal := tx.db.nextNodeID, tx.db.nextEdgeID, tx.db.wal
+	nextNodeID, nextEdgeID, wal, archive := tx.db.nextNodeID, tx.db.nextEdgeID, tx.db.wal, tx.db.backupArchive
 	if tx.db.checkpointInFlight.Load() || tx.db.checkpointNeeded.Load() {
 		tail, tailErr := wal.TailSize()
 		if tailErr == nil && tail >= 0 && uint64(tail) >= tx.db.walCheckpointThresholdBytes {
@@ -3404,6 +3447,14 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 			tx.db.mu.Unlock()
 		}
 		return err
+	}
+	if archive != nil {
+		if _, err := archive.captureAt(tx.db.timeNow(), tx.graph, nextNodeID, nextEdgeID, nextCommitID, tx.db.maxDatabaseSnapshotBytes); err != nil {
+			tx.db.mu.Lock()
+			tx.db.recoveryRequired = true
+			tx.db.mu.Unlock()
+			return errors.Join(ErrCommitOutcomeUnknown, fmt.Errorf("archive durable commit %d: %w", nextCommitID, err))
+		}
 	}
 	tx.db.mu.Lock()
 	tx.db.graph = tx.graph

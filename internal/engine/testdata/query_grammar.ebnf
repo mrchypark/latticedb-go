@@ -1,24 +1,36 @@
 query          = query-part {WITH with-clause query-part} [";"]
-query-part     = match-query | create-node-query | unwind-query | RETURN return-tail
+query-part     = match-query | create-node-query | merge-query | unwind-query | RETURN return-tail
 with-clause    = [DISTINCT] projection {"," projection} [WHERE predicates]
                 [ORDER BY order {"," order}] [SKIP pagination] [LIMIT pagination]
 match-query    = MATCH patterns [WHERE predicates] [match-terminal]
 match-terminal = RETURN return-tail
                 | SET assignments [RETURN return-tail]
                 | CREATE edge-create [RETURN return-tail]
+                | MERGE merge-tail
                 | REMOVE removals [RETURN return-tail]
                 | [DETACH] DELETE bindings
 create-node-query
                 = CREATE node-pattern [RETURN return-tail]
-unwind-query   = UNWIND value AS binding RETURN return-tail
-                | UNWIND value AS binding CREATE node-pattern [RETURN return-tail]
-                | UNWIND value AS binding match-query
+unwind-query   = UNWIND expression AS binding RETURN return-tail
+                | UNWIND expression AS binding CREATE node-pattern [RETURN return-tail]
+                | UNWIND expression AS binding MERGE merge-tail
+                | UNWIND expression AS binding match-query
+merge-query    = MERGE merge-tail
+merge-tail     = merge-pattern merge-actions [SET assignments] [RETURN return-tail]
+merge-pattern  = node-pattern {fixed-merge-relationship node-pattern}
+merge-actions  = [ON CREATE SET assignments] [ON MATCH SET assignments]
+                | [ON MATCH SET assignments] [ON CREATE SET assignments]
 
 patterns       = pattern {"," pattern}
 pattern        = node-pattern | node-pattern {relationship node-pattern}
-relationship   = "-[" [binding] [":" type] [properties] "]->"
-                | "<-[" [binding] [":" type] [properties] "]-"
-                | "-[" [binding] [":" type] [properties] "]-"
+relationship   = "-[" [binding] [":" type] ["*" hops] [properties] "]->"
+                | "<-[" [binding] [":" type] ["*" hops] [properties] "]-"
+                | "-[" [binding] [":" type] ["*" hops] [properties] "]-"
+fixed-merge-relationship
+               = "-[" [binding] ":" type [properties] "]->"
+                | "<-[" [binding] ":" type [properties] "]-"
+                | "-[" [binding] ":" type [properties] "]-"
+hops           = [non-negative-integer] [".." [non-negative-integer]]
 node-pattern   = "(" [binding] {":" label} [properties] ")"
 properties     = "{" [property ":" expression {"," property ":" expression}] "}"
 
@@ -49,17 +61,27 @@ return-tail    = [DISTINCT] (count-return | projection {"," projection})
                  [ORDER BY order {"," order}]
                  [SKIP pagination] [LIMIT pagination]
 count-return   = "count(" ("*" | binding) ")" [AS alias]
-projection     = (binding | property-access | id-access | function-call | aggregate-call | list) [AS alias]
+projection     = (binding | property-access | id-access | expression | aggregate-call) [AS alias]
 order          = (binding | property-access | id-access | alias) [ASC | DESC]
 pagination     = non-negative-integer | parameter
 
 value          = null | true | false | integer | float | string | parameter | map | list
 map            = "{" [property ":" expression {"," property ":" expression}] "}"
 list           = "[" [expression {"," expression}] "]"
-expression     = value | binding | property-access | function-call
+expression     = sum-expression
+sum-expression = product-expression {("+" | "-") product-expression}
+product-expression
+               = unary-expression {("*" | "/" | "%") unary-expression}
+unary-expression
+               = {"+" | "-"} power-expression
+power-expression
+               = primary-expression ["^" unary-expression]
+primary-expression
+               = value | binding | property-access | function-call | "(" expression ")"
 function-call  = identifier "(" [expression {"," expression}] ")"
-aggregate-call = aggregate-name "(" ("*" | expression) ")"
-aggregate-name = "count" | "sum" | "avg" | "min" | "max" | "collect"
+aggregate-call = "count(" ("*" | [DISTINCT] expression) ")"
+                | aggregate-name "(" [DISTINCT] expression ")"
+aggregate-name = "sum" | "avg" | "min" | "max" | "collect"
 
 identifier     = unquoted-identifier | quoted-identifier
 unquoted-identifier

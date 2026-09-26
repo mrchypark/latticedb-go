@@ -25,6 +25,31 @@ func TestTokenizeContextMatchesAndCancels(t *testing.T) {
 	}
 }
 
+func TestAnalyzeEnglishPorter(t *testing.T) {
+	tokens, err := AnalyzeEnglishPorterContextWithLimit(context.Background(), "feed agreed ponies hopping filing happy sky relational 검색", ^uint64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Expected final stems are drawn from the Porter 1980 vocabulary, not
+	// intermediate-step examples.
+	want := []string{"feed", "agre", "poni", "hop", "file", "happi", "sky", "relat", "검색"}
+	if !slices.Equal(tokens, want) {
+		t.Fatalf("tokens = %q, want %q", tokens, want)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := AnalyzeEnglishPorterContextWithLimit(canceled, "running", ^uint64(0)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled analyzer = %v", err)
+	}
+	base, err := tokenizationLogicalBytes(context.Background(), "running")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AnalyzeEnglishPorterContextWithLimit(context.Background(), "running", base+saturatingTokenStemBytes("running")-1); !errors.Is(err, ErrTokenizationLimit) {
+		t.Fatalf("stem scratch budget = %v", err)
+	}
+}
+
 func TestTokenizeContextPreflightsHighCardinality(t *testing.T) {
 	text := strings.Repeat("A ", 100_000)
 	if _, err := TokenizeContextWithLimit(context.Background(), text, uint64(len(text))*8); !errors.Is(err, ErrTokenizationLimit) {
