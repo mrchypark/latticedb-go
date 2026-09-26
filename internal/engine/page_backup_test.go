@@ -122,7 +122,8 @@ func snapshotArchiveFiles(t *testing.T, directory string) map[string][]byte {
 	}
 	files := make(map[string][]byte, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() {
+		// Windows denies reads of the held lock; it is coordination state, not backup data.
+		if entry.IsDir() || entry.Name() == backupLockFile {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
