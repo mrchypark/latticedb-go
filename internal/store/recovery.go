@@ -131,6 +131,7 @@ type WALWriter struct {
 	encodeValue   walPayload
 	encodeDelta   persistedDelta
 	encodeBuffer  bytes.Buffer
+	encodeHeader  [walHeaderSize]byte
 	file          *os.File
 	tailSize      atomic.Int64
 	fullSync      bool
@@ -222,11 +223,12 @@ func (writer *WALWriter) append(databaseID string, commitID uint64, payload []by
 	if err != nil {
 		return err
 	}
+	writer.encodeHeader = header
 	offset, err := writer.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return fmt.Errorf("locate WAL writer: %w", err)
 	}
-	if full, err := writer.write(header[:]); err != nil {
+	if full, err := writer.write(writer.encodeHeader[:]); err != nil {
 		if full {
 			return fmt.Errorf("%w: write WAL header: %w", ErrCommitOutcomeUnknown, err)
 		}
@@ -867,7 +869,8 @@ func WALFilesHaveCheckpointMarker(files DatabaseFiles) (bool, error) {
 		return false, err
 	}
 	defer file.Close()
-	header, err := readWALHeader(file)
+	var headerBuffer [walHeaderSize]byte
+	header, err := readWALHeader(file, &headerBuffer)
 	if err != nil {
 		return false, err
 	}
@@ -2195,13 +2198,14 @@ func loadLatestWALV2ContextWithRecoveryBudgetAndAppendReady(ctx context.Context,
 	}
 	var accumulator *walAccumulator
 	currentFormat := true
+	var headerBuffer [walHeaderSize]byte
 	var wrapper walPayload
 	payloadReader := bufio.NewReaderSize(nil, 4096)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, false, err
 		}
-		header, err := readWALHeader(file)
+		header, err := readWALHeader(file, &headerBuffer)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -3905,8 +3909,8 @@ func walHeaderLength(prefix []byte) int {
 	return 0
 }
 
-func readWALHeader(input io.Reader) ([]byte, error) {
-	prefix := make([]byte, walHeaderPrefixSize)
+func readWALHeader(input io.Reader, buffer *[walHeaderSize]byte) ([]byte, error) {
+	prefix := buffer[:walHeaderPrefixSize]
 	if _, err := io.ReadFull(input, prefix); err != nil {
 		return nil, err
 	}
@@ -3914,8 +3918,7 @@ func readWALHeader(input io.Reader) ([]byte, error) {
 	if headerSize == 0 {
 		headerSize = legacyWALHeaderSize
 	}
-	header := make([]byte, headerSize)
-	copy(header, prefix)
+	header := buffer[:headerSize]
 	if _, err := io.ReadFull(input, header[walHeaderPrefixSize:]); err != nil {
 		return nil, err
 	}

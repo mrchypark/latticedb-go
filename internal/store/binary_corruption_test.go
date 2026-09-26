@@ -10,6 +10,32 @@ import (
 	"testing"
 )
 
+func TestReadWALHeaderReusesBufferAcrossFormats(t *testing.T) {
+	header, err := encodeWALHeader(strings.Repeat("a", 32), 1, []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.Clone(header[:legacyWALHeaderSize])
+	copy(legacy[:8], binaryWALMagic[:])
+	binary.BigEndian.PutUint16(legacy[8:10], binaryWALVersion)
+	binary.BigEndian.PutUint16(legacy[10:12], legacyWALHeaderSize)
+	var buffer [walHeaderSize]byte
+	reader := bytes.NewReader(nil)
+	frames := [][]byte{header[:], legacy, header[:]}
+	allocations := testing.AllocsPerRun(100, func() {
+		for _, frame := range frames {
+			reader.Reset(frame)
+			got, err := readWALHeader(reader, &buffer)
+			if err != nil || !bytes.Equal(got, frame) || !validWALHeader(got) {
+				t.Fatalf("reused header = %x, %v", got, err)
+			}
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("reading into a reusable header buffer allocated %g times", allocations)
+	}
+}
+
 func TestWALHeaderChecksumRejectsLengthCorruption(t *testing.T) {
 	files := DirectoryDatabaseFiles(t.TempDir())
 	base := NewGraphState()
