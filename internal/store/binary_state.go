@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -76,12 +75,13 @@ func writePersistedStateBinary(output io.Writer, graph *GraphState, nextNodeID, 
 	e.u(nextNodeID)
 	e.u(nextEdgeID)
 	e.metadata(metadata)
-	e.u(uint64(graph.Nodes.Len()) + 1)
-	for id, node := range graph.Nodes.Ordered() {
-		if node == nil || node.ID != id {
-			return fmt.Errorf("node key %d does not match record", id)
-		}
-		if err := ValidateEntityID(id); err != nil {
+	nodes, err := graph.NodeCount()
+	if err != nil {
+		return err
+	}
+	e.u(nodes + 1)
+	if err := graph.VisitNodes(context.Background(), func(node *NodeRecord) error {
+		if err := ValidateEntityID(node.ID); err != nil {
 			return err
 		}
 		if err := ValidateCreateLabels(node.Labels); err != nil {
@@ -91,18 +91,19 @@ func writePersistedStateBinary(output io.Writer, graph *GraphState, nextNodeID, 
 		if err != nil {
 			return err
 		}
-		e.node(persistedNode{ID: id, Labels: CloneStrings(node.Labels), Properties: properties})
-		if e.err != nil {
-			return e.err
-		}
+		e.node(persistedNode{ID: node.ID, Labels: node.Labels, Properties: properties})
+		return e.err
+	}); err != nil {
+		return err
 	}
-	e.u(uint64(graph.Edges.Len()) + 1)
-	for id, edge := range graph.Edges.Ordered() {
-		if edge == nil || edge.ID != id {
-			return fmt.Errorf("edge key %d does not match record", id)
-		}
-		for _, entityID := range []uint64{id, edge.SourceID, edge.TargetID} {
-			if err := ValidateEntityID(entityID); err != nil {
+	edges, err := graph.EdgeCount()
+	if err != nil {
+		return err
+	}
+	e.u(edges + 1)
+	if err := graph.VisitEdges(context.Background(), func(edge *EdgeRecord) error {
+		for _, id := range []uint64{edge.ID, edge.SourceID, edge.TargetID} {
+			if err := ValidateEntityID(id); err != nil {
 				return err
 			}
 		}
@@ -113,34 +114,38 @@ func writePersistedStateBinary(output io.Writer, graph *GraphState, nextNodeID, 
 		if err != nil {
 			return err
 		}
-		e.edge(persistedEdge{ID: id, SourceID: edge.SourceID, TargetID: edge.TargetID, Type: edge.Type, Properties: properties})
-		if e.err != nil {
-			return e.err
-		}
+		e.edge(persistedEdge{ID: edge.ID, SourceID: edge.SourceID, TargetID: edge.TargetID, Type: edge.Type, Properties: properties})
+		return e.err
+	}); err != nil {
+		return err
 	}
-	e.u(uint64(graph.FTS.Len()) + 1)
-	for id, record := range graph.FTS.Ordered() {
+	ftsCount, err := graph.FTSCount()
+	if err != nil {
+		return err
+	}
+	e.u(ftsCount + 1)
+	if err := graph.VisitFTS(context.Background(), func(id uint64, record *FTSRecord) error {
 		if err := ValidateEntityID(id); err != nil {
 			return err
 		}
-		if record == nil || graph.Nodes.Get(id) == nil {
+		node, err := graph.ReadNode(id)
+		if err != nil {
+			return err
+		}
+		if record == nil || node == nil {
 			return fmt.Errorf("invalid FTS record for node %d", id)
 		}
 		if err := ValidateFTSText(record.Text); err != nil {
 			return err
 		}
 		e.fts(persistedFTS{NodeID: id, Text: record.Text})
-		if e.err != nil {
-			return e.err
-		}
+		return e.err
+	}); err != nil {
+		return err
 	}
 	e.indexes(persistedPropertyIndexes(graph.NodeProperties))
 	e.indexes(persistedPropertyIndexes(graph.EdgeProperties))
-	streams, err := buildPersistedStreams(graph.Streams)
-	if err != nil {
-		return err
-	}
-	e.streams(streams)
+	e.streamStore(graph.Streams)
 	if e.err != nil {
 		return e.err
 	}
@@ -219,7 +224,7 @@ func decodeBinaryStatePayload(input io.Reader, length, maxBytes uint64) (*persis
 }
 
 func decodeWALPayloadBytes(ctx context.Context, header, payload []byte, maxBytes uint64, out *walPayload) error {
-	if binary.BigEndian.Uint16(header[8:10]) != walVersion {
+	if !isBinaryWALHeader(header) {
 		return unmarshalContext(ctx, payload, out)
 	}
 	decoded, err := decodeBinaryWALPayload(&contextReader{ctx: ctx, reader: bytes.NewReader(payload)}, uint64(len(payload)), maxBytes)

@@ -39,6 +39,86 @@ func gateFixture(overrides map[string]float64) result {
 	return parsed
 }
 
+func diskBaselineFixture() result {
+	input := strings.Join([]string{
+		"BenchmarkReadRequests/query-8 1 200 ns/op 200 B/op 20 allocs/op",
+		"BenchmarkReadRequests/write_commit-8 1 300 ns/op 300 B/op 30 allocs/op",
+		"BenchmarkSingleRecordCommitScaling/nodes_100000/direct-8 1 400 ns/op 400 B/op 40 allocs/op",
+	}, "\n")
+	parsed, err := parse(strings.NewReader(input))
+	if err != nil {
+		panic(err)
+	}
+	return parsed
+}
+
+func cloneMetricSet(metrics map[string][]float64) map[string][]float64 {
+	cloned := make(map[string][]float64, len(metrics))
+	for unit, values := range metrics {
+		cloned[unit] = append([]float64(nil), values...)
+	}
+	return cloned
+}
+
+func TestValidateDiskBaselineRequiresAllThreeMetrics(t *testing.T) {
+	baseline := diskBaselineFixture()
+	if err := validateDiskBaseline(baseline); err != nil {
+		t.Fatalf("complete disk baseline rejected: %v", err)
+	}
+	delete(baseline[diskBaselineBenchmarks[1]], "allocs/op")
+	if err := validateDiskBaseline(baseline); err == nil || !strings.Contains(err.Error(), diskBaselineBenchmarks[1]+" missing or invalid allocs/op") {
+		t.Fatalf("missing disk metric error = %v", err)
+	}
+	if _, err := parse(strings.NewReader("BenchmarkReadRequests/query-8 1 NaN ns/op 200 B/op 20 allocs/op\n")); err == nil {
+		t.Fatal("invalid disk metric parsed")
+	}
+}
+
+func TestDiskBaselineReplacesOnlySelectedComparisonSources(t *testing.T) {
+	previous := gateFixture(nil)
+	current := gateFixture(nil)
+	disk := diskBaselineFixture()
+	for _, benchmark := range diskBaselineBenchmarks {
+		current[benchmark] = cloneMetricSet(disk[benchmark])
+	}
+	current[diskBaselineBenchmarks[0]]["B/op"] = []float64{201}
+	if err := checkGates(current, withDiskBaseline(previous, disk), new(bytes.Buffer)); err != nil {
+		t.Fatalf("disk baseline was not used for selected query metric: %v", err)
+	}
+
+	current[diskBaselineBenchmarks[0]]["B/op"] = []float64{203}
+	if err := checkGates(current, withDiskBaseline(previous, disk), new(bytes.Buffer)); err == nil || !strings.Contains(err.Error(), diskBaselineBenchmarks[0]+" B/op") {
+		t.Fatalf("disk regression was not checked: %v", err)
+	}
+
+	current = gateFixture(nil)
+	for _, benchmark := range diskBaselineBenchmarks {
+		current[benchmark] = cloneMetricSet(disk[benchmark])
+	}
+	current["BenchmarkQueryMultiHopSlots"]["B/op"] = []float64{102}
+	if err := checkGates(current, withDiskBaseline(previous, disk), new(bytes.Buffer)); err == nil || !strings.Contains(err.Error(), "BenchmarkQueryMultiHopSlots B/op") {
+		t.Fatalf("non-disk memory gate changed when disk baseline was provided: %v", err)
+	}
+}
+
+func TestDiskBaselineReportIdentifiesSourceAndValues(t *testing.T) {
+	current := diskBaselineFixture()
+	previous := gateFixture(nil)
+	current[diskBaselineBenchmarks[0]]["B/op"] = []float64{210}
+	var report bytes.Buffer
+	writeReport(&report, current, previous, "candidate", "memory-reference", nil, "", false, diskBaselineInput{
+		metrics: diskBaselineFixture(), source: "baseline.txt", label: "f3518b7 run36258284773",
+	})
+	for _, want := range []string{
+		"Disk baseline for `BenchmarkReadRequests/query`, `BenchmarkReadRequests/write_commit`, and `BenchmarkSingleRecordCommitScaling/nodes_100000/direct`: `f3518b7 run36258284773` (input `baseline.txt`)",
+		"| `BenchmarkReadRequests/query` | 1 / 1 | 200 | 200 | +0.0% | 210 | 200 | +5.0% |",
+	} {
+		if !strings.Contains(report.String(), want) {
+			t.Fatalf("disk baseline report does not contain %q:\n%s", want, report.String())
+		}
+	}
+}
+
 func TestReportUsesMediansAndComparesMetrics(t *testing.T) {
 	current, err := parse(strings.NewReader("BenchmarkLookup-8 1 120 ns/op 8 B/op 1 allocs/op\nBenchmarkLookup-8 1 100 ns/op 8 B/op 1 allocs/op\nBenchmarkLookup-8 1 110 ns/op 8 B/op 1 allocs/op\n"))
 	if err != nil {

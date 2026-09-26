@@ -3,10 +3,233 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"hash/crc32"
 	"os"
 	"strings"
 	"testing"
 )
+
+func TestReadWALHeaderReusesBufferAcrossFormats(t *testing.T) {
+	databaseID := strings.Repeat("a", 32)
+	header, err := encodeWALHeader(databaseID, 1, []byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := bytes.Clone(header[:legacyWALHeaderSize])
+	copy(legacy[:8], binaryWALMagic[:])
+	binary.BigEndian.PutUint16(legacy[8:10], binaryWALVersion)
+	binary.BigEndian.PutUint16(legacy[10:12], legacyWALHeaderSize)
+	var buffer [walHeaderSize]byte
+	reader := bytes.NewReader(nil)
+	frames := [][]byte{header[:], legacy, header[:]}
+	allocations := testing.AllocsPerRun(100, func() {
+		for _, frame := range frames {
+			reader.Reset(frame)
+			got, err := readWALHeader(reader, &buffer)
+			if err != nil || !bytes.Equal(got, frame) || !validWALHeader(got) {
+				t.Fatalf("reused header = %x, %v", got, err)
+			}
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("reading into a reusable header buffer allocated %g times", allocations)
+	}
+	payloadChecksum := binary.BigEndian.Uint32(header[28:32])
+	allocations = testing.AllocsPerRun(100, func() {
+		if err := encodeWALHeaderFieldsInto(&buffer, databaseID, 1, 1, payloadChecksum); err != nil || !bytes.Equal(buffer[:], header[:]) {
+			t.Fatalf("reused encoded header = %x, %v", buffer, err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("encoding into a reusable header buffer allocated %g times", allocations)
+	}
+}
+
+func TestWALHeaderChecksumRejectsLengthCorruption(t *testing.T) {
+	files := DirectoryDatabaseFiles(t.TempDir())
+	base := NewGraphState()
+	if err := CheckpointGraphState(files.Directory, base, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := AppendWALCommitFiles(files, base, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	updated := CloneGraphState(base)
+	updated.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"v": "committed"})})
+	if err := AppendWALDeltaFiles(files, updated, 2, 1, 1, GraphDelta{UpsertNodes: []uint64{1}}); err != nil {
+		t.Fatal(err)
+	}
+	wal, err := os.ReadFile(files.WAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstLength := binary.BigEndian.Uint64(wal[20:28])
+	second := walHeaderSize + int(firstLength)
+	wal[second+27]++ // Payload length increases by one while remaining below every budget.
+	if err := os.WriteFile(files.WAL, wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := LoadGraphState(files.Directory); err == nil {
+		t.Fatal("corrupt v5 header length silently discarded the committed frame")
+	}
+	if WALFilesReadyForAppend(files) {
+		t.Fatal("corrupt v5 header is append-ready")
+	}
+}
+
+func TestWALV5RejectsEveryHeaderBitCorruption(t *testing.T) {
+	files := DirectoryDatabaseFiles(t.TempDir())
+	graph := NewGraphState()
+	if err := AppendWALCommitFiles(files, graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	record, err := os.ReadFile(files.WAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for byteIndex := 0; byteIndex < walHeaderSize; byteIndex++ {
+		for bit := byte(0); bit < 8; bit++ {
+			corrupt := append([]byte(nil), record...)
+			corrupt[byteIndex] ^= 1 << bit
+			if err := os.WriteFile(files.WAL, corrupt, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, _, _, err := LoadGraphState(files.Directory); err == nil {
+				t.Fatalf("header byte %d bit %d was accepted", byteIndex, bit)
+			}
+		}
+	}
+}
+
+func TestValidWALHeaderRejectsShortBuffers(t *testing.T) {
+	for length := 0; length < walHeaderPrefixSize; length++ {
+		if validWALHeader(make([]byte, length)) {
+			t.Fatalf("short header length %d was accepted", length)
+		}
+	}
+}
+
+func TestWALV5RejectsCompletePayloadChecksumMismatch(t *testing.T) {
+	files := DirectoryDatabaseFiles(t.TempDir())
+	graph := NewGraphState()
+	if err := AppendWALCommitFiles(files, graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	record, err := os.ReadFile(files.WAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record[len(record)-1] ^= 1
+	if err := os.WriteFile(files.WAL, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := LoadGraphState(files.Directory); err == nil {
+		t.Fatal("complete payload checksum mismatch was accepted")
+	}
+}
+
+func TestWALV5TruncationReturnsOnlyCompletePrefix(t *testing.T) {
+	files := DirectoryDatabaseFiles(t.TempDir())
+	base := NewGraphState()
+	if err := AppendWALCommitFiles(files, base, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	updated := CloneGraphState(base)
+	updated.Nodes.Set(1, &NodeRecord{ID: 1, Properties: PropertiesFromMap(map[string]any{"v": "committed"})})
+	if err := AppendWALDeltaFiles(files, updated, 2, 1, 1, GraphDelta{UpsertNodes: []uint64{1}}); err != nil {
+		t.Fatal(err)
+	}
+	wal, err := os.ReadFile(files.WAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := walHeaderSize + int(binary.BigEndian.Uint64(wal[20:28]))
+	for length := 0; length < len(wal); length++ {
+		if err := os.WriteFile(files.WAL, wal[:length], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		graph, _, _, commit, err := LoadGraphState(files.Directory)
+		if length < second {
+			if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("truncate at %d: error = %v, want os.ErrNotExist", length, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("truncate at %d: %v", length, err)
+		}
+		if commit != 0 || graph.Nodes.Get(1) != nil {
+			t.Fatalf("truncate at %d recovered commit %d, node=%v", length, commit, graph.Nodes.Get(1) != nil)
+		}
+	}
+	if err := os.WriteFile(files.WAL, wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	graph, _, _, commit, err := LoadGraphState(files.Directory)
+	if err != nil || commit != 1 || graph.Nodes.Get(1) == nil {
+		t.Fatalf("complete v5 frame = commit %d, node=%v, err=%v", commit, graph.Nodes.Get(1) != nil, err)
+	}
+}
+
+func TestWALV5VersionDowngradeDoesNotReinterpretHeaderLayout(t *testing.T) {
+	files := DirectoryDatabaseFiles(t.TempDir())
+	graph := NewGraphState()
+	if err := AppendWALCommitFiles(files, graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	record, err := os.ReadFile(files.WAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint16(record[8:10], binaryWALVersion)
+	binary.BigEndian.PutUint32(record[walHeaderChecksumAt:walHeaderSize], crc32.ChecksumIEEE(record[:walHeaderChecksumAt]))
+	if err := os.WriteFile(files.WAL, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := LoadGraphState(files.Directory); err == nil {
+		t.Fatal("v5 header was reinterpreted as v4 after a version downgrade")
+	}
+}
+
+func TestBinaryWALV4LoadsAndMigratesToV5(t *testing.T) {
+	files := DirectoryDatabaseFiles(t.TempDir())
+	graph := NewGraphState()
+	if err := EnsureDatabaseID(graph); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := buildPersistedState(graph, 1, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := encodeBinaryWALPayload(walPayload{Kind: "snapshot", Snapshot: &snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := make([]byte, legacyWALHeaderSize)
+	copy(header[:8], binaryWALMagic[:])
+	binary.BigEndian.PutUint16(header[8:10], binaryWALVersion)
+	binary.BigEndian.PutUint16(header[10:12], legacyWALHeaderSize)
+	binary.BigEndian.PutUint64(header[20:28], uint64(len(payload)))
+	binary.BigEndian.PutUint32(header[28:32], crc32.ChecksumIEEE(payload))
+	copy(header[walDatabaseIDAt:legacyWALHeaderSize], graph.DatabaseID)
+	if err := os.WriteFile(files.WAL, append(header, payload...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, commit, err := LoadGraphState(files.Directory); err != nil || commit != 0 {
+		t.Fatalf("load v4 WAL = commit %d, err=%v", commit, err)
+	}
+	if err := AppendWALCommitFiles(files, graph, 1, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := os.ReadFile(files.WAL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validCurrentWALHeader(migrated) {
+		t.Fatal("v4 WAL was not rewritten as an integrity-protected v5 frame")
+	}
+}
 
 func TestBinaryCorruptStateLengthStillFallsBackToValidWAL(t *testing.T) {
 	files := DirectoryDatabaseFiles(t.TempDir())

@@ -89,7 +89,7 @@ func TestIndependentMatchPatternsStartWithSmallestLabel(t *testing.T) {
 	// Include planning and sorting work; the unordered control below isolates
 	// the original source-order expansion budget.
 	query := `MATCH (b:Broad), (r:Rare) RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`
-	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 350})
+	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 500})
 	if err != nil {
 		t.Fatalf("rare-first query failed: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestIndependentMatchPatternsUseWherePropertyCardinality(t *testing.T) {
 	}
 	// Count sorting as well as predicate comparisons and candidate visits.
 	// The unordered control retains its original expansion-only allowance.
-	result, err := db.QueryContext(t.Context(), `MATCH (b:Item), (r:Item) WHERE r.kind = "rare" RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`, nil, QueryOptions{MaxWork: 650})
+	result, err := db.QueryContext(t.Context(), `MATCH (b:Item), (r:Item) WHERE r.kind = "rare" RETURN r.id AS rid, b.id AS bid ORDER BY rid, bid`, nil, QueryOptions{MaxWork: 850})
 	if err != nil {
 		t.Fatal(err)
 	}

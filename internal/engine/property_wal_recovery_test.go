@@ -84,21 +84,22 @@ func TestPropertyWALDeltaRecoversMixedDerivedStateAndChangefeed(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	const walHeaderSize = 68
 	foundPatch := false
 	for offset := 0; offset < len(wal); {
-		if len(wal)-offset < 64 {
+		if len(wal)-offset < walHeaderSize {
 			t.Fatal("incomplete WAL header")
 		}
-		header := wal[offset : offset+64]
+		header := wal[offset : offset+walHeaderSize]
 		length := binary.BigEndian.Uint64(header[20:28])
-		if length > uint64(len(wal)-offset-64) {
+		if length > uint64(len(wal)-offset-walHeaderSize) {
 			t.Fatal("incomplete WAL payload")
 		}
-		// WAL v4 payload tag 3 identifies a property delta.
-		if string(header[:8]) == "LDBWAL4\x00" && length > 0 && wal[offset+64] == 3 {
+		// WAL v5 payload tag 3 identifies a property delta.
+		if string(header[:8]) == "LDBWAL5\x00" && length > 0 && wal[offset+walHeaderSize] == 3 {
 			foundPatch = true
 		}
-		offset += 64 + int(length)
+		offset += walHeaderSize + int(length)
 	}
 	if !foundPatch {
 		t.Fatal("property mutation used no patch WAL frame")

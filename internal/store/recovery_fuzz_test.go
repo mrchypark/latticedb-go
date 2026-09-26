@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"hash/crc32"
 	"os"
 	"reflect"
 	"testing"
@@ -70,16 +71,7 @@ func FuzzLoadLatestWALFrames(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(record)
-	legacyPayload, err := json.Marshal(walPayload{Kind: "snapshot", Snapshot: &snapshot})
-	if err != nil {
-		f.Fatal(err)
-	}
-	legacyRecord, err := encodeWALRecord(snapshot, legacyPayload)
-	if err != nil {
-		f.Fatal(err)
-	}
-	copy(legacyRecord[:8], legacyWALMagic[:])
-	binary.BigEndian.PutUint16(legacyRecord[8:10], legacyWALVersion)
+	legacyRecord := legacyWALFuzzRecord(graph.DatabaseID, snapshot)
 	f.Add(legacyRecord)
 	f.Add([]byte("not a WAL frame"))
 
@@ -125,6 +117,19 @@ func FuzzLoadLatestWALFrames(f *testing.F) {
 			t.Fatal("round trip WAL state is not canonical")
 		}
 	})
+}
+
+func legacyWALFuzzRecord(databaseID string, snapshot persistedState) []byte {
+	payload, _ := json.Marshal(walPayload{Kind: "snapshot", Snapshot: &snapshot})
+	header := make([]byte, legacyWALHeaderSize)
+	copy(header[:8], legacyWALMagic[:])
+	binary.BigEndian.PutUint16(header[8:10], legacyWALVersion)
+	binary.BigEndian.PutUint16(header[10:12], legacyWALHeaderSize)
+	binary.BigEndian.PutUint64(header[12:20], snapshot.CommitID)
+	binary.BigEndian.PutUint64(header[20:28], uint64(len(payload)))
+	binary.BigEndian.PutUint32(header[28:32], crc32.ChecksumIEEE(payload))
+	copy(header[walDatabaseIDAt:legacyWALHeaderSize], databaseID)
+	return append(header, payload...)
 }
 
 func FuzzNestedValueRoundTrip(f *testing.F) {

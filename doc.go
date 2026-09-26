@@ -1,7 +1,5 @@
-// Package latticedb will host the pure Go LatticeDB engine.
-//
-// The repo is being bootstrapped contract-first. The engine conformance spec
-// and extracted conformance suite are in docs/ and conformance/go/; the
-// concrete engine API and storage implementation will be built against that
-// contract.
+// Package latticedb provides a pure Go embedded graph database with durable
+// transactions, Cypher-style queries, full-text and vector search, streams,
+// and online snapshots. Zig LatticeDB is a feature reference; Go API behavior
+// and storage formats are defined by this package and docs/engine_conformance.md.
 package latticedb

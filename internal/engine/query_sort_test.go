@@ -14,12 +14,12 @@ func TestSortQueryRowsBudgetAndCancellation(t *testing.T) {
 		budget := newQueryBudget(ctx, QueryOptions{MaxWork: 5})
 		rows := []int{9, 8, 7, 6, 5, 4, 3, 2, 1}
 		comparisons := 0
-		err := sortQueryRows(rows, func(a, b int) int {
+		err := sortQueryRows(rows, func(a, b int) (int, error) {
 			comparisons++
 			if cancel && comparisons == 5 {
 				stop()
 			}
-			return cmp.Compare(a, b)
+			return cmp.Compare(a, b), nil
 		}, budget)
 		want := ErrResourceLimit
 		if cancel {
@@ -41,7 +41,7 @@ func TestSortQueryRowsPropagatesComparatorPanic(t *testing.T) {
 			t.Errorf("panic = %v", got)
 		}
 	}()
-	_ = sortQueryRows([]int{2, 1}, func(int, int) int { panic("comparator bug") }, budget)
+	_ = sortQueryRows([]int{2, 1}, func(int, int) (int, error) { panic("comparator bug") }, budget)
 }
 
 func TestQuerySortPathsChargeWork(t *testing.T) {

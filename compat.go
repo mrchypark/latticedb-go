@@ -26,8 +26,8 @@ func (tx *Tx) IsReadOnly() bool { return tx != nil && tx.inner != nil && tx.inne
 func (tx *Tx) IsActive() bool   { return tx != nil && tx.inner != nil && tx.inner.IsActive() }
 
 func (tx *Tx) DeleteEdge(sourceID, targetID NodeID, edgeType string) error {
-	if tx == nil || tx.inner == nil {
-		return wrapError(ErrInactiveTx)
+	if err := tx.requireInner(); err != nil {
+		return err
 	}
 	return wrapError(tx.inner.DeleteEdge(sourceID, targetID, edgeType))
 }
@@ -37,8 +37,8 @@ func (tx *Tx) Query(query string, params map[string]Value) (QueryResult, error) 
 }
 
 func (tx *Tx) QueryContext(ctx context.Context, query string, params map[string]Value, opts QueryOptions) (QueryResult, error) {
-	if tx == nil || tx.inner == nil {
-		return QueryResult{}, ErrInactiveTx
+	if err := tx.requireInner(); err != nil {
+		return QueryResult{}, err
 	}
 	result, err := tx.inner.QueryContext(ctx, query, params, engine.QueryOptions{
 		MaxRows:           opts.MaxRows,
@@ -55,23 +55,23 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, params map[string]
 }
 
 func (tx *Tx) GetAppMetadata(key []byte) ([]byte, bool, error) {
-	if tx == nil || tx.inner == nil {
-		return nil, false, ErrInactiveTx
+	if err := tx.requireInner(); err != nil {
+		return nil, false, err
 	}
 	value, ok, err := tx.inner.GetAppMetadata(key)
 	return value, ok, wrapError(err)
 }
 
 func (tx *Tx) PutAppMetadata(key, value []byte) error {
-	if tx == nil || tx.inner == nil {
-		return ErrInactiveTx
+	if err := tx.requireInner(); err != nil {
+		return err
 	}
 	return wrapError(tx.inner.PutAppMetadata(key, value))
 }
 
 func (tx *Tx) DeleteAppMetadata(key []byte) error {
-	if tx == nil || tx.inner == nil {
-		return ErrInactiveTx
+	if err := tx.requireInner(); err != nil {
+		return err
 	}
 	return wrapError(tx.inner.DeleteAppMetadata(key))
 }

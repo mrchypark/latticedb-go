@@ -13,6 +13,10 @@ func FuzzParseQuery(f *testing.F) {
 		"MATCH (n) DETACH DELETE n",
 		"CREATE (n:Person {name: 'Ada'}) RETURN n",
 		"UNWIND [1, 2, 3] AS value RETURN value ORDER BY value",
+		"RETURN -9223372036854775808 + 1 AS value, 2 ^ 3 ^ 2 AS power",
+		"UNWIND [1, 1, 2] AS value RETURN count(DISTINCT value)",
+		"MERGE (a:Person {name: $name})-[:KNOWS]->(b) ON CREATE SET a.count = 1 ON MATCH SET a.count = a.count + 1 RETURN a",
+		"MATCH (a)-[path:KNOWS*0..3]->(b) RETURN path, size(path) AS hops",
 	} {
 		f.Add(query)
 	}

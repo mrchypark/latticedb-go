@@ -39,10 +39,10 @@ func jsonWALTestRecord(t *testing.T, databaseID string, commit uint64, value wal
 	if err != nil {
 		t.Fatal(err)
 	}
-	header, err := encodeWALHeader(databaseID, commit, payload)
-	if err != nil {
+	if err := validateDatabaseID(databaseID); err != nil {
 		t.Fatal(err)
 	}
+	header := make([]byte, legacyWALHeaderSize)
 	switch version {
 	case jsonWALVersion:
 		copy(header[:8], jsonWALMagic[:])
@@ -52,5 +52,10 @@ func jsonWALTestRecord(t *testing.T, databaseID string, commit uint64, value wal
 		t.Fatal("invalid JSON WAL fixture version")
 	}
 	binary.BigEndian.PutUint16(header[8:10], version)
-	return append(header[:], payload...)
+	binary.BigEndian.PutUint16(header[10:12], legacyWALHeaderSize)
+	binary.BigEndian.PutUint64(header[12:20], commit)
+	binary.BigEndian.PutUint64(header[20:28], uint64(len(payload)))
+	binary.BigEndian.PutUint32(header[28:32], crc32.ChecksumIEEE(payload))
+	copy(header[walDatabaseIDAt:legacyWALHeaderSize], databaseID)
+	return append(header, payload...)
 }

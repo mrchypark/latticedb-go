@@ -42,11 +42,39 @@ type layoutOwner struct {
 }
 
 func acquirePathLock(path string, create, readOnly bool) (*pathLock, string, bool, error) {
+	return acquirePathLockMode(path, create, readOnly, false)
+}
+
+// Backup destinations are flat files even when they do not exist yet. Lock
+// their state path before checking sidecars so cooperating creators cannot
+// install a WAL or layout marker between validation and publication.
+func acquireFlatDestinationLock(path string) (*pathLock, error) {
+	if _, err := os.Lstat(path); err == nil {
+		return nil, fmt.Errorf("%w: backup destination already exists", ErrInvalidArgument)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	lock, _, _, err := acquirePathLockMode(path, true, false, true)
+	if errors.Is(err, ErrDatabaseLocked) {
+		return nil, fmt.Errorf("%w: backup destination is in use: %w", ErrInvalidArgument, err)
+	}
+	return lock, err
+}
+
+func acquirePathLockMode(path string, create, readOnly, flatDestination bool) (*pathLock, string, bool, error) {
 	canonical, err := canonicalDBPath(path)
 	if err != nil {
 		return nil, "", false, err
 	}
-	flat, err := prepareDBPath(canonical, create)
+	flat := flatDestination
+	if flatDestination {
+		err = validateFlatStatePath(canonical)
+		if err == nil {
+			err = durableMkdirAll(filepath.Dir(canonical))
+		}
+	} else {
+		flat, err = prepareDBPath(canonical, create)
+	}
 	if err != nil {
 		return nil, "", false, err
 	}

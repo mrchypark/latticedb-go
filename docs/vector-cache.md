@@ -56,3 +56,12 @@ the OS page cache is warm. This is not a cold-device or process-start benchmark.
 Cached opens were about 10.7× and 13.3× faster on these fixtures, while allocated
 bytes increased about 9.3% and 10.2%, respectively. These are reopen-time
 measurements, not steady-state memory or ANN recall comparisons.
+
+## Construction degree
+
+`OpenOptions.VectorM` is the upper-layer maximum degree: zero selects 16,
+and explicit values must be in `2..64`. The bottom layer allows `2*M` neighbors.
+Construction ef remains 200; query ef is controlled separately. M applies to
+the global index and configured namespaces, participates in cache validation,
+and scales retained-index and build-scratch budget estimates. It does not change
+stored vectors or exact-search results.

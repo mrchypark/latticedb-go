@@ -1,9 +1,12 @@
 package latticedb
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
+
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
 )
 
 func benchmarkDB(b *testing.B) *DB {
@@ -254,6 +257,7 @@ func BenchmarkDeserialize(b *testing.B) {
 
 func BenchmarkReaderDuringCommit(b *testing.B) {
 	db, target := benchmarkWriteScaleDB(b, 10_000)
+	var retries uint64
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -280,10 +284,22 @@ func BenchmarkReaderDuringCommit(b *testing.B) {
 		if err := <-readerDone; err != nil {
 			b.Fatal(err)
 		}
+		// Page storage can reject a commit before publication when a pinned
+		// reader leaves insufficient mmap headroom. Retry the same mutation
+		// after releasing that reader; the benchmark includes this backpressure
+		// cycle and still requires a successful commit.
+		if errors.Is(commitErr, pagestore.ErrSnapshotGrowth) {
+			retries++
+			commitErr = db.Update(func(tx *Tx) error {
+				return tx.SetProperty(target, "reader_overlap", int64(i))
+			})
+		}
 		if commitErr != nil {
 			b.Fatal(commitErr)
 		}
 	}
+	b.ReportMetric(float64(retries)/float64(b.N), "retries/op")
+	b.ReportMetric(1, "commits/op")
 }
 
 func BenchmarkMatchedScale10K(b *testing.B) {

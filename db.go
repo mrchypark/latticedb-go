@@ -70,6 +70,13 @@ type Tx struct {
 	inner *engine.Tx
 }
 
+func (tx *Tx) requireInner() error {
+	if tx == nil || tx.inner == nil {
+		return wrapError(ErrInactiveTx)
+	}
+	return nil
+}
+
 // Snapshot is one fixed committed database generation. Its methods may be
 // called concurrently. A Snapshot must not be copied after first use.
 type Snapshot struct {
@@ -88,6 +95,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		return nil, wrapError(err)
 	}
 	inner, err := engine.OpenContext(ctx, path, engine.OpenOptions{
+		PageStorage:                       true,
 		Create:                            opts.Create,
 		ReadOnly:                          opts.ReadOnly,
 		DisableLock:                       opts.DisableLock,
@@ -95,10 +103,12 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		PageSize:                          opts.PageSize,
 		EnableVector:                      opts.EnableVector || opts.EnableVectors,
 		VectorIndexMode:                   engine.VectorIndexMode(opts.VectorIndexMode),
+		VectorM:                           opts.VectorM,
 		VectorDimensions:                  opts.VectorDimensions,
 		VectorNamespaces:                  slices.Clone(opts.VectorNamespaces),
 		FTSProperties:                     slices.Clone(opts.FTSProperties),
 		Durability:                        engine.DurabilityMode(opts.Durability),
+		BackupDirectory:                   opts.BackupDirectory,
 		WALCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
 		ChangefeedMaxBytes:                opts.ChangefeedMaxBytes,
 		MaxDatabaseSnapshotBytes:          opts.MaxDatabaseSnapshotBytes,
@@ -124,15 +134,18 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 		return nil, wrapError(err)
 	}
 	inner, err := engine.Deserialize(data, engine.OpenOptions{
+		PageStorage:                       true,
 		ReadOnly:                          opts.ReadOnly,
 		CacheSizeMB:                       opts.CacheSizeMB,
 		PageSize:                          opts.PageSize,
 		EnableVector:                      opts.EnableVector || opts.EnableVectors,
 		VectorIndexMode:                   engine.VectorIndexMode(opts.VectorIndexMode),
+		VectorM:                           opts.VectorM,
 		VectorDimensions:                  opts.VectorDimensions,
 		VectorNamespaces:                  slices.Clone(opts.VectorNamespaces),
 		FTSProperties:                     slices.Clone(opts.FTSProperties),
 		Durability:                        engine.DurabilityMode(opts.Durability),
+		BackupDirectory:                   opts.BackupDirectory,
 		WALCheckpointThresholdBytes:       opts.WALCheckpointThresholdBytes,
 		ChangefeedMaxBytes:                opts.ChangefeedMaxBytes,
 		MaxDatabaseSnapshotBytes:          opts.MaxDatabaseSnapshotBytes,
@@ -461,6 +474,8 @@ func (db *DB) FTSSearch(query string, opts FTSSearchOptions) ([]FTSSearchResult,
 		MinTermLength: opts.MinTermLength,
 		MaxWork:       opts.MaxWork,
 		MaxBytes:      opts.MaxBytes,
+		Scoring:       opts.Scoring,
+		Analyzer:      opts.Analyzer,
 	})
 	if err != nil {
 		return nil, wrapError(err)
@@ -473,7 +488,7 @@ func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearch
 	if err != nil {
 		return nil, wrapError(err)
 	}
-	results, err := inner.FTSSearchContext(ctx, query, engine.FTSSearchOptions{Limit: opts.Limit, MaxDistance: opts.MaxDistance, MinTermLength: opts.MinTermLength, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes})
+	results, err := inner.FTSSearchContext(ctx, query, engine.FTSSearchOptions{Limit: opts.Limit, MaxDistance: opts.MaxDistance, MinTermLength: opts.MinTermLength, MaxWork: opts.MaxWork, MaxBytes: opts.MaxBytes, Scoring: opts.Scoring, Analyzer: opts.Analyzer})
 	if err != nil {
 		return nil, wrapError(err)
 	}
@@ -670,16 +685,16 @@ func (db *DB) VectorIndexNamespaceStats(namespace VectorNamespace) (VectorIndexS
 
 // Commit makes the transaction inactive, whether it succeeds or fails.
 func (tx *Tx) Commit() error {
-	if tx == nil || tx.inner == nil {
-		return ErrInactiveTx
+	if err := tx.requireInner(); err != nil {
+		return err
 	}
 	return wrapError(tx.inner.Commit())
 }
 
 // CommitContext makes the transaction inactive, whether it succeeds or fails.
 func (tx *Tx) CommitContext(ctx context.Context) error {
-	if tx == nil || tx.inner == nil {
-		return ErrInactiveTx
+	if err := tx.requireInner(); err != nil {
+		return err
 	}
 	return wrapError(tx.inner.CommitContext(ctx))
 }
@@ -695,6 +710,9 @@ func (tx *Tx) Rollback() error {
 }
 
 func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
+	if err := tx.requireInner(); err != nil {
+		return Node{}, err
+	}
 	node, err := tx.inner.CreateNode(engine.CreateNodeOptions{
 		Labels:     opts.Labels,
 		Properties: opts.Properties,
@@ -706,15 +724,24 @@ func (tx *Tx) CreateNode(opts CreateNodeOptions) (Node, error) {
 }
 
 func (tx *Tx) DeleteNode(nodeID uint64) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.DeleteNode(nodeID))
 }
 
 func (tx *Tx) NodeExists(nodeID uint64) (bool, error) {
+	if err := tx.requireInner(); err != nil {
+		return false, err
+	}
 	exists, err := tx.inner.NodeExists(nodeID)
 	return exists, wrapError(err)
 }
 
 func (tx *Tx) GetNode(nodeID uint64) (*Node, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, err
+	}
 	node, ok, err := tx.inner.GetNodeValue(nodeID)
 	if err != nil || !ok {
 		return nil, wrapError(err)
@@ -724,25 +751,40 @@ func (tx *Tx) GetNode(nodeID uint64) (*Node, error) {
 }
 
 func (tx *Tx) SetProperty(nodeID uint64, key string, value Value) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.SetProperty(nodeID, key, value))
 }
 
 func (tx *Tx) GetProperty(nodeID uint64, key string) (Value, bool, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, false, err
+	}
 	value, ok, err := tx.inner.GetProperty(nodeID, key)
 	return value, ok, wrapError(err)
 }
 
 func (tx *Tx) FindNodesByLabelProperty(label, property string, value Value, limit uint) ([]uint64, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, err
+	}
 	ids, err := tx.inner.FindNodesByLabelProperty(label, property, value, limit)
 	return ids, wrapError(err)
 }
 
 func (tx *Tx) SetVector(nodeID uint64, key string, vector []float32) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.SetVector(nodeID, key, vector))
 }
 
 // BatchInsertVectors inserts multiple vector-bearing nodes in a single call.
 func (tx *Tx) BatchInsertVectors(label string, vectors [][]float32) ([]uint64, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, err
+	}
 	ids, err := tx.inner.BatchInsertVectors(label, vectors)
 	return ids, wrapError(err)
 }
@@ -753,31 +795,52 @@ func (tx *Tx) BatchInsert(label string, vectors [][]float32) ([]uint64, error) {
 }
 
 func (tx *Tx) FTSIndex(nodeID uint64, text string) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.FTSIndex(nodeID, text))
 }
 
 func (tx *Tx) FTSIndexContext(ctx context.Context, nodeID uint64, text string) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.FTSIndexContext(ctx, nodeID, text))
 }
 
 func (tx *Tx) PublishStream(stream, kind string, payload Value) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.PublishStream(stream, kind, payload))
 }
 
 func (tx *Tx) PublishStreamGetSequence(stream, kind string, payload Value) (uint64, error) {
+	if err := tx.requireInner(); err != nil {
+		return 0, err
+	}
 	sequence, err := tx.inner.PublishStreamGetSequence(stream, kind, payload)
 	return sequence, wrapError(err)
 }
 
 func (tx *Tx) SetStreamOffset(stream, consumer string, sequence uint64) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.SetStreamOffset(stream, consumer, sequence))
 }
 
 func (tx *Tx) TrimStream(stream string, beforeSequence uint64) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.TrimStream(stream, beforeSequence))
 }
 
 func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts CreateEdgeOptions) (Edge, error) {
+	if err := tx.requireInner(); err != nil {
+		return Edge{}, err
+	}
 	edge, err := tx.inner.CreateEdge(sourceID, targetID, edgeType, engine.CreateEdgeOptions{
 		Properties: opts.Properties,
 	})
@@ -788,24 +851,39 @@ func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts
 }
 
 func (tx *Tx) GetEdgeProperty(edgeID uint64, key string) (Value, bool, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, false, err
+	}
 	value, ok, err := tx.inner.GetEdgeProperty(edgeID, key)
 	return value, ok, wrapError(err)
 }
 
 func (tx *Tx) FindEdgesByTypeProperty(edgeType, property string, value Value, limit uint) ([]uint64, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, err
+	}
 	ids, err := tx.inner.FindEdgesByTypeProperty(edgeType, property, value, limit)
 	return ids, wrapError(err)
 }
 
 func (tx *Tx) SetEdgeProperty(edgeID uint64, key string, value Value) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.SetEdgeProperty(edgeID, key, value))
 }
 
 func (tx *Tx) RemoveEdgeProperty(edgeID uint64, key string) error {
+	if err := tx.requireInner(); err != nil {
+		return err
+	}
 	return wrapError(tx.inner.RemoveEdgeProperty(edgeID, key))
 }
 
 func (tx *Tx) GetOutgoingEdges(nodeID uint64) ([]Edge, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, err
+	}
 	edges, err := tx.inner.GetOutgoingEdges(nodeID)
 	if err != nil {
 		return nil, wrapError(err)
@@ -818,6 +896,9 @@ func (tx *Tx) GetOutgoingEdges(nodeID uint64) ([]Edge, error) {
 }
 
 func (tx *Tx) GetIncomingEdges(nodeID uint64) ([]Edge, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, err
+	}
 	edges, err := tx.inner.GetIncomingEdges(nodeID)
 	if err != nil {
 		return nil, wrapError(err)
@@ -830,6 +911,9 @@ func (tx *Tx) GetIncomingEdges(nodeID uint64) ([]Edge, error) {
 }
 
 func (tx *Tx) GetOutgoingEdgesByType(nodeID uint64, edgeType string, limit uint) ([]Edge, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, err
+	}
 	edges, err := tx.inner.GetOutgoingEdgesByType(nodeID, edgeType, limit)
 	if err != nil {
 		return nil, wrapError(err)
@@ -842,6 +926,9 @@ func (tx *Tx) GetOutgoingEdgesByType(nodeID uint64, edgeType string, limit uint)
 }
 
 func (tx *Tx) GetIncomingEdgesByType(nodeID uint64, edgeType string, limit uint) ([]Edge, error) {
+	if err := tx.requireInner(); err != nil {
+		return nil, err
+	}
 	edges, err := tx.inner.GetIncomingEdgesByType(nodeID, edgeType, limit)
 	if err != nil {
 		return nil, wrapError(err)

@@ -164,6 +164,45 @@ func TokenizeContextWithLimit(ctx context.Context, text string, maxLogicalBytes 
 	return TokenizeContext(ctx, text)
 }
 
+// AnalyzeEnglishPorter tokenizes text with the standard tokenizer and applies
+// the English Porter stemmer to ASCII words. Non-ASCII tokens are preserved.
+func AnalyzeEnglishPorterContextWithLimit(ctx context.Context, text string, maxLogicalBytes uint64) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	baseBytes, err := tokenizationLogicalBytes(ctx, text)
+	if err != nil {
+		return nil, err
+	}
+	tokens, err := TokenizeContextWithLimit(ctx, text, maxLogicalBytes)
+	if err != nil {
+		return nil, err
+	}
+	var scratchBytes uint64
+	for i, token := range tokens {
+		if i&63 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		// Porter allocates a byte copy, consonant flags, and its result string for
+		// one token at a time. Reserve the largest concurrent scratch footprint.
+		scratchBytes = max(scratchBytes, saturatingTokenStemBytes(token))
+		if baseBytes > maxLogicalBytes || scratchBytes > maxLogicalBytes-baseBytes {
+			return nil, ErrTokenizationLimit
+		}
+		tokens[i], err = StemEnglishPorterContext(ctx, token)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return tokens, nil
+}
+
+func saturatingTokenStemBytes(token string) uint64 {
+	return searchMultiplySaturated(uint64(len(token)), 3)
+}
+
 func tokenizationLogicalBytes(ctx context.Context, text string) (uint64, error) {
 	if ctx == nil {
 		ctx = context.Background()

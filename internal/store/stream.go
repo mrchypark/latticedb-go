@@ -42,6 +42,7 @@ type streamLog struct {
 	tail          *streamChunk
 	first         uint64
 	count         uint64
+	diskCount     uint64
 	bytes         uint64
 	snapshotBytes uint64
 }
@@ -69,6 +70,8 @@ type StreamStore struct {
 	clonedOffsets map[string]struct{}
 	logicalBytes  uint64
 	snapshotBytes uint64
+	page          *pageStreamSource
+	pageErr       error
 }
 
 type persistedStreams struct {
@@ -137,11 +140,19 @@ func (store StreamStore) Fork() StreamStore {
 		offsets:       store.offsets,
 		logicalBytes:  store.logicalBytes,
 		snapshotBytes: store.snapshotBytes,
+		page:          store.page,
+		pageErr:       store.pageErr,
 	}
 }
 
 func (store StreamStore) Read(name string, after uint64, limit uint) []StreamRecord {
 	return store.ReadBounded(name, after, limit, 0).Records
+}
+
+// ReadContext reads records while propagating page and context errors.
+func (store StreamStore) ReadContext(ctx context.Context, name string, after uint64, limit uint) ([]StreamRecord, error) {
+	result, err := store.ReadBoundedContext(ctx, name, after, limit, 0)
+	return result.Records, err
 }
 
 // ReadBounded returns at most limit records without cloning a record that
@@ -164,12 +175,18 @@ func (store StreamStore) readBoundedTraverse(ctx context.Context, name string, a
 	if err := ctx.Err(); err != nil {
 		return StreamReadResult{}, err
 	}
+	if store.pageErr != nil {
+		return StreamReadResult{}, store.pageErr
+	}
 	log := store.streams[name]
 	if limit == 0 || log.count == 0 {
 		return StreamReadResult{Records: []StreamRecord{}}, nil
 	}
 	if after >= log.first+log.count-1 {
 		return StreamReadResult{Records: []StreamRecord{}}, nil
+	}
+	if store.page != nil {
+		return store.readPageBounded(ctx, name, after, limit, maxBytes)
 	}
 	sequence := after + 1
 	if sequence < log.first {
@@ -247,6 +264,13 @@ func (result *StreamReadResult) appendCtx(ctx context.Context, record StreamReco
 func (store StreamStore) StreamBytes(name string) uint64 { return store.streams[name].bytes }
 
 func (store *StreamStore) TrimToBytes(name string, maxBytes uint64) (uint64, bool) {
+	if store.page != nil {
+		through, trimmed, err := store.TrimToBytesContext(context.Background(), name, maxBytes)
+		if err != nil {
+			store.pageErr = err
+		}
+		return through, trimmed
+	}
 	log := store.streams[name]
 	if log.bytes <= maxBytes || log.count == 0 {
 		return 0, false
@@ -273,6 +297,52 @@ func (store *StreamStore) TrimToBytes(name string, maxBytes uint64) (uint64, boo
 		return through, true
 	}
 	return 0, false
+}
+
+// TrimToBytesContext is TrimToBytes with errors propagated from page-backed
+// records. Callers that use a disk-backed store should prefer this method.
+func (store *StreamStore) TrimToBytesContext(ctx context.Context, name string, maxBytes uint64) (uint64, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	if store.page == nil {
+		through, trimmed := store.TrimToBytes(name, maxBytes)
+		return through, trimmed, nil
+	}
+	log := store.streams[name]
+	if log.bytes <= maxBytes || log.count == 0 {
+		return 0, false, nil
+	}
+	store.cloneStream(name)
+	target := maxBytes / 2
+	var retained uint64
+	through := log.first - 1
+	for sequence := log.first + log.count; sequence > log.first; {
+		if err := ctx.Err(); err != nil {
+			return 0, false, err
+		}
+		sequence--
+		record, err := store.pageRecord(ctx, name, sequence)
+		if err != nil {
+			return 0, false, err
+		}
+		recordBytes := streamRecordBytes(record)
+		if snapshotAdd(retained, recordBytes) > target {
+			through = sequence
+			break
+		}
+		retained = snapshotAdd(retained, recordBytes)
+	}
+	if through >= log.first {
+		if err := store.trimPage(ctx, name, through); err != nil {
+			return 0, false, err
+		}
+		return through, true, nil
+	}
+	return 0, false, nil
 }
 
 func (store StreamStore) NextSequence(name string) uint64 {
@@ -353,6 +423,12 @@ func (store *StreamStore) Trim(name string, through uint64) {
 		store.snapshotBytes = snapshotAdd(store.snapshotBytes, streamSnapshotBytes(name))
 	}
 	log := store.streams[name]
+	if store.page != nil {
+		if err := store.trimPage(context.Background(), name, through); err != nil {
+			store.pageErr = err
+		}
+		return
+	}
 	if log.count == 0 || through < log.first {
 		return
 	}
@@ -535,6 +611,9 @@ func ApplyPersistedStreamOperations(store StreamStore, operations []persistedStr
 		default:
 			return StreamStore{}, fmt.Errorf("invalid stream operation")
 		}
+		if updated.pageErr != nil {
+			return StreamStore{}, updated.pageErr
+		}
 	}
 	return updated, nil
 }
@@ -587,28 +666,23 @@ func buildPersistedStreams(store StreamStore) (persistedStreams, error) {
 		log := store.streams[name]
 		stream := persistedStream{Name: name, Next: store.next[name], Records: make([]persistedStreamRecord, 0, log.count)}
 		var previous uint64
-		chunks := make([]*streamChunk, 0, (log.count+streamChunkSize-1)/streamChunkSize)
-		for chunk := log.tail; chunk != nil && chunk.records[len(chunk.records)-1].Sequence >= log.first; chunk = chunk.previous {
-			chunks = append(chunks, chunk)
-		}
-		for index := len(chunks) - 1; index >= 0; index-- {
-			for _, record := range chunks[index].records {
-				if record.Sequence < log.first {
-					continue
-				}
-				if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next || previous != 0 && record.Sequence != previous+1 {
-					return persistedStreams{}, fmt.Errorf("invalid stream sequence")
-				}
-				if err := ValidateStreamKind(record.Kind); err != nil {
-					return persistedStreams{}, err
-				}
-				payload, err := encodeValue(record.Payload)
-				if err != nil {
-					return persistedStreams{}, err
-				}
-				stream.Records = append(stream.Records, persistedStreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: payload})
-				previous = record.Sequence
+		err := store.visitStreamRecords(context.Background(), name, func(record StreamRecord) error {
+			if record.Sequence == 0 || record.Sequence <= previous || record.Sequence >= stream.Next || previous != 0 && record.Sequence != previous+1 {
+				return fmt.Errorf("invalid stream sequence")
 			}
+			if err := ValidateStreamKind(record.Kind); err != nil {
+				return err
+			}
+			payload, err := encodeValue(record.Payload)
+			if err != nil {
+				return err
+			}
+			stream.Records = append(stream.Records, persistedStreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: payload})
+			previous = record.Sequence
+			return nil
+		})
+		if err != nil {
+			return persistedStreams{}, err
 		}
 		if previous != 0 && stream.Next != previous+1 {
 			return persistedStreams{}, fmt.Errorf("invalid stream next sequence")
@@ -714,6 +788,9 @@ func streamStoreSnapshotBytes(store StreamStore) uint64 {
 }
 
 func calculateStreamStoreSnapshotBytes(store StreamStore) uint64 {
+	if store.page != nil {
+		return store.snapshotBytes
+	}
 	var size uint64
 	for name := range store.next {
 		log := store.streams[name]
@@ -748,6 +825,9 @@ func streamRecordSnapshotBytes(record StreamRecord) uint64 {
 }
 
 func calculateStreamStoreBytes(store StreamStore) uint64 {
+	if store.page != nil {
+		return store.logicalBytes
+	}
 	var size uint64
 	for name := range store.next {
 		log := store.streams[name]
