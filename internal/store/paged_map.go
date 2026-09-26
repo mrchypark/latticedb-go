@@ -332,8 +332,8 @@ func (m *PagedMap[V]) CloneShardOnce(id uint64) {
 	}
 	high, bucket, shard := pageIndexes(key)
 	if high == 0 && !m.root0Cloned {
-		root := new(pageRoot[V])
 		if m.root0 != nil {
+			root := new(pageRoot[V])
 			*root = *m.root0
 			m.root0 = root
 		}
