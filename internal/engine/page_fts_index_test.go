@@ -272,10 +272,16 @@ func TestNamedPageFTSIndexSearchesNodesAndEdges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		if err := pages.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	write, err := pages.Begin(true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer write.Rollback()
 	page := &store.PageGraph{Tx: write}
 	graph := store.NewGraphState()
 	graph.PageBase = page
@@ -303,7 +309,6 @@ func TestNamedPageFTSIndexSearchesNodesAndEdges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer read.Rollback()
-	defer pages.Close()
 	graph.PageBase = &store.PageGraph{Tx: read, SearchIndexesCurrent: true}
 	db := &DB{graph: graph}
 	for _, tc := range []struct {
