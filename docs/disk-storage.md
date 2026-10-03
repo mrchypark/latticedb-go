@@ -31,6 +31,9 @@ Direct vector and full-text scan limits include newly read canonical records,
 decoded properties, and token storage. Temporary source storage is released
 after each record; work remains cumulative across fallback and BM25 passes.
 A query that fits a ready index can therefore exceed its budget on a scan path.
+Named node/edge and configured-property FTS builds also admit source copies
+and decoding before allocation. They reuse each decoded record and release its
+source storage after indexing; posting staging and work remain cumulative.
 FTS readiness cleanup and subsequent rebuild share the writable open's budget;
 a rejected open does not publish partial cleanup.
 

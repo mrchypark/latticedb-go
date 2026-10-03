@@ -185,6 +185,13 @@ func (b *ftsIndexBudget) RemainingPageFTSBytes() uint64 {
 	return b.maxBytes - min(b.maxBytes, b.bytes)
 }
 
+// Source buffers are transient; posting staging and work remain cumulative.
+func (b *ftsIndexBudget) ReservePageRead(work, bytes uint64) error {
+	return b.ChargePageFTS(work, bytes)
+}
+func (b *ftsIndexBudget) ReleasePageRead(bytes uint64)   { b.bytes -= min(b.bytes, bytes) }
+func (b *ftsIndexBudget) RemainingPageReadBytes() uint64 { return b.RemainingPageFTSBytes() }
+
 func dropPageFTSIndex(ctx context.Context, page *store.PageGraph, index string, budget *ftsIndexBudget) error {
 	return page.DropFTSIndexWithCharge(ctx, index, budget.chargeUnit)
 }
@@ -422,20 +429,20 @@ func rebuildDeclaredPageFTS(ctx context.Context, page *store.PageGraph, def FTSI
 		return err
 	}
 	if def.Kind == FTSIndexNode {
-		if err := page.VisitNodes(ctx, func(node *store.NodeRecord) error {
+		if err := page.VisitNodes(store.WithPageReadBudget(ctx, budget), func(node *store.NodeRecord) error {
 			if err := budget.chargeUnit(); err != nil {
 				return err
 			}
-			return indexDeclaredNode(ctx, page, def, index, node.ID, budget)
+			return indexDeclaredNodeRecord(ctx, page, def, index, node.ID, node, budget)
 		}); err != nil {
 			return err
 		}
 	} else {
-		if err := page.VisitEdges(ctx, func(edge *store.EdgeRecord) error {
+		if err := page.VisitEdges(store.WithPageReadBudget(ctx, budget), func(edge *store.EdgeRecord) error {
 			if err := budget.chargeUnit(); err != nil {
 				return err
 			}
-			return indexDeclaredEdge(ctx, page, def, index, edge.ID, budget)
+			return indexDeclaredEdgeRecord(ctx, page, def, index, edge.ID, edge, budget)
 		}); err != nil {
 			return err
 		}
@@ -448,11 +455,11 @@ func rebuildConfiguredPropertyPageFTS(ctx context.Context, page *store.PageGraph
 	if err := dropPageFTSIndex(ctx, page, index, budget); err != nil {
 		return err
 	}
-	if err := page.VisitNodes(ctx, func(node *store.NodeRecord) error {
+	if err := page.VisitNodes(store.WithPageReadBudget(ctx, budget), func(node *store.NodeRecord) error {
 		if err := budget.chargeUnit(); err != nil {
 			return err
 		}
-		return indexConfiguredPropertyNode(ctx, page, property, index, node.ID, budget)
+		return indexConfiguredPropertyNodeRecord(ctx, page, property, index, node.ID, node, budget)
 	}); err != nil {
 		return err
 	}
@@ -463,10 +470,12 @@ func indexConfiguredPropertyNode(ctx context.Context, page *store.PageGraph, pro
 	if err := budget.chargeUnit(); err != nil {
 		return err
 	}
-	node, err := page.GetNode(id)
-	if err != nil {
-		return err
-	}
+	return page.VisitNode(store.WithPageReadBudget(ctx, budget), id, func(node *store.NodeRecord) error {
+		return indexConfiguredPropertyNodeRecord(ctx, page, property, index, id, node, budget)
+	})
+}
+
+func indexConfiguredPropertyNodeRecord(ctx context.Context, page *store.PageGraph, property, index string, id uint64, node *store.NodeRecord, budget *ftsIndexBudget) error {
 	if node == nil {
 		if err := budget.chargeUnit(); err != nil {
 			return err
@@ -494,10 +503,12 @@ func indexDeclaredNode(ctx context.Context, page *store.PageGraph, def FTSIndexD
 	if err := budget.chargeUnit(); err != nil {
 		return err
 	}
-	node, err := page.GetNode(id)
-	if err != nil {
-		return err
-	}
+	return page.VisitNode(store.WithPageReadBudget(ctx, budget), id, func(node *store.NodeRecord) error {
+		return indexDeclaredNodeRecord(ctx, page, def, index, id, node, budget)
+	})
+}
+
+func indexDeclaredNodeRecord(ctx context.Context, page *store.PageGraph, def FTSIndexDefinition, index string, id uint64, node *store.NodeRecord, budget *ftsIndexBudget) error {
 	if node == nil || !slices.Contains(node.Labels, def.Scope) {
 		if err := budget.chargeUnit(); err != nil {
 			return err
@@ -525,10 +536,12 @@ func indexDeclaredEdge(ctx context.Context, page *store.PageGraph, def FTSIndexD
 	if err := budget.chargeUnit(); err != nil {
 		return err
 	}
-	edge, err := page.GetEdge(id)
-	if err != nil {
-		return err
-	}
+	return page.VisitEdge(store.WithPageReadBudget(ctx, budget), id, func(edge *store.EdgeRecord) error {
+		return indexDeclaredEdgeRecord(ctx, page, def, index, id, edge, budget)
+	})
+}
+
+func indexDeclaredEdgeRecord(ctx context.Context, page *store.PageGraph, def FTSIndexDefinition, index string, id uint64, edge *store.EdgeRecord, budget *ftsIndexBudget) error {
 	if edge == nil || edge.Type != def.Scope {
 		if err := budget.chargeUnit(); err != nil {
 			return err

@@ -64,23 +64,30 @@ func (page *PageGraph) scanReadRecords(ctx context.Context, bucket string, visit
 		if len(key) != 8 {
 			return errors.New("invalid page record key")
 		}
-		scope := &pageReadScope{budget: budget}
-		defer func() { budget.ReleasePageRead(scope.held) }()
-		// Record wrappers and decoder state have a fixed bounded cost.
-		if err := scope.reserve(0, 256); err != nil {
-			return err
-		}
-		data, err := page.Tx.GetBoundedWithCharge(bucket, key, page.recordLimit(), func(size uint64) error {
-			return scope.reserve(size, size)
-		})
-		if errors.Is(err, pagestore.ErrValueTooLarge) {
-			return ErrLoadResourceLimit
-		}
-		if err != nil {
-			return err
-		}
-		return visit(binary.BigEndian.Uint64(key), data, scope)
+		return page.visitReadRecord(ctx, bucket, binary.BigEndian.Uint64(key), key, visit)
 	})
+}
+
+func (page *PageGraph) visitReadRecord(ctx context.Context, bucket string, id uint64, key []byte, visit func(uint64, []byte, *pageReadScope) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	budget := pageReadBudgetFromContext(ctx)
+	scope := &pageReadScope{budget: budget}
+	defer func() { budget.ReleasePageRead(scope.held) }()
+	if err := scope.reserve(0, 256); err != nil {
+		return err
+	}
+	data, err := page.Tx.GetBoundedWithCharge(bucket, key, page.recordLimit(), func(size uint64) error {
+		return scope.reserve(size, size)
+	})
+	if errors.Is(err, pagestore.ErrValueTooLarge) {
+		return ErrLoadResourceLimit
+	}
+	if err != nil {
+		return err
+	}
+	return visit(id, data, scope)
 }
 
 func (page *PageGraph) decodeFTSRead(ctx context.Context, id uint64, data []byte, scope *pageReadScope) (*FTSRecord, error) {

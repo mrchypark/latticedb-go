@@ -64,3 +64,15 @@ These findings keep the merge gate open. Final correction evidence and the exact
 The follow-up source reader admits key/raw storage before copying, uses decoder allocation hooks before constructing strings/collections, and reserves conservative property-normalization copies. Search contexts retain source storage through each visitor and release it afterward. Work remains cumulative across ANN fallback and both BM25 passes. The same source reader covers named node/edge FTS scan paths. Resident records do not incur a page-read allocation charge.
 
 FTS namespace invalidation now uses key-only preadmission, charges every visited key and deletion staging, and serves stale-history cleanup too. Writable open supplies one maintenance budget to cleanup and preparation. The property-index budget fixture admits the now-budgeted readiness inspection, rejects larger node/edge definitions, and admits a small definition; production allowances were not weakened.
+
+## Round 4 follow-up
+
+The independent fourth review verified all 412 blobs and the Git tree at `ead438fa729b47a7c235b1ed03f79ba0ce89a58a`. Its three unchanged reproductions and relevant controls passed, closing LDB221-16 and LDB221-17. It reported one new actionable finding:
+
+| ID | Finding | Correction |
+| --- | --- | --- |
+| LDB221-18 | Named and configured-property FTS builds copy and decode canonical records before maintenance-byte admission, then read them again | Share the maintenance allowance with admitted source readers; consume each decoded record directly; use admitted point visitors for incremental maintenance |
+
+The follow-up uses the same FTS budget for transient source storage and retained posting staging. Only the source scope's bytes are released after its visitor; work and posting staging remain cumulative. Named node/edge and configured-property rebuilds reuse their admitted records. Incremental updates use admitted point visitors, including missing-record callbacks for derived deletion.
+
+Regressions cover all three public builds with a 1 MiB unrelated property under insufficient and sufficient allowances, named-build commit rollback, 64 records whose combined source size exceeds the peak allowance, cumulative work rejection, and six rebuild/incremental paths with a malformed 1 MiB source. The latter reject on resource admission before decoding at 16 KiB and expose the decode error at 32 MiB. Lower-level node/edge point-read controls also reject before corrupt-source decoding. These are correction evidence; the final exact-head review and CI verdict remain recorded on the PR.

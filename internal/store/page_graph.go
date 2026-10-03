@@ -77,6 +77,50 @@ func (graph *PageGraph) GetEdge(id uint64) (*EdgeRecord, error) {
 	}
 	return decodePageEdge(data, id, graph.recordLimit())
 }
+
+// VisitNode holds admitted source storage until visit returns. A missing ID
+// calls visit with nil, so maintenance can remove the old derived document.
+func (graph *PageGraph) VisitNode(ctx context.Context, id uint64, visit func(*NodeRecord) error) error {
+	if pageReadBudgetFromContext(ctx) == nil {
+		record, err := graph.GetNode(id)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	}
+	return graph.visitReadRecord(ctx, pageNodes, id, pageID(id), func(id uint64, data []byte, scope *pageReadScope) error {
+		if data == nil {
+			return visit(nil)
+		}
+		record, err := decodePageNodeAdmitted(data, id, graph.recordLimit(), scope.decoded)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	})
+}
+
+// VisitEdge is the edge equivalent of VisitNode.
+func (graph *PageGraph) VisitEdge(ctx context.Context, id uint64, visit func(*EdgeRecord) error) error {
+	if pageReadBudgetFromContext(ctx) == nil {
+		record, err := graph.GetEdge(id)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	}
+	return graph.visitReadRecord(ctx, pageEdges, id, pageID(id), func(id uint64, data []byte, scope *pageReadScope) error {
+		if data == nil {
+			return visit(nil)
+		}
+		record, err := decodePageEdgeAdmitted(data, id, graph.recordLimit(), scope.decoded)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	})
+}
+
 func (graph *PageGraph) VisitNodes(ctx context.Context, visit func(*NodeRecord) error) error {
 	if pageReadBudgetFromContext(ctx) != nil {
 		return graph.scanReadRecords(ctx, pageNodes, func(id uint64, data []byte, scope *pageReadScope) error {

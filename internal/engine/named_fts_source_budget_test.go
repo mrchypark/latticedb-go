@@ -44,3 +44,78 @@ func TestNamedFTSPorterScanAdmitsCanonicalNodeAndEdge(t *testing.T) {
 		}
 	}
 }
+
+func TestFTSBuildAdmitsUnrelatedCanonicalProperties(t *testing.T) {
+	for _, kind := range []string{"node", "edge", "configured"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "build-source")
+			db, err := Open(path, OpenOptions{Create: true, PageStorage: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if db != nil {
+					db.Close()
+				}
+			})
+			if err := db.Update(func(tx *Tx) error {
+				props := map[string]any{"body": strings.Repeat("x", 1<<20)}
+				if kind == "edge" {
+					n, err := tx.CreateNode(CreateNodeOptions{})
+					if err != nil {
+						return err
+					}
+					_, err = tx.CreateEdge(n.ID, n.ID, "OTHER", CreateEdgeOptions{Properties: props})
+					return err
+				}
+				_, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Other"}, Properties: props})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			low := OpenOptions{PageStorage: true, DerivedIndexBuildMaxWork: 8 << 20, DerivedIndexBuildMaxLogicalBytes: 1024}
+			def := FTSIndexDefinition{Name: "filtered", Kind: FTSIndexNode, Scope: "Item", Property: "text"}
+			if kind == "edge" {
+				def.Kind = FTSIndexEdge
+				def.Scope = "LINK"
+			}
+			if kind == "configured" {
+				low.FTSProperties = []string{"text"}
+				db, err = Open(path, low)
+			} else {
+				db, err = Open(path, low)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before := db.commitID
+				err = db.CreateFTSIndex(def)
+				if db.commitID != before {
+					t.Fatal("rejected source read published index definition")
+				}
+			}
+			if !errors.Is(err, ErrResourceLimit) {
+				t.Fatalf("source read under 1KiB: %v", err)
+			}
+			if db != nil {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				db = nil
+			}
+			high := low
+			high.DerivedIndexBuildMaxLogicalBytes = 8 << 20
+			db, err = Open(path, high)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind != "configured" {
+				if err := db.CreateFTSIndex(def); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}

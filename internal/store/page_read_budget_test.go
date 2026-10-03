@@ -64,7 +64,7 @@ func TestPageReadBudgetAdmitsBeforeCanonicalDecode(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, kind := range []string{"node", "edge"} {
+	for _, kind := range []string{"node", "edge", "node-point", "edge-point"} {
 		t.Run(kind, func(t *testing.T) {
 			low := &recordReadTestBudget{maxWork: 8 << 20, maxBytes: 128 << 10}
 			ctx := WithPageReadBudget(context.Background(), low)
@@ -72,8 +72,12 @@ func TestPageReadBudgetAdmitsBeforeCanonicalDecode(t *testing.T) {
 			var err error
 			if kind == "node" {
 				err = page.VisitNodes(ctx, func(*NodeRecord) error { visits++; return nil })
-			} else {
+			} else if kind == "edge" {
 				err = page.VisitEdges(ctx, func(*EdgeRecord) error { visits++; return nil })
+			} else if kind == "node-point" {
+				err = page.VisitNode(ctx, 1, func(*NodeRecord) error { visits++; return nil })
+			} else {
+				err = page.VisitEdge(ctx, 1, func(*EdgeRecord) error { visits++; return nil })
 			}
 			if !errors.Is(err, errRecordReadTestBudget) || visits != 0 || low.bytes != 0 {
 				t.Fatalf("admission err=%v visits=%d retained=%d", err, visits, low.bytes)
