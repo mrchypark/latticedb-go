@@ -73,6 +73,10 @@ func TestFTSFullKeyStagingBudget(t *testing.T) {
 			if label == "long" {
 				run(false, 128<<10, true)
 				run(false, 4<<20, false)
+				original := tokens[0]
+				tokens[0] = "replacement"
+				run(false, 128<<10, true)
+				tokens[0] = original
 				run(true, 128<<10, true)
 			} else {
 				run(false, 128<<10, false)
