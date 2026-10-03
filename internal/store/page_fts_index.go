@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"io"
 	"slices"
 	"strings"
 
@@ -161,6 +160,32 @@ func (page *PageGraph) FTSIndexStats(index string) (PageFTSStats, error) {
 	return stats, d.finish()
 }
 
+// FTSTermDocumentCount returns the number of documents in the named page FTS
+// index that contain the given term. A missing term reports zero documents.
+func (page *PageGraph) FTSTermDocumentCount(index, term string) (uint64, error) {
+	key := pageFTSTermPrefix(index, term)
+	data, err := page.Tx.GetBounded(pageFTSTerms, key, 26+uint64(len(term)))
+	if err != nil || data == nil {
+		return 0, err
+	}
+	d, err := decodePageRecord(data, 12, 26+2*uint64(len(term)))
+	if err != nil {
+		return 0, err
+	}
+	storedTerm := d.str()
+	count := d.u()
+	if err := d.finish(); err != nil {
+		return 0, err
+	}
+	if storedTerm != term {
+		return 0, errors.New("FTS term document count mismatch")
+	}
+	if count == 0 {
+		return 0, errors.New("invalid FTS term document count")
+	}
+	return count, nil
+}
+
 func (page *PageGraph) ftsDocumentTerms(index string, id uint64) (map[string]uint64, uint64, error) {
 	data, err := page.Tx.Get(pageFTSDocuments, pageFTSDocumentKey(index, id))
 	if err != nil || data == nil {
@@ -210,9 +235,9 @@ func (page *PageGraph) ftsDocumentTermsWithBudget(ctx context.Context, index str
 		return nil, 0, ErrLoadResourceLimit
 	}
 	mapBytes := saturatingFTSBytes(count, 64)
-	// The decoder owns term strings while the encoded value remains live, so
-	// account for a second copy of the full payload before decoding it.
-	decodeBytes := saturatingFTSBytesAdd(mapBytes, uint64(len(data)))
+	// The decoder uses a temporary byte buffer and owns term strings while
+	// the encoded value remains live. Admit both extra payload copies.
+	decodeBytes := saturatingFTSBytesAdd(mapBytes, saturatingFTSBytes(uint64(len(data)), 2))
 	if err := budget.ChargePageFTS(count, decodeBytes); err != nil {
 		return nil, 0, err
 	}
@@ -480,59 +505,47 @@ func (page *PageGraph) VisitFTSVocabularyWithLimit(ctx context.Context, index st
 	return err
 }
 
-// DropFTSIndex removes all persistent records for an index in bounded batches.
+// DropFTSIndex removes persistent records without reading their payloads.
 func (page *PageGraph) DropFTSIndex(ctx context.Context, index string) error {
 	return page.DropFTSIndexWithCharge(ctx, index, nil)
 }
 
-// DropFTSIndexWithCharge charges each physical record removed to the caller's budget.
+// DropFTSIndexWithCharge admits key scratch and deletion staging before each
+// key is copied. The transaction owner rolls back on any failure.
 func (page *PageGraph) DropFTSIndexWithCharge(ctx context.Context, index string, charge func() error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prefix := pageFTSIndexPrefix(index)
-	for _, bucket := range []string{pageFTSPostings, pageFTSDocuments, pageFTSTerms} {
-		for {
-			keys := make([][]byte, 0, 128)
-			err := page.Tx.Scan(ctx, bucket, prefix, pagePrefixEnd(prefix), func(k, _ []byte) error {
-				keys = append(keys, append([]byte(nil), k...))
-				if len(keys) == cap(keys) {
-					return io.EOF
-				}
-				return nil
-			})
-			if err != nil {
-				return err
-			}
-			if len(keys) == 0 {
-				break
-			}
-			for _, key := range keys {
-				if charge != nil {
-					if err := charge(); err != nil {
-						return err
-					}
-				}
-				if err := page.Tx.Delete(bucket, key); err != nil {
-					return err
-				}
-			}
-		}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	for _, bucket := range []string{pageFTSStats, pageFTSReady} {
-		data, err := page.Tx.Get(bucket, prefix)
-		if err != nil {
+	budget := FTSMaintenanceBudgetFromContext(ctx)
+	if budget != nil {
+		if err := budget.ChargePageFTS(0, saturatingFTSBytes(saturatingFTSBytesAdd(uint64(len(index)), 2), 4)); err != nil {
 			return err
 		}
-		if data == nil {
-			continue
-		}
+	}
+	prefix := pageFTSIndexPrefix(index)
+	end := pagePrefixEnd(prefix)
+	admitKey := func(size uint64) error {
 		if charge != nil {
 			if err := charge(); err != nil {
 				return err
 			}
 		}
-		if err := page.Tx.Delete(bucket, prefix); err != nil {
+		if budget != nil {
+			work := uint64(0)
+			if charge == nil {
+				work = 1
+			}
+			return budget.ChargePageFTS(work, saturatingFTSBytesAdd(saturatingFTSBytes(size, 2), 64))
+		}
+		return nil
+	}
+	for _, bucket := range []string{pageFTSPostings, pageFTSDocuments, pageFTSTerms, pageFTSStats, pageFTSReady} {
+		if err := page.Tx.ScanKeysWithCharge(ctx, bucket, prefix, end, ^uint64(0), admitKey, func(key []byte) error {
+			return page.Tx.Delete(bucket, key)
+		}); err != nil {
 			return err
 		}
 	}

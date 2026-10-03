@@ -409,7 +409,7 @@ func rebuildManualPageFTS(ctx context.Context, page *store.PageGraph, graph *sto
 		return page.ReplaceFTSDocument(ctx, index, id, tokens)
 	})
 	if err != nil {
-		return err
+		return pageStorageOpenError(err)
 	}
 	return page.SetFTSIndexReady(index, true)
 }

@@ -124,6 +124,99 @@ func TestQuerySequentialMatchSkipsLaterWhereAfterEmptyScope(t *testing.T) {
 	}
 }
 
+func TestQueryLaterIndexedPredicateDoesNotPruneEarlierMatchErrors(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "sequential-index-scope.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (:Person {name: 42, x: 2}), (:Person {name: 'Ada', x: 1})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNodePropertyIndex("Person", "x"); err != nil {
+		t.Fatal(err)
+	}
+	query := `MATCH (a:Person) WHERE toLower(a.name) = 'ada' MATCH (a:Person) WHERE a.x = 1 RETURN a`
+	if _, err := db.Query(query, nil); err == nil {
+		t.Fatalf("later indexed equality pruned the row before the earlier WHERE error: %s", query)
+	}
+}
+
+func TestQueryLaterIndexedBindingIDDoesNotPruneEarlierMatchErrors(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "sequential-index-bindingid.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (:A {x: 2})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNodePropertyIndex("A", "x"); err != nil {
+		t.Fatal(err)
+	}
+	query := `MATCH (a:A) WHERE a.x = 0 MATCH (a) WHERE id(a) = $bad RETURN a`
+	result, err := db.Query(query, map[string]any{"bad": "notanint"})
+	if err != nil || len(result.Rows) != 0 {
+		t.Fatalf("later indexed binding-id comparison with empty first scope: rows=%#v err=%v", result.Rows, err)
+	}
+}
+
+func TestQueryLaterIndexedMissingParamDoesNotPruneEarlierMatchErrors(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "sequential-index-missing-param.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (:A {x: 2})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	query := `MATCH (a:A) WHERE a.x = 0 MATCH (a:A) WHERE a.x = $missing RETURN a`
+	result, err := db.Query(query, nil)
+	if err != nil || len(result.Rows) != 0 {
+		t.Fatalf("later indexed equality with missing param and empty first scope: rows=%#v err=%v", result.Rows, err)
+	}
+}
+
+func TestQuerySequentialMatchRetainedRowErrorControl(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "sequential-retained-row-error.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (:A {x: 1}), (:A {x: 2})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	query := `MATCH (a:A) WHERE a.x = 1 MATCH (a:A) WHERE a.x = toLower(1) RETURN a`
+	if _, err := db.Query(query, nil); err == nil {
+		t.Fatalf("later WHERE error was hidden despite a retained row: %s", query)
+	}
+}
+
+func TestQuerySequentialMatchLimitDoesNotTruncateIntermediateScope(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "sequential-limit-intermediate.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (:A {x: 1}), (:A {x: 2})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Query(`MATCH (a:A) MATCH (a) WHERE a.x = 2 RETURN a.x AS x LIMIT 1`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["x"] != int64(2) {
+		t.Fatalf("terminal LIMIT truncated intermediate MATCH: got %#v, want x=2", result.Rows)
+	}
+	result, err = db.Query(`MATCH (a:A) MATCH (a) WHERE a.x = 2 RETURN a.x AS x`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["x"] != int64(2) {
+		t.Fatalf("intermediate MATCH scope was truncated: got %#v, want x=2", result.Rows)
+	}
+}
+
 func TestQueryWithWhereValidatesExpressionBindings(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "with-where-expression.ltdb"), OpenOptions{Create: true})
 	if err != nil {

@@ -334,8 +334,17 @@ func TestPropertyIndexTracksQueryLabelPropertyAndEntityRemoval(t *testing.T) {
 }
 
 func TestPropertyIndexCreationChargesDefinitionBudget(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "definition-budget.ltdb"), OpenOptions{
-		Create:                           true,
+	path := filepath.Join(t.TempDir(), "definition-budget.ltdb")
+	// Prepare the database under the normal maintenance allowance. The tiny
+	// budget below targets property-index creation, not initial FTS setup.
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{
 		DerivedIndexBuildMaxWork:         1,
 		DerivedIndexBuildMaxLogicalBytes: 1,
 	})

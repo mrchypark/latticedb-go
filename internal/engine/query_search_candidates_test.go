@@ -336,6 +336,94 @@ func TestPageFTSCandidateKeepsSelectiveGlobalPostingUnderLowWork(t *testing.T) {
 	}
 }
 
+func TestPageFTSCandidateKeepsSelectivePostingWithLargeLabelUnderLowWork(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "page-fts-large-label-selective"), OpenOptions{
+		Create: true, PageStorage: true, FTSProperties: []string{"text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var matchID uint64
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 1_000; i++ {
+			text := "ordinary"
+			if i == 777 {
+				text = "needle"
+			}
+			node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Common"}, Properties: map[string]any{"text": text}})
+			if err != nil {
+				return err
+			}
+			if i == 777 {
+				matchID = node.ID
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.QueryContext(t.Context(), `MATCH (n:Common) WHERE n.text @@ "needle" RETURN id(n) AS id`, nil, QueryOptions{
+		MaxWork: 32, MaxBytes: 1 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["id"] != int64(matchID) {
+		t.Fatalf("rows=%v, want only matching node %d", result.Rows, matchID)
+	}
+}
+
+func TestPageFTSCandidateKeepsTenMatchesWithLargeLabelUnderLowWork(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "page-fts-large-label-ten-matches"), OpenOptions{
+		Create: true, PageStorage: true, FTSProperties: []string{"text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	needle := "needlewithalongdescriptivesuffixover26characters"
+	matchIDs := make(map[uint64]struct{})
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 1_000; i++ {
+			text := "ordinary"
+			if i < 10 {
+				text = needle
+			}
+			node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Common"}, Properties: map[string]any{"text": text}})
+			if err != nil {
+				return err
+			}
+			if i < 10 {
+				matchIDs[node.ID] = struct{}{}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.QueryContext(t.Context(), `MATCH (n:Common) WHERE n.text @@ "`+needle+`" RETURN id(n) AS id`, nil, QueryOptions{
+		MaxWork: 768, MaxBytes: 1 << 12,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != len(matchIDs) {
+		t.Fatalf("rows=%d, want %d matching nodes", len(result.Rows), len(matchIDs))
+	}
+	for _, row := range result.Rows {
+		id, ok := row["id"].(int64)
+		if !ok {
+			t.Fatalf("row id=%#v, want int64", row["id"])
+		}
+		if _, ok := matchIDs[uint64(id)]; !ok {
+			t.Fatalf("row id=%d not in matching set", id)
+		}
+	}
+}
+
 func TestPageFTSCandidateReleasesUnionBeforeMemoryBoundedFallback(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "page-fts-candidate-memory-fallback"), OpenOptions{
 		Create: true, PageStorage: true, FTSProperties: []string{"text"},

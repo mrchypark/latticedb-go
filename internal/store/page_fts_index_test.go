@@ -191,3 +191,66 @@ func TestPageFTSPostingsSupportTokensAboveBboltKeyLimit(t *testing.T) {
 		t.Fatalf("large token vocabulary count=%d", vocabulary)
 	}
 }
+
+func TestDropFTSIndexAdmitsKeysAndDeletesWithoutSkipping(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "drop-keys"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	write, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer write.Rollback()
+	page := &PageGraph{Tx: write}
+	buckets := []string{pageFTSPostings, pageFTSDocuments, pageFTSTerms, pageFTSStats, pageFTSReady}
+	payload := []byte(strings.Repeat("x", 33<<10))
+	for _, bucket := range buckets {
+		for id := uint64(1); id <= 160; id++ {
+			if err := write.Put(bucket, pageFTSDocumentKey("docs", id), payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := write.Put(bucket, pageFTSDocumentKey("other", 1), payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	low := &sourceFTSReadBudget{maxWork: 1000, maxBytes: 32}
+	ctx := WithFTSMaintenanceBudget(context.Background(), low)
+	if err := page.DropFTSIndexWithCharge(ctx, "docs", nil); !errors.Is(err, errSourceFTSReadBudget) {
+		t.Fatalf("low-budget drop=%v", err)
+	}
+	for _, bucket := range buckets {
+		var count int
+		if err := write.ScanKeys(context.Background(), bucket, nil, nil, func([]byte) error { count++; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if count != 161 {
+			t.Fatalf("%s changed before key admission: count=%d", bucket, count)
+		}
+	}
+	enough := &sourceFTSReadBudget{maxWork: 1000, maxBytes: 128 << 10}
+	ctx = WithFTSMaintenanceBudget(context.Background(), enough)
+	if err := page.DropFTSIndexWithCharge(ctx, "docs", nil); err != nil {
+		t.Fatal(err)
+	}
+	if enough.work != 800 {
+		t.Fatalf("work=%d, want each of 800 records charged once", enough.work)
+	}
+	for _, bucket := range buckets {
+		var count int
+		if err := write.ScanKeys(context.Background(), bucket, nil, nil, func(key []byte) error {
+			count++
+			if string(key) != string(pageFTSDocumentKey("other", 1)) {
+				t.Fatalf("%s retained target key", bucket)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("%s remaining=%d, want other index only", bucket, count)
+		}
+	}
+}

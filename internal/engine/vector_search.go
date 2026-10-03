@@ -55,7 +55,16 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 		if err != nil {
 			return nil, false, err
 		}
-		return pageResults, false, nil
+		meta, err := pageIndex.Meta()
+		if err != nil {
+			return nil, false, err
+		}
+		// Duplicate vectors and reciprocal pruning can leave a disconnected
+		// component. Match resident HNSW's underfill behavior without resetting
+		// the budget or hiding graph corruption errors.
+		if uint64(len(pageResults)) >= min(limit, meta.Count-meta.DeletedCount) {
+			return pageResults, false, nil
+		}
 	}
 	exactFallbackUsed := graph.PageBase != nil && !opts.Exact && !disableIndex
 	if graph.PageBase == nil && !opts.Exact && !disableIndex && graph.VectorIndex.Nodes.Len() > 0 {

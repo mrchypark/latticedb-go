@@ -33,3 +33,7 @@ func (*DB) Compact(context.Context) error { return ErrUnsupportedPlatform }
 func (*Tx) ScanBounded(context.Context, string, []byte, []byte, uint64, func([]byte, []byte) error) error {
 	return ErrUnsupportedPlatform
 }
+
+func (*Tx) ScanKeysWithCharge(context.Context, string, []byte, []byte, uint64, func(uint64) error, func([]byte) error) error {
+	return ErrUnsupportedPlatform
+}

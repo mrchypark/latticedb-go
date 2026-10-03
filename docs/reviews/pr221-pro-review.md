@@ -30,3 +30,20 @@ Page FTS commits and rebuilds share one maintenance budget. Canonical deletion r
 Memory initialization checks the logical snapshot estimate before optional index construction and worker startup. Public tests cover fresh memory, deserialized empty/populated databases, read-only admission, and a successful admitted no-op commit.
 
 Final integrated checks and the review verdict are recorded on PR #221 at the exact pushed candidate. These correction notes are not a clean-review claim.
+
+## Second implementation review
+
+Pro verified all 405 repository blobs at `8ce935553982cdded2e5e05e8402df49b0e0d2e5`. All 13 original reproduction tests passed. The expanded review retained LDB221-04 and added three findings, with six failing expanded tests:
+
+| ID | Remaining defect | Follow-up correction |
+|---|---|---|
+| LDB221-04 | Later MATCH predicates still enter earlier ID/property lookup planning | Give each scope its own lookup predicates while retaining full-plan pagination eligibility |
+| LDB221-13 | Selective labeled FTS queries count the entire label posting first | Bound label probes by the candidate information needed to choose a path |
+| LDB221-14 | Whole-index drop copies payloads without byte admission; manual rebuild copies and tokenizes canonical data before admission | Use key-only drop traversal and admit source bytes, decoded text, and token storage before allocation |
+| LDB221-15 | Partial deletion of duplicate vectors leaves page HNSW results empty or short despite live matches | Restore bounded underfill handling without hiding corruption errors or resetting the query budget |
+
+The reviewer confirmed no actionable defect in the corrected Windows maintenance test. All native CI jobs and the benchmark passed for `8ce9355`; that did not override the failed review gate. The follow-up changes require a new exact-head review and final CI before merge.
+
+The second-round correction isolates lookup predicates per MATCH scope, uses bounded term-frequency reads and label probes for FTS planning, and admits maintenance keys before copying them. Whole-index deletion now reads keys only and charges cumulative deletion staging. Manual rebuild admits the canonical value, decode copies, and tokenizer storage before use. HNSW underfill uses the existing streaming exact path with the same budget; index-read errors still propagate.
+
+Regression coverage includes empty earlier scopes with invalid later parameters, retained-row errors and terminal LIMIT, one and ten selective hits in a 1,000-node label, a 1 MiB canonical FTS source under a 256-byte allowance, whole-index drop rollback, and duplicate-vector deletion/reopen. These are correction evidence, not a clean-review verdict.

@@ -254,10 +254,45 @@ func pageFTSSearchCandidate(tx *Tx, node nodePattern, clause *whereClause, param
 	if len(node.Labels) == 0 {
 		population, err = tx.graph.NodeCount()
 	} else {
+		// Summed document frequencies bound the posting union. Probe labels
+		// only far enough to show that this union can narrow them.
+		var candidateBound uint64
+		for _, term := range terms {
+			scratch := saturatingAdd(saturatingMul(saturatingAdd(26, uint64(len(term))), 3), saturatingMul(saturatingAdd(34, uint64(len(selected))), 2))
+			if err := budget.check(1, 0); err != nil {
+				return nil, err
+			}
+			if err := budget.chargeTemporary(scratch); err != nil {
+				return nil, err
+			}
+			count, countErr := page.FTSTermDocumentCount(selected, term)
+			budget.releaseTemporary(scratch)
+			if countErr != nil {
+				return nil, countErr
+			}
+			candidateBound = saturatingAdd(candidateBound, count)
+		}
+		if candidateBound == 0 {
+			return &querySearchCandidate{variable: node.Var}, nil
+		}
+		remainingWork := uint64(budget.maxWork - budget.work)
+		probeWork := remainingWork / 4
+		if probeWork < uint64(len(node.Labels)) {
+			return nil, nil
+		}
+		perLabelLimit := min(saturatingAdd(candidateBound, 1), probeWork/uint64(len(node.Labels)))
 		population = ^uint64(0)
 		for _, label := range node.Labels {
-			count, countErr := tx.graph.LabelCountContext(budget.ctx, label, func() error {
-				return budget.check(1, 0)
+			var count uint64
+			countErr := tx.graph.VisitLabel(budget.ctx, label, func(uint64) error {
+				if err := budget.check(1, 0); err != nil {
+					return err
+				}
+				count++
+				if count >= perLabelLimit {
+					return io.EOF
+				}
+				return nil
 			})
 			if countErr != nil {
 				return nil, countErr
@@ -268,9 +303,9 @@ func pageFTSSearchCandidate(tx *Tx, node nodePattern, clause *whereClause, param
 	if err != nil {
 		return nil, err
 	}
-	// A candidate set at least as large as the smallest required label
-	// population cannot narrow this pattern. Stop as soon as that is proven,
-	// then release the partial union before the normal label scan.
+	// Label populations are probed only as far as the posting bound and work
+	// allowance require. The minimum count is a lower bound: reaching it cannot prove
+	// selectivity, so release the partial union before the normal label scan.
 	if population == 0 {
 		return nil, nil
 	}

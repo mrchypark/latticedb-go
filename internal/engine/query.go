@@ -1961,8 +1961,14 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 	match := stream
 	if len(plan.matchWhereScopes) > 1 {
 		for _, scope := range plan.matchWhereScopes {
+			// Index lookup may prune candidates from the predicates attached to
+			// this MATCH only. Later scope predicates must not suppress errors
+			// that an earlier scope would raise while evaluating its rows.
+			scopePlan := *plan
+			scopePlan.whereClauses = scope.clauses
+			scopePlan.wherePredicate = scope.predicate
 			for _, pattern := range scope.patterns {
-				match = newPatternQueryIterator(plan, tx, match, pattern, params, limit, skip, budget, nil)
+				match = newPatternQueryIterator(&scopePlan, tx, match, pattern, params, limit, skip, budget, nil)
 			}
 			match, err = applyWhereQueryStream(match, tx, params, budget, scope.clauses, scope.predicate)
 			if err != nil {

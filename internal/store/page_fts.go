@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
 	"github.com/mrchypark/latticedb-go/internal/search"
 )
 
@@ -164,6 +165,17 @@ func (page *PageGraph) ftsRecordSize(id uint64, text string) uint64 {
 }
 
 func (page *PageGraph) decodeFTS(id uint64, data []byte) (*FTSRecord, error) {
+	return page.decodeFTSContext(context.Background(), id, data)
+}
+
+func (page *PageGraph) decodeFTSContext(ctx context.Context, id uint64, data []byte) (*FTSRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	budget := FTSMaintenanceBudgetFromContext(ctx)
 	d, err := decodePageRecord(data, 4, page.recordLimit())
 	if err != nil {
 		return nil, err
@@ -175,9 +187,25 @@ func (page *PageGraph) decodeFTS(id uint64, data []byte) (*FTSRecord, error) {
 	if record.NodeID != id {
 		return nil, errors.New("FTS page key mismatch")
 	}
-	tokens, err := page.TokenizeFTSContext(context.Background(), id, record.Text, page.recordLimit())
+	limit := page.recordLimit()
+	if budget != nil {
+		limit = min(limit, budget.RemainingPageFTSBytes())
+	}
+	tokens, err := page.TokenizeFTSContext(ctx, id, record.Text, limit)
+	if errors.Is(err, search.ErrTokenizationLimit) {
+		return nil, fmt.Errorf("%w: FTS source tokenization exceeds maintenance limit", ErrLoadResourceLimit)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if budget != nil {
+		bytes := saturatingFTSBytes(uint64(len(tokens)), 48)
+		for _, token := range tokens {
+			bytes = saturatingFTSBytesAdd(bytes, uint64(len(token)))
+		}
+		if err := budget.ChargePageFTS(uint64(len(tokens)), bytes); err != nil {
+			return nil, err
+		}
 	}
 	return &FTSRecord{Text: record.Text, Tokens: tokens}, nil
 }
@@ -206,12 +234,33 @@ func (graph *GraphState) VisitFTS(ctx context.Context, visit func(uint64, *FTSRe
 	var base func(func(uint64, pageFTSEntry) error) error
 	if graph.PageBase != nil {
 		base = func(fn func(uint64, pageFTSEntry) error) error {
-			return graph.PageBase.Tx.Scan(ctx, "fts", nil, nil, func(key, value []byte) error {
+			var admitKey func(uint64) error
+			if budget := FTSMaintenanceBudgetFromContext(ctx); budget != nil {
+				admitKey = func(size uint64) error { return budget.ChargePageFTS(1, size) }
+			}
+			return graph.PageBase.Tx.ScanKeysWithCharge(ctx, "fts", nil, nil, 8, admitKey, func(key []byte) error {
 				if len(key) != 8 {
 					return errors.New("invalid FTS page key")
 				}
 				id := binary.BigEndian.Uint64(key)
-				record, err := graph.PageBase.decodeFTS(id, value)
+				limit := graph.PageBase.recordLimit()
+				var admit func(uint64) error
+				if budget := FTSMaintenanceBudgetFromContext(ctx); budget != nil {
+					// Admit raw bytes, the temporary decode buffer, owned text, and source work
+					// before the page store copies the value or the decoder runs.
+					limit = min(limit, budget.RemainingPageFTSBytes()/3)
+					admit = func(size uint64) error {
+						return budget.ChargePageFTS(saturatingFTSBytes(size, 5), saturatingFTSBytes(size, 3))
+					}
+				}
+				value, err := graph.PageBase.Tx.GetBoundedWithCharge("fts", key, limit, admit)
+				if errors.Is(err, pagestore.ErrValueTooLarge) {
+					return fmt.Errorf("%w: FTS source record exceeds maintenance limit", ErrLoadResourceLimit)
+				}
+				if err != nil {
+					return err
+				}
+				record, err := graph.PageBase.decodeFTSContext(ctx, id, value)
 				if err != nil {
 					return err
 				}

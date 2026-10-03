@@ -2,10 +2,12 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"math"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/latticedb-go/internal/pagestore"
@@ -693,5 +695,209 @@ func TestPageVectorMutationBudgetAggregatesNamespaces(t *testing.T) {
 	}
 	if err = db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPageVectorPublicDeleteSubsetSearchAndReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page-vector-delete-subset")
+	opts := OpenOptions{Create: true, PageStorage: true, EnableVector: true, VectorDimensions: 2, VectorIndexMode: VectorIndexHNSWSynchronous, VectorM: 2}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]uint64, 20)
+	if err = db.Update(func(tx *Tx) error {
+		for i := range ids {
+			n, e := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"embedding": []float32{1, 1}}})
+			if e != nil {
+				return e
+			}
+			ids[i] = n.ID
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ann, err := db.VectorSearch([]float32{1, 1}, VectorSearchOptions{K: 20, EfSearch: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ann) != 20 {
+		t.Fatalf("initial ANN returned %d results, want 20", len(ann))
+	}
+	if err = db.Update(func(tx *Tx) error {
+		for i := 0; i < 6; i++ {
+			if e := tx.DeleteNode(ids[i]); e != nil {
+				return e
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ann, err = db.VectorSearch([]float32{1, 1}, VectorSearchOptions{K: 1, EfSearch: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ann) != 1 {
+		t.Fatalf("post-delete ANN returned %d results, want 1", len(ann))
+	}
+	for i := 0; i < 6; i++ {
+		if ann[0].NodeID == ids[i] {
+			t.Fatalf("deleted node %d returned by ANN", ids[i])
+		}
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opts.Create = false
+	db, err = Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ann, err = db.VectorSearch([]float32{1, 1}, VectorSearchOptions{K: 1, EfSearch: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ann) != 1 {
+		t.Fatalf("reopened ANN returned %d results, want 1", len(ann))
+	}
+	for i := 0; i < 6; i++ {
+		if ann[0].NodeID == ids[i] {
+			t.Fatalf("deleted node %d returned by reopened ANN", ids[i])
+		}
+	}
+}
+
+func TestPageVectorSharedBudgetFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page-vector-shared-budget")
+	opts := OpenOptions{Create: true, PageStorage: true, EnableVector: true, VectorDimensions: 2, VectorIndexMode: VectorIndexHNSWSynchronous, VectorM: 2}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err = db.Update(func(tx *Tx) error {
+		for i := 0; i < 20; i++ {
+			if _, e := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"embedding": []float32{1, 1}}}); e != nil {
+				return e
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var annResults []VectorSearchResult
+	var annFallback bool
+	annBudget := &directSearchBudget{ctx: context.Background(), maxWork: 1_000_000, maxBytes: 64 << 20}
+	err = db.View(func(tx *Tx) error {
+		annResults, annFallback, err = searchVectorGraph(tx.graph, []float32{1, 1}, VectorSearchOptions{K: 20, EfSearch: 20}, annBudget, false)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !annFallback {
+		t.Fatal("expected fallback to exact search")
+	}
+	if len(annResults) != 20 {
+		t.Fatalf("ANN+fallback returned %d results, want 20", len(annResults))
+	}
+	annWork := annBudget.work
+	var exactResults []VectorSearchResult
+	var exactFallback bool
+	exactBudget := &directSearchBudget{ctx: context.Background(), maxWork: 1_000_000, maxBytes: 64 << 20}
+	err = db.View(func(tx *Tx) error {
+		exactResults, exactFallback, err = searchVectorGraph(tx.graph, []float32{1, 1}, VectorSearchOptions{K: 20, Exact: true}, exactBudget, false)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exactFallback {
+		t.Fatal("exact search should not report fallback")
+	}
+	if len(exactResults) != 20 {
+		t.Fatalf("exact search returned %d results, want 20", len(exactResults))
+	}
+	exactWork := exactBudget.work
+	if annWork <= exactWork {
+		t.Fatalf("ANN work %d should exceed exact work %d", annWork, exactWork)
+	}
+	limitedBudget := &directSearchBudget{ctx: context.Background(), maxWork: exactWork, maxBytes: 64 << 20}
+	err = db.View(func(tx *Tx) error {
+		_, _, err = searchVectorGraph(tx.graph, []float32{1, 1}, VectorSearchOptions{K: 20, EfSearch: 20}, limitedBudget, false)
+		return err
+	})
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("limited budget error = %v, want ErrResourceLimit", err)
+	}
+}
+
+func TestPageVectorLowBudgetErrorPropagates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page-vector-low-budget")
+	opts := OpenOptions{Create: true, PageStorage: true, EnableVector: true, VectorDimensions: 2, VectorIndexMode: VectorIndexHNSWSynchronous, VectorM: 2}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err = db.Update(func(tx *Tx) error {
+		for i := 0; i < 20; i++ {
+			if _, e := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"embedding": []float32{1, 1}}}); e != nil {
+				return e
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.VectorSearch([]float32{1, 1}, VectorSearchOptions{K: 20, EfSearch: 20, MaxWork: 1})
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("low budget error = %v, want ErrResourceLimit", err)
+	}
+}
+
+func TestPageVectorCorruptionPropagatesWithoutFallback(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "page-vector-corruption"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	write, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := &store.PageGraph{Tx: write}
+	idx := store.PageVectorIndex{Tx: page.Tx, Namespace: "default"}
+	meta := store.PageVectorMeta{EntryID: 1, LastID: 1, MaxLevel: 0, Count: 1, M: 2, Dimensions: 2, Valid: true}
+	if err := idx.PutMeta(meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Put(1, &store.PageVectorNode{Level: 0, Neighbors: [][]uint64{{}}, Vector: []float32{1, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("default"))
+	metaKey := append([]byte{0}, hash[:]...)
+	if err := write.Put("vector-hnsw", metaKey, []byte{0xff, 0xff, 0xff, 0xff}); err != nil {
+		t.Fatal(err)
+	}
+	if err := write.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	read, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Rollback()
+	graph := store.NewGraphState()
+	graph.PageBase = &store.PageGraph{Tx: read, SearchIndexesCurrent: true}
+	graph.VectorDimensions = 2
+	graph.VectorIndexM = 2
+	budget := &directSearchBudget{ctx: context.Background(), maxWork: 100_000, maxBytes: 4 << 20}
+	_, _, err = searchVectorGraph(graph, []float32{1, 1}, VectorSearchOptions{K: 1}, budget, false)
+	if err == nil || !strings.Contains(err.Error(), "invalid page record") {
+		t.Fatalf("corruption error = %v, want invalid page record header", err)
 	}
 }
