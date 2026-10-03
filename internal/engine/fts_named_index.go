@@ -104,7 +104,7 @@ func (db *DB) FTSSearchIndexContext(ctx context.Context, name, query string, opt
 		return scanNamedFTSDefinition(ctx, tx.graph, def, terms, opts, limit, budget, &results)
 	})
 	if err != nil {
-		return nil, err
+		return nil, pageStorageOpenError(err)
 	}
 	return results, nil
 }
@@ -112,7 +112,7 @@ func (db *DB) FTSSearchIndexContext(ctx context.Context, name, query string, opt
 func scanNamedFTSDefinition(ctx context.Context, graph *store.GraphState, def FTSIndexDefinition, terms []string, opts FTSSearchOptions, limit uint64, budget *directSearchBudget, out *[]FTSIndexSearchResult) error {
 	visitDocs := func(fn func(uint64, store.Properties) error) error {
 		if def.Kind == FTSIndexNode {
-			return graph.VisitNodes(ctx, func(n *store.NodeRecord) error {
+			return graph.VisitNodes(store.WithPageReadBudget(ctx, budget), func(n *store.NodeRecord) error {
 				if err := budget.add(1); err != nil {
 					return err
 				}
@@ -122,7 +122,7 @@ func scanNamedFTSDefinition(ctx context.Context, graph *store.GraphState, def FT
 				return nil
 			})
 		}
-		return graph.VisitEdges(ctx, func(e *store.EdgeRecord) error {
+		return graph.VisitEdges(store.WithPageReadBudget(ctx, budget), func(e *store.EdgeRecord) error {
 			if err := budget.add(1); err != nil {
 				return err
 			}

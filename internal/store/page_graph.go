@@ -78,6 +78,15 @@ func (graph *PageGraph) GetEdge(id uint64) (*EdgeRecord, error) {
 	return decodePageEdge(data, id, graph.recordLimit())
 }
 func (graph *PageGraph) VisitNodes(ctx context.Context, visit func(*NodeRecord) error) error {
+	if pageReadBudgetFromContext(ctx) != nil {
+		return graph.scanReadRecords(ctx, pageNodes, func(id uint64, data []byte, scope *pageReadScope) error {
+			record, err := decodePageNodeAdmitted(data, id, graph.recordLimit(), scope.decoded)
+			if err != nil {
+				return err
+			}
+			return visit(record)
+		})
+	}
 	return graph.Tx.Scan(ctx, pageNodes, nil, nil, func(key, value []byte) error {
 		if len(key) != 8 {
 			return errors.New("invalid page node key")
@@ -90,6 +99,15 @@ func (graph *PageGraph) VisitNodes(ctx context.Context, visit func(*NodeRecord) 
 	})
 }
 func (graph *PageGraph) VisitEdges(ctx context.Context, visit func(*EdgeRecord) error) error {
+	if pageReadBudgetFromContext(ctx) != nil {
+		return graph.scanReadRecords(ctx, pageEdges, func(id uint64, data []byte, scope *pageReadScope) error {
+			record, err := decodePageEdgeAdmitted(data, id, graph.recordLimit(), scope.decoded)
+			if err != nil {
+				return err
+			}
+			return visit(record)
+		})
+	}
 	return graph.Tx.Scan(ctx, pageEdges, nil, nil, func(key, value []byte) error {
 		if len(key) != 8 {
 			return errors.New("invalid page edge key")

@@ -235,15 +235,18 @@ func preparePageFTSIndexes(ctx context.Context, page *store.PageGraph, graph *st
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	budget := ftsIndexBudget{maxWork: maxWork, maxBytes: maxBytes}
-	ctx = store.WithFTSMaintenanceBudget(ctx, &budget)
+	budget, ok := store.FTSMaintenanceBudgetFromContext(ctx).(*ftsIndexBudget)
+	if !ok {
+		budget = &ftsIndexBudget{maxWork: maxWork, maxBytes: maxBytes}
+		ctx = store.WithFTSMaintenanceBudget(ctx, budget)
+	}
 	for _, index := range []string{store.PageFTSManualStandard, store.PageFTSManualPorter} {
 		ready, err := page.FTSIndexReady(index)
 		if err != nil {
 			return err
 		}
 		if !ready {
-			if err := rebuildManualPageFTS(ctx, page, graph, index, &budget); err != nil {
+			if err := rebuildManualPageFTS(ctx, page, graph, index, budget); err != nil {
 				return err
 			}
 		}
@@ -255,7 +258,7 @@ func preparePageFTSIndexes(ctx context.Context, page *store.PageGraph, graph *st
 			return err
 		}
 		if !ready {
-			if err := rebuildConfiguredPropertyPageFTS(ctx, page, graph, property, &budget); err != nil {
+			if err := rebuildConfiguredPropertyPageFTS(ctx, page, graph, property, budget); err != nil {
 				return err
 			}
 		}
@@ -278,7 +281,7 @@ func preparePageFTSIndexes(ctx context.Context, page *store.PageGraph, graph *st
 			return err
 		}
 		if !ready {
-			if err := rebuildDeclaredPageFTS(ctx, page, def, index, &budget); err != nil {
+			if err := rebuildDeclaredPageFTS(ctx, page, def, index, budget); err != nil {
 				return err
 			}
 		}

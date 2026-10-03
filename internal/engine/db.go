@@ -2313,6 +2313,20 @@ func (budget *directSearchBudget) add(work uint64) error {
 
 func (budget *directSearchBudget) check() error { return budget.ctx.Err() }
 
+func (budget *directSearchBudget) ReservePageRead(work, bytes uint64) error {
+	if err := budget.check(); err != nil {
+		return err
+	}
+	if err := budget.add(work); err != nil {
+		return err
+	}
+	return budget.reserveBytes(bytes)
+}
+func (budget *directSearchBudget) ReleasePageRead(bytes uint64) { budget.releaseBytes(bytes) }
+func (budget *directSearchBudget) RemainingPageReadBytes() uint64 {
+	return budget.maxBytes - min(budget.bytes, budget.maxBytes)
+}
+
 func (budget *directSearchBudget) reserveBytes(bytes uint64) error {
 	if budget.bytes > budget.maxBytes || bytes > budget.maxBytes-budget.bytes {
 		return fmt.Errorf("%w: search memory exceeds budget", ErrResourceLimit)

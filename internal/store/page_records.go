@@ -60,10 +60,15 @@ func encodePageNode(node *NodeRecord) ([]byte, error) {
 }
 
 func decodePageNode(data []byte, id, maxBytes uint64) (*NodeRecord, error) {
+	return decodePageNodeAdmitted(data, id, maxBytes, nil)
+}
+
+func decodePageNodeAdmitted(data []byte, id, maxBytes uint64, admit func(uint64) error) (*NodeRecord, error) {
 	d, err := decodePageRecord(data, pageNodeRecord, maxBytes)
 	if err != nil {
 		return nil, err
 	}
+	d.admitAllocation = admit
 	node := d.node()
 	if err := d.finish(); err != nil {
 		return nil, fmt.Errorf("decode page record: %w", err)
@@ -106,10 +111,15 @@ func encodePageEdge(edge *EdgeRecord) ([]byte, error) {
 }
 
 func decodePageEdge(data []byte, id, maxBytes uint64) (*EdgeRecord, error) {
+	return decodePageEdgeAdmitted(data, id, maxBytes, nil)
+}
+
+func decodePageEdgeAdmitted(data []byte, id, maxBytes uint64, admit func(uint64) error) (*EdgeRecord, error) {
 	d, err := decodePageRecord(data, pageEdgeRecord, maxBytes)
 	if err != nil {
 		return nil, err
 	}
+	d.admitAllocation = admit
 	edge := d.edge()
 	if err := d.finish(); err != nil {
 		return nil, fmt.Errorf("decode page record: %w", err)

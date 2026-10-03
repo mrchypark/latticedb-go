@@ -47,3 +47,20 @@ The reviewer confirmed no actionable defect in the corrected Windows maintenance
 The second-round correction isolates lookup predicates per MATCH scope, uses bounded term-frequency reads and label probes for FTS planning, and admits maintenance keys before copying them. Whole-index deletion now reads keys only and charges cumulative deletion staging. Manual rebuild admits the canonical value, decode copies, and tokenizer storage before use. HNSW underfill uses the existing streaming exact path with the same budget; index-read errors still propagate.
 
 Regression coverage includes empty earlier scopes with invalid later parameters, retained-row errors and terminal LIMIT, one and ten selective hits in a 1,000-node label, a 1 MiB canonical FTS source under a 256-byte allowance, whole-index drop rollback, and duplicate-vector deletion/reopen. These are correction evidence, not a clean-review verdict.
+
+## Third implementation review
+
+Pro verified all 407 repository blobs at `020c8a6b2c1bb389b0185100c6dd70cf408083e6`. All six unchanged second-round reproductions and nineteen central correction controls passed. Key admission and 800-record whole-drop controls passed in normal and race modes. LDB221-04, -13, -14, and -15 are closed. The property-index fixture adjustment was accepted. Native CI and the 100K benchmark also passed for this candidate.
+
+Two new findings remain, supported by three failing reproductions:
+
+| ID | Defect | Required correction |
+|---|---|---|
+| LDB221-16 | Page vector exact/fallback scans and stale manual FTS scans allocate canonical source records outside the request budget | Admit raw copies, decoder/property storage, and FTS tokenization before allocation; hold source bytes through the visitor, then release them; retain cumulative work |
+| LDB221-17 | FTS namespace and stale-history readiness invalidation bypass maintenance budgets | Admit visited keys and deletion staging; share one open budget across cleanup and preparation; preserve rollback |
+
+These findings keep the merge gate open. Final correction evidence and the exact-head review verdict are recorded on the PR.
+
+The follow-up source reader admits key/raw storage before copying, uses decoder allocation hooks before constructing strings/collections, and reserves conservative property-normalization copies. Search contexts retain source storage through each visitor and release it afterward. Work remains cumulative across ANN fallback and both BM25 passes. The same source reader covers named node/edge FTS scan paths. Resident records do not incur a page-read allocation charge.
+
+FTS namespace invalidation now uses key-only preadmission, charges every visited key and deletion staging, and serves stale-history cleanup too. Writable open supplies one maintenance budget to cleanup and preparation. The property-index budget fixture admits the now-budgeted readiness inspection, rejects larger node/edge definitions, and admits a small definition; production allowances were not weakened.

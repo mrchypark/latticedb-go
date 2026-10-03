@@ -109,7 +109,7 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 		if documentCount != 0 {
 			averageLength = float64(totalLength) / float64(documentCount)
 		}
-		err := tx.graph.VisitFTS(ctx, func(nodeID uint64, record *store.FTSRecord) error {
+		err := tx.graph.VisitFTS(store.WithPageReadBudget(ctx, budget), func(nodeID uint64, record *store.FTSRecord) error {
 			tokens, tokenBytes, err := ftsRecordTokens(ctx, record, opts.Analyzer, budget)
 			if err != nil {
 				return err
@@ -139,7 +139,7 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 		return sortFTSResultsBudget(results, budget)
 	})
 	if err != nil {
-		return nil, err
+		return nil, pageStorageOpenError(err)
 	}
 	return results, nil
 }
@@ -147,7 +147,7 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 func ftsBM25CorpusStats(ctx context.Context, graph *store.GraphState, terms []string, opts FTSSearchOptions, budget *directSearchBudget) (uint64, uint64, []uint64, error) {
 	frequencies := make([]uint64, len(terms))
 	var documentCount, totalLength uint64
-	err := graph.VisitFTS(ctx, func(_ uint64, record *store.FTSRecord) error {
+	err := graph.VisitFTS(store.WithPageReadBudget(ctx, budget), func(_ uint64, record *store.FTSRecord) error {
 		if err := budget.add(1); err != nil {
 			return err
 		}
@@ -171,7 +171,7 @@ func ftsBM25CorpusStats(ctx context.Context, graph *store.GraphState, terms []st
 		return nil
 	})
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, nil, pageStorageOpenError(err)
 	}
 	return documentCount, totalLength, frequencies, budget.check()
 }

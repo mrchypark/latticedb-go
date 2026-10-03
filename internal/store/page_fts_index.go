@@ -127,7 +127,19 @@ func (page *PageGraph) SetFTSIndexReady(index string, ready bool) error {
 // InvalidateFTSIndexNamespace makes indexes under prefix unavailable unless
 // their physical names are explicitly retained by the active configuration.
 func (page *PageGraph) InvalidateFTSIndexNamespace(ctx context.Context, prefix string, retain map[string]struct{}) error {
-	return page.Tx.Scan(ctx, pageFTSReady, nil, nil, func(key, _ []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	budget := FTSMaintenanceBudgetFromContext(ctx)
+	admit := func(size uint64) error {
+		if budget == nil {
+			return nil
+		}
+		// Owned key, cursor resume key, and decoded index name are temporary
+		// storage. Charge every visited key, including retained namespaces.
+		return budget.ChargePageFTS(1, saturatingFTSBytes(size, 3))
+	}
+	return page.Tx.ScanKeysWithCharge(ctx, pageFTSReady, nil, nil, 65537, admit, func(key []byte) error {
 		if len(key) < 2 {
 			return errors.New("invalid FTS index readiness key")
 		}
@@ -141,6 +153,11 @@ func (page *PageGraph) InvalidateFTSIndexNamespace(ctx context.Context, prefix s
 		}
 		if _, ok := retain[name]; ok {
 			return nil
+		}
+		if budget != nil {
+			if err := budget.ChargePageFTS(0, saturatingFTSBytesAdd(uint64(len(key)), 64)); err != nil {
+				return err
+			}
 		}
 		return page.Tx.Delete(pageFTSReady, key)
 	})

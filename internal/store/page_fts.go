@@ -234,6 +234,15 @@ func (graph *GraphState) VisitFTS(ctx context.Context, visit func(uint64, *FTSRe
 	var base func(func(uint64, pageFTSEntry) error) error
 	if graph.PageBase != nil {
 		base = func(fn func(uint64, pageFTSEntry) error) error {
+			if pageReadBudgetFromContext(ctx) != nil {
+				return graph.PageBase.scanReadRecords(ctx, "fts", func(id uint64, data []byte, scope *pageReadScope) error {
+					record, err := graph.PageBase.decodeFTSRead(ctx, id, data, scope)
+					if err != nil {
+						return err
+					}
+					return fn(id, pageFTSEntry{id, record})
+				})
+			}
 			var admitKey func(uint64) error
 			if budget := FTSMaintenanceBudgetFromContext(ctx); budget != nil {
 				admitKey = func(size uint64) error { return budget.ChargePageFTS(1, size) }

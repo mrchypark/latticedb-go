@@ -255,16 +255,18 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 		page := &store.PageGraph{Tx: write}
 		buildGraph := *graph
 		buildGraph.PageBase = page
+		ftsBudget := &ftsIndexBudget{maxWork: opts.DerivedIndexBuildMaxWork, maxBytes: opts.DerivedIndexBuildMaxLogicalBytes}
+		ftsCtx := store.WithFTSMaintenanceBudget(ctx, ftsBudget)
 		if !graph.PageBase.SearchIndexesCurrent {
 			lifecycleBudget := &directSearchBudget{ctx: ctx, maxWork: opts.VectorIndexBuildMaxWork, maxBytes: opts.VectorIndexBuildMaxLogicalBytes}
 			lifecycleStage := &pageVectorBuildBudget{maxStagedBytes: opts.VectorIndexBuildMaxLogicalBytes}
 			e = invalidatePageVectorIndexesBudget(ctx, page, nil, lifecycleBudget, lifecycleStage)
 			if e == nil {
-				e = page.InvalidateFTSIndexReadiness(ctx)
+				e = page.InvalidateFTSIndexReadiness(ftsCtx)
 			}
 		}
 		if e == nil {
-			e = preparePageFTSIndexes(ctx, page, &buildGraph, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes)
+			e = preparePageFTSIndexes(ftsCtx, page, &buildGraph, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes)
 		}
 		if e == nil && opts.VectorIndexMode == VectorIndexHNSWSynchronous && graph.VectorDimensions != 0 {
 			e = preparePageVectorIndexes(ctx, page, &buildGraph, opts.VectorIndexBuildMaxWork, opts.VectorIndexBuildMaxLogicalBytes)

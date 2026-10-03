@@ -134,7 +134,7 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 	}
 	exact := vectorCandidateHeap{items: candidateStorage, max: true, exact: true}
 	cutoff := math.Inf(1)
-	if err := graph.VisitNodes(budget.ctx, func(node *store.NodeRecord) error {
+	if err := graph.VisitNodes(store.WithPageReadBudget(budget.ctx, budget), func(node *store.NodeRecord) error {
 		vectorValue, ok := selectedVector(graph, node)
 		if !ok {
 			return budget.add(1)
@@ -173,7 +173,7 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 		}
 		return nil
 	}); err != nil {
-		return nil, false, err
+		return nil, false, pageStorageOpenError(err)
 	}
 	if err := budget.check(); err != nil {
 		return nil, false, err

@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"io"
 )
 
 // The stamp binds disposable search records to the source history. An older
@@ -22,25 +21,5 @@ func (page *PageGraph) searchIndexesMatch(history [32]byte) (bool, error) {
 // InvalidateFTSIndexReadiness preserves postings until a bounded rebuild can
 // replace them. No incomplete index is admitted for candidate selection.
 func (page *PageGraph) InvalidateFTSIndexReadiness(ctx context.Context) error {
-	for {
-		keys := make([][]byte, 0, 128)
-		err := page.Tx.Scan(ctx, pageFTSReady, nil, nil, func(key, _ []byte) error {
-			keys = append(keys, bytes.Clone(key))
-			if len(keys) == cap(keys) {
-				return io.EOF
-			}
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		if len(keys) == 0 {
-			return nil
-		}
-		for _, key := range keys {
-			if err := page.Tx.Delete(pageFTSReady, key); err != nil {
-				return err
-			}
-		}
-	}
+	return page.InvalidateFTSIndexNamespace(ctx, "", nil)
 }

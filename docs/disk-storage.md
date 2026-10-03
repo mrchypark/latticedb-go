@@ -27,6 +27,12 @@ commit history; mutations publish canonical records and derived changes in the
 same native write transaction. Writable opens rebuild stale indexes within
 configured work and byte budgets. Read-only full-text search can fall back to
 a bounded scan; read-only HNSW requires a current compatible index.
+Direct vector and full-text scan limits include newly read canonical records,
+decoded properties, and token storage. Temporary source storage is released
+after each record; work remains cumulative across fallback and BM25 passes.
+A query that fits a ready index can therefore exceed its budget on a scan path.
+FTS readiness cleanup and subsequent rebuild share the writable open's budget;
+a rejected open does not publish partial cleanup.
 
 An older v5 state/WAL database is migrated to a staged `state.json.pages`
 sidecar, then the staged file is published after import and validation. The
