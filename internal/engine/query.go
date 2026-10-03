@@ -23,34 +23,42 @@ import (
 )
 
 type queryPlan struct {
-	slots          map[string]int
-	unwindClause   *unwindClause
-	matchPatterns  []matchPattern
-	whereClauses   []*whereClause
-	wherePredicate wherePredicate
-	createNode     *createNodeClause
-	setClauses     []*setClause
-	createClause   *createClause
-	mergeClause    *mergeClause
-	removeClause   *removeClause
-	deleteClause   *deleteClause
-	returnClause   *returnClause
-	orderClauses   []orderClause
-	skipExpr       valueExpr
-	limitExpr      valueExpr
-	withClause     *returnClause
-	withWhere      wherePredicate
-	withOrder      []orderClause
-	withSkipExpr   valueExpr
-	withLimitExpr  valueExpr
-	next           *queryPlan
-	inherited      []string
-	inheritedSlots []string
-	inheritedRoles map[string]bindingRole
+	slots            map[string]int
+	unwindClause     *unwindClause
+	matchPatterns    []matchPattern
+	matchWhereScopes []matchWhereScope
+	whereClauses     []*whereClause
+	wherePredicate   wherePredicate
+	createNode       *createNodeClause
+	createPatterns   []createPatternClause
+	setClauses       []*setClause
+	createClause     *createClause
+	mergeClause      *mergeClause
+	removeClause     *removeClause
+	deleteClause     *deleteClause
+	returnClause     *returnClause
+	orderClauses     []orderClause
+	skipExpr         valueExpr
+	limitExpr        valueExpr
+	withClause       *returnClause
+	withWhere        wherePredicate
+	withOrder        []orderClause
+	withSkipExpr     valueExpr
+	withLimitExpr    valueExpr
+	next             *queryPlan
+	inherited        []string
+	inheritedSlots   []string
+	inheritedRoles   map[string]bindingRole
 }
 
 type matchPattern interface {
 	apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error)
+}
+
+type matchWhereScope struct {
+	patterns  []matchPattern
+	clauses   []*whereClause
+	predicate wherePredicate
 }
 
 // queryBudget tracks cumulative work and logical live bytes. Live bytes include
@@ -202,6 +210,8 @@ type whereClause struct {
 	Var      string
 	Property string
 	Expr     valueExpr
+	LeftExpr valueExpr
+	Operator whereKind
 }
 
 type whereKind string
@@ -222,6 +232,7 @@ const (
 	whereVector       whereKind = "vector"
 	whereFTS          whereKind = "fts"
 	whereBindingID    whereKind = "binding_id"
+	whereExpression   whereKind = "expression"
 )
 
 type wherePredicate interface {
@@ -259,12 +270,18 @@ type createClause struct {
 	EdgeVar   string
 	EdgeType  string
 	Props     map[string]valueExpr
+	Patterns  []createPatternClause
 }
 
 type createNodeClause struct {
 	Var    string
 	Labels []string
 	Props  map[string]valueExpr
+}
+
+type createPatternClause struct {
+	Nodes []nodePattern
+	Edges []edgePattern
 }
 
 type setKind string
@@ -560,6 +577,60 @@ func (it *patternQueryIterator) apply(row queryRow) ([]queryRow, error) {
 		}
 	}
 	return it.pattern.apply(it.tx, []queryRow{row}, it.budget)
+}
+
+func newPatternQueryIterator(plan *queryPlan, tx *Tx, input queryIterator, pattern matchPattern, params map[string]any, limit, skip int, budget *queryBudget, search *querySearchCandidate) *patternQueryIterator {
+	lookupLimit := uint(0)
+	if node, ok := pattern.(nodePattern); ok {
+		lookupLimit = plan.indexedNodeLookupLimit(node, limit, skip)
+	}
+	if search != nil {
+		lookupLimit = ^uint(0)
+	}
+	return &patternQueryIterator{plan: plan, tx: tx, input: input, pattern: pattern, params: params, limit: lookupLimit, budget: budget, search: search}
+}
+
+func applyWhereQueryStream(stream queryIterator, tx *Tx, params map[string]any, budget *queryBudget, clauses []*whereClause, predicate wherePredicate) (queryIterator, error) {
+	for _, clause := range clauses {
+		if clause.Kind == whereVector || clause.Kind == whereFTS {
+			var rows []queryRow
+			for {
+				row, ok, err := stream.Next()
+				if err != nil {
+					budget.releaseRows(len(rows))
+					stream.Close()
+					return nil, err
+				}
+				if !ok {
+					break
+				}
+				rows = append(rows, row)
+			}
+			stream.Close()
+			inputRows := len(rows)
+			var err error
+			rows, err = clause.apply(tx, rows, params, budget)
+			if err != nil {
+				budget.releaseRows(inputRows)
+				return nil, err
+			}
+			budget.releaseRows(inputRows - len(rows))
+			stream = &sliceQueryIterator{rows: rows, budget: budget}
+			continue
+		}
+		stream = &whereQueryIterator{input: stream, tx: tx, clause: clause, params: params, budget: budget}
+	}
+	if predicate != nil {
+		predicateWork := uint64(len(wherePredicateClauses(predicate)))
+		stream = &filterQueryIterator{input: stream, budget: budget, eval: func(row queryRow) (bool, error) {
+			if err := budget.check(predicateWork, 0); err != nil {
+				return false, err
+			}
+			match, err := predicate.eval(row, params, budget)
+			return match == predicateTrue, err
+		}}
+	}
+	return stream, nil
 }
 
 func (it *limitQueryIterator) Next() (queryRow, bool, error) {
@@ -1168,6 +1239,22 @@ func (plan *queryPlan) validateBindings() error {
 			return err
 		}
 	}
+	createPatterns := slices.Clone(plan.createPatterns)
+	if plan.createClause != nil {
+		createPatterns = append(createPatterns, plan.createClause.Patterns...)
+	}
+	for _, pattern := range createPatterns {
+		for _, node := range pattern.Nodes {
+			if err := bind(node.Var, bindingNode); err != nil {
+				return err
+			}
+		}
+		for _, edge := range pattern.Edges {
+			if err := bind(edge.EdgeVar, bindingEdge); err != nil {
+				return err
+			}
+		}
+	}
 	for _, pattern := range plan.matchPatterns {
 		switch pattern := pattern.(type) {
 		case nodePattern:
@@ -1227,19 +1314,122 @@ func (plan *queryPlan) validateBindings() error {
 		}
 		return nil
 	}
+	available := make(map[string]struct{}, len(plan.inherited)+len(plan.matchPatterns))
+	for _, name := range plan.inherited {
+		available[name] = struct{}{}
+	}
+	if plan.unwindClause != nil {
+		available[plan.unwindClause.Var] = struct{}{}
+	}
+	validateScopedName := func(name string) error {
+		if name == "" {
+			return nil
+		}
+		if _, ok := available[name]; !ok {
+			return fmt.Errorf("unknown binding %q", name)
+		}
+		return nil
+	}
+	validateScopedExpr := func(expr valueExpr) error {
+		for _, name := range valueExprBindings(expr) {
+			if err := validateScopedName(name); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, scope := range plan.matchWhereScopes {
+		for _, pattern := range scope.patterns {
+			switch pattern := pattern.(type) {
+			case nodePattern:
+				if pattern.Var != "" {
+					available[pattern.Var] = struct{}{}
+				}
+			case edgePattern:
+				for _, name := range []string{pattern.Left.Var, pattern.EdgeVar, pattern.Right.Var} {
+					if name != "" {
+						available[name] = struct{}{}
+					}
+				}
+			}
+		}
+		for _, clause := range scope.clauses {
+			if err := validateScopedName(clause.Var); err != nil {
+				return err
+			}
+			if err := validateScopedExpr(clause.Expr); err != nil {
+				return err
+			}
+			if err := validateScopedExpr(clause.LeftExpr); err != nil {
+				return err
+			}
+		}
+		for _, clause := range wherePredicateClauses(scope.predicate) {
+			if err := validateScopedName(clause.Var); err != nil {
+				return err
+			}
+			if err := validateScopedExpr(clause.Expr); err != nil {
+				return err
+			}
+			if err := validateScopedExpr(clause.LeftExpr); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pattern := range createPatterns {
+		for _, node := range pattern.Nodes {
+			for _, expr := range node.PropertyExprs {
+				for _, name := range valueExprBindings(expr) {
+					if name == node.Var {
+						return fmt.Errorf("binding %q is not available while it is created", name)
+					}
+					if err := require(name, bindingNode, bindingEdge, bindingValue); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		for _, edge := range pattern.Edges {
+			for _, name := range []string{edge.Left.Var, edge.Right.Var} {
+				if err := require(name, bindingNode); err != nil {
+					return err
+				}
+			}
+			for _, expr := range edge.PropertyExprs {
+				for _, name := range valueExprBindings(expr) {
+					if name == edge.EdgeVar {
+						return fmt.Errorf("binding %q is not available while it is created", name)
+					}
+				}
+				if err := requireExpr(expr); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	for _, clause := range plan.whereClauses {
-		if err := require(clause.Var, bindingNode, bindingEdge, bindingValue); err != nil {
-			return err
+		if clause.Var != "" {
+			if err := require(clause.Var, bindingNode, bindingEdge, bindingValue); err != nil {
+				return err
+			}
 		}
 		if err := requireExpr(clause.Expr); err != nil {
+			return err
+		}
+		if err := requireExpr(clause.LeftExpr); err != nil {
 			return err
 		}
 	}
 	for _, clause := range wherePredicateClauses(plan.wherePredicate) {
-		if err := require(clause.Var, bindingNode, bindingEdge, bindingValue); err != nil {
-			return err
+		if clause.Var != "" {
+			if err := require(clause.Var, bindingNode, bindingEdge, bindingValue); err != nil {
+				return err
+			}
 		}
 		if err := requireExpr(clause.Expr); err != nil {
+			return err
+		}
+		if err := requireExpr(clause.LeftExpr); err != nil {
 			return err
 		}
 	}
@@ -1277,7 +1467,7 @@ func (plan *queryPlan) validateBindings() error {
 			}
 		}
 	}
-	if plan.createClause != nil {
+	if plan.createClause != nil && len(plan.createClause.Patterns) == 0 {
 		if err := require(plan.createClause.SourceVar, bindingNode); err != nil {
 			return err
 		}
@@ -1400,8 +1590,15 @@ func (plan *queryPlan) validateBindings() error {
 			projected[name] = struct{}{}
 		}
 		for _, item := range wherePredicateClauses(plan.withWhere) {
-			if _, ok := projected[item.Var]; !ok {
-				return fmt.Errorf("unknown binding %q", item.Var)
+			if item.Var != "" {
+				if _, ok := projected[item.Var]; !ok {
+					return fmt.Errorf("unknown binding %q", item.Var)
+				}
+			}
+			for _, name := range valueExprBindings(item.LeftExpr) {
+				if _, ok := projected[name]; !ok {
+					return fmt.Errorf("unknown binding %q", name)
+				}
 			}
 			for _, name := range valueExprBindings(item.Expr) {
 				if _, ok := projected[name]; !ok {
@@ -1463,9 +1660,14 @@ func valueExprBindings(expr valueExpr) []string {
 }
 
 func parseMatchQuery(query string) (*queryPlan, error) {
+	pathIndex := 0
+	return parseMatchQueryWithPathIndex(query, &pathIndex)
+}
+
+func parseMatchQueryWithPathIndex(query string, pathIndex *int) (*queryPlan, error) {
 	rest := strings.TrimSpace(strings.TrimPrefix(query, "MATCH "))
-	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
-	patterns, err := parseMatchPatterns(matchText)
+	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " MATCH ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
+	patterns, err := parseMatchPatternsWithPathIndex(matchText, pathIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -1475,7 +1677,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 
 	switch nextKeyword {
 	case " WHERE ":
-		whereText, whereNext, afterWhere := splitOnNextClause(tail, " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
+		whereText, whereNext, afterWhere := splitOnNextClause(tail, " MATCH ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
 		predicate, err := parseWherePredicate(whereText)
 		if err != nil {
 			return nil, err
@@ -1492,12 +1694,37 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 		}
 		nextKeyword = whereNext
 		tail = afterWhere
+	case " MATCH ":
+		// Handled with the other terminal clauses below.
 	case " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ", "":
 	default:
 		return nil, fmt.Errorf("unsupported clause after MATCH: %q", nextKeyword)
 	}
+	plan.matchWhereScopes = append(plan.matchWhereScopes, matchWhereScope{
+		patterns:  slices.Clone(patterns),
+		clauses:   slices.Clone(plan.whereClauses),
+		predicate: plan.wherePredicate,
+	})
 
 	switch nextKeyword {
+	case " MATCH ":
+		next, err := parseMatchQueryWithPathIndex("MATCH "+tail, pathIndex)
+		if err != nil {
+			return nil, err
+		}
+		plan.matchPatterns = append(plan.matchPatterns, next.matchPatterns...)
+		plan.matchWhereScopes = append(plan.matchWhereScopes, next.matchWhereScopes...)
+		plan.whereClauses = append(plan.whereClauses, next.whereClauses...)
+		if next.wherePredicate != nil {
+			if plan.wherePredicate == nil {
+				plan.wherePredicate = next.wherePredicate
+			} else {
+				plan.wherePredicate = booleanPredicate{Operator: "AND", Items: []wherePredicate{plan.wherePredicate, next.wherePredicate}}
+			}
+		}
+		plan.returnClause, plan.orderClauses, plan.skipExpr, plan.limitExpr = next.returnClause, next.orderClauses, next.skipExpr, next.limitExpr
+		plan.setClauses, plan.createClause = next.setClauses, next.createClause
+		plan.mergeClause, plan.removeClause, plan.deleteClause = next.mergeClause, next.removeClause, next.deleteClause
 	case " MERGE ":
 		if err := parseMergeTail(plan, tail); err != nil {
 			return nil, err
@@ -1607,12 +1834,12 @@ func parseUnwindQueryPart(query string, allowNoTerminal bool) (*queryPlan, error
 func parseCreateQuery(query string) (*queryPlan, error) {
 	rest := strings.TrimSpace(strings.TrimPrefix(query, "CREATE "))
 	createText, nextKeyword, tail := splitOnNextClause(rest, " RETURN ")
-	createNode, err := parseCreateNodeClause(createText)
+	patterns, err := parseCreatePatterns(createText)
 	if err != nil {
 		return nil, err
 	}
 
-	plan := &queryPlan{createNode: createNode}
+	plan := &queryPlan{createPatterns: patterns}
 	switch nextKeyword {
 	case "":
 		return plan, nil
@@ -1638,7 +1865,7 @@ func (plan *queryPlan) mutates() bool {
 // mutatesLocally reports whether this part alone writes, which the per-part
 // execution fast paths need.
 func (plan *queryPlan) mutatesLocally() bool {
-	return plan.createNode != nil || len(plan.setClauses) != 0 || plan.createClause != nil || plan.mergeClause != nil || plan.removeClause != nil || plan.deleteClause != nil
+	return plan.createNode != nil || len(plan.createPatterns) != 0 || len(plan.setClauses) != 0 || plan.createClause != nil || plan.mergeClause != nil || plan.removeClause != nil || plan.deleteClause != nil
 }
 
 func parsePlanReturn(plan *queryPlan, text string) error {
@@ -1723,7 +1950,6 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		rows = nextRows
 		stream = &sliceQueryIterator{rows: rows, budget: budget}
 	}
-	match := stream
 	patterns, err := plan.orderedMatchPatterns(tx, params, budget)
 	if err != nil {
 		return QueryResult{}, err
@@ -1732,52 +1958,44 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 	if err != nil {
 		return QueryResult{}, err
 	}
-	for _, pattern := range patterns {
-		lookupLimit := uint(0)
-		if node, ok := pattern.(nodePattern); ok {
-			lookupLimit = plan.indexedNodeLookupLimit(node, limit, skip)
-		}
-		var candidate *querySearchCandidate
-		if searchCandidate != nil {
-			if node, ok := pattern.(nodePattern); ok && node.Var == searchCandidate.variable {
-				candidate = searchCandidate
-				searchCandidate = nil
-				lookupLimit = ^uint(0)
+	match := stream
+	if len(plan.matchWhereScopes) > 1 {
+		for _, scope := range plan.matchWhereScopes {
+			// Index lookup may prune candidates from the predicates attached to
+			// this MATCH only. Later scope predicates must not suppress errors
+			// that an earlier scope would raise while evaluating its rows.
+			scopePlan := *plan
+			scopePlan.whereClauses = scope.clauses
+			scopePlan.wherePredicate = scope.predicate
+			for _, pattern := range scope.patterns {
+				match = newPatternQueryIterator(&scopePlan, tx, match, pattern, params, limit, skip, budget, nil)
+			}
+			match, err = applyWhereQueryStream(match, tx, params, budget, scope.clauses, scope.predicate)
+			if err != nil {
+				return QueryResult{}, err
 			}
 		}
-		match = &patternQueryIterator{plan: plan, tx: tx, input: match, pattern: pattern, params: params, limit: lookupLimit, budget: budget, search: candidate}
+	} else {
+		for _, pattern := range patterns {
+			var candidate *querySearchCandidate
+			if searchCandidate != nil {
+				if node, ok := pattern.(nodePattern); ok && node.Var == searchCandidate.variable {
+					candidate = searchCandidate
+					searchCandidate = nil
+				}
+			}
+			match = newPatternQueryIterator(plan, tx, match, pattern, params, limit, skip, budget, candidate)
+		}
+		clauses, predicate := plan.whereClauses, plan.wherePredicate
+		if len(plan.matchWhereScopes) == 1 {
+			clauses, predicate = plan.matchWhereScopes[0].clauses, plan.matchWhereScopes[0].predicate
+		}
+		match, err = applyWhereQueryStream(match, tx, params, budget, clauses, predicate)
+		if err != nil {
+			return QueryResult{}, err
+		}
 	}
 	stream = match
-	if len(plan.whereClauses) > 0 {
-		for _, clause := range plan.whereClauses {
-			if clause.Kind == whereVector || clause.Kind == whereFTS {
-				rows, err = collectQueryRows(stream)
-				if err != nil {
-					return QueryResult{}, err
-				}
-				inputRows := len(rows)
-				rows, err = clause.apply(tx, rows, params, budget)
-				if err != nil {
-					budget.releaseRows(inputRows)
-					return QueryResult{}, err
-				}
-				budget.releaseRows(inputRows - len(rows))
-				stream = &sliceQueryIterator{rows: rows, budget: budget}
-				continue
-			}
-			stream = &whereQueryIterator{input: stream, tx: tx, clause: clause, params: params, budget: budget}
-		}
-	}
-	if plan.wherePredicate != nil {
-		predicateWork := uint64(len(wherePredicateClauses(plan.wherePredicate)))
-		stream = &filterQueryIterator{input: stream, budget: budget, eval: func(row queryRow) (bool, error) {
-			if err := budget.check(predicateWork, 0); err != nil {
-				return false, err
-			}
-			match, err := plan.wherePredicate.eval(row, params, budget)
-			return match == predicateTrue, err
-		}}
-	}
 	if plan.returnClause != nil && input == nil && plan.next == nil && !plan.mutates() && len(plan.orderClauses) == 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() {
 		iteratorLimit := limit
 		if plan.limitExpr == nil {
@@ -1814,6 +2032,11 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		}
 		budget.releaseRows(len(rows))
 		rows = nextRows
+	}
+	if len(plan.createPatterns) != 0 {
+		if err := applyCreatePatterns(tx, rows, params, plan.createPatterns, budget); err != nil {
+			return QueryResult{}, err
+		}
 	}
 	if plan.createNode != nil {
 		nextRows, err := plan.createNode.apply(tx, rows, params, budget)
@@ -1936,7 +2159,7 @@ func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any, budge
 	if len(budgets) != 0 {
 		budget = budgets[0]
 	}
-	if plan.unwindClause != nil || plan.mutates() || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) == 0 {
+	if plan.unwindClause != nil || plan.mutates() || len(plan.matchWhereScopes) > 1 || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) == 0 {
 		return plan.matchPatterns, nil
 	}
 	search, err := plan.hasSearchPatternClause(budget)
@@ -3244,6 +3467,11 @@ func (clause *unwindClause) apply(rows []queryRow, params map[string]any, budget
 }
 
 func parseMatchPatterns(text string) ([]matchPattern, error) {
+	pathIndex := 0
+	return parseMatchPatternsWithPathIndex(text, &pathIndex)
+}
+
+func parseMatchPatternsWithPathIndex(text string, pathIndex *int) ([]matchPattern, error) {
 	parts := splitTopLevel(text, ',')
 	patterns := make([]matchPattern, 0, len(parts))
 	for _, part := range parts {
@@ -3251,8 +3479,10 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 		if part == "" {
 			return nil, fmt.Errorf("empty MATCH pattern in %q", text)
 		}
+		currentPathIndex := *pathIndex
+		*pathIndex = *pathIndex + 1
 		if findTopLevelToken(part, "-[") >= 0 || findTopLevelToken(part, "<-[") >= 0 {
-			path, err := parsePathPattern(part, len(patterns))
+			path, err := parsePathPattern(part, currentPathIndex)
 			if err != nil {
 				return nil, err
 			}
@@ -3264,7 +3494,7 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 			return nil, err
 		}
 		if pattern.Var == "" && len(pattern.PropertyExprs) != 0 {
-			pattern.Var = fmt.Sprintf("\x00node%d", len(patterns))
+			pattern.Var = fmt.Sprintf("\x00node%d", currentPathIndex)
 		}
 		patterns = append(patterns, pattern)
 	}
@@ -3702,13 +3932,17 @@ func parseWhereClause(text string) (*whereClause, error) {
 			}
 			return &whereClause{Kind: whereBindingID, Var: varName, Expr: expr}, nil
 		}
-		varName, property, err := parsePropertyAccess(left)
-		if err != nil {
-			return nil, err
-		}
 		expr, err := parseValueExpr(right)
 		if err != nil {
 			return nil, err
+		}
+		varName, property, err := parsePropertyAccess(left)
+		if err != nil {
+			leftExpr, exprErr := parseValueExpr(left)
+			if exprErr != nil {
+				return nil, err
+			}
+			return &whereClause{Kind: whereExpression, LeftExpr: leftExpr, Expr: expr}, nil
 		}
 		return &whereClause{Kind: whereEquals, Var: varName, Property: property, Expr: expr}, nil
 	}
@@ -3723,13 +3957,17 @@ func parseWhereClause(text string) (*whereClause, error) {
 		{" > ", whereGreater},
 	} {
 		if left, right, ok := splitOperator(text, operator.Token); ok {
-			varName, property, err := parsePropertyAccess(left)
-			if err != nil {
-				return nil, err
-			}
 			expr, err := parseValueExpr(right)
 			if err != nil {
 				return nil, err
+			}
+			varName, property, err := parsePropertyAccess(left)
+			if err != nil {
+				leftExpr, exprErr := parseValueExpr(left)
+				if exprErr != nil {
+					return nil, err
+				}
+				return &whereClause{Kind: whereExpression, LeftExpr: leftExpr, Expr: expr, Operator: operator.Kind}, nil
 			}
 			return &whereClause{Kind: operator.Kind, Var: varName, Property: property, Expr: expr}, nil
 		}
@@ -3796,33 +4034,73 @@ func parseSetClauses(text string) ([]*setClause, error) {
 }
 
 func parseCreateClause(text string) (*createClause, error) {
-	patterns, err := parsePathPattern(text, 0)
-	if err != nil || len(patterns) != 1 {
-		return nil, fmt.Errorf("unsupported CREATE clause %q", text)
+	patterns, err := parseCreatePatterns(text)
+	if err != nil {
+		return nil, err
 	}
-	pattern := patterns[0].(edgePattern)
-	validEndpoint := func(node nodePattern) bool {
-		return node.Var != "" && node.Var[0] != 0 && len(node.Labels) == 0 && len(node.Properties) == 0 && len(node.PropertyExprs) == 0
-	}
-	if !validEndpoint(pattern.Left) || !validEndpoint(pattern.Right) || pattern.EdgeType == "" || pattern.Undirected {
-		return nil, fmt.Errorf("invalid CREATE edge pattern %q", text)
-	}
+	return &createClause{Patterns: patterns}, nil
+}
 
-	props := map[string]valueExpr{}
-	for key, value := range pattern.Properties {
-		props[key] = literalExpr{Value: value}
+func parseCreatePatterns(text string) ([]createPatternClause, error) {
+	parts := splitTopLevel(text, ',')
+	patterns := make([]createPatternClause, 0, len(parts))
+	for pathIndex, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("invalid CREATE clause %q", text)
+		}
+		var path []matchPattern
+		var err error
+		if findTopLevelToken(part, "-[") >= 0 || findTopLevelToken(part, "<-[") >= 0 {
+			// parsePathPattern uses its path index to create hidden bindings for
+			// anonymous nodes and edges. Keep CREATE's hidden namespace disjoint
+			// from MATCH so anonymous CREATE endpoints can never reuse matched rows.
+			path, err = parsePathPattern(part, -pathIndex-1)
+		} else {
+			var node nodePattern
+			node, err = parseNodePattern(part)
+			if node.Var == "" {
+				node.Var = fmt.Sprintf("\x00create%d", pathIndex)
+			}
+			path = []matchPattern{node}
+		}
+		if err != nil {
+			return nil, err
+		}
+		created := createPatternClause{}
+		seenNodes := map[string]bool{}
+		addNode := func(node nodePattern) error {
+			if seenNodes[node.Var] {
+				if len(node.Labels) != 0 || len(node.Properties) != 0 || len(node.PropertyExprs) != 0 {
+					return fmt.Errorf("repeated CREATE node %q cannot add labels or properties", node.Var)
+				}
+				return nil
+			}
+			created.Nodes = append(created.Nodes, node)
+			seenNodes[node.Var] = true
+			return nil
+		}
+		for _, item := range path {
+			switch pattern := item.(type) {
+			case nodePattern:
+				if err := addNode(pattern); err != nil {
+					return nil, err
+				}
+			case edgePattern:
+				if pattern.VariableLength || pattern.Undirected || pattern.EdgeType == "" {
+					return nil, fmt.Errorf("invalid CREATE path %q", part)
+				}
+				for _, node := range []nodePattern{pattern.Left, pattern.Right} {
+					if err := addNode(node); err != nil {
+						return nil, err
+					}
+				}
+				created.Edges = append(created.Edges, pattern)
+			}
+		}
+		patterns = append(patterns, created)
 	}
-	for key, expr := range pattern.PropertyExprs {
-		props[key] = expr
-	}
-
-	return &createClause{
-		SourceVar: pattern.Left.Var,
-		TargetVar: pattern.Right.Var,
-		EdgeVar:   pattern.EdgeVar,
-		EdgeType:  pattern.EdgeType,
-		Props:     props,
-	}, nil
+	return patterns, nil
 }
 
 func parseCreateNodeClause(text string) (*createNodeClause, error) {
@@ -4812,6 +5090,16 @@ func (clause *whereClause) apply(tx *Tx, rows []queryRow, params map[string]any,
 				return nil, err
 			}
 		}
+		if clause.Kind == whereExpression {
+			match, err := clause.eval(row, params, budget)
+			if err != nil {
+				return nil, err
+			}
+			if match == predicateTrue {
+				filtered = append(filtered, row)
+			}
+			continue
+		}
 		binding, ok := row.get(clause.Var)
 		if !ok {
 			continue
@@ -4981,6 +5269,32 @@ func scoreQueryFTSTokens(tokens, terms []string, budget *queryBudget) (float32, 
 func (clause *whereClause) eval(row queryRow, params map[string]any, budget *queryBudget) (predicateTruth, error) {
 	initialBytes := budget.bytes
 	defer func() { budget.releaseTemporary(uint64(budget.bytes - initialBytes)) }()
+	if clause.Kind == whereExpression {
+		left, err := evalQueryExpr(clause.LeftExpr, row, params, budget)
+		if err != nil {
+			return predicateUnknown, err
+		}
+		right, err := evalQueryExpr(clause.Expr, row, params, budget)
+		if err != nil || left == nil || right == nil {
+			return predicateUnknown, err
+		}
+		operator := clause.Operator
+		if operator == "" {
+			operator = whereEquals
+		}
+		if operator == whereEquals || operator == whereNotEquals {
+			equal, err := queryValuesEqualWithBudget(left, right, budget)
+			if operator == whereNotEquals {
+				equal = !equal
+			}
+			return predicateBool(equal), err
+		}
+		comparison, comparable := compareQueryValues(left, right)
+		if !comparable {
+			return predicateUnknown, nil
+		}
+		return predicateBool(comparisonMatches(operator, comparison)), nil
+	}
 	binding, ok := row.get(clause.Var)
 	if !ok {
 		return predicateUnknown, nil
@@ -5604,6 +5918,66 @@ func (clause *createNodeClause) apply(tx *Tx, rows []queryRow, params map[string
 	return nextRows, nil
 }
 
+func applyCreatePatterns(tx *Tx, rows []queryRow, params map[string]any, patterns []createPatternClause, budget *queryBudget) error {
+	var temporaryBytes uint64
+	defer func() { budget.releaseTemporary(temporaryBytes) }()
+	for rowIndex := range rows {
+		row := &rows[rowIndex]
+		for _, pattern := range patterns {
+			for _, nodePattern := range pattern.Nodes {
+				if err := budget.check(1, 0); err != nil {
+					return err
+				}
+				if existing, ok := row.get(nodePattern.Var); ok {
+					if existing.Node == nil || len(nodePattern.Labels) != 0 || len(nodePattern.PropertyExprs) != 0 {
+						return fmt.Errorf("CREATE binding %q already exists", nodePattern.Var)
+					}
+					continue
+				}
+				props := make(map[string]any, len(nodePattern.PropertyExprs))
+				for key, expr := range nodePattern.PropertyExprs {
+					if err := budget.check(1, 0); err != nil {
+						return err
+					}
+					value, err := evalQueryExpr(expr, *row, params, budget)
+					if err != nil {
+						return err
+					}
+					normalized, bytes, err := normalizeMutationValue(value, budget)
+					if err != nil {
+						return err
+					}
+					temporaryBytes = saturatingAdd(temporaryBytes, bytes)
+					props[key] = normalized
+				}
+				node, err := tx.CreateNode(CreateNodeOptions{Labels: slices.Clone(nodePattern.Labels), Properties: props})
+				if err != nil {
+					return err
+				}
+				record, err := tx.graph.ReadNode(node.ID)
+				if err != nil {
+					return err
+				}
+				row.set(nodePattern.Var, boundValue{Node: record})
+			}
+			for _, edge := range pattern.Edges {
+				props := make(map[string]valueExpr, len(edge.Properties)+len(edge.PropertyExprs))
+				for key, value := range edge.Properties {
+					props[key] = literalExpr{Value: value}
+				}
+				for key, expr := range edge.PropertyExprs {
+					props[key] = expr
+				}
+				clause := &createClause{SourceVar: edge.Left.Var, TargetVar: edge.Right.Var, EdgeVar: edge.EdgeVar, EdgeType: edge.EdgeType, Props: props}
+				if err := clause.apply(tx, []queryRow{*row}, params, budget); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (clause *removeClause) apply(tx *Tx, rows []queryRow, budget *queryBudget) error {
 	var temporaryBytes uint64
 	defer func() { budget.releaseTemporary(temporaryBytes) }()
@@ -5666,6 +6040,9 @@ func (clause *removeClause) apply(tx *Tx, rows []queryRow, budget *queryBudget) 
 }
 
 func (clause *createClause) apply(tx *Tx, rows []queryRow, params map[string]any, budget *queryBudget) error {
+	if len(clause.Patterns) != 0 {
+		return applyCreatePatterns(tx, rows, params, clause.Patterns, budget)
+	}
 	var temporaryBytes uint64
 	defer func() { budget.releaseTemporary(temporaryBytes) }()
 	for _, row := range rows {

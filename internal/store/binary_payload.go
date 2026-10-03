@@ -206,11 +206,12 @@ func (e *binaryEncoder) value(value persistedValue, depth int) {
 }
 
 type binaryDecoder struct {
-	in             io.Reader
-	remaining      uint64
-	allocationLeft uint64
-	scratch        [8]byte
-	err            error
+	in              io.Reader
+	remaining       uint64
+	allocationLeft  uint64
+	admitAllocation func(uint64) error
+	scratch         [8]byte
+	err             error
 }
 
 func newBinaryDecoder(in io.Reader, length, maxBytes uint64) *binaryDecoder {
@@ -257,6 +258,12 @@ func (d *binaryDecoder) reserve(count, size uint64) bool {
 	if size != 0 && count > d.allocationLeft/size {
 		d.err = fmt.Errorf("%w: binary decoded allocation exceeds limit", ErrLoadResourceLimit)
 		return false
+	}
+	if d.admitAllocation != nil {
+		if err := d.admitAllocation(count * size); err != nil {
+			d.err = err
+			return false
+		}
 	}
 	d.allocationLeft -= count * size
 	return true

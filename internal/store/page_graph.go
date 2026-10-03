@@ -24,8 +24,9 @@ const (
 // PageGraph is scoped to one storage transaction. It never caches the graph;
 // returned records own their data and scans decode one record at a time.
 type PageGraph struct {
-	Tx             *pagestore.Tx
-	MaxRecordBytes uint64
+	Tx                   *pagestore.Tx
+	MaxRecordBytes       uint64
+	SearchIndexesCurrent bool
 }
 
 func pageID(id uint64) []byte { var key [8]byte; binary.BigEndian.PutUint64(key[:], id); return key[:] }
@@ -76,7 +77,60 @@ func (graph *PageGraph) GetEdge(id uint64) (*EdgeRecord, error) {
 	}
 	return decodePageEdge(data, id, graph.recordLimit())
 }
+
+// VisitNode holds admitted source storage until visit returns. A missing ID
+// calls visit with nil, so maintenance can remove the old derived document.
+func (graph *PageGraph) VisitNode(ctx context.Context, id uint64, visit func(*NodeRecord) error) error {
+	if pageReadBudgetFromContext(ctx) == nil {
+		record, err := graph.GetNode(id)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	}
+	return graph.visitReadRecord(ctx, pageNodes, id, pageID(id), func(id uint64, data []byte, scope *pageReadScope) error {
+		if data == nil {
+			return visit(nil)
+		}
+		record, err := decodePageNodeAdmitted(data, id, graph.recordLimit(), scope.decoded)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	})
+}
+
+// VisitEdge is the edge equivalent of VisitNode.
+func (graph *PageGraph) VisitEdge(ctx context.Context, id uint64, visit func(*EdgeRecord) error) error {
+	if pageReadBudgetFromContext(ctx) == nil {
+		record, err := graph.GetEdge(id)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	}
+	return graph.visitReadRecord(ctx, pageEdges, id, pageID(id), func(id uint64, data []byte, scope *pageReadScope) error {
+		if data == nil {
+			return visit(nil)
+		}
+		record, err := decodePageEdgeAdmitted(data, id, graph.recordLimit(), scope.decoded)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	})
+}
+
 func (graph *PageGraph) VisitNodes(ctx context.Context, visit func(*NodeRecord) error) error {
+	if pageReadBudgetFromContext(ctx) != nil {
+		return graph.scanReadRecords(ctx, pageNodes, func(id uint64, data []byte, scope *pageReadScope) error {
+			record, err := decodePageNodeAdmitted(data, id, graph.recordLimit(), scope.decoded)
+			if err != nil {
+				return err
+			}
+			return visit(record)
+		})
+	}
 	return graph.Tx.Scan(ctx, pageNodes, nil, nil, func(key, value []byte) error {
 		if len(key) != 8 {
 			return errors.New("invalid page node key")
@@ -89,6 +143,15 @@ func (graph *PageGraph) VisitNodes(ctx context.Context, visit func(*NodeRecord) 
 	})
 }
 func (graph *PageGraph) VisitEdges(ctx context.Context, visit func(*EdgeRecord) error) error {
+	if pageReadBudgetFromContext(ctx) != nil {
+		return graph.scanReadRecords(ctx, pageEdges, func(id uint64, data []byte, scope *pageReadScope) error {
+			record, err := decodePageEdgeAdmitted(data, id, graph.recordLimit(), scope.decoded)
+			if err != nil {
+				return err
+			}
+			return visit(record)
+		})
+	}
 	return graph.Tx.Scan(ctx, pageEdges, nil, nil, func(key, value []byte) error {
 		if len(key) != 8 {
 			return errors.New("invalid page edge key")
@@ -315,7 +378,7 @@ func (graph *PageGraph) DeleteNode(ctx context.Context, id uint64) error {
 	if err := graph.UpdateNodePropertyIndexes(node, nil); err != nil {
 		return err
 	}
-	if err := graph.PutFTS(id, nil); err != nil {
+	if err := graph.PutFTSContext(ctx, id, nil); err != nil {
 		return err
 	}
 	if err := graph.changeCount(pageNodes, false); err != nil {

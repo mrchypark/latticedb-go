@@ -10,6 +10,7 @@ var (
 	ErrSnapshotGrowth     = errors.New("pagestore: write may require mmap growth while read snapshots are open")
 	ErrSnapshotWriteLimit = errors.New("pagestore: write exceeds snapshot growth limit")
 	ErrInvalidOptions     = errors.New("pagestore: invalid options")
+	ErrValueTooLarge      = errors.New("pagestore: value exceeds read limit")
 )
 
 var ErrUnsupportedPlatform = errors.New("page storage is unavailable on this platform")
@@ -21,5 +22,7 @@ var ErrUnsupportedPlatform = errors.New("page storage is unavailable on this pla
 // platform size limit.
 type Options struct {
 	ReadOnly              bool
+	PageSize              int
+	CacheBytes            uint64
 	MaxSnapshotWriteBytes int64
 }

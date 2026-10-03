@@ -108,6 +108,10 @@ func (graph *PageGraph) LoadGraph(ctx context.Context) (*GraphState, PageCatalog
 	if err != nil {
 		return nil, c, err
 	}
+	graph.SearchIndexesCurrent, err = graph.searchIndexesMatch(c.History)
+	if err != nil {
+		return nil, c, err
+	}
 	state := NewGraphState()
 	state.PageBase = graph
 	state.DatabaseID = c.DatabaseID

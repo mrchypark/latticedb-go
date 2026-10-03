@@ -766,11 +766,65 @@ func TestConformanceQueryCreateNodeWithLabelsAndProperties(t *testing.T) {
 		t.Fatalf("validate created node: %v", err)
 	}
 
-	unsupported := "CREATE (a:Profile {name: $a})-[:REL]->(b:Profile {name: $b})"
-	if _, err := db.Query(unsupported, map[string]Value{"a": "A", "b": "B"}); err == nil {
-		t.Fatal("unsupported compound CREATE unexpectedly succeeded")
+	result, err = db.Query(
+		"CREATE (a:Profile {name: $a})-[:REL]->(b:Profile {name: $b}) RETURN id(a) AS a, id(b) AS b",
+		map[string]Value{"a": "A", "b": "B"},
+	)
+	if err != nil {
+		t.Fatalf("query compound CREATE: %v", err)
+	}
+	if !reflect.DeepEqual(result.Columns, []string{"a", "b"}) || len(result.Rows) != 1 {
+		t.Fatalf("unexpected compound CREATE result: columns=%#v rows=%#v", result.Columns, result.Rows)
+	}
+	aID, aOK := result.Rows[0]["a"].(int64)
+	bID, bOK := result.Rows[0]["b"].(int64)
+	if !aOK || !bOK || aID <= 0 || bID <= 0 || aID == bID {
+		t.Fatalf("unexpected compound CREATE node IDs: a=%#v b=%#v", result.Rows[0]["a"], result.Rows[0]["b"])
+	}
+	err = db.View(func(tx Tx) error {
+		for id, want := range map[uint64]string{uint64(aID): "A", uint64(bID): "B"} {
+			node, err := tx.GetNode(id)
+			if err != nil {
+				return err
+			}
+			if node == nil || !reflect.DeepEqual(node.Labels, []string{"Profile"}) {
+				t.Fatalf("compound CREATE node %d = %#v, want Profile node", id, node)
+			}
+			name, ok, err := tx.GetProperty(id, "name")
+			if err != nil {
+				return err
+			}
+			if !ok || name != want {
+				t.Fatalf("compound CREATE node %d name = %#v (present %v), want %q", id, name, ok, want)
+			}
+		}
+		outgoing, err := tx.GetOutgoingEdges(uint64(aID))
+		if err != nil {
+			return err
+		}
+		for _, edge := range outgoing {
+			if edge.Type == "REL" && edge.TargetID == uint64(bID) {
+				return nil
+			}
+		}
+		t.Fatalf("compound CREATE did not link node %d to node %d", aID, bID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("validate compound CREATE: %v", err)
+	}
+
+	if _, err := db.Query(
+		`CREATE (c:Profile {name: "C"})-[:REL]->(d:Profile {name: toLower(1)})`, nil,
+	); err == nil {
+		t.Fatal("invalid compound CREATE unexpectedly succeeded")
 	}
 	result, err = db.Query("MATCH (n) RETURN count(n) AS count", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireSingleIntResult(t, result, "count", 3)
+	result, err = db.Query("MATCH ()-[r:REL]->() RETURN count(r) AS count", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

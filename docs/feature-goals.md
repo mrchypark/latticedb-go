@@ -2,44 +2,46 @@
 
 ## 프로젝트 목표
 
-LatticeDB Go는 외부 DB 서버나 cgo 없이 Go 애플리케이션에서 그래프·벡터·텍스트 데이터를 함께 저장하고 조회하는 임베디드 데이터베이스다. 트랜잭션, 내구성, 제한 가능한 조회 비용, 증분 백업과 복구, 디스크 페이징을 통한 RAM보다 큰 데이터 처리를 목표로 한다. 공개 `Open`은 page backend를 사용하지만 전체 페이징 완료 게이트는 아직 통과하지 않았다.
+LatticeDB Go는 외부 DB 서버나 cgo 없이 Go 애플리케이션에서 그래프·벡터·텍스트 데이터를 함께 저장하고 조회하는 임베디드 데이터베이스다. 트랜잭션, 내구성, 제한 가능한 조회 비용, 증분 백업과 복구, 디스크 페이징을 통한 RAM보다 큰 데이터 처리를 목표로 한다. 디스크 경로의 공개 `Open`은 page backend를 사용하며, 아래에 기록한 제한 메모리 시나리오를 통과했다. `:memory:`와 `Deserialize`는 파일을 사용하지 않는 메모리 엔진을 사용한다.
 
 2026-09-26에 정한 구현 우선순위는 **증분 백업·재개 → 디스크 페이징 → 검색 확장**이다. 디스크 페이징은 이제 비목표가 아니라 필수 기능 목표다. 메모리 한도 상향, 전체 디코딩 후 mmap 적용, 속성만 디스크로 이동하는 구현은 이 목표의 완료로 인정하지 않는다.
 
 **Zig LatticeDB는 기능 목표의 기준이며 호환성 목표가 아니다.** 같은 사용자 작업을 달성하면 Go의 API, 파일 배치, 검색 점수, 실행 계획이 달라도 기능을 달성한 것으로 본다. Zig의 버그나 구현 제약을 복제하지 않는다. 기존 Go 사용자가 의존하는 동작은 [Go 엔진 계약](engine_conformance.md)으로 관리한다.
 
-기준 기능 목록은 [Zig README의 고정 리비전 `827891e`](https://github.com/jeffhajewski/latticedb/blob/827891e2c6fd55d13aa8f8284a7c7043f68b60fd/README.md#features)과 해당 리비전의 쿼리 parser/expression/aggregate 구현이다. 로컬 비교의 기준점은 Go `v0.9.0` (`bf00f8a`)이다. 이 문서는 작업 트리의 기능을 평가하며, 아직 태그로 배포되지 않은 기능을 릴리스에 포함됐다고 뜻하지 않는다.
+기준 기능 목록은 [Zig README의 고정 리비전 `827891e`](https://github.com/jeffhajewski/latticedb/blob/827891e2c6fd55d13aa8f8284a7c7043f68b60fd/README.md#features)과 해당 리비전의 쿼리 parser/expression/aggregate 구현이다. 이번 기능 보완의 기준점은 Go `v0.10.0` (`da60461`)이다. 이 문서는 작업 트리의 기능을 평가하며, 아직 태그로 배포되지 않은 기능을 릴리스에 포함됐다고 뜻하지 않는다.
 
 ## 기능별 판정
 
-| 기능 목표 | v0.9.0 기준 | 이번 작업 / 확인 근거 |
+| 기능 목표 | 현재 작업 트리 | 확인 근거 |
 |---|---|---|
 | 노드·방향 관계·다중 라벨·중첩 속성 | 달성 | 공개 API 및 `conformance/go`의 값·ID·라벨 회귀 검사 |
 | 노드·관계 속성 equality 인덱스 | 달성 | page postings의 생성·갱신·삭제·재오픈·롤백 검사 및 256 MiB 제한에서 10만 노드 인덱스 구축·복원 검증 |
 | 고정 길이 그래프 탐색 | 달성 | outgoing/incoming/undirected와 여러 경로 조합 |
-| 가변 길이 경로 | 미달 | `query_variable_path_test.go`: 범위·방향·0홉·cycle·자원 제한 |
+| 가변 길이 경로 | 달성 | `query_variable_path_test.go`: 범위·방향·0홉·cycle·자원 제한 |
 | 단일 writer 트랜잭션, commit/rollback, crash recovery | 달성 | bbolt 원자 commit·재오픈, 미커밋 변경을 남긴 프로세스 종료, snapshot 보존 및 쓰기 거절 후 재시도 검사 |
-| 기본 조회·필터·정렬·페이지 처리·파라미터 | 달성 | 기존 grammar/conformance 검사; 깊은 ORDER BY 비교 예산 결함 수정 |
+| 기본 조회·필터·정렬·페이지 처리·파라미터 | 달성 | grammar/conformance, 함수·산술식 비교, 깊은 ORDER BY 비교 예산 검사 |
+| 다중·경로 CREATE와 연속 MATCH | 달성 | 기존 binding 재사용, 관계 방향, clause별 WHERE 범위, 후속 오류 롤백 검사 |
 | WITH·UNWIND | 달성 | 새 표현식·MERGE·경로와 조합하는 회귀 검사 추가 |
-| 산술식과 일반/독립 RETURN | 미달 | `query_arithmetic_test.go`: 우선순위·괄호·오버플로·0 나눗셈·원자성 |
+| 산술식과 일반/독립 RETURN | 달성 | `query_arithmetic_test.go`: 우선순위·괄호·오버플로·0 나눗셈·원자성 |
 | count/sum/avg/min/max/collect | 달성 | 기존 Go의 NULL·타입 처리 규칙 유지 |
-| 집계 내부 DISTINCT | 미달 | `query_aggregate_distinct_test.go`: 그룹별 중복 제거·중첩 값·메모리 예산 |
-| MERGE 및 ON CREATE/ON MATCH SET | 미달 | `query_merge_test.go`: 전체 패턴·중복 입력·조건부 수정·후속 오류 롤백·재오픈 |
-| HNSW 근사 벡터 검색과 ef 설정 | 메모리 엔진에서 달성 | 기존 exact/ANN 계약은 유지; page backend의 HNSW 저장·재오픈은 미구현이며 exact 경로는 페이지를 스캔 |
-| HNSW M 설정 | 메모리 엔진에서 달성 | `OpenOptions.VectorM`과 namespace/cache/build 예산 및 공개 API 검사; page backend에 HNSW 인덱스는 아직 없음 |
+| 집계 내부 DISTINCT | 달성 | `query_aggregate_distinct_test.go`: 그룹별 중복 제거·중첩 값·메모리 예산 |
+| MERGE 및 ON CREATE/ON MATCH SET | 달성 | `query_merge_test.go`: 전체 패턴·중복 입력·조건부 수정·후속 오류 롤백·재오픈 |
+| HNSW 근사 벡터 검색과 ef 설정 | 달성 | page 저장·재오픈·갱신·namespace·rebuild·자원 제한·exact 비교 검사 |
+| HNSW M 설정 | 달성 | `OpenOptions.VectorM`, persisted metadata 검증과 설정 변경 시 rebuild |
 | hash/Ollama/OpenAI 호환 임베딩 | 달성 | `embedding` 패키지; 외부 HTTP 클라이언트는 선택 사항 |
 | 벡터 노드 일괄 삽입 | 달성 | `Tx.BatchInsertVectors` |
-| 전문 검색과 fuzzy Levenshtein 검색 | 달성 | direct FTS, property-scoped `@@`, 인덱스/스캔 비교 검사 |
-| BM25 순위와 English stemming | 미달 | `FTSSearchOptions.Scoring` / `Analyzer`; 순위·어간·fuzzy·재오픈·예산 검사. 기존 frequency 점수는 기본값으로 유지 |
+| 전문 검색과 fuzzy Levenshtein 검색 | 달성 | persistent postings, 노드 라벨·관계 타입별 텍스트 속성 정의, `@@`, 인덱스/스캔 비교 검사 |
+| BM25 순위와 English stemming | 달성 | `FTSSearchOptions.Scoring` / `Analyzer`; 순위·어간·fuzzy·재오픈·예산 검사. 기존 frequency 점수는 기본값으로 유지 |
 | DB를 닫지 않는 온라인 백업 | 달성 | `BeginSnapshot` / `Snapshot.Backup`, writer와 동시 사용 검사 |
 | 연속 백업 및 시점 복구 | 달성, 기록된 복구점 기준 | 기준 체크포인트와 커밋별 증분, durable outbox 재개, source history 검증 및 보존. 백업 비활성화 중의 미기록 커밋은 복원하지 않으며 중단 구간 선택을 명시적으로 거절 |
-| bytes 직렬화·역직렬화·메모리 DB | 달성 | `Serialize` / `Deserialize` / `:memory:` |
+| bytes 직렬화·역직렬화·메모리 DB | 달성 | `:memory:`와 `Deserialize`의 WAL·잠금·임시 파일 없는 실행, rollback ID·snapshot·stream·취소·명시적 백업·adjacency 정리 검사 |
 | durable stream·consumer offset·trim·changefeed | 달성 | 스트림·복구·트림·알림 회귀 검사 |
-| 삭제 후 공간 재사용 | 달성, 파일 축소는 미구현 | bbolt freelist가 해제된 페이지를 이후 쓰기에 재사용한다. page backend의 `Checkpoint`는 sync하며 파일을 축소하지 않는다. |
+| 삭제 후 공간 재사용과 파일 축소 | 달성 | freelist 재사용과 `Compact` / `CompactContext`. 활성 snapshot 거절, rename/reopen 실패, 축소 후 mmap 성장, 백업 chain·소비된 ID 유지 검사 |
+| 페이지 크기와 읽기 캐시 설정 | 달성 | `PageSize` 생성·마이그레이션·재오픈·두 번째 meta 복구. `CacheSizeMB`의 generation별 소유권·예산·snapshot 검사 |
 | 서버 없이 열기·단일 writer 로컬 운영 | 달성 | native file lock, context-aware writer acquisition, 복구 후 reopen |
 | 디스크 페이징으로 RAM보다 큰 DB 처리 | 달성, 명시한 범위 검증 | 공개 `Open`의 기본 엔진. 256 MiB에서 1.42 GB DB의 생성·인덱스·재오픈·수정·삭제·백업·migration·증분 복원 통과. 개별 트랜잭션과 metadata/catalog는 RAM에 들어가야 함. [검증 범위](disk-storage.md) |
 
-기존 쿼리 확장과 안전성 수정은 구현했다. page backend가 공개 기본 저장 경로이며, 아래 제한 메모리 시나리오를 통과했다. HNSW 페이지화와 검색 확장은 후속 작업이다.
+이번 보완 작업은 true-memory 실행, 물리 compaction, 저장 옵션, 남은 쿼리 문법, 페이지 기반 검색 인덱스를 포함한다. 검색 인덱스는 원본 graph의 commit history와 연결해 오래된 writer가 남긴 인덱스를 그대로 사용하지 않도록 한다. 최종 통합 검증 결과는 아래에 별도로 기록한다.
 
 새 쿼리 기능의 공개 API 조합 검사는 루트의 `TestQueryFeatureGoalsTogether`가 담당한다. 개별 기능이 동작하는 것과 함께, WITH 경계·중첩 관계 반환·조건부 수정·집계가 연결되는지도 검증한다.
 
@@ -94,3 +96,28 @@ Linux/Windows에서의 실제 실행, 물리 전원 차단, 장시간 soak와 �
 2026-09-27, swap 없는 256 MiB cgroup에서 1,418,768,384바이트 DB로 `TestPageDBMemoryCheck`가 298.27초에 통과했다. 작은 노드 100,000개, 관계 99,999개, 큰 속성 노드 1,024개를 사용했다. 속성 인덱스 생성·재오픈·무작위 조회·수정·삭제·snapshot backup·대용량 체크포인트 migration·증분 archive 복원과 복원된 인덱스/삭제 결과까지 확인했다.
 
 전체 일반/race 검사와 conformance 검사를 통과했다. 개별 트랜잭션·delta frame·애플리케이션 metadata 및 schema/stream catalog의 메모리 한계, snapshot 유지 중 보수적인 쓰기 거절 등은 [저장 엔진 계약](disk-storage.md)에 명시한다.
+
+## 기능 보완 작업 검증 (2026-10-03)
+
+현재 작업 트리에서 true-memory 실행, 물리 compaction, PageSize/CacheSizeMB,
+다중·경로 CREATE와 연속 MATCH, 페이지 HNSW, 영속 전문 검색과 범위별 텍스트
+속성 인덱스를 구현했다. 이 결과는 아직 릴리스 태그에 포함되지 않았다.
+
+macOS arm64에서 다음 검사를 통과했다.
+
+- 루트 `go test ./...`, `go test -race ./...`, `go vet ./...`
+- `conformance/go`의 일반 검사와 race 검사
+- CI에 지정된 벡터 reader/rebuild/cancellation 및 CSV publication/lock registry race 검사 각각 20회
+- 쿼리 파서 퍼징 5초, 1 worker (8,580회 실행, 실패 없음)
+- Linux/Windows/Solaris/AIX/Plan 9/js-wasm/WASI 교차 컴파일
+- 벤치마크 설정·기록 provenance Python 검사 2개와 `git diff --check`
+
+새 회귀 검사는 메모리 모드의 파일 미생성, compaction 후 이력·ID·백업 보존,
+실패 시 fencing, snapshot 성장 거절 후 재시도, HNSW 재오픈·갱신·삭제·recall,
+FTS 인덱스/스캔 점수 비교, 긴 토큰과 디코드 전 예산 검사, 오래된 writer의
+검색 인덱스 무효화, 스키마만 변경한 증분 복원과 직렬화 복원을 포함한다.
+
+인덱스 구축과 재구축은 작업·논리 바이트 예산 안의 단일 유지보수 작업이다.
+큰 구축 작업은 `ErrResourceLimit`으로 거절될 수 있다. 이 검사는 새 검색
+인덱스의 제한 메모리 대규모 성능 측정이나 Linux/Windows 실제 실행을
+대체하지 않는다. 이전 256 MiB/1.42 GB 실측 범위는 위 기록 그대로 유지한다.

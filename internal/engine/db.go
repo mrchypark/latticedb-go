@@ -221,6 +221,7 @@ type FTSSearchResult struct {
 }
 
 type DB struct {
+	memory                            bool
 	pageCleanupErr                    error
 	pages                             *pagestore.DB
 	pageTemporary                     string
@@ -298,6 +299,7 @@ type DB struct {
 	checkpointQueued                  bool
 	checkpointNeeded                  atomic.Bool
 	adjacencyMaintenanceNeeded        atomic.Bool
+	adjacencyMaintenanceComplete      chan struct{}
 	adjacencyCompactor                *store.AdjacencyCompactor
 	adjacencyCompactorGraph           *store.GraphState
 	adjacencyCompactorCommit          uint64
@@ -461,10 +463,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	if opts.ReadOnly && opts.Create {
 		return nil, errors.New("read-only database cannot be created")
 	}
-	if opts.CacheSizeMB != 0 {
-		return nil, fmt.Errorf("%w: CacheSizeMB", ErrUnsupportedOption)
-	}
-	if opts.PageSize != 0 {
+	if opts.PageSize != 0 && (opts.PageSize < 1024 || opts.PageSize > 65536 || opts.PageSize&(opts.PageSize-1) != 0) {
 		return nil, fmt.Errorf("%w: PageSize", ErrUnsupportedOption)
 	}
 	if opts.VectorDimensions != 0 && !opts.EnableVector {
@@ -514,6 +513,9 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 	}
 	if opts.DerivedIndexBuildMaxLogicalBytes == 0 {
 		opts.DerivedIndexBuildMaxLogicalBytes = defaultDerivedBuildMaxLogicalBytes
+	}
+	if path == ":memory:" {
+		return openMemoryDB(ctx, opts)
 	}
 	var lock *pathLock
 	var flat bool
@@ -819,15 +821,30 @@ func (db *DB) requestBackgroundCheckpoint() {
 		return
 	}
 	db.mu.RLock()
-	if db.closed || db.readOnly || db.recoveryRequired || db.wal == nil || (!db.dirty && !db.adjacencyMaintenanceNeeded.Load()) {
+	if db.closed || db.readOnly || db.recoveryRequired {
 		db.mu.RUnlock()
 		return
 	}
-	size, err := db.wal.TailSize()
-	threshold := db.walCheckpointThresholdBytes
-	pending := db.checkpointInFlight.Load()
+	var size int64
+	var err error
+	var threshold uint64
+	pending := false
+	if db.memory {
+		if !db.adjacencyMaintenanceNeeded.Load() {
+			db.mu.RUnlock()
+			return
+		}
+	} else {
+		if db.wal == nil || (!db.dirty && !db.adjacencyMaintenanceNeeded.Load()) {
+			db.mu.RUnlock()
+			return
+		}
+		size, err = db.wal.TailSize()
+		threshold = db.walCheckpointThresholdBytes
+		pending = db.checkpointInFlight.Load()
+	}
 	db.mu.RUnlock()
-	if !db.adjacencyMaintenanceNeeded.Load() && !pending && (err != nil || size < 0 || uint64(size) < threshold) {
+	if !db.memory && !db.adjacencyMaintenanceNeeded.Load() && !pending && (err != nil || size < 0 || uint64(size) < threshold) {
 		return
 	}
 	db.checkpointWorkerMu.Lock()
@@ -865,6 +882,12 @@ func (db *DB) checkpointWorker() {
 			default:
 			}
 			db.runBackgroundAdjacencyMaintenance()
+			if db.memory && db.adjacencyMaintenanceComplete != nil {
+				select {
+				case db.adjacencyMaintenanceComplete <- struct{}{}:
+				default:
+				}
+			}
 			checkpointRequested := db.checkpointNeeded.Load()
 			db.runBackgroundCheckpoint()
 			if checkpointRequested && db.checkpointComplete != nil {
@@ -1068,6 +1091,9 @@ func (db *DB) checkpointAttemptEpochChanged(epoch uint64) bool {
 }
 
 func (db *DB) runBackgroundCheckpoint() {
+	if db.memory {
+		return
+	}
 	if db.checkpointPending == nil {
 		generation, ok := db.rotateBackgroundCheckpoint()
 		if !ok {
@@ -1272,6 +1298,11 @@ func (db *DB) closeWithWriterHeld() error {
 	db.closed = true
 	db.notifyAllStreamsLocked()
 	db.mu.Unlock()
+	if db.memory {
+		db.stopCheckpointWorker()
+		db.clearAdjacencyCompactor()
+		return nil
+	}
 
 	if db.pages != nil {
 		err := errors.Join(db.pageCleanupErr, db.graph.PageBase.Tx.Rollback())
@@ -1391,35 +1422,12 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 		}
 		return nil, err
 	}
-	path, err := os.MkdirTemp("", "latticedb-")
-	if err != nil {
-		return nil, err
-	}
-	if err := store.CheckpointGraphStateAndWAL(path, graph, nextNodeID, nextEdgeID, commitID); err != nil {
-		_ = os.RemoveAll(path)
-		return nil, err
-	}
-	if err := store.ReserveIDs(path, graph.DatabaseID, nextNodeID, nextEdgeID); err != nil {
-		_ = os.RemoveAll(path)
-		return nil, err
-	}
-	// The generated checkpoint/WAL are an implementation detail; the caller's
-	// recovery budgets have already been enforced on the standalone input.
-	opts.RecoveryMaxDecodedBytes = 0
-	opts.RecoveryMaxFrames = 0
-	opts.RecoveryMaxWork = 0
 	opts.preloaded = true
 	opts.preloadedGraph = graph
 	opts.preloadedNextNodeID = nextNodeID
 	opts.preloadedNextEdgeID = nextEdgeID
 	opts.preloadedCommitID = commitID
-	db, err := Open(path, opts)
-	if err != nil {
-		_ = os.RemoveAll(path)
-		return nil, err
-	}
-	db.temporary = true
-	return db, nil
+	return Open(":memory:", opts)
 }
 
 func (db *DB) writeCheckpoint(graph *store.GraphState, nextNodeID, nextEdgeID, commitID uint64) error {
@@ -1461,6 +1469,9 @@ func (db *DB) Checkpoint() error {
 		return ErrTransactionsActive
 	}
 	db.mu.RUnlock()
+	if db.memory {
+		return nil
+	}
 	return db.checkpointWithWriterHeld(nil)
 }
 
@@ -1505,6 +1516,10 @@ func (db *DB) CheckpointContext(ctx context.Context) error {
 	if db.activeTx.Load() != 0 {
 		db.mu.RUnlock()
 		return ErrTransactionsActive
+	}
+	if db.memory {
+		db.mu.RUnlock()
+		return nil
 	}
 	graph, nextNodeID, nextEdgeID, commitID := db.graph, db.nextNodeID, db.nextEdgeID, db.commitID
 	db.mu.RUnlock()
@@ -2142,7 +2157,7 @@ func (db *DB) FTSSearchContext(ctx context.Context, query string, opts FTSSearch
 	if err := validateFTSSearchScoring(opts); err != nil {
 		return nil, err
 	}
-	if db.pages != nil || opts.Scoring == FTSScoringBM25 || opts.Analyzer == FTSAnalyzerEnglishPorter {
+	if db.pages != nil || db.memory || opts.Scoring == FTSScoringBM25 || opts.Analyzer == FTSAnalyzerEnglishPorter {
 		return db.ftsSearchBM25Context(ctx, query, opts)
 	}
 	limit := uint64(opts.Limit)
@@ -2297,6 +2312,20 @@ func (budget *directSearchBudget) add(work uint64) error {
 }
 
 func (budget *directSearchBudget) check() error { return budget.ctx.Err() }
+
+func (budget *directSearchBudget) ReservePageRead(work, bytes uint64) error {
+	if err := budget.check(); err != nil {
+		return err
+	}
+	if err := budget.add(work); err != nil {
+		return err
+	}
+	return budget.reserveBytes(bytes)
+}
+func (budget *directSearchBudget) ReleasePageRead(bytes uint64) { budget.releaseBytes(bytes) }
+func (budget *directSearchBudget) RemainingPageReadBytes() uint64 {
+	return budget.maxBytes - min(budget.bytes, budget.maxBytes)
+}
 
 func (budget *directSearchBudget) reserveBytes(bytes uint64) error {
 	if budget.bytes > budget.maxBytes || bytes > budget.maxBytes-budget.bytes {
@@ -3014,9 +3043,21 @@ func (db *DB) VectorIndexNamespaceStats(namespace VectorNamespace) (VectorIndexS
 func vectorIndexStats(graph *store.GraphState, fallbacks, rebuilds, nanos uint64) (VectorIndexStats, error) {
 	live := graph.VectorLiveCount
 	indexEntries := uint64(graph.VectorIndex.Nodes.Len())
+	tombstones := uint64(graph.VectorTombstones.Len())
+	mutations := graph.VectorMutations
 	if graph.PageBase != nil {
 		live = 0
-		indexEntries = 0
+		indexEntries, tombstones, mutations = 0, 0, 0
+		index := store.PageVectorIndex{Tx: graph.PageBase.Tx, Namespace: pageVectorNamespaceKey(graph.VectorNamespace)}
+		if has, err := index.HasMeta(); err != nil {
+			return VectorIndexStats{}, err
+		} else if has {
+			meta, err := index.Meta()
+			if err != nil {
+				return VectorIndexStats{}, err
+			}
+			indexEntries, mutations, tombstones = meta.Count, meta.Mutations, meta.DeletedCount
+		}
 		if err := graph.VisitNodes(context.Background(), func(node *store.NodeRecord) error {
 			if _, ok := selectedVector(graph, node); ok {
 				live++
@@ -3027,17 +3068,21 @@ func vectorIndexStats(graph *store.GraphState, fallbacks, rebuilds, nanos uint64
 		}
 	}
 	threshold := uint64(vectorRebuildThreshold(graph))
-	debt := uint64(graph.VectorTombstones.Len()) + graph.VectorMutations
+	debt := tombstones + mutations
 	remaining := uint64(0)
 	if debt < saturatingAdd(threshold, 1) {
 		remaining = saturatingAdd(threshold, 1) - debt
 	}
-	tombstoneBytes := saturatingMul(uint64(graph.VectorTombstones.Len()), uint64(graph.VectorDimensions)*4)
+	dimensions := graph.VectorDimensions
+	if graph.VectorNamespace != nil {
+		dimensions = graph.VectorNamespace.Dimensions
+	}
+	tombstoneBytes := saturatingMul(tombstones, uint64(dimensions)*4)
 	tombstoneRemaining := uint64(0)
 	if tombstoneBytes <= 64<<20 {
 		tombstoneRemaining = (64 << 20) + 1 - tombstoneBytes
 	}
-	return VectorIndexStats{LiveEntries: live, IndexEntries: indexEntries, Tombstones: uint64(graph.VectorTombstones.Len()), TombstoneBytes: tombstoneBytes, TombstoneBytesUntilRebuild: tombstoneRemaining, MutationDebt: graph.VectorMutations, RebuildThreshold: threshold, DebtUntilRebuild: remaining, EstimatedBuildLogicalBytes: estimateVectorBuildLogicalBytes(graph, live), ExactFallbacks: fallbacks, Rebuilds: rebuilds, RebuildNanoseconds: nanos}, nil
+	return VectorIndexStats{LiveEntries: live, IndexEntries: indexEntries, Tombstones: tombstones, TombstoneBytes: tombstoneBytes, TombstoneBytesUntilRebuild: tombstoneRemaining, MutationDebt: mutations, RebuildThreshold: threshold, DebtUntilRebuild: remaining, EstimatedBuildLogicalBytes: estimateVectorBuildLogicalBytes(graph, live), ExactFallbacks: fallbacks, Rebuilds: rebuilds, RebuildNanoseconds: nanos}, nil
 }
 
 func (db *DB) RebuildVectorIndexContext(ctx context.Context) error {
@@ -3069,7 +3114,7 @@ func (db *DB) rebuildVectorIndexTargetContext(ctx context.Context, namespace *Ve
 		}
 		if db.pages != nil {
 			db.mu.Unlock()
-			return fmt.Errorf("%w: vector index rebuild is unavailable for page storage", ErrUnsupportedOption)
+			return db.rebuildPageVectorTargetContext(ctx, namespace)
 		}
 		if !db.enableVector || db.disableVectorIndex {
 			db.mu.Unlock()
@@ -3472,7 +3517,7 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 	}
 	nextCommitID := tx.db.commitID + 1
 	nextNodeID, nextEdgeID, wal, archive := tx.db.nextNodeID, tx.db.nextEdgeID, tx.db.wal, tx.db.backupArchive
-	if tx.db.checkpointInFlight.Load() || tx.db.checkpointNeeded.Load() {
+	if !tx.db.memory && (tx.db.checkpointInFlight.Load() || tx.db.checkpointNeeded.Load()) {
 		tail, tailErr := wal.TailSize()
 		if tailErr == nil && tail >= 0 && uint64(tail) >= tx.db.walCheckpointThresholdBytes {
 			tx.db.mu.Unlock()
@@ -3532,18 +3577,20 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		}
 	}
 	var err error
-	if tx.base == nil {
-		err = wal.AppendSnapshot(tx.graph, nextNodeID, nextEdgeID, nextCommitID)
-	} else {
-		err = wal.AppendDelta(tx.graph, nextNodeID, nextEdgeID, nextCommitID, delta)
-	}
-	if err != nil {
-		if errors.Is(err, store.ErrCommitOutcomeUnknown) {
-			tx.db.mu.Lock()
-			tx.db.recoveryRequired = true
-			tx.db.mu.Unlock()
+	if !tx.db.memory {
+		if tx.base == nil {
+			err = wal.AppendSnapshot(tx.graph, nextNodeID, nextEdgeID, nextCommitID)
+		} else {
+			err = wal.AppendDelta(tx.graph, nextNodeID, nextEdgeID, nextCommitID, delta)
 		}
-		return err
+		if err != nil {
+			if errors.Is(err, store.ErrCommitOutcomeUnknown) {
+				tx.db.mu.Lock()
+				tx.db.recoveryRequired = true
+				tx.db.mu.Unlock()
+			}
+			return err
+		}
 	}
 	if archive != nil {
 		copyCommit := func(output io.Writer) (bool, error) {
@@ -3571,8 +3618,10 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 			tx.db.adjacencyMaintenanceNeeded.Store(true)
 		}
 	}
-	if size, sizeErr := wal.TailSize(); sizeErr == nil && size >= 0 && uint64(size) >= tx.db.walCheckpointThresholdBytes {
-		tx.db.checkpointNeeded.Store(true)
+	if !tx.db.memory {
+		if size, sizeErr := wal.TailSize(); sizeErr == nil && size >= 0 && uint64(size) >= tx.db.walCheckpointThresholdBytes {
+			tx.db.checkpointNeeded.Store(true)
+		}
 	}
 	tx.db.notifyStreamsLocked(delta.StreamOperations)
 	tx.db.mu.Unlock()
@@ -4937,6 +4986,9 @@ func (db *DB) allocateEdgeID() (uint64, error) {
 }
 
 func (db *DB) reserveIDsToDisk(databaseID string, nextNodeID, nextEdgeID uint64) error {
+	if db.memory {
+		return nil
+	}
 	if db.reserveIDs != nil {
 		return db.reserveIDs(db.files, databaseID, nextNodeID, nextEdgeID)
 	}

@@ -95,7 +95,7 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 		return nil, wrapError(err)
 	}
 	inner, err := engine.OpenContext(ctx, path, engine.OpenOptions{
-		PageStorage:                       true,
+		PageStorage:                       path != ":memory:",
 		Create:                            opts.Create,
 		ReadOnly:                          opts.ReadOnly,
 		DisableLock:                       opts.DisableLock,
@@ -134,7 +134,7 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 		return nil, wrapError(err)
 	}
 	inner, err := engine.Deserialize(data, engine.OpenOptions{
-		PageStorage:                       true,
+		PageStorage:                       false,
 		ReadOnly:                          opts.ReadOnly,
 		CacheSizeMB:                       opts.CacheSizeMB,
 		PageSize:                          opts.PageSize,
@@ -166,10 +166,7 @@ func Deserialize(data []byte, opts OpenOptions) (*DB, error) {
 }
 
 func validateOpenOptions(opts OpenOptions) error {
-	if opts.CacheSizeMB != 0 {
-		return fmt.Errorf("%w: CacheSizeMB", ErrUnsupportedOption)
-	}
-	if opts.PageSize != 0 {
+	if opts.PageSize != 0 && (opts.PageSize < 1024 || opts.PageSize > 65536 || opts.PageSize&(opts.PageSize-1) != 0) {
 		return fmt.Errorf("%w: PageSize", ErrUnsupportedOption)
 	}
 	if opts.DisableWAL {

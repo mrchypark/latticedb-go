@@ -2,8 +2,11 @@ package engine
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"slices"
+
+	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
 type querySearchCandidate struct {
@@ -18,6 +21,9 @@ type querySearchCandidate struct {
 // continue through the normal pattern and WHERE evaluation.
 func (plan *queryPlan) searchCandidate(tx *Tx, patterns []matchPattern, params map[string]any, limit, skip int, budget *queryBudget) (*querySearchCandidate, error) {
 	if tx == nil || !querySearchSnapshotClean(tx) || plan.unwindClause != nil || plan.mutates() || len(patterns) != 1 || plan.wherePredicate != nil {
+		return nil, nil
+	}
+	if tx.graph.PageBase != nil && !tx.graph.PageBase.SearchIndexesCurrent {
 		return nil, nil
 	}
 	node, ok := patterns[0].(nodePattern)
@@ -82,7 +88,7 @@ func (plan *queryPlan) searchCandidate(tx *Tx, patterns []matchPattern, params m
 		return nil, nil
 	}
 	graph := vectorNamespaceFacade(tx.graph, *budget.vectorNamespace)
-	if graph.VectorIndex.Nodes.Len() == 0 {
+	if graph.PageBase == nil && graph.VectorIndex.Nodes.Len() == 0 {
 		return nil, nil
 	}
 	if limit > maxSearchResults {
@@ -118,6 +124,9 @@ func (plan *queryPlan) searchCandidate(tx *Tx, patterns []matchPattern, params m
 }
 
 func (plan *queryPlan) ftsSearchCandidate(tx *Tx, node nodePattern, clause *whereClause, params map[string]any, budget *queryBudget) (*querySearchCandidate, error) {
+	if page := tx.graph.PageBase; page != nil {
+		return pageFTSSearchCandidate(tx, node, clause, params, budget)
+	}
 	postings, configured := tx.graph.FTSProperties[clause.Property]
 	if !configured {
 		return nil, nil
@@ -175,6 +184,190 @@ func (plan *queryPlan) ftsSearchCandidate(tx *Tx, node nodePattern, clause *wher
 	}
 	slices.Sort(ids)
 	ids = slices.Compact(ids)
+	return &querySearchCandidate{variable: node.Var, nodeIDs: ids, bytes: candidateBytes}, nil
+}
+
+func pageFTSSearchCandidate(tx *Tx, node nodePattern, clause *whereClause, params map[string]any, budget *queryBudget) (*querySearchCandidate, error) {
+	page := tx.graph.PageBase
+	if page == nil || !page.SearchIndexesCurrent {
+		return nil, nil
+	}
+	expected, err := clause.Expr.eval(queryRow{}, params, nil)
+	if err != nil {
+		return nil, nil
+	}
+	queryText, ok := expected.(string)
+	if !ok {
+		return nil, nil
+	}
+	terms, termBytes, err := tokenizeQueryText(queryText, budget)
+	if err != nil {
+		return nil, err
+	}
+	defer budget.releaseTemporary(termBytes)
+	if len(terms) == 0 {
+		return &querySearchCandidate{variable: node.Var}, nil
+	}
+	slices.Sort(terms)
+	terms = slices.Compact(terms)
+
+	var selected string
+	if len(node.Labels) != 0 {
+		definitions, err := ftsIndexDefinitions(tx.graph)
+		if err != nil {
+			return nil, err
+		}
+		for _, def := range definitions {
+			if def.Kind != FTSIndexNode || def.Property != clause.Property || !slices.Contains(node.Labels, def.Scope) {
+				continue
+			}
+			index := declaredFTSPageIndexName(def.Name)
+			ready, err := page.FTSIndexReady(index)
+			if err != nil {
+				return nil, err
+			}
+			if ready {
+				selected = index
+				break
+			}
+		}
+	}
+	if selected == "" {
+		if _, configured := tx.graph.FTSProperties[clause.Property]; configured {
+			index := configuredPropertyFTSPageIndexName(clause.Property)
+			ready, err := page.FTSIndexReady(index)
+			if err != nil {
+				return nil, err
+			}
+			if ready {
+				selected = index
+			}
+		}
+	}
+	if selected == "" {
+		return nil, nil
+	}
+	if err := budget.check(0, 0); err != nil {
+		return nil, err
+	}
+	var population uint64
+	if len(node.Labels) == 0 {
+		population, err = tx.graph.NodeCount()
+	} else {
+		// Summed document frequencies bound the posting union. Probe labels
+		// only far enough to show that this union can narrow them.
+		var candidateBound uint64
+		for _, term := range terms {
+			scratch := saturatingAdd(saturatingMul(saturatingAdd(26, uint64(len(term))), 3), saturatingMul(saturatingAdd(34, uint64(len(selected))), 2))
+			if err := budget.check(1, 0); err != nil {
+				return nil, err
+			}
+			if err := budget.chargeTemporary(scratch); err != nil {
+				return nil, err
+			}
+			count, countErr := page.FTSTermDocumentCount(selected, term)
+			budget.releaseTemporary(scratch)
+			if countErr != nil {
+				return nil, countErr
+			}
+			candidateBound = saturatingAdd(candidateBound, count)
+		}
+		if candidateBound == 0 {
+			return &querySearchCandidate{variable: node.Var}, nil
+		}
+		remainingWork := uint64(budget.maxWork - budget.work)
+		probeWork := remainingWork / 4
+		if probeWork < uint64(len(node.Labels)) {
+			return nil, nil
+		}
+		perLabelLimit := min(saturatingAdd(candidateBound, 1), probeWork/uint64(len(node.Labels)))
+		population = ^uint64(0)
+		for _, label := range node.Labels {
+			var count uint64
+			countErr := tx.graph.VisitLabel(budget.ctx, label, func(uint64) error {
+				if err := budget.check(1, 0); err != nil {
+					return err
+				}
+				count++
+				if count >= perLabelLimit {
+					return io.EOF
+				}
+				return nil
+			})
+			if countErr != nil {
+				return nil, countErr
+			}
+			population = min(population, count)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Label populations are probed only as far as the posting bound and work
+	// allowance require. The minimum count is a lower bound: reaching it cannot prove
+	// selectivity, so release the partial union before the normal label scan.
+	if population == 0 {
+		return nil, nil
+	}
+
+	ids := make([]uint64, 0)
+	seen := make(map[uint64]struct{})
+	var candidateBytes uint64
+	keep := false
+	defer func() {
+		if !keep && candidateBytes != 0 {
+			budget.releaseTemporary(candidateBytes)
+		}
+	}()
+	for _, term := range terms {
+		saturated := false
+		memoryLimited := false
+		err := page.VisitFTSPostings(budget.ctx, selected, term, func(posting store.PageFTSPosting) error {
+			if err := budget.check(1, 0); err != nil {
+				return err
+			}
+			if _, exists := seen[posting.DocumentID]; exists {
+				return nil
+			}
+			if uint64(len(ids)) == population-1 {
+				saturated = true
+				return io.EOF
+			}
+			// Account for the ID slice and its deduplication entry while the
+			// union is being built. The map portion is released below once
+			// the final sorted candidate slice is retained.
+			if uint64(budget.maxBytes-budget.bytes) < 24 {
+				memoryLimited = true
+				return io.EOF
+			}
+			if err := budget.chargeTemporary(24); err != nil {
+				return err
+			}
+			candidateBytes += 24
+			seen[posting.DocumentID] = struct{}{}
+			ids = append(ids, posting.DocumentID)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if memoryLimited {
+			if err := budget.check(0, 0); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		if saturated || uint64(len(ids)) >= population {
+			return nil, nil
+		}
+	}
+	slices.Sort(ids)
+	retainedBytes := uint64(len(ids)) * 8
+	if candidateBytes > retainedBytes {
+		budget.releaseTemporary(candidateBytes - retainedBytes)
+		candidateBytes = retainedBytes
+	}
+	keep = true
 	return &querySearchCandidate{variable: node.Var, nodeIDs: ids, bytes: candidateBytes}, nil
 }
 

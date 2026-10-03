@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -334,19 +335,31 @@ func TestPropertyIndexTracksQueryLabelPropertyAndEntityRemoval(t *testing.T) {
 }
 
 func TestPropertyIndexCreationChargesDefinitionBudget(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "definition-budget.ltdb"), OpenOptions{
-		Create:                           true,
-		DerivedIndexBuildMaxWork:         1,
-		DerivedIndexBuildMaxLogicalBytes: 1,
+	path := filepath.Join(t.TempDir(), "definition-budget.ltdb")
+	// Prepare the database under the normal maintenance allowance. The tiny
+	// budget below admits readiness inspection but not a larger definition.
+	db, err := Open(path, OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{
+		DerivedIndexBuildMaxWork:         100,
+		DerivedIndexBuildMaxLogicalBytes: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := db.CreateNodePropertyIndex("Unused", "value"); !errors.Is(err, ErrResourceLimit) {
+	if err := db.CreateNodePropertyIndex(strings.Repeat("Unused", 512), "value"); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("node index definition budget = %v", err)
 	}
-	if err := db.CreateEdgePropertyIndex("UNUSED", "value"); !errors.Is(err, ErrResourceLimit) {
+	if err := db.CreateEdgePropertyIndex(strings.Repeat("UNUSED", 512), "value"); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("edge index definition budget = %v", err)
+	}
+	if err := db.CreateNodePropertyIndex("Small", "value"); err != nil {
+		t.Fatalf("admitted small definition: %v", err)
 	}
 }

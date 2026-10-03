@@ -30,21 +30,26 @@ type DB struct {
 	writers  int
 	mapSize  int64
 	closed   bool
+	cache    recordCache
 }
 
 // Open opens or creates the bbolt file at path. It uses a bounded 1 MiB initial
 // mapping cushion; on Windows bbolt sizes the file to that mapping on open.
 func Open(path string, opts Options) (*DB, error) {
-	if path == "" || opts.MaxSnapshotWriteBytes < 0 {
+	if path == "" || opts.MaxSnapshotWriteBytes < 0 || (opts.PageSize != 0 && (opts.PageSize < 1024 || opts.PageSize > 65536 || opts.PageSize&(opts.PageSize-1) != 0)) {
 		return nil, ErrInvalidOptions
 	}
 	limit := opts.MaxSnapshotWriteBytes
 	if limit == 0 {
 		limit = defaultSnapshotWriteLimit
 	}
-	bdb, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: opts.ReadOnly, Timeout: 100 * time.Millisecond, InitialMmapSize: int(initialMmapSize)})
+	bdb, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: opts.ReadOnly, Timeout: 100 * time.Millisecond, InitialMmapSize: int(initialMmapSize), PageSize: opts.PageSize})
 	if err != nil {
 		return nil, fmt.Errorf("pagestore: open %q: %w", path, err)
+	}
+	if opts.PageSize != 0 && bdb.Info().PageSize != opts.PageSize {
+		_ = bdb.Close()
+		return nil, fmt.Errorf("%w: existing page size differs from requested size", ErrInvalidOptions)
 	}
 	mapSize, err := mappedCapacity(path)
 	if err != nil {
@@ -54,7 +59,7 @@ func Open(path string, opts Options) (*DB, error) {
 	if mapSize < initialMmapSize {
 		mapSize = initialMmapSize
 	}
-	return &DB{db: bdb, path: path, readOnly: opts.ReadOnly, limit: limit, mapSize: mapSize}, nil
+	return &DB{db: bdb, path: path, readOnly: opts.ReadOnly, limit: limit, mapSize: mapSize, cache: recordCache{limit: opts.CacheBytes}}, nil
 }
 
 // Begin opens a read snapshot or a writable transaction.
@@ -97,6 +102,7 @@ func (db *DB) Close() error {
 		return fmt.Errorf("pagestore: close: %w", err)
 	}
 	db.closed = true
+	db.cache.clear()
 	return nil
 }
 
@@ -131,11 +137,22 @@ func (tx *Tx) Get(bucket string, key []byte) ([]byte, error) {
 	if err := tx.check(); err != nil {
 		return nil, err
 	}
+	var ck recordCacheKey
+	if !tx.writable && tx.db.cache.limit != 0 {
+		ck = recordCacheKey{generation: tx.tx.ID(), bucket: bucket, key: string(key)}
+		if value, ok := tx.db.cache.get(ck); ok {
+			return value, nil
+		}
+	}
 	b := tx.tx.Bucket([]byte(bucket))
 	if b == nil {
 		return nil, nil
 	}
-	return bytes.Clone(b.Get(key)), nil
+	value := b.Get(key)
+	if !tx.writable && tx.db.cache.limit != 0 {
+		tx.db.cache.put(ck, value)
+	}
+	return bytes.Clone(value), nil
 }
 
 // Put creates bucket if needed and copies key and value into the transaction.
@@ -203,6 +220,11 @@ func (tx *Tx) Delete(bucket string, key []byte) error {
 // callback returns. Returning io.EOF stops normally;
 // any other callback error is returned wrapped. A callback may call Get.
 func (tx *Tx) Scan(ctx context.Context, bucket string, start, end []byte, visit func([]byte, []byte) error) error {
+	return tx.ScanBounded(ctx, bucket, start, end, ^uint64(0), visit)
+}
+
+// ScanBounded is Scan with a per-record key plus value byte limit checked before copying.
+func (tx *Tx) ScanBounded(ctx context.Context, bucket string, start, end []byte, maxBytes uint64, visit func([]byte, []byte) error) error {
 	if ctx == nil {
 		return errors.New("pagestore: nil scan context")
 	}
@@ -214,7 +236,7 @@ func (tx *Tx) Scan(ctx context.Context, bucket string, start, end []byte, visit 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		key, value, err := tx.scanEntry(bucket, seek, inclusive)
+		key, value, err := tx.scanEntry(bucket, seek, end, inclusive, maxBytes)
 		if err != nil {
 			return err
 		}
@@ -230,7 +252,7 @@ func (tx *Tx) Scan(ctx context.Context, bucket string, start, end []byte, visit 
 	}
 }
 
-func (tx *Tx) scanEntry(bucket string, seek []byte, inclusive bool) ([]byte, []byte, error) {
+func (tx *Tx) scanEntry(bucket string, seek, end []byte, inclusive bool, maxBytes uint64) ([]byte, []byte, error) {
 	if tx == nil {
 		return nil, nil, ErrClosed
 	}
@@ -252,6 +274,12 @@ func (tx *Tx) scanEntry(bucket string, seek []byte, inclusive bool) ([]byte, []b
 		if !inclusive && bytes.Equal(key, seek) {
 			key, value = c.Next()
 		}
+	}
+	if key == nil || end != nil && bytes.Compare(key, end) >= 0 {
+		return nil, nil, nil
+	}
+	if uint64(len(key))+uint64(len(value)) > maxBytes {
+		return nil, nil, fmt.Errorf("%w: scan bucket %q record exceeds %d bytes", ErrValueTooLarge, bucket, maxBytes)
 	}
 	return bytes.Clone(key), bytes.Clone(value), nil
 }

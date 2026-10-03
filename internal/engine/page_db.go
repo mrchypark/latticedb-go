@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/mrchypark/latticedb-go/internal/pagestore"
@@ -59,7 +60,7 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 				}
 				pagePath = filepath.Join(temporary, "database.pages")
 			}
-			if err := store.MigrateToPages(ctx, files, pagePath, store.RecoveryLimits{MaxDecodedBytes: opts.RecoveryMaxDecodedBytes, MaxFrames: opts.RecoveryMaxFrames, MaxWork: opts.RecoveryMaxWork}); err != nil {
+			if err := store.MigrateToPagesWithPageSize(ctx, files, pagePath, int(opts.PageSize), store.RecoveryLimits{MaxDecodedBytes: opts.RecoveryMaxDecodedBytes, MaxFrames: opts.RecoveryMaxFrames, MaxWork: opts.RecoveryMaxWork}); err != nil {
 				_ = lock.close()
 				return nil, pageStorageOpenError(err)
 			}
@@ -79,7 +80,7 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 	if fresh {
 		pagePath = files.State
 	}
-	pages, err := pagestore.Open(pagePath, pagestore.Options{ReadOnly: opts.ReadOnly})
+	pages, err := pagestore.Open(pagePath, pagestore.Options{ReadOnly: opts.ReadOnly, PageSize: int(opts.PageSize), CacheBytes: uint64(opts.CacheSizeMB) << 20})
 	if err != nil {
 		_ = lock.close()
 		return nil, pageStorageOpenError(err)
@@ -177,9 +178,11 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 		return nil, fmt.Errorf("%w: vector namespaces require vector support", ErrUnsupportedOption)
 	}
 	graph.VectorNamespaces = emptyVectorNamespaceStates(namespaces)
-	if _, e := normalizeFTSProperties(opts.FTSProperties); e != nil {
+	ftsProperties, e := normalizeFTSProperties(opts.FTSProperties)
+	if e != nil {
 		return nil, e
 	}
+	graph.FTSProperties = pageFTSPropertyConfiguration(ftsProperties)
 	if !opts.ReadOnly {
 		if pagePath != files.State {
 			if e := ensureLayoutOwner(pagePath, false, graph.DatabaseID); e != nil {
@@ -223,6 +226,72 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 		}
 		graph.VectorIndexM = effectiveVectorIndexM(opts.VectorM)
 		graph.VectorNamespaces = emptyVectorNamespaceStates(namespaces)
+		graph.FTSProperties = pageFTSPropertyConfiguration(ftsProperties)
+	}
+	if _, err = ftsIndexDefinitions(graph); err != nil {
+		return nil, err
+	}
+	if opts.ReadOnly {
+		if opts.VectorIndexMode == VectorIndexHNSWSynchronous && graph.VectorDimensions != 0 {
+			if !graph.PageBase.SearchIndexesCurrent {
+				return nil, fmt.Errorf("%w: open writable to refresh search indexes", ErrVectorIndexMaintenanceRequired)
+			}
+			if err = preparePageVectorIndexes(ctx, graph.PageBase, graph, opts.VectorIndexBuildMaxWork, opts.VectorIndexBuildMaxLogicalBytes); err != nil {
+				if errors.Is(err, pagestore.ErrReadOnly) {
+					err = fmt.Errorf("%w: open writable to build the page vector index", ErrVectorIndexMaintenanceRequired)
+				}
+				return nil, err
+			}
+		}
+	} else {
+		if err = read.Rollback(); err != nil {
+			return nil, err
+		}
+		read = nil
+		write, e := pages.Begin(true)
+		if e != nil {
+			return nil, e
+		}
+		page := &store.PageGraph{Tx: write}
+		buildGraph := *graph
+		buildGraph.PageBase = page
+		ftsBudget := &ftsIndexBudget{maxWork: opts.DerivedIndexBuildMaxWork, maxBytes: opts.DerivedIndexBuildMaxLogicalBytes}
+		ftsCtx := store.WithFTSMaintenanceBudget(ctx, ftsBudget)
+		if !graph.PageBase.SearchIndexesCurrent {
+			lifecycleBudget := &directSearchBudget{ctx: ctx, maxWork: opts.VectorIndexBuildMaxWork, maxBytes: opts.VectorIndexBuildMaxLogicalBytes}
+			lifecycleStage := &pageVectorBuildBudget{maxStagedBytes: opts.VectorIndexBuildMaxLogicalBytes}
+			e = invalidatePageVectorIndexesBudget(ctx, page, nil, lifecycleBudget, lifecycleStage)
+			if e == nil {
+				e = page.InvalidateFTSIndexReadiness(ftsCtx)
+			}
+		}
+		if e == nil {
+			e = preparePageFTSIndexes(ftsCtx, page, &buildGraph, opts.DerivedIndexBuildMaxWork, opts.DerivedIndexBuildMaxLogicalBytes)
+		}
+		if e == nil && opts.VectorIndexMode == VectorIndexHNSWSynchronous && graph.VectorDimensions != 0 {
+			e = preparePageVectorIndexes(ctx, page, &buildGraph, opts.VectorIndexBuildMaxWork, opts.VectorIndexBuildMaxLogicalBytes)
+		}
+		if e == nil {
+			e = page.MarkSearchIndexesCurrent(catalog.History)
+		}
+		if e == nil {
+			e = write.Commit()
+		}
+		if e != nil {
+			_ = write.Rollback()
+			return nil, e
+		}
+		read, err = pages.Begin(false)
+		if err != nil {
+			return nil, err
+		}
+		graph, catalog, err = (&store.PageGraph{Tx: read}).LoadGraph(ctx)
+		if err != nil {
+			return nil, err
+		}
+		graph.VectorIndexM = effectiveVectorIndexM(opts.VectorM)
+		graph.VectorNamespaces = emptyVectorNamespaceStates(namespaces)
+		graph.FTSProperties = pageFTSPropertyConfiguration(ftsProperties)
 	}
 	db := &DB{
 		path: path, files: files, graph: graph, pages: pages, pathLock: lock, pageTemporary: temporary,
@@ -273,6 +342,7 @@ func validatePageGraphVectorsContext(ctx context.Context, page *store.PageGraph,
 }
 
 func clearPageArchiveBasePending(pages *pagestore.DB, read **pagestore.Tx, graph **store.GraphState, catalog *store.PageCatalog, vectorM uint16, namespaces []VectorNamespace) error {
+	ftsProperties := (*graph).FTSProperties
 	if *read != nil {
 		if err := (*read).Rollback(); err != nil {
 			return err
@@ -308,6 +378,7 @@ func clearPageArchiveBasePending(pages *pagestore.DB, read **pagestore.Tx, graph
 	}
 	(*graph).VectorIndexM = effectiveVectorIndexM(vectorM)
 	(*graph).VectorNamespaces = emptyVectorNamespaceStates(namespaces)
+	(*graph).FTSProperties = ftsProperties
 	return nil
 }
 
@@ -398,10 +469,39 @@ func (tx *Tx) commitPages(ctx context.Context) error {
 	}
 	defer write.Rollback()
 	page := &store.PageGraph{Tx: write}
-	catalog, _, err := page.PageCommit(ctx, tx.graph, db.nextNodeID, db.nextEdgeID, db.commitID+1, delta, db.backupArchive != nil)
+	if len(delta.UpsertNodes) != 0 || len(delta.DeleteNodes) != 0 {
+		if db.disableVectorIndex {
+			lifecycleBudget := &directSearchBudget{ctx: ctx, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes}
+			lifecycleStage := &pageVectorBuildBudget{maxStagedBytes: db.vectorIndexBuildMaxLogicalBytes}
+			if err := invalidatePageVectorIndexesBudget(ctx, page, nil, lifecycleBudget, lifecycleStage); err != nil {
+				return err
+			}
+		} else if db.enableVector {
+			ids := append(slices.Clone(delta.UpsertNodes), delta.DeleteNodes...)
+			slices.Sort(ids)
+			ids = slices.Compact(ids)
+			budget := &directSearchBudget{ctx: ctx, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes, annVisitedLimit: ^uint64(0)}
+			if err := applyPageVectorChanges(ctx, page, tx.base, tx.graph, ids, budget); err != nil {
+				return err
+			}
+		}
+	}
+	ftsBudget := &ftsIndexBudget{maxWork: db.derivedIndexBuildMaxWork, maxBytes: db.derivedIndexBuildMaxLogicalBytes}
+	ftsCtx := store.WithFTSMaintenanceBudget(ctx, ftsBudget)
+	catalog, _, err := page.PageCommit(ftsCtx, tx.graph, db.nextNodeID, db.nextEdgeID, db.commitID+1, delta, db.backupArchive != nil)
 	if err != nil {
+		if errors.Is(err, store.ErrLoadResourceLimit) {
+			return fmt.Errorf("%w: %w", ErrResourceLimit, err)
+		}
 		return err
 	}
+	if err = applyPageFTSIndexDelta(ftsCtx, page, tx.base, tx.graph, delta, db.derivedIndexBuildMaxWork, db.derivedIndexBuildMaxLogicalBytes); err != nil {
+		return err
+	}
+	if err = page.MarkSearchIndexesCurrent(catalog.History); err != nil {
+		return err
+	}
+
 	if err = ctx.Err(); err != nil {
 		return err
 	}
@@ -427,6 +527,7 @@ func (tx *Tx) commitPages(ctx context.Context) error {
 			}
 			reloaded.VectorIndexM = old.VectorIndexM
 			reloaded.VectorNamespaces = old.VectorNamespaces
+			reloaded.FTSProperties = old.FTSProperties
 			db.graph = reloaded
 		}
 		if errors.Is(err, pagestore.ErrSnapshotGrowth) || errors.Is(err, pagestore.ErrSnapshotWriteLimit) {
@@ -448,6 +549,7 @@ func (tx *Tx) commitPages(ctx context.Context) error {
 	}
 	graph.VectorIndexM = old.VectorIndexM
 	graph.VectorNamespaces = old.VectorNamespaces
+	graph.FTSProperties = old.FTSProperties
 	db.graph = graph
 	db.commitID = catalog.CommitID
 	if archive := db.backupArchive; archive != nil {
@@ -495,4 +597,16 @@ func (db *DB) checkpointPages(ctx context.Context) error {
 	}
 	db.checkpointCount++
 	return nil
+}
+
+// Page-backed property configurations retain names only; postings stay on disk.
+func pageFTSPropertyConfiguration(properties []string) map[string]store.StringPostings {
+	if len(properties) == 0 {
+		return nil
+	}
+	result := make(map[string]store.StringPostings, len(properties))
+	for _, property := range properties {
+		result[property] = store.NewStringPostings()
+	}
+	return result
 }

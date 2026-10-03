@@ -34,6 +34,38 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 	}
 	queryVector := vector
 	capacity := limit
+	if graph.PageBase != nil && graph.Nodes.Len() == 0 && graph.DeletedNodes.Len() == 0 && !opts.Exact && !disableIndex {
+		if !graph.PageBase.SearchIndexesCurrent {
+			return nil, false, ErrVectorIndexMaintenanceRequired
+		}
+		pageIndex := store.PageVectorIndex{Tx: graph.PageBase.Tx, Namespace: pageVectorNamespaceKey(graph.VectorNamespace)}
+		hasIndex, err := pageIndex.HasMeta()
+		if err != nil {
+			return nil, false, err
+		}
+		if !hasIndex {
+			return nil, false, fmt.Errorf("%w: page HNSW index is missing", ErrVectorIndexMaintenanceRequired)
+		}
+		ef := int(opts.EfSearch)
+		if ef == 0 {
+			ef = vectorIndexSearchEF
+		}
+		ef = max(ef, int(limit))
+		pageResults, err := pageVectorSearch(budget.ctx, pageIndex, queryVector, int(limit), ef, configuredVectorIndexM(graph), budget)
+		if err != nil {
+			return nil, false, err
+		}
+		meta, err := pageIndex.Meta()
+		if err != nil {
+			return nil, false, err
+		}
+		// Duplicate vectors and reciprocal pruning can leave a disconnected
+		// component. Match resident HNSW's underfill behavior without resetting
+		// the budget or hiding graph corruption errors.
+		if uint64(len(pageResults)) >= min(limit, meta.Count-meta.DeletedCount) {
+			return pageResults, false, nil
+		}
+	}
 	exactFallbackUsed := graph.PageBase != nil && !opts.Exact && !disableIndex
 	if graph.PageBase == nil && !opts.Exact && !disableIndex && graph.VectorIndex.Nodes.Len() > 0 {
 		capacity = min(limit, graph.VectorLiveCount)
@@ -102,7 +134,7 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 	}
 	exact := vectorCandidateHeap{items: candidateStorage, max: true, exact: true}
 	cutoff := math.Inf(1)
-	if err := graph.VisitNodes(budget.ctx, func(node *store.NodeRecord) error {
+	if err := graph.VisitNodes(store.WithPageReadBudget(budget.ctx, budget), func(node *store.NodeRecord) error {
 		vectorValue, ok := selectedVector(graph, node)
 		if !ok {
 			return budget.add(1)
@@ -141,7 +173,7 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 		}
 		return nil
 	}); err != nil {
-		return nil, false, err
+		return nil, false, pageStorageOpenError(err)
 	}
 	if err := budget.check(); err != nil {
 		return nil, false, err

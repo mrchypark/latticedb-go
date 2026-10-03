@@ -4909,7 +4909,7 @@ func TestAdditionalCypherSyntaxBatch(t *testing.T) {
 	}
 }
 
-func TestUnsupportedCreatePatternFailsBeforeMutation(t *testing.T) {
+func TestCreatePathsWithNewNodes(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "partial-create.ltdb"), OpenOptions{Create: true})
 	if err != nil {
 		t.Fatal(err)
@@ -4919,16 +4919,20 @@ func TestUnsupportedCreatePatternFailsBeforeMutation(t *testing.T) {
 		"CREATE (a:Person {name: $a})-[e:KNOWS]->(b:Person {name: $b})",
 		"CREATE (:Person)-[:KNOWS]->(:Person)",
 	} {
-		if _, err := db.Query(query, map[string]any{"a": "Alice", "b": "Bob"}); err == nil {
-			t.Fatalf("unsupported create pattern unexpectedly succeeded: %s", query)
+		if _, err := db.Query(query, map[string]any{"a": "Alice", "b": "Bob"}); err != nil {
+			t.Fatalf("CREATE path unexpectedly failed: %s: %v", query, err)
 		}
 	}
 	result, err := db.Query("MATCH (n) RETURN count(n) AS count", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Rows[0]["count"] != int64(0) {
-		t.Fatalf("unsupported CREATE partially mutated graph: %#v", result.Rows)
+	if result.Rows[0]["count"] != int64(4) {
+		t.Fatalf("CREATE path node count = %#v, want 4", result.Rows)
+	}
+	result, err = db.Query("MATCH ()-[r:KNOWS]->() RETURN count(r) AS count", nil)
+	if err != nil || result.Rows[0]["count"] != int64(2) {
+		t.Fatalf("CREATE path edge count = %#v, %v", result.Rows, err)
 	}
 }
 
@@ -4941,7 +4945,6 @@ func TestQuerySemanticValidationFailsClosed(t *testing.T) {
 	for _, query := range []string{
 		"MATCH (n) RETURN missing.value",
 		"MATCH (n) SET missing.value = 1",
-		"MATCH (n) CREATE (n)-[:LINK]->(missing)",
 		"MATCH (n) DELETE missing",
 		"MATCH (n)-[n]->(m) RETURN id(n)",
 		"MATCH (n) RETURN n.value trailing",
@@ -4956,6 +4959,9 @@ func TestQuerySemanticValidationFailsClosed(t *testing.T) {
 	}
 	if stats.Entries != 0 {
 		t.Fatalf("invalid plans entered cache: %+v", stats)
+	}
+	if _, err := parseQuery("MATCH (n) CREATE (n)-[:LINK]->(fresh:Fresh)"); err != nil {
+		t.Fatalf("new CREATE endpoint should pass semantic validation: %v", err)
 	}
 }
 
