@@ -7,13 +7,12 @@ An embedded graph database written entirely in Go. It provides transactional gra
 LatticeDB Go requires Go 1.27 or newer.
 
 ```sh
-go get github.com/mrchypark/latticedb-go@v0.9.0
+go get github.com/mrchypark/latticedb-go@latest
 ```
 
-`v0.9.0` is the latest tagged release in this checkout. The working tree also
-contains unreleased arithmetic/general `RETURN`, aggregate `DISTINCT`, `MERGE`,
-variable-length paths, BM25/English stemming, configurable HNSW `M`, continuous
-backup recovery points, and the legacy binary WAL v5 format; the contracts below describe that working tree.
+The contracts below describe this source revision. See the
+[releases](https://github.com/mrchypark/latticedb-go/releases) for versioned
+changes and upgrade notes. Pin a release tag in reproducible builds.
 
 ## Quick start
 

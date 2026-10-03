@@ -24,6 +24,59 @@ const (
 	pageFTSTerms          = "fts-terms"
 )
 
+// FTSMaintenanceBudget is supplied by the transaction owner so canonical FTS
+// writes and derived posting maintenance consume one shared budget.
+type FTSMaintenanceBudget interface {
+	ChargePageFTS(work, bytes uint64) error
+	RemainingPageFTSBytes() uint64
+}
+
+type ftsMaintenanceBudgetContextKey struct{}
+
+func WithFTSMaintenanceBudget(ctx context.Context, budget FTSMaintenanceBudget) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, ftsMaintenanceBudgetContextKey{}, budget)
+}
+
+func FTSMaintenanceBudgetFromContext(ctx context.Context) FTSMaintenanceBudget {
+	if ctx == nil {
+		return nil
+	}
+	budget, _ := ctx.Value(ftsMaintenanceBudgetContextKey{}).(FTSMaintenanceBudget)
+	return budget
+}
+
+func (page *PageGraph) getFTSMaintenanceValue(ctx context.Context, bucket string, key []byte) ([]byte, error) {
+	budget := FTSMaintenanceBudgetFromContext(ctx)
+	if budget == nil {
+		return page.Tx.Get(bucket, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	remaining := budget.RemainingPageFTSBytes()
+	if remaining == 0 {
+		return nil, budget.ChargePageFTS(0, 1)
+	}
+	data, err := page.Tx.GetBoundedWithCharge(bucket, key, remaining, func(size uint64) error {
+		return budget.ChargePageFTS(0, size)
+	})
+	if errors.Is(err, pagestore.ErrValueTooLarge) {
+		if remaining != ^uint64(0) {
+			if chargeErr := budget.ChargePageFTS(0, remaining+1); chargeErr != nil {
+				return nil, chargeErr
+			}
+		}
+		return nil, ErrLoadResourceLimit
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
 // PageFTSPosting is one term/document frequency from a persistent FTS index.
 type PageFTSPosting struct{ DocumentID, Frequency, Length uint64 }
 
@@ -135,6 +188,75 @@ func (page *PageGraph) ftsDocumentTerms(index string, id uint64) (map[string]uin
 	return terms, length, d.finish()
 }
 
+func (page *PageGraph) ftsDocumentTermsWithBudget(ctx context.Context, index string, id uint64, budget FTSMaintenanceBudget) (map[string]uint64, uint64, error) {
+	data, err := page.getFTSMaintenanceValue(ctx, pageFTSDocuments, pageFTSDocumentKey(index, id))
+	if err != nil || data == nil {
+		return nil, 0, err
+	}
+	if len(data) < 8 {
+		return nil, 0, errors.New("invalid FTS document record")
+	}
+	// Read the encoded term count without allocating. Charge map/slice and
+	// decode work before the decoder creates strings or the map.
+	if len(data) <= 6 {
+		return nil, 0, errors.New("invalid FTS document record")
+	}
+	_, n1 := binary.Uvarint(data[6:])
+	if n1 <= 0 || 6+n1 >= len(data) {
+		return nil, 0, errors.New("invalid FTS document length")
+	}
+	count, n2 := binary.Uvarint(data[6+n1:])
+	if n2 <= 0 || count > uint64(page.recordLimit()/2) {
+		return nil, 0, ErrLoadResourceLimit
+	}
+	mapBytes := saturatingFTSBytes(count, 64)
+	// The decoder owns term strings while the encoded value remains live, so
+	// account for a second copy of the full payload before decoding it.
+	decodeBytes := saturatingFTSBytesAdd(mapBytes, uint64(len(data)))
+	if err := budget.ChargePageFTS(count, decodeBytes); err != nil {
+		return nil, 0, err
+	}
+	d, err := decodePageRecord(data, 9, page.recordLimit())
+	if err != nil {
+		return nil, 0, err
+	}
+	length, n := d.u(), d.u()
+	if n != count {
+		return nil, 0, errors.New("invalid FTS document term count")
+	}
+	terms := make(map[string]uint64, int(n))
+	for i := uint64(0); i < n; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		term, frequency := d.str(), d.u()
+		if d.err != nil {
+			return nil, 0, d.err
+		}
+		if term == "" || frequency == 0 {
+			return nil, 0, errors.New("invalid FTS document term")
+		}
+		if _, exists := terms[term]; exists {
+			return nil, 0, errors.New("duplicate FTS document term")
+		}
+		terms[term] = frequency
+	}
+	return terms, length, d.finish()
+}
+
+func saturatingFTSBytes(count, per uint64) uint64 {
+	if per != 0 && count > ^uint64(0)/per {
+		return ^uint64(0)
+	}
+	return count * per
+}
+func saturatingFTSBytesAdd(a, b uint64) uint64 {
+	if ^uint64(0)-a < b {
+		return ^uint64(0)
+	}
+	return a + b
+}
+
 // ReplaceFTSDocument updates one document's postings and aggregate statistics
 // in the caller's page transaction. The transaction must roll back on error.
 func (page *PageGraph) ReplaceFTSDocument(ctx context.Context, index string, id uint64, tokens []string) error {
@@ -155,9 +277,26 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 	if index == "" || len(index) > 65535 {
 		return errors.New("invalid FTS index name")
 	}
-	oldTerms, oldLength, err := page.ftsDocumentTerms(index, id)
+	budget := FTSMaintenanceBudgetFromContext(ctx)
+	var oldTerms map[string]uint64
+	var oldLength uint64
+	var err error
+	if budget != nil {
+		oldTerms, oldLength, err = page.ftsDocumentTermsWithBudget(ctx, index, id, budget)
+	} else {
+		oldTerms, oldLength, err = page.ftsDocumentTerms(index, id)
+	}
 	if err != nil {
 		return err
+	}
+	if budget != nil && !remove {
+		var tokenBytes uint64
+		for _, token := range tokens {
+			tokenBytes = saturatingFTSBytesAdd(tokenBytes, uint64(len(token))+64)
+		}
+		if err := budget.ChargePageFTS(uint64(len(tokens)), tokenBytes); err != nil {
+			return err
+		}
 	}
 	stats, err := page.FTSIndexStats(index)
 	if err != nil {
@@ -165,6 +304,11 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 	}
 	if stats.TotalLength < oldLength {
 		return errors.New("invalid FTS aggregate length")
+	}
+	if budget != nil {
+		if err := budget.ChargePageFTS(uint64(len(tokens)), saturatingFTSBytes(uint64(len(tokens)), 64)); err != nil {
+			return err
+		}
 	}
 	newTerms := make(map[string]uint64, len(tokens))
 	for _, token := range tokens {
@@ -175,6 +319,11 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 	for term, frequency := range newTerms {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if budget != nil {
+			if err := budget.ChargePageFTS(1, uint64(len(term))+64); err != nil {
+				return err
+			}
 		}
 		if oldTerms == nil || oldTerms[term] == 0 {
 			if err := page.changeFTSTermDocuments(index, term, 1); err != nil {
@@ -190,7 +339,15 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 		}
 	}
 	for term := range oldTerms {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if newTerms[term] == 0 {
+			if budget != nil {
+				if err := budget.ChargePageFTS(1, uint64(len(term))+32); err != nil {
+					return err
+				}
+			}
 			if err := page.Tx.Delete(pageFTSPostings, pageFTSPostingKey(index, term, id)); err != nil {
 				return err
 			}

@@ -316,7 +316,7 @@ func (graph *PageGraph) DeleteNode(ctx context.Context, id uint64) error {
 	if err := graph.UpdateNodePropertyIndexes(node, nil); err != nil {
 		return err
 	}
-	if err := graph.PutFTS(id, nil); err != nil {
+	if err := graph.PutFTSContext(ctx, id, nil); err != nil {
 		return err
 	}
 	if err := graph.changeCount(pageNodes, false); err != nil {

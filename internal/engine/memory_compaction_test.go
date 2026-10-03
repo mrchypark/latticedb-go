@@ -88,12 +88,19 @@ func TestMemoryAdjacencyCompactionRunsWithoutWAL(t *testing.T) {
 	}
 
 	completed := false
+	var residualTombstones int
+	var maintenanceNeeded bool
 	timeout := time.NewTimer(10 * time.Second)
 	defer timeout.Stop()
 	for !completed {
 		db.mu.RLock()
 		list := db.graph.Outgoing.Get(source.ID)
-		completed = list != nil && !list.HasRemovals() && list.Len() == liveEdges
+		residualTombstones = countAdjacencyTombstones(list)
+		maintenanceNeeded = db.adjacencyMaintenanceNeeded.Load()
+		// The worker schedules only when tombstones exceed one chunk. If it
+		// compacts during the churn loop, up to one chunk may remain afterward.
+		completed = list != nil && list.Len() == liveEdges &&
+			residualTombstones <= store.AdjacencyCompactionChunkBudget && !maintenanceNeeded
 		db.mu.RUnlock()
 		if completed {
 			break
@@ -101,7 +108,10 @@ func TestMemoryAdjacencyCompactionRunsWithoutWAL(t *testing.T) {
 		select {
 		case <-db.adjacencyMaintenanceComplete:
 		case <-timeout.C:
-			t.Fatal("memory adjacency compaction did not complete")
+			db.mu.RLock()
+			queued := len(db.adjacencyMaintenanceQueue)
+			db.mu.RUnlock()
+			t.Fatalf("memory adjacency maintenance did not settle: residual tombstones=%d needed=%v queued=%d", residualTombstones, maintenanceNeeded, queued)
 		}
 	}
 	oldList := oldGraph.Outgoing.Get(source.ID)
@@ -128,6 +138,18 @@ func TestMemoryAdjacencyCompactionRunsWithoutWAL(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("memory compaction created files: %v", entries)
 	}
+}
+
+func countAdjacencyTombstones(list *store.EdgeList) int {
+	count := 0
+	for chunk := range list.Chunks() {
+		for _, id := range chunk {
+			if list.IsRemoved(id) {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func beginMemoryChurnWrite(db *DB) (*Tx, error) {

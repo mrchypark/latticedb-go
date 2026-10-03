@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/latticedb-go/internal/pagestore"
@@ -352,4 +353,178 @@ func TestDeclaredFTSBuildChargesOutOfScopeRows(t *testing.T) {
 		t.Fatalf("out-of-scope row scan error=%v", err)
 	}
 	_ = tx.Rollback()
+}
+
+func TestNamedFTSScanChargesOutOfScopeRows(t *testing.T) {
+	ctx := context.Background()
+	pages, err := pagestore.Open(filepath.Join(t.TempDir(), "named-scan-budget"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pages.Close()
+	write, err := pages.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := &store.PageGraph{Tx: write}
+	graph := store.NewGraphState()
+	graph.PageBase = page
+	for id := uint64(1); id <= 64; id++ {
+		if err := page.PutNode(&store.NodeRecord{ID: id, Labels: []string{"Elsewhere"}, Properties: store.PropertiesFromMap(map[string]any{"body": "value"})}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, scoring := range []FTSScoring{FTSScoringFrequency, FTSScoringBM25} {
+		budget, err := newDirectSearchBudget(ctx, 4, 1<<20, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := []FTSIndexSearchResult{}
+		err = scanNamedFTSDefinition(ctx, graph, FTSIndexDefinition{Name: "scoped", Kind: FTSIndexNode, Scope: "Wanted", Property: "body"}, []string{"value"}, FTSSearchOptions{Limit: 10, Scoring: scoring}, 10, budget, &out)
+		if !errors.Is(err, ErrResourceLimit) {
+			t.Fatalf("scoring=%d out-of-scope scan error=%v", scoring, err)
+		}
+	}
+	_ = write.Rollback()
+}
+
+func TestPageFTSDeltaChargesManualPostingDeletion(t *testing.T) {
+	ctx := context.Background()
+	pages, err := pagestore.Open(filepath.Join(t.TempDir(), "manual-delete-budget"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pages.Close()
+	write, err := pages.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := &store.PageGraph{Tx: write}
+	tokens := make([]string, 1024)
+	for i := range tokens {
+		tokens[i] = "term" + base26Word(uint64(i))
+	}
+	if err := page.ReplaceFTSDocument(ctx, store.PageFTSManualStandard, 1, tokens); err != nil {
+		t.Fatal(err)
+	}
+	low := &ftsIndexBudget{maxWork: 4, maxBytes: 256}
+	err = page.DeleteFTSDocument(store.WithFTSMaintenanceBudget(ctx, low), store.PageFTSManualStandard, 1)
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("1024 unique-term posting deletion under four units: %v", err)
+	}
+	_ = write.Rollback()
+}
+
+func TestPageFTSDeleteBudgetRejectsAndRollsBackLargePostingSet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "delete-budget-reopen")
+	high := OpenOptions{Create: true, PageStorage: true, DerivedIndexBuildMaxWork: 1 << 20, DerivedIndexBuildMaxLogicalBytes: 1 << 20}
+	db, err := Open(path, high)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id uint64
+	words := make([]string, 1024)
+	for i := range words {
+		words[i] = "term" + base26Word(uint64(i))
+	}
+	text := strings.Join(words, " ")
+	if err := db.Update(func(tx *Tx) error {
+		n, e := tx.CreateNode(CreateNodeOptions{})
+		if e != nil {
+			return e
+		}
+		id = n.ID
+		return tx.FTSIndex(id, text)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	low := OpenOptions{PageStorage: true, DerivedIndexBuildMaxWork: 4, DerivedIndexBuildMaxLogicalBytes: 256}
+	db, err = Open(path, low)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	before := db.commitID
+	record, readErr := db.graph.ReadFTS(id)
+	if readErr != nil || record == nil || len(record.Tokens) == 0 {
+		t.Fatalf("read FTS record=%v err=%v", record, readErr)
+	}
+	initialHits, initialErr := db.FTSSearch(record.Tokens[0], FTSSearchOptions{})
+	if initialErr != nil || len(initialHits) != 1 {
+		t.Fatalf("initial indexed term %v err=%v", initialHits, initialErr)
+	}
+	err = db.Update(func(tx *Tx) error { return tx.DeleteNode(id) })
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("delete with four-unit budget error=%v", err)
+	}
+	if db.commitID != before {
+		t.Fatalf("rejected delete advanced commit %d -> %d", before, db.commitID)
+	}
+	if hits, e := db.FTSSearch(record.Tokens[0], FTSSearchOptions{}); e != nil || len(hits) != 1 || hits[0].NodeID != id {
+		t.Fatalf("post-rollback manual posting=%v err=%v", hits, e)
+	}
+}
+
+func TestNamedPageFTSDeleteBudgetRejectsLargePostingSet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "named-delete-budget-reopen")
+	high := OpenOptions{Create: true, PageStorage: true, DerivedIndexBuildMaxWork: 1 << 20, DerivedIndexBuildMaxLogicalBytes: 1 << 20}
+	db, err := Open(path, high)
+	if err != nil {
+		t.Fatal(err)
+	}
+	words := make([]string, 1024)
+	for i := range words {
+		words[i] = "term" + base26Word(uint64(i))
+	}
+	var id uint64
+	if err := db.Update(func(tx *Tx) error {
+		n, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"body": strings.Join(words, " ")}})
+		if err != nil {
+			return err
+		}
+		id = n.ID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateFTSIndex(FTSIndexDefinition{Name: "named", Kind: FTSIndexNode, Scope: "Item", Property: "body"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	low := OpenOptions{PageStorage: true, DerivedIndexBuildMaxWork: 4, DerivedIndexBuildMaxLogicalBytes: 256}
+	db, err = Open(path, low)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	before := db.commitID
+	if err := db.Update(func(tx *Tx) error { return tx.DeleteNode(id) }); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("named delete under four-unit budget error=%v", err)
+	}
+	if db.commitID != before {
+		t.Fatalf("rejected named delete advanced commit %d -> %d", before, db.commitID)
+	}
+	hits, err := db.FTSSearchIndex("named", words[0], FTSSearchOptions{})
+	if err != nil || len(hits) != 1 || hits[0].EntityID != id {
+		t.Fatalf("named posting after rollback=%v err=%v", hits, err)
+	}
+}
+
+func base26Word(n uint64) string {
+	var b [16]byte
+	i := len(b)
+	for {
+		i--
+		b[i] = byte('a' + n%26)
+		n /= 26
+		if n == 0 {
+			break
+		}
+	}
+	return string(b[i:])
 }

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"slices"
 
@@ -246,8 +247,36 @@ func pageFTSSearchCandidate(tx *Tx, node nodePattern, clause *whereClause, param
 	if selected == "" {
 		return nil, nil
 	}
+	if err := budget.check(0, 0); err != nil {
+		return nil, err
+	}
+	var population uint64
+	if len(node.Labels) == 0 {
+		population, err = tx.graph.NodeCount()
+	} else {
+		population = ^uint64(0)
+		for _, label := range node.Labels {
+			count, countErr := tx.graph.LabelCountContext(budget.ctx, label, func() error {
+				return budget.check(1, 0)
+			})
+			if countErr != nil {
+				return nil, countErr
+			}
+			population = min(population, count)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	// A candidate set at least as large as the smallest required label
+	// population cannot narrow this pattern. Stop as soon as that is proven,
+	// then release the partial union before the normal label scan.
+	if population == 0 {
+		return nil, nil
+	}
 
 	ids := make([]uint64, 0)
+	seen := make(map[uint64]struct{})
 	var candidateBytes uint64
 	keep := false
 	defer func() {
@@ -256,33 +285,52 @@ func pageFTSSearchCandidate(tx *Tx, node nodePattern, clause *whereClause, param
 		}
 	}()
 	for _, term := range terms {
-		if err := page.VisitFTSPostings(budget.ctx, selected, term, func(posting store.PageFTSPosting) error {
+		saturated := false
+		memoryLimited := false
+		err := page.VisitFTSPostings(budget.ctx, selected, term, func(posting store.PageFTSPosting) error {
 			if err := budget.check(1, 0); err != nil {
 				return err
 			}
-			if err := budget.chargeTemporary(8); err != nil {
+			if _, exists := seen[posting.DocumentID]; exists {
+				return nil
+			}
+			if uint64(len(ids)) == population-1 {
+				saturated = true
+				return io.EOF
+			}
+			// Account for the ID slice and its deduplication entry while the
+			// union is being built. The map portion is released below once
+			// the final sorted candidate slice is retained.
+			if uint64(budget.maxBytes-budget.bytes) < 24 {
+				memoryLimited = true
+				return io.EOF
+			}
+			if err := budget.chargeTemporary(24); err != nil {
 				return err
 			}
-			candidateBytes += 8
+			candidateBytes += 24
+			seen[posting.DocumentID] = struct{}{}
 			ids = append(ids, posting.DocumentID)
 			return nil
-		}); err != nil {
+		})
+		if err != nil {
 			return nil, err
+		}
+		if memoryLimited {
+			if err := budget.check(0, 0); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		if saturated || uint64(len(ids)) >= population {
+			return nil, nil
 		}
 	}
 	slices.Sort(ids)
-	ids = slices.Compact(ids)
-	uniqueBytes := uint64(len(ids)) * 8
-	if candidateBytes > uniqueBytes {
-		budget.releaseTemporary(candidateBytes - uniqueBytes)
-		candidateBytes = uniqueBytes
-	}
-	stats, err := page.FTSIndexStats(selected)
-	if err != nil {
-		return nil, err
-	}
-	if uint64(len(ids)) >= stats.Documents {
-		return nil, nil
+	retainedBytes := uint64(len(ids)) * 8
+	if candidateBytes > retainedBytes {
+		budget.releaseTemporary(candidateBytes - retainedBytes)
+		candidateBytes = retainedBytes
 	}
 	keep = true
 	return &querySearchCandidate{variable: node.Var, nodeIDs: ids, bytes: candidateBytes}, nil

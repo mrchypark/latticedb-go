@@ -23,7 +23,7 @@ func (page *PageGraph) PutFTSContext(ctx context.Context, id uint64, record *FTS
 	if err := ValidateEntityID(id); err != nil {
 		return err
 	}
-	old, err := page.Tx.Get("fts", pageID(id))
+	old, err := page.getFTSMaintenanceValue(ctx, "fts", pageID(id))
 	if err != nil {
 		return err
 	}
@@ -52,11 +52,29 @@ func (page *PageGraph) PutFTSContext(ctx context.Context, id uint64, record *FTS
 	if err := ValidateFTSText(record.Text); err != nil {
 		return err
 	}
-	if _, err := page.TokenizeFTSContext(ctx, id, record.Text, page.recordLimit()); err != nil {
+	budget := FTSMaintenanceBudgetFromContext(ctx)
+	maxTokenBytes := page.recordLimit()
+	if budget != nil {
+		if err := budget.ChargePageFTS(uint64(len(record.Text))*5, uint64(len(record.Text))); err != nil {
+			return err
+		}
+		maxTokenBytes = min(maxTokenBytes, budget.RemainingPageFTSBytes())
+	}
+	tokens, err := page.TokenizeFTSContext(ctx, id, record.Text, maxTokenBytes)
+	if err != nil {
 		if errors.Is(err, search.ErrTokenizationLimit) {
 			return fmt.Errorf("%w: FTS tokenization exceeds page decode limit", ErrLoadResourceLimit)
 		}
 		return err
+	}
+	if budget != nil {
+		bytes := uint64(len(tokens)) * 48
+		for _, token := range tokens {
+			bytes += uint64(len(token))
+		}
+		if err := budget.ChargePageFTS(uint64(len(tokens)), bytes); err != nil {
+			return err
+		}
 	}
 	data, err := encodePageRecord(4, func(e *binaryEncoder) { e.fts(persistedFTS{NodeID: id, Text: record.Text}) })
 	if err != nil {
@@ -89,10 +107,30 @@ func (page *PageGraph) indexManualFTSDocument(ctx context.Context, id uint64, re
 		}
 		tokens := record.Tokens
 		if index.name == PageFTSManualPorter {
+			budget := FTSMaintenanceBudgetFromContext(ctx)
+			limit := page.recordLimit()
+			if budget != nil {
+				if err := budget.ChargePageFTS(uint64(len(record.Text))*5, uint64(len(record.Text))); err != nil {
+					return err
+				}
+				limit = min(limit, budget.RemainingPageFTSBytes())
+			}
 			var err error
-			tokens, err = search.AnalyzeEnglishPorterContextWithLimit(ctx, record.Text, page.recordLimit())
+			tokens, err = search.AnalyzeEnglishPorterContextWithLimit(ctx, record.Text, limit)
 			if err != nil {
+				if errors.Is(err, search.ErrTokenizationLimit) {
+					return fmt.Errorf("%w: FTS Porter tokenization exceeds maintenance budget", ErrLoadResourceLimit)
+				}
 				return err
+			}
+			if budget != nil {
+				bytes := uint64(len(tokens)) * 48
+				for _, token := range tokens {
+					bytes += uint64(len(token))
+				}
+				if err := budget.ChargePageFTS(uint64(len(tokens)), bytes); err != nil {
+					return err
+				}
 			}
 		}
 		if err := page.ReplaceFTSDocument(ctx, index.name, id, tokens); err != nil {

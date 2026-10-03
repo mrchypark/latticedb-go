@@ -19,6 +19,9 @@ type PageVectorIndex struct {
 	Tx             *pagestore.Tx
 	Namespace      string
 	MaxRecordBytes uint64
+	// BeforeWrite charges the maximum encoded record size before encoding or
+	// staging it in the page transaction.
+	BeforeWrite func(uint64) error
 }
 
 type PageVectorNode struct {
@@ -45,19 +48,26 @@ func (index PageVectorIndex) prefix() []byte {
 	return h[:]
 }
 
+func (index PageVectorIndex) metaKey() []byte {
+	return append([]byte{0}, index.prefix()...)
+}
+
 func (index PageVectorIndex) key(id uint64) []byte {
-	key := append([]byte(nil), index.prefix()...)
-	key = append(key, 1)
+	key := append([]byte{1}, index.prefix()...)
 	return append(key, pageID(id)...)
 }
 
 func (index PageVectorIndex) Meta() (PageVectorMeta, error) {
-	var result PageVectorMeta
-	data, err := index.Tx.GetBounded(pageVectorBucket, append(index.prefix(), 0), 4096)
+	data, err := index.Tx.GetBounded(pageVectorBucket, index.metaKey(), 256)
 	if err != nil || data == nil {
-		return result, err
+		return PageVectorMeta{}, err
 	}
-	d, err := decodePageRecord(data, 4, 4096)
+	return decodePageVectorMeta(data)
+}
+
+func decodePageVectorMeta(data []byte) (PageVectorMeta, error) {
+	var result PageVectorMeta
+	d, err := decodePageRecord(data, 4, 256)
 	if err != nil {
 		return result, err
 	}
@@ -84,11 +94,16 @@ func (index PageVectorIndex) Meta() (PageVectorMeta, error) {
 }
 
 func (index PageVectorIndex) HasMeta() (bool, error) {
-	data, err := index.Tx.Get(pageVectorBucket, append(index.prefix(), 0))
+	data, err := index.Tx.GetBounded(pageVectorBucket, index.metaKey(), 256)
 	return data != nil, err
 }
 
 func (index PageVectorIndex) PutMeta(meta PageVectorMeta) error {
+	if index.BeforeWrite != nil {
+		if err := index.BeforeWrite(128); err != nil {
+			return err
+		}
+	}
 	data, err := encodePageRecord(4, func(e *binaryEncoder) {
 		e.u(meta.EntryID)
 		e.u(uint64(meta.MaxLevel))
@@ -107,7 +122,7 @@ func (index PageVectorIndex) PutMeta(meta PageVectorMeta) error {
 	if err != nil {
 		return err
 	}
-	return index.Tx.Put(pageVectorBucket, append(index.prefix(), 0), data)
+	return index.Tx.Put(pageVectorBucket, index.metaKey(), data)
 }
 
 func (index PageVectorIndex) Get(id uint64) (*PageVectorNode, error) {
@@ -206,8 +221,28 @@ func (index PageVectorIndex) GetBounded(id uint64, maxBytes uint64) (*PageVector
 }
 
 func (index PageVectorIndex) Put(id uint64, node *PageVectorNode) error {
-	if node == nil || node.Level < 0 || node.Level >= len(node.Neighbors) {
+	if node == nil || node.Level < 0 || node.Level >= 17 || node.Level+1 != len(node.Neighbors) {
 		return errors.New("invalid page vector node")
+	}
+	if len(node.Vector) > math.MaxUint16 || len(node.Neighbors) > 17 {
+		return errors.New("page vector node exceeds encoding limits")
+	}
+	for _, value := range node.Vector {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return errors.New("non-finite page vector value")
+		}
+	}
+	if index.BeforeWrite != nil {
+		maxBytes := uint64(64 + 5*len(node.Vector) + 10*len(node.Neighbors))
+		for _, neighbors := range node.Neighbors {
+			if len(neighbors) > 128 {
+				return errors.New("page vector degree exceeds limit")
+			}
+			maxBytes += uint64(10 + 10*len(neighbors))
+		}
+		if err := index.BeforeWrite(maxBytes); err != nil {
+			return err
+		}
 	}
 	data, err := encodePageRecord(5, func(e *binaryEncoder) {
 		e.u(uint64(node.Level))
@@ -232,6 +267,11 @@ func (index PageVectorIndex) Put(id uint64, node *PageVectorNode) error {
 }
 
 func (index PageVectorIndex) Delete(id uint64) error {
+	if index.BeforeWrite != nil {
+		if err := index.BeforeWrite(64); err != nil {
+			return err
+		}
+	}
 	return index.Tx.Delete(pageVectorBucket, index.key(id))
 }
 
@@ -249,20 +289,13 @@ func (index PageVectorIndex) Visit(ctx context.Context, visit func(uint64, *Page
 }
 
 func (index PageVectorIndex) VisitIDs(ctx context.Context, visit func(uint64) error) error {
-	prefix := index.prefix()
-	end := append([]byte(nil), prefix...)
-	for i := len(end) - 1; i >= 0; i-- {
-		if end[i] != 255 {
-			end[i]++
-			end = end[:i+1]
-			break
-		}
-	}
-	return index.Tx.ScanKeys(ctx, pageVectorBucket, append(prefix, 1), end, func(key []byte) error {
-		if len(key) != sha256.Size+9 || key[sha256.Size] != 1 {
+	start := append([]byte{1}, index.prefix()...)
+	end := pagePrefixEnd(start)
+	return index.Tx.ScanKeys(ctx, pageVectorBucket, start, end, func(key []byte) error {
+		if len(key) != 1+sha256.Size+8 || key[0] != 1 {
 			return errors.New("invalid page vector key")
 		}
-		id := binary.BigEndian.Uint64(key[sha256.Size+1:])
+		id := binary.BigEndian.Uint64(key[1+sha256.Size:])
 		return visit(id)
 	})
 }
@@ -280,39 +313,58 @@ func (index PageVectorIndex) DeleteAll(ctx context.Context, visit func() error) 
 
 // InvalidatePageVectorIndexesExcept marks every persisted namespace except the
 // supplied names invalid. Only metadata records are scanned; node records stay on disk.
-func InvalidatePageVectorIndexesExcept(ctx context.Context, tx *pagestore.Tx, active []string) error {
+type PageVectorInvalidationBudget struct {
+	Work         func(uint64) error
+	ReserveBytes func(uint64) error
+	ReleaseBytes func(uint64)
+	StageBytes   func(uint64) error
+}
+
+func InvalidatePageVectorIndexesExceptBudget(ctx context.Context, tx *pagestore.Tx, active []string, budget *PageVectorInvalidationBudget) error {
 	keep := make(map[[sha256.Size]byte]struct{}, len(active))
 	for _, name := range active {
 		keep[sha256.Sum256([]byte(name))] = struct{}{}
 	}
-	return tx.Scan(ctx, pageVectorBucket, nil, nil, func(key, _ []byte) error {
-		if len(key) != sha256.Size+1 || key[sha256.Size] != 0 {
-			return nil
+	return tx.ScanKeys(ctx, pageVectorBucket, []byte{0}, []byte{1}, func(key []byte) error {
+		if budget != nil && budget.Work != nil {
+			if err := budget.Work(1); err != nil {
+				return err
+			}
+		}
+		if len(key) != 1+sha256.Size || key[0] != 0 {
+			return errors.New("invalid page vector metadata key")
 		}
 		var hash [sha256.Size]byte
-		copy(hash[:], key[:sha256.Size])
+		copy(hash[:], key[1:])
 		if _, ok := keep[hash]; ok {
 			return nil
 		}
-		data, err := tx.Get(pageVectorBucket, key)
+		if budget != nil && budget.ReserveBytes != nil {
+			if err := budget.ReserveBytes(256); err != nil {
+				return err
+			}
+			if budget.ReleaseBytes != nil {
+				defer budget.ReleaseBytes(256)
+			}
+		}
+		data, err := tx.GetBounded(pageVectorBucket, key, 256)
 		if err != nil {
 			return err
 		}
-		d, err := decodePageRecord(data, 4, 4096)
+		if data == nil {
+			return nil
+		}
+		meta, err := decodePageVectorMeta(data)
 		if err != nil {
-			return err
-		}
-		meta := PageVectorMeta{EntryID: d.u(), MaxLevel: int(d.u()), Count: d.u(), Mutations: d.u(), LastID: d.u(), DeletedCount: d.u(), M: uint16(d.u()), Dimensions: uint16(d.u())}
-		valid := d.u()
-		if valid > 1 {
-			return errors.New("invalid page vector validity flag")
-		}
-		meta.Valid = valid == 1
-		if err := d.finish(); err != nil {
 			return err
 		}
 		if !meta.Valid {
 			return nil
+		}
+		if budget != nil && budget.StageBytes != nil {
+			if err := budget.StageBytes(128); err != nil {
+				return err
+			}
 		}
 		encoded, err := encodePageRecord(4, func(e *binaryEncoder) {
 			e.u(meta.EntryID)

@@ -579,6 +579,60 @@ func (it *patternQueryIterator) apply(row queryRow) ([]queryRow, error) {
 	return it.pattern.apply(it.tx, []queryRow{row}, it.budget)
 }
 
+func newPatternQueryIterator(plan *queryPlan, tx *Tx, input queryIterator, pattern matchPattern, params map[string]any, limit, skip int, budget *queryBudget, search *querySearchCandidate) *patternQueryIterator {
+	lookupLimit := uint(0)
+	if node, ok := pattern.(nodePattern); ok {
+		lookupLimit = plan.indexedNodeLookupLimit(node, limit, skip)
+	}
+	if search != nil {
+		lookupLimit = ^uint(0)
+	}
+	return &patternQueryIterator{plan: plan, tx: tx, input: input, pattern: pattern, params: params, limit: lookupLimit, budget: budget, search: search}
+}
+
+func applyWhereQueryStream(stream queryIterator, tx *Tx, params map[string]any, budget *queryBudget, clauses []*whereClause, predicate wherePredicate) (queryIterator, error) {
+	for _, clause := range clauses {
+		if clause.Kind == whereVector || clause.Kind == whereFTS {
+			var rows []queryRow
+			for {
+				row, ok, err := stream.Next()
+				if err != nil {
+					budget.releaseRows(len(rows))
+					stream.Close()
+					return nil, err
+				}
+				if !ok {
+					break
+				}
+				rows = append(rows, row)
+			}
+			stream.Close()
+			inputRows := len(rows)
+			var err error
+			rows, err = clause.apply(tx, rows, params, budget)
+			if err != nil {
+				budget.releaseRows(inputRows)
+				return nil, err
+			}
+			budget.releaseRows(inputRows - len(rows))
+			stream = &sliceQueryIterator{rows: rows, budget: budget}
+			continue
+		}
+		stream = &whereQueryIterator{input: stream, tx: tx, clause: clause, params: params, budget: budget}
+	}
+	if predicate != nil {
+		predicateWork := uint64(len(wherePredicateClauses(predicate)))
+		stream = &filterQueryIterator{input: stream, budget: budget, eval: func(row queryRow) (bool, error) {
+			if err := budget.check(predicateWork, 0); err != nil {
+				return false, err
+			}
+			match, err := predicate.eval(row, params, budget)
+			return match == predicateTrue, err
+		}}
+	}
+	return stream, nil
+}
+
 func (it *limitQueryIterator) Next() (queryRow, bool, error) {
 	for it.skip > 0 {
 		_, ok, err := it.input.Next()
@@ -1536,8 +1590,15 @@ func (plan *queryPlan) validateBindings() error {
 			projected[name] = struct{}{}
 		}
 		for _, item := range wherePredicateClauses(plan.withWhere) {
-			if _, ok := projected[item.Var]; !ok {
-				return fmt.Errorf("unknown binding %q", item.Var)
+			if item.Var != "" {
+				if _, ok := projected[item.Var]; !ok {
+					return fmt.Errorf("unknown binding %q", item.Var)
+				}
+			}
+			for _, name := range valueExprBindings(item.LeftExpr) {
+				if _, ok := projected[name]; !ok {
+					return fmt.Errorf("unknown binding %q", name)
+				}
 			}
 			for _, name := range valueExprBindings(item.Expr) {
 				if _, ok := projected[name]; !ok {
@@ -1599,9 +1660,14 @@ func valueExprBindings(expr valueExpr) []string {
 }
 
 func parseMatchQuery(query string) (*queryPlan, error) {
+	pathIndex := 0
+	return parseMatchQueryWithPathIndex(query, &pathIndex)
+}
+
+func parseMatchQueryWithPathIndex(query string, pathIndex *int) (*queryPlan, error) {
 	rest := strings.TrimSpace(strings.TrimPrefix(query, "MATCH "))
 	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " MATCH ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
-	patterns, err := parseMatchPatterns(matchText)
+	patterns, err := parseMatchPatternsWithPathIndex(matchText, pathIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -1642,7 +1708,7 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 
 	switch nextKeyword {
 	case " MATCH ":
-		next, err := parseMatchQuery("MATCH " + tail)
+		next, err := parseMatchQueryWithPathIndex("MATCH "+tail, pathIndex)
 		if err != nil {
 			return nil, err
 		}
@@ -1884,7 +1950,6 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		rows = nextRows
 		stream = &sliceQueryIterator{rows: rows, budget: budget}
 	}
-	match := stream
 	patterns, err := plan.orderedMatchPatterns(tx, params, budget)
 	if err != nil {
 		return QueryResult{}, err
@@ -1893,52 +1958,38 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 	if err != nil {
 		return QueryResult{}, err
 	}
-	for _, pattern := range patterns {
-		lookupLimit := uint(0)
-		if node, ok := pattern.(nodePattern); ok {
-			lookupLimit = plan.indexedNodeLookupLimit(node, limit, skip)
-		}
-		var candidate *querySearchCandidate
-		if searchCandidate != nil {
-			if node, ok := pattern.(nodePattern); ok && node.Var == searchCandidate.variable {
-				candidate = searchCandidate
-				searchCandidate = nil
-				lookupLimit = ^uint(0)
+	match := stream
+	if len(plan.matchWhereScopes) > 1 {
+		for _, scope := range plan.matchWhereScopes {
+			for _, pattern := range scope.patterns {
+				match = newPatternQueryIterator(plan, tx, match, pattern, params, limit, skip, budget, nil)
+			}
+			match, err = applyWhereQueryStream(match, tx, params, budget, scope.clauses, scope.predicate)
+			if err != nil {
+				return QueryResult{}, err
 			}
 		}
-		match = &patternQueryIterator{plan: plan, tx: tx, input: match, pattern: pattern, params: params, limit: lookupLimit, budget: budget, search: candidate}
+	} else {
+		for _, pattern := range patterns {
+			var candidate *querySearchCandidate
+			if searchCandidate != nil {
+				if node, ok := pattern.(nodePattern); ok && node.Var == searchCandidate.variable {
+					candidate = searchCandidate
+					searchCandidate = nil
+				}
+			}
+			match = newPatternQueryIterator(plan, tx, match, pattern, params, limit, skip, budget, candidate)
+		}
+		clauses, predicate := plan.whereClauses, plan.wherePredicate
+		if len(plan.matchWhereScopes) == 1 {
+			clauses, predicate = plan.matchWhereScopes[0].clauses, plan.matchWhereScopes[0].predicate
+		}
+		match, err = applyWhereQueryStream(match, tx, params, budget, clauses, predicate)
+		if err != nil {
+			return QueryResult{}, err
+		}
 	}
 	stream = match
-	if len(plan.whereClauses) > 0 {
-		for _, clause := range plan.whereClauses {
-			if clause.Kind == whereVector || clause.Kind == whereFTS {
-				rows, err = collectQueryRows(stream)
-				if err != nil {
-					return QueryResult{}, err
-				}
-				inputRows := len(rows)
-				rows, err = clause.apply(tx, rows, params, budget)
-				if err != nil {
-					budget.releaseRows(inputRows)
-					return QueryResult{}, err
-				}
-				budget.releaseRows(inputRows - len(rows))
-				stream = &sliceQueryIterator{rows: rows, budget: budget}
-				continue
-			}
-			stream = &whereQueryIterator{input: stream, tx: tx, clause: clause, params: params, budget: budget}
-		}
-	}
-	if plan.wherePredicate != nil {
-		predicateWork := uint64(len(wherePredicateClauses(plan.wherePredicate)))
-		stream = &filterQueryIterator{input: stream, budget: budget, eval: func(row queryRow) (bool, error) {
-			if err := budget.check(predicateWork, 0); err != nil {
-				return false, err
-			}
-			match, err := plan.wherePredicate.eval(row, params, budget)
-			return match == predicateTrue, err
-		}}
-	}
 	if plan.returnClause != nil && input == nil && plan.next == nil && !plan.mutates() && len(plan.orderClauses) == 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() {
 		iteratorLimit := limit
 		if plan.limitExpr == nil {
@@ -2102,7 +2153,7 @@ func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any, budge
 	if len(budgets) != 0 {
 		budget = budgets[0]
 	}
-	if plan.unwindClause != nil || plan.mutates() || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) == 0 {
+	if plan.unwindClause != nil || plan.mutates() || len(plan.matchWhereScopes) > 1 || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) == 0 {
 		return plan.matchPatterns, nil
 	}
 	search, err := plan.hasSearchPatternClause(budget)
@@ -3410,6 +3461,11 @@ func (clause *unwindClause) apply(rows []queryRow, params map[string]any, budget
 }
 
 func parseMatchPatterns(text string) ([]matchPattern, error) {
+	pathIndex := 0
+	return parseMatchPatternsWithPathIndex(text, &pathIndex)
+}
+
+func parseMatchPatternsWithPathIndex(text string, pathIndex *int) ([]matchPattern, error) {
 	parts := splitTopLevel(text, ',')
 	patterns := make([]matchPattern, 0, len(parts))
 	for _, part := range parts {
@@ -3417,8 +3473,10 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 		if part == "" {
 			return nil, fmt.Errorf("empty MATCH pattern in %q", text)
 		}
+		currentPathIndex := *pathIndex
+		*pathIndex = *pathIndex + 1
 		if findTopLevelToken(part, "-[") >= 0 || findTopLevelToken(part, "<-[") >= 0 {
-			path, err := parsePathPattern(part, len(patterns))
+			path, err := parsePathPattern(part, currentPathIndex)
 			if err != nil {
 				return nil, err
 			}
@@ -3430,7 +3488,7 @@ func parseMatchPatterns(text string) ([]matchPattern, error) {
 			return nil, err
 		}
 		if pattern.Var == "" && len(pattern.PropertyExprs) != 0 {
-			pattern.Var = fmt.Sprintf("\x00node%d", len(patterns))
+			pattern.Var = fmt.Sprintf("\x00node%d", currentPathIndex)
 		}
 		patterns = append(patterns, pattern)
 	}
@@ -3988,7 +4046,10 @@ func parseCreatePatterns(text string) ([]createPatternClause, error) {
 		var path []matchPattern
 		var err error
 		if findTopLevelToken(part, "-[") >= 0 || findTopLevelToken(part, "<-[") >= 0 {
-			path, err = parsePathPattern(part, pathIndex)
+			// parsePathPattern uses its path index to create hidden bindings for
+			// anonymous nodes and edges. Keep CREATE's hidden namespace disjoint
+			// from MATCH so anonymous CREATE endpoints can never reuse matched rows.
+			path, err = parsePathPattern(part, -pathIndex-1)
 		} else {
 			var node nodePattern
 			node, err = parseNodePattern(part)
@@ -5223,7 +5284,10 @@ func (clause *whereClause) eval(row queryRow, params map[string]any, budget *que
 			return predicateBool(equal), err
 		}
 		comparison, comparable := compareQueryValues(left, right)
-		return predicateBool(comparable && comparisonMatches(operator, comparison)), nil
+		if !comparable {
+			return predicateUnknown, nil
+		}
+		return predicateBool(comparisonMatches(operator, comparison)), nil
 	}
 	binding, ok := row.get(clause.Var)
 	if !ok {

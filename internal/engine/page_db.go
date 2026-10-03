@@ -256,7 +256,9 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 		buildGraph := *graph
 		buildGraph.PageBase = page
 		if !graph.PageBase.SearchIndexesCurrent {
-			e = invalidatePageVectorIndexes(ctx, page, nil)
+			lifecycleBudget := &directSearchBudget{ctx: ctx, maxWork: opts.VectorIndexBuildMaxWork, maxBytes: opts.VectorIndexBuildMaxLogicalBytes}
+			lifecycleStage := &pageVectorBuildBudget{maxStagedBytes: opts.VectorIndexBuildMaxLogicalBytes}
+			e = invalidatePageVectorIndexesBudget(ctx, page, nil, lifecycleBudget, lifecycleStage)
 			if e == nil {
 				e = page.InvalidateFTSIndexReadiness(ctx)
 			}
@@ -467,7 +469,9 @@ func (tx *Tx) commitPages(ctx context.Context) error {
 	page := &store.PageGraph{Tx: write}
 	if len(delta.UpsertNodes) != 0 || len(delta.DeleteNodes) != 0 {
 		if db.disableVectorIndex {
-			if err := invalidatePageVectorIndexes(ctx, page, nil); err != nil {
+			lifecycleBudget := &directSearchBudget{ctx: ctx, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes}
+			lifecycleStage := &pageVectorBuildBudget{maxStagedBytes: db.vectorIndexBuildMaxLogicalBytes}
+			if err := invalidatePageVectorIndexesBudget(ctx, page, nil, lifecycleBudget, lifecycleStage); err != nil {
 				return err
 			}
 		} else if db.enableVector {
@@ -480,11 +484,16 @@ func (tx *Tx) commitPages(ctx context.Context) error {
 			}
 		}
 	}
-	catalog, _, err := page.PageCommit(ctx, tx.graph, db.nextNodeID, db.nextEdgeID, db.commitID+1, delta, db.backupArchive != nil)
+	ftsBudget := &ftsIndexBudget{maxWork: db.derivedIndexBuildMaxWork, maxBytes: db.derivedIndexBuildMaxLogicalBytes}
+	ftsCtx := store.WithFTSMaintenanceBudget(ctx, ftsBudget)
+	catalog, _, err := page.PageCommit(ftsCtx, tx.graph, db.nextNodeID, db.nextEdgeID, db.commitID+1, delta, db.backupArchive != nil)
 	if err != nil {
+		if errors.Is(err, store.ErrLoadResourceLimit) {
+			return fmt.Errorf("%w: %w", ErrResourceLimit, err)
+		}
 		return err
 	}
-	if err = applyPageFTSIndexDelta(ctx, page, tx.base, tx.graph, delta, db.derivedIndexBuildMaxWork, db.derivedIndexBuildMaxLogicalBytes); err != nil {
+	if err = applyPageFTSIndexDelta(ftsCtx, page, tx.base, tx.graph, delta, db.derivedIndexBuildMaxWork, db.derivedIndexBuildMaxLogicalBytes); err != nil {
 		return err
 	}
 	if err = page.MarkSearchIndexesCurrent(catalog.History); err != nil {

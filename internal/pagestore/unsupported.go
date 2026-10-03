@@ -13,8 +13,11 @@ func (*DB) Close() error                                      { return ErrUnsupp
 func (*DB) Sync() error                                       { return ErrUnsupportedPlatform }
 func (*Tx) Get(string, []byte) ([]byte, error)                { return nil, ErrUnsupportedPlatform }
 func (*Tx) GetBounded(string, []byte, uint64) ([]byte, error) { return nil, ErrUnsupportedPlatform }
-func (*Tx) Put(string, []byte, []byte) error                  { return ErrUnsupportedPlatform }
-func (*Tx) Delete(string, []byte) error                       { return ErrUnsupportedPlatform }
+func (*Tx) GetBoundedWithCharge(string, []byte, uint64, func(uint64) error) ([]byte, error) {
+	return nil, ErrUnsupportedPlatform
+}
+func (*Tx) Put(string, []byte, []byte) error { return ErrUnsupportedPlatform }
+func (*Tx) Delete(string, []byte) error      { return ErrUnsupportedPlatform }
 func (*Tx) Scan(context.Context, string, []byte, []byte, func([]byte, []byte) error) error {
 	return ErrUnsupportedPlatform
 }

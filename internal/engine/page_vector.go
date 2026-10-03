@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"slices"
@@ -363,14 +364,14 @@ func rebuildPageVectorIndexWithBudget(ctx context.Context, graph *store.PageGrap
 	}
 	index := store.PageVectorIndex{Tx: graph.Tx, Namespace: namespace}
 	index.MaxRecordBytes = pageVectorNodeReadBudget(int(dimensions), m)
-	deleteBytes := estimateVectorIndexBytesForM(1, dimensions, uint16(m))
+	index.BeforeWrite = buildBudget.chargeStaged
 	if err := index.DeleteAll(ctx, func() error {
 		if budget != nil {
 			if e := budget.add(1); e != nil {
 				return e
 			}
 		}
-		return buildBudget.chargeStaged(deleteBytes)
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -392,12 +393,6 @@ func rebuildPageVectorIndexWithBudget(ctx context.Context, graph *store.PageGrap
 		}
 		entryBytes := estimateVectorIndexBytesForM(1, dimensions, uint16(m))
 		if e := buildBudget.chargePersistent(entryBytes); e != nil {
-			return e
-		}
-		// Each inserted node can rewrite up to 2M reciprocal records. Bound
-		// transaction staging cumulatively, including those repeated values.
-		staged := saturatingMul(entryBytes, uint64(2*m+2))
-		if e := buildBudget.chargeStaged(staged); e != nil {
 			return e
 		}
 		if budget != nil {
@@ -427,12 +422,62 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 		ctx = context.Background()
 	}
 	m := configuredVectorIndexM(after)
-	if err := invalidateInactivePageVectorIndexes(ctx, page, sortedVectorNamespaces(after.VectorNamespaces)); err != nil {
-		return err
+	type target struct {
+		name       string
+		dimensions uint16
 	}
+	targets := []target{{name: "default", dimensions: after.VectorDimensions}}
+	for _, ns := range sortedVectorNamespaces(after.VectorNamespaces) {
+		targets = append(targets, target{name: pageVectorNamespaceKey(&ns), dimensions: ns.Dimensions})
+	}
+	buildBudget := &pageVectorBuildBudget{maxPersistentBytes: ^uint64(0), maxStagedBytes: ^uint64(0)}
+	if budget != nil {
+		buildBudget.maxPersistentBytes = budget.maxBytes
+		buildBudget.maxStagedBytes = budget.maxBytes
+	}
+	// Include every active namespace's current persistent footprint before
+	// reserving additions and staged neighbor rewrites for this transaction.
+	for _, target := range targets {
+		if budget != nil {
+			if err := budget.add(1); err != nil {
+				return err
+			}
+		}
+		index := store.PageVectorIndex{Tx: page.Tx, Namespace: target.name}
+		meta, err := index.Meta()
+		if err != nil {
+			return err
+		}
+		entryBytes := estimateVectorIndexBytesForM(1, target.dimensions, uint16(m))
+		if err = buildBudget.chargePersistent(saturatingMul(meta.Count, entryBytes)); err != nil {
+			return err
+		}
+	}
+	chargeChange := func(name string, dimensions uint16, id uint64, adding bool) error {
+		if budget != nil {
+			if err := budget.add(1); err != nil {
+				return err
+			}
+		}
+		entryBytes := estimateVectorIndexBytesForM(1, dimensions, uint16(m))
+		if adding {
+			if err := buildBudget.chargePersistent(entryBytes); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// Preflight all source changes and aggregate costs before invalidation or
+	// any HNSW record is staged in the page transaction.
+	namespaces := sortedVectorNamespaces(after.VectorNamespaces)
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if budget != nil {
+			if err := budget.add(1); err != nil {
+				return err
+			}
 		}
 		oldNode, err := before.ReadNode(id)
 		if err != nil {
@@ -445,18 +490,70 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 		oldVector, oldOK := selectedVector(before, oldNode)
 		newVector, newOK := selectedVector(after, newNode)
 		if oldOK != newOK || !slices.Equal(oldVector, newVector) {
-			if err := applyPageVectorChange(ctx, page, "default", id, newVector, newOK, m, budget); err != nil {
+			if err := chargeChange("default", after.VectorDimensions, id, !oldOK && newOK); err != nil {
 				return err
 			}
 		}
-		for _, namespace := range sortedVectorNamespaces(after.VectorNamespaces) {
-			oldView, newView := vectorNamespaceFacade(before, namespace), vectorNamespaceFacade(after, namespace)
+		for _, ns := range namespaces {
+			if budget != nil {
+				if err := budget.add(1); err != nil {
+					return err
+				}
+			}
+			oldView, newView := vectorNamespaceFacade(before, ns), vectorNamespaceFacade(after, ns)
+			oldView.VectorDimensions, newView.VectorDimensions = ns.Dimensions, ns.Dimensions
+			oldVector, oldOK = selectedVector(oldView, oldNode)
+			newVector, newOK = selectedVector(newView, newNode)
+			if oldOK != newOK || !slices.Equal(oldVector, newVector) {
+				if err := chargeChange(pageVectorNamespaceKey(&ns), ns.Dimensions, id, !oldOK && newOK); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if err := invalidateInactivePageVectorIndexesBudget(ctx, page, sortedVectorNamespaces(after.VectorNamespaces), budget, buildBudget); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if budget != nil {
+			if err := budget.add(1); err != nil {
+				return err
+			}
+		}
+		oldNode, err := before.ReadNode(id)
+		if err != nil {
+			return err
+		}
+		newNode, err := after.ReadNode(id)
+		if err != nil {
+			return err
+		}
+		oldVector, oldOK := selectedVector(before, oldNode)
+		newVector, newOK := selectedVector(after, newNode)
+		if oldOK != newOK || !slices.Equal(oldVector, newVector) {
+			if err := applyPageVectorChange(ctx, page, "default", id, newVector, newOK, m, budget, buildBudget); err != nil {
+				return err
+			}
+		}
+		for _, ns := range namespaces {
+			if budget != nil {
+				if err := budget.add(1); err != nil {
+					return err
+				}
+			}
+			newView := vectorNamespaceFacade(after, ns)
+			newView.VectorDimensions = ns.Dimensions
+			oldView := vectorNamespaceFacade(before, ns)
+			oldView.VectorDimensions = ns.Dimensions
 			oldVector, oldOK = selectedVector(oldView, oldNode)
 			newVector, newOK = selectedVector(newView, newNode)
 			if oldOK == newOK && slices.Equal(oldVector, newVector) {
 				continue
 			}
-			if err := applyPageVectorChange(ctx, page, pageVectorNamespaceKey(&namespace), id, newVector, newOK, m, budget); err != nil {
+			if err := applyPageVectorChange(ctx, page, pageVectorNamespaceKey(&ns), id, newVector, newOK, m, budget, buildBudget); err != nil {
 				return err
 			}
 		}
@@ -464,11 +561,18 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 	return nil
 }
 
-func applyPageVectorChange(ctx context.Context, page *store.PageGraph, namespace string, id uint64, vector []float32, present bool, m int, budget *directSearchBudget) error {
-	index := store.PageVectorIndex{Tx: page.Tx, Namespace: namespace}
+func applyPageVectorChange(ctx context.Context, page *store.PageGraph, namespace string, id uint64, vector []float32, present bool, m int, budget *directSearchBudget, buildBudget *pageVectorBuildBudget) error {
+	index := store.PageVectorIndex{Tx: page.Tx, Namespace: namespace, BeforeWrite: buildBudget.chargeStaged}
 	meta, err := index.Meta()
 	if err != nil {
 		return err
+	}
+	dimensions := meta.Dimensions
+	if present {
+		dimensions = uint16(len(vector))
+	}
+	if dimensions != 0 {
+		index.MaxRecordBytes = pageVectorNodeReadBudget(int(dimensions), m)
 	}
 	if ok, err := index.HasMeta(); err != nil {
 		return err
@@ -602,7 +706,7 @@ func preparePageVectorIndexes(ctx context.Context, page *store.PageGraph, graph 
 	return nil
 }
 
-func invalidatePageVectorIndexes(ctx context.Context, page *store.PageGraph, namespaces []VectorNamespace) error {
+func invalidatePageVectorIndexesBudget(ctx context.Context, page *store.PageGraph, namespaces []VectorNamespace, work *directSearchBudget, staged *pageVectorBuildBudget) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -614,16 +718,31 @@ func invalidatePageVectorIndexes(ctx context.Context, page *store.PageGraph, nam
 			active = append(active, pageVectorNamespaceKey(&ns))
 		}
 	}
-	return store.InvalidatePageVectorIndexesExcept(ctx, page.Tx, active)
+	return store.InvalidatePageVectorIndexesExceptBudget(ctx, page.Tx, active, pageStoreInvalidationBudget(work, staged))
 }
 
-func invalidateInactivePageVectorIndexes(ctx context.Context, page *store.PageGraph, namespaces []VectorNamespace) error {
+func invalidateInactivePageVectorIndexesBudget(ctx context.Context, page *store.PageGraph, namespaces []VectorNamespace, work *directSearchBudget, staged *pageVectorBuildBudget) error {
 	active := []string{"default"}
 	for i := range namespaces {
 		ns := namespaces[i]
 		active = append(active, pageVectorNamespaceKey(&ns))
 	}
-	return store.InvalidatePageVectorIndexesExcept(ctx, page.Tx, active)
+	return store.InvalidatePageVectorIndexesExceptBudget(ctx, page.Tx, active, pageStoreInvalidationBudget(work, staged))
+}
+
+func pageStoreInvalidationBudget(work *directSearchBudget, staged *pageVectorBuildBudget) *store.PageVectorInvalidationBudget {
+	if work == nil && staged == nil {
+		return nil
+	}
+	var b store.PageVectorInvalidationBudget
+	if work != nil {
+		b.Work = work.add
+		b.ReserveBytes, b.ReleaseBytes = work.reserveBytes, work.releaseBytes
+	}
+	if staged != nil {
+		b.StageBytes = staged.chargeStaged
+	}
+	return &b
 }
 
 func insertPageVector(ctx context.Context, index store.PageVectorIndex, meta *store.PageVectorMeta, id uint64, vector []float32, m int, budget *directSearchBudget) error {
@@ -722,6 +841,18 @@ func mutatePageVectorIndex(ctx context.Context, index store.PageVectorIndex, met
 		}
 		return index.PutMeta(*meta)
 	}
+	if meta.Count != 0 && meta.DeletedCount == meta.Count {
+		if err := index.DeleteAll(ctx, func() error {
+			if budget != nil {
+				return budget.add(1)
+			}
+			return ctx.Err()
+		}); err != nil {
+			return err
+		}
+		meta.EntryID, meta.LastID, meta.MaxLevel = 0, 0, 0
+		meta.Count, meta.DeletedCount, meta.Mutations = 0, 0, 0
+	}
 	if err := insertPageVector(ctx, index, meta, id, vector, m, budget); err != nil {
 		return err
 	}
@@ -767,5 +898,14 @@ func pageVectorNamespaceKey(namespace *VectorNamespace) string {
 	if namespace == nil {
 		return "default"
 	}
-	return fmt.Sprintf("%s\x00%s\x00%d\x00%d", namespace.Scope, namespace.Property, namespace.Dimensions, namespace.Metric)
+	// Versioned length-prefix encoding avoids collisions when valid scope or
+	// property strings contain the old NUL delimiter.
+	key := []byte("\x00page-vector-namespace\x01")
+	key = binary.AppendUvarint(key, uint64(len(namespace.Scope)))
+	key = append(key, namespace.Scope...)
+	key = binary.AppendUvarint(key, uint64(len(namespace.Property)))
+	key = append(key, namespace.Property...)
+	key = binary.AppendUvarint(key, uint64(namespace.Dimensions))
+	key = binary.AppendUvarint(key, uint64(namespace.Metric))
+	return string(key)
 }

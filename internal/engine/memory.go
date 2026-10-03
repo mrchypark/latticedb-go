@@ -76,6 +76,18 @@ func newMemoryDB(ctx context.Context, opts OpenOptions, graph *store.GraphState,
 			graph.VectorDimensions = 128
 		}
 	}
+	// Use the same logical snapshot estimate as commit admission before building
+	// optional indexes or starting the maintenance worker.
+	if graph.SnapshotBytes == 0 {
+		var err error
+		graph.SnapshotBytes, err = store.EstimateSnapshotBytes(graph)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if graph.SnapshotBytes > opts.MaxDatabaseSnapshotBytes {
+		return nil, fmt.Errorf("%w: database snapshot requires %d bytes, limit is %d", ErrResourceLimit, graph.SnapshotBytes, opts.MaxDatabaseSnapshotBytes)
+	}
 	if _, err := ftsIndexDefinitions(graph); err != nil {
 		return nil, err
 	}
@@ -116,12 +128,6 @@ func newMemoryDB(ctx context.Context, opts OpenOptions, graph *store.GraphState,
 		graph.DerivedIndexLogicalBytes = saturatingAdd(graph.DerivedIndexLogicalBytes, logicalBytes)
 		if graph.DerivedIndexWork > opts.DerivedIndexBuildMaxWork || graph.DerivedIndexLogicalBytes > opts.DerivedIndexBuildMaxLogicalBytes {
 			return nil, fmt.Errorf("%w: FTS property index build exceeds derived-index budget", ErrResourceLimit)
-		}
-	}
-	if graph.SnapshotBytes == 0 {
-		graph.SnapshotBytes, err = store.EstimateSnapshotBytes(graph)
-		if err != nil {
-			return nil, err
 		}
 	}
 	db := &DB{

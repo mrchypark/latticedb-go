@@ -256,6 +256,143 @@ func TestFTSCandidateSkipsWidePostingsForNarrowLabel(t *testing.T) {
 	}
 }
 
+func TestPageFTSCandidateSkipsWidePostingsForNarrowLabels(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "page-fts-narrow-label"), OpenOptions{
+		Create: true, PageStorage: true, FTSProperties: []string{"text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 1_000; i++ {
+			if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Common"}, Properties: map[string]any{"text": "needle"}}); err != nil {
+				return err
+			}
+		}
+		_, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Common", "Rare"}, Properties: map[string]any{"text": "needle"}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateFTSIndex(FTSIndexDefinition{Name: "common-text", Kind: FTSIndexNode, Scope: "Common", Property: "text"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, query := range []string{
+		`MATCH (n:Rare) WHERE n.text @@ "needle" RETURN id(n) AS id`,
+		`MATCH (n:Common:Rare) WHERE n.text @@ "needle" RETURN id(n) AS id`,
+	} {
+		options := QueryOptions{MaxBytes: 1 << 10}
+		if i == 0 {
+			options.MaxWork = 32
+		}
+		result, err := db.QueryContext(context.Background(), query, nil, options)
+		if err != nil {
+			t.Fatalf("query %q: %v", query, err)
+		}
+		if len(result.Rows) != 1 {
+			t.Fatalf("query %q rows=%v, want the single rare node", query, result.Rows)
+		}
+	}
+}
+
+func TestPageFTSCandidateKeepsSelectiveGlobalPostingUnderLowWork(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "page-fts-global-selective"), OpenOptions{
+		Create: true, PageStorage: true, FTSProperties: []string{"text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var matchID uint64
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 1_000; i++ {
+			text := "ordinary"
+			if i == 777 {
+				text = "needle"
+			}
+			node, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"text": text}})
+			if err != nil {
+				return err
+			}
+			if i == 777 {
+				matchID = node.ID
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.QueryContext(t.Context(), `MATCH (n) WHERE n.text @@ "needle" RETURN id(n) AS id`, nil, QueryOptions{
+		MaxWork: 32, MaxBytes: 1 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["id"] != int64(matchID) {
+		t.Fatalf("rows=%v, want only matching node %d", result.Rows, matchID)
+	}
+}
+
+func TestPageFTSCandidateReleasesUnionBeforeMemoryBoundedFallback(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "page-fts-candidate-memory-fallback"), OpenOptions{
+		Create: true, PageStorage: true, FTSProperties: []string{"text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 100; i++ {
+			text := "ordinary"
+			if i < 80 {
+				text = "needle"
+			}
+			if _, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"text": text}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	query := `MATCH (n) WHERE n.text @@ "needle" RETURN id(n) AS id LIMIT 1`
+	plan, err := parseQuery(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := newQueryBudget(t.Context(), QueryOptions{MaxBytes: 1 << 10})
+	candidate, err := pageFTSSearchCandidate(tx, plan.matchPatterns[0].(nodePattern), plan.whereClauses[0], nil, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate != nil || budget.bytes != 0 {
+		t.Fatalf("memory-limited candidate=%v budget bytes=%d, want fallback with released scratch", candidate, budget.bytes)
+	}
+	releaseQueryBudget(budget)
+	workBudget := newQueryBudget(t.Context(), QueryOptions{MaxWork: 45, MaxBytes: 1 << 10})
+	_, err = pageFTSSearchCandidate(tx, plan.matchPatterns[0].(nodePattern), plan.whereClauses[0], nil, workBudget)
+	if !errors.Is(err, ErrResourceLimit) || workBudget.bytes != 0 {
+		t.Fatalf("work-limited candidate err=%v budget bytes=%d, want propagated limit and released scratch", err, workBudget.bytes)
+	}
+	releaseQueryBudget(workBudget)
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{})
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["id"] != int64(1) {
+		t.Fatalf("unbounded fallback query rows=%v err=%v", result.Rows, err)
+	}
+}
+
 func TestPageQueryUsesOnlyCurrentScopedFTSIndex(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "page-fts-candidate"), OpenOptions{
 		Create: true, PageStorage: true, FTSProperties: []string{"text"},

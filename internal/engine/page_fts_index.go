@@ -163,11 +163,26 @@ func manualFTSPageIndex(analyzer FTSAnalyzer) string {
 type ftsIndexBudget struct{ work, bytes, maxWork, maxBytes uint64 }
 
 func (b *ftsIndexBudget) chargeUnit() error {
-	if b.maxWork != 0 && b.work >= b.maxWork {
+	return b.ChargePageFTS(1, 0)
+}
+
+func (b *ftsIndexBudget) ChargePageFTS(work, bytes uint64) error {
+	if b.maxWork != 0 && (b.work > b.maxWork || work > b.maxWork-b.work) {
 		return fmt.Errorf("%w: FTS index work budget exceeded", ErrResourceLimit)
 	}
-	b.work++
+	if b.maxBytes != 0 && (b.bytes > b.maxBytes || bytes > b.maxBytes-b.bytes) {
+		return fmt.Errorf("%w: FTS index byte budget exceeded", ErrResourceLimit)
+	}
+	b.work = saturatingAdd(b.work, work)
+	b.bytes = saturatingAdd(b.bytes, bytes)
 	return nil
+}
+
+func (b *ftsIndexBudget) RemainingPageFTSBytes() uint64 {
+	if b.maxBytes == 0 {
+		return ^uint64(0)
+	}
+	return b.maxBytes - min(b.maxBytes, b.bytes)
 }
 
 func dropPageFTSIndex(ctx context.Context, page *store.PageGraph, index string, budget *ftsIndexBudget) error {
@@ -180,30 +195,18 @@ func (b *ftsIndexBudget) charge(text string, tokens []string) error {
 	for _, token := range tokens {
 		bytes = saturatingAdd(bytes, uint64(len(token)))
 	}
-	if b.maxWork != 0 && saturatingAdd(b.work, work) > b.maxWork {
-		return fmt.Errorf("%w: FTS index work budget exceeded", ErrResourceLimit)
-	}
-	if b.maxBytes != 0 && saturatingAdd(b.bytes, bytes) > b.maxBytes {
-		return fmt.Errorf("%w: FTS index byte budget exceeded", ErrResourceLimit)
-	}
-	b.work = saturatingAdd(b.work, work)
-	b.bytes = saturatingAdd(b.bytes, bytes)
-	return nil
+	return b.ChargePageFTS(work, bytes)
 }
 
 func tokenizePageFTSBuild(ctx context.Context, page *store.PageGraph, text string, budget *ftsIndexBudget, porter bool) ([]string, error) {
 	baseWork, baseBytes := saturatingMul(uint64(len(text)), 5), uint64(len(text))
-	if budget.maxWork != 0 && (budget.work > budget.maxWork || baseWork > budget.maxWork-budget.work) {
-		return nil, fmt.Errorf("%w: FTS index work budget exceeded", ErrResourceLimit)
+	if err := budget.ChargePageFTS(baseWork, baseBytes); err != nil {
+		return nil, err
 	}
-	if budget.maxBytes != 0 && (budget.bytes > budget.maxBytes || baseBytes > budget.maxBytes-budget.bytes) {
-		return nil, fmt.Errorf("%w: FTS index byte budget exceeded", ErrResourceLimit)
-	}
-	budget.work += baseWork
-	budget.bytes += baseBytes
 	limit := page.FTSIndexTokenLimit()
-	if budget.maxBytes != 0 && budget.maxBytes-budget.bytes < limit {
-		limit = budget.maxBytes - budget.bytes
+	remaining := budget.RemainingPageFTSBytes()
+	if remaining < limit {
+		limit = remaining
 	}
 	var tokens []string
 	var err error
@@ -222,14 +225,9 @@ func tokenizePageFTSBuild(ctx context.Context, page *store.PageGraph, text strin
 	for _, token := range tokens {
 		tokenBytes = saturatingAdd(tokenBytes, uint64(len(token)))
 	}
-	if budget.maxBytes != 0 && (budget.bytes > budget.maxBytes || tokenBytes > budget.maxBytes-budget.bytes) {
-		return nil, fmt.Errorf("%w: FTS index byte budget exceeded", ErrResourceLimit)
+	if err := budget.ChargePageFTS(uint64(len(tokens)), tokenBytes); err != nil {
+		return nil, err
 	}
-	if budget.maxWork != 0 && (budget.work > budget.maxWork || uint64(len(tokens)) > budget.maxWork-budget.work) {
-		return nil, fmt.Errorf("%w: FTS index work budget exceeded", ErrResourceLimit)
-	}
-	budget.bytes += tokenBytes
-	budget.work += uint64(len(tokens))
 	return tokens, nil
 }
 
@@ -238,6 +236,7 @@ func preparePageFTSIndexes(ctx context.Context, page *store.PageGraph, graph *st
 		ctx = context.Background()
 	}
 	budget := ftsIndexBudget{maxWork: maxWork, maxBytes: maxBytes}
+	ctx = store.WithFTSMaintenanceBudget(ctx, &budget)
 	for _, index := range []string{store.PageFTSManualStandard, store.PageFTSManualPorter} {
 		ready, err := page.FTSIndexReady(index)
 		if err != nil {
@@ -291,7 +290,12 @@ func applyPageFTSIndexDelta(ctx context.Context, page *store.PageGraph, before, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	budget := ftsIndexBudget{maxWork: maxWork, maxBytes: maxBytes}
+	budget := &ftsIndexBudget{maxWork: maxWork, maxBytes: maxBytes}
+	if shared, ok := store.FTSMaintenanceBudgetFromContext(ctx).(*ftsIndexBudget); ok {
+		budget = shared
+	} else {
+		ctx = store.WithFTSMaintenanceBudget(ctx, budget)
+	}
 	oldDefs, err := ftsIndexDefinitions(before)
 	if err != nil {
 		return err
@@ -310,7 +314,7 @@ func applyPageFTSIndexDelta(ctx context.Context, page *store.PageGraph, before, 
 	}
 	for name := range oldByName {
 		if _, ok := newByName[name]; !ok {
-			if err := dropPageFTSIndex(ctx, page, declaredFTSPageIndexName(name), &budget); err != nil {
+			if err := dropPageFTSIndex(ctx, page, declaredFTSPageIndexName(name), budget); err != nil {
 				return err
 			}
 		}
@@ -322,16 +326,16 @@ func applyPageFTSIndexDelta(ctx context.Context, page *store.PageGraph, before, 
 			return err
 		}
 		if !ready {
-			if err := rebuildDeclaredPageFTS(ctx, page, def, index, &budget); err != nil {
+			if err := rebuildDeclaredPageFTS(ctx, page, def, index, budget); err != nil {
 				return err
 			}
 			continue
 		}
 		if old, ok := oldByName[def.Name]; ok && old != def {
-			if err := dropPageFTSIndex(ctx, page, index, &budget); err != nil {
+			if err := dropPageFTSIndex(ctx, page, index, budget); err != nil {
 				return err
 			}
-			if err := rebuildDeclaredPageFTS(ctx, page, def, index, &budget); err != nil {
+			if err := rebuildDeclaredPageFTS(ctx, page, def, index, budget); err != nil {
 				return err
 			}
 			continue
@@ -339,14 +343,14 @@ func applyPageFTSIndexDelta(ctx context.Context, page *store.PageGraph, before, 
 		if def.Kind == FTSIndexNode {
 			ids := uniqueIDs(append(slices.Clone(delta.UpsertNodes), delta.DeleteNodes...))
 			for _, id := range ids {
-				if err := indexDeclaredNode(ctx, page, def, index, id, &budget); err != nil {
+				if err := indexDeclaredNode(ctx, page, def, index, id, budget); err != nil {
 					return err
 				}
 			}
 		} else {
 			ids := uniqueIDs(append(slices.Clone(delta.UpsertEdges), delta.DeleteEdges...))
 			for _, id := range ids {
-				if err := indexDeclaredEdge(ctx, page, def, index, id, &budget); err != nil {
+				if err := indexDeclaredEdge(ctx, page, def, index, id, budget); err != nil {
 					return err
 				}
 			}
@@ -363,7 +367,7 @@ func applyPageFTSIndexDelta(ctx context.Context, page *store.PageGraph, before, 
 		}
 		ids := uniqueIDs(append(slices.Clone(delta.UpsertNodes), delta.DeleteNodes...))
 		for _, id := range ids {
-			if err := indexConfiguredPropertyNode(ctx, page, property, index, id, &budget); err != nil {
+			if err := indexConfiguredPropertyNode(ctx, page, property, index, id, budget); err != nil {
 				return err
 			}
 		}

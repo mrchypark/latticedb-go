@@ -113,6 +113,9 @@ func scanNamedFTSDefinition(ctx context.Context, graph *store.GraphState, def FT
 	visitDocs := func(fn func(uint64, store.Properties) error) error {
 		if def.Kind == FTSIndexNode {
 			return graph.VisitNodes(ctx, func(n *store.NodeRecord) error {
+				if err := budget.add(1); err != nil {
+					return err
+				}
 				if containsFTSString(n.Labels, def.Scope) {
 					return fn(n.ID, n.Properties)
 				}
@@ -120,6 +123,9 @@ func scanNamedFTSDefinition(ctx context.Context, graph *store.GraphState, def FT
 			})
 		}
 		return graph.VisitEdges(ctx, func(e *store.EdgeRecord) error {
+			if err := budget.add(1); err != nil {
+				return err
+			}
 			if e.Type == def.Scope {
 				return fn(e.ID, e.Properties)
 			}
@@ -151,17 +157,15 @@ func scanNamedFTSDefinition(ctx context.Context, graph *store.GraphState, def FT
 		return tokens, bytes, nil
 	}
 	var documentCount, totalLength uint64
-	df := make([]uint64, len(terms))
+	var df []uint64
 	if opts.Scoring == FTSScoringBM25 {
 		dfBytes := saturatingMul(uint64(len(terms)), 8)
 		if err := budget.reserveBytes(dfBytes); err != nil {
 			return err
 		}
 		defer budget.releaseBytes(dfBytes)
+		df = make([]uint64, len(terms))
 		if err := visitDocs(func(_ uint64, props store.Properties) error {
-			if err := budget.add(1); err != nil {
-				return err
-			}
 			text, ok := props.Get(def.Property).(string)
 			if !ok {
 				return nil
@@ -202,9 +206,6 @@ func scanNamedFTSDefinition(ctx context.Context, graph *store.GraphState, def FT
 	defer budget.releaseBytes(resultBytes)
 	var results []FTSSearchResult
 	err := visitDocs(func(id uint64, props store.Properties) error {
-		if err := budget.add(1); err != nil {
-			return err
-		}
 		text, ok := props.Get(def.Property).(string)
 		if !ok {
 			return nil

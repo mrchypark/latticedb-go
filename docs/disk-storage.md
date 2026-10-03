@@ -96,7 +96,9 @@ need not stop immediately. Publication and reopening then finish without cancell
 Windows retains its existing platform durability limits; directory sync is not
 advertised there.
 
-Search index builds and rebuilds are bounded maintenance operations. Large
-builds can return `ErrResourceLimit`; page-backed storage does not promise an
+Search index builds, rebuilds, and page-index mutation maintenance use the
+configured work and logical-byte limits. A commit that exceeds these limits
+returns `ErrResourceLimit` and rolls back both source and derived changes.
+Page-backed storage does not promise an
 unbounded single transaction or constant-memory index construction. The earlier
 constrained-memory run above did not include the new search implementations.

@@ -45,6 +45,160 @@ func TestQueryFeatureGoalsTogether(t *testing.T) {
 	}
 }
 
+func TestQueryAnonymousCreatePathUsesFreshNodes(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "anonymous-create.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (a:A)-[:R]->(b:B)`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Query(`MATCH (a:A)-[:R]->() CREATE (a)-[:S]->()`, nil); err != nil {
+		t.Fatalf("anonymous path CREATE: %v", err)
+	}
+	result, err := db.Query(`MATCH (a:A)-[r:R]->(b:B) RETURN id(a) AS a, id(b) AS b`, nil)
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("seed path: %#v, %v", result.Rows, err)
+	}
+	seedA, aOK := result.Rows[0]["a"].(int64)
+	seedB, bOK := result.Rows[0]["b"].(int64)
+	if !aOK || !bOK || seedA == seedB {
+		t.Fatalf("seed path endpoints: %#v", result.Rows[0])
+	}
+	result, err = db.Query(`MATCH (a:A)-[r:S]->(b) RETURN id(a) AS a, id(b) AS b`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["a"] != seedA {
+		t.Fatalf("created S path: %#v, %v", result.Rows, err)
+	}
+	createdTarget, ok := result.Rows[0]["b"].(int64)
+	if !ok || createdTarget == seedB {
+		t.Fatalf("anonymous CREATE endpoint reused matched node: seedB=%d S-target=%#v", seedB, result.Rows[0]["b"])
+	}
+	result, err = db.Query(`MATCH (n) RETURN count(n) AS count`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["count"] != int64(3) {
+		t.Fatalf("CREATE reused matched anonymous nodes: rows=%#v err=%v", result.Rows, err)
+	}
+	if _, err := db.Query(`CREATE ()<-[:INCOMING {weight: 1}]-()`, nil); err != nil {
+		t.Fatalf("incoming anonymous CREATE path with relationship properties: %v", err)
+	}
+	result, err = db.Query(`MATCH (a)-[r:INCOMING {weight: 1}]->(b) RETURN id(a) AS a, id(b) AS b`, nil)
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("incoming CREATE direction/property: %#v, %v", result.Rows, err)
+	}
+}
+
+func TestQuerySequentialAnonymousPropertyMatchesAreIndependent(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "anonymous-property-scopes.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (:A {x: 1}), (:B {x: 2})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Query(`MATCH (:A {x: 1}) MATCH (:B {x: 2}) RETURN count(*) AS n`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["n"] != int64(1) {
+		t.Fatalf("sequential anonymous node patterns collided: %#v, %v", result.Rows, err)
+	}
+}
+
+func TestQuerySequentialMatchSkipsLaterWhereAfterEmptyScope(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "sequential-where.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (:A {x: 2}), (:B {x: 2})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	query := `MATCH (a:A) WHERE a.x = 0 OR a.x = 1 MATCH (b:B) WHERE b.x = toLower(1) RETURN b`
+	result, err := db.Query(query, nil)
+	if err != nil || len(result.Rows) != 0 {
+		t.Fatalf("later WHERE ran after prior MATCH scope was empty: rows=%#v err=%v", result.Rows, err)
+	}
+	if _, err := db.Query(`CREATE (:A {x: 0})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Query(query, nil); err == nil {
+		t.Fatal("later WHERE error was hidden despite a retained row")
+	}
+}
+
+func TestQueryWithWhereValidatesExpressionBindings(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "with-where-expression.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	result, err := db.Query(`UNWIND [1, 2] AS x WITH x WHERE abs(x) > 1 RETURN x`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["x"] != int64(2) {
+		t.Fatalf("WITH WHERE function expression: %#v, %v", result.Rows, err)
+	}
+	for _, query := range []string{
+		`UNWIND [1] AS x WITH x AS z WHERE abs(x) > 0 RETURN z`,
+		`UNWIND [1] AS x WITH x AS z WHERE z > x RETURN z`,
+	} {
+		if _, err := db.Query(query, nil); err == nil {
+			t.Errorf("WITH WHERE accepted non-projected expression binding: %s", query)
+		}
+	}
+}
+
+func TestQueryComputedOrderedComparisonsPreserveUnknown(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "comparison-unknown.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Query(`CREATE (:Number {x: 2}), (:NullValue {x: null})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, operator := range []string{"<", "<=", ">", ">="} {
+		for _, negated := range []bool{false, true} {
+			prefix := ""
+			if negated {
+				prefix = "NOT "
+			}
+			for _, test := range []struct {
+				name  string
+				query string
+			}{
+				{name: "property incomparable", query: `MATCH (n:Number) WHERE ` + prefix + `n.x ` + operator + ` 'bad' RETURN count(n) AS n`},
+				{name: "expression incomparable", query: `MATCH (n:Number) WHERE ` + prefix + `abs(n.x) ` + operator + ` 'bad' RETURN count(n) AS n`},
+				{name: "property null", query: `MATCH (n:NullValue) WHERE ` + prefix + `n.x ` + operator + ` 2 RETURN count(n) AS n`},
+			} {
+				result, err := db.Query(test.query, nil)
+				if err != nil || len(result.Rows) != 1 || result.Rows[0]["n"] != int64(0) {
+					t.Errorf("%s, operator %q negated=%t: %#v, %v", test.name, operator, negated, result.Rows, err)
+				}
+			}
+		}
+	}
+	for _, test := range []struct {
+		operator string
+		want     int64
+	}{
+		{operator: "<", want: 0}, {operator: "<=", want: 1},
+		{operator: ">", want: 0}, {operator: ">=", want: 1},
+	} {
+		for _, negated := range []bool{false, true} {
+			prefix := ""
+			want := test.want
+			if negated {
+				prefix = "NOT "
+				want = 1 - want
+			}
+			for _, expression := range []string{"n.x", "abs(n.x)"} {
+				result, err := db.Query(`MATCH (n:Number) WHERE `+prefix+expression+` `+test.operator+` 2 RETURN count(n) AS n`, nil)
+				if err != nil || len(result.Rows) != 1 || result.Rows[0]["n"] != want {
+					t.Errorf("ordered numeric %s %s negated=%t: %#v, %v; want %d", expression, test.operator, negated, result.Rows, err, want)
+				}
+			}
+		}
+	}
+}
+
 func TestQueryCreatePathsSequentialMatchAndExpressionPredicate(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "query-create-paths.ltdb"), OpenOptions{Create: true})
 	if err != nil {
@@ -55,7 +209,7 @@ func TestQueryCreatePathsSequentialMatchAndExpressionPredicate(t *testing.T) {
 	if _, err := db.Query(`CREATE (a:Person {name: 'Ada', rank: 5})-[:KNOWS]->(b:Person {name: 'Bob'}), (team:Team {name: 'Ops'})`, nil); err != nil {
 		t.Fatal(err)
 	}
-	result, err := db.Query(`MATCH (a:Person) WHERE abs(toInteger(a.rank) + 1) = abs(toInteger(2) * toInteger(3)) MATCH (a)-[:KNOWS]->(b:Person) WHERE toLower(b.name) = toLower('Bob') RETURN b.name AS name`, nil)
+	result, err := db.Query(`MATCH (a:Person {name: 'Ada'}) WHERE abs(toInteger(a.rank) + 1) = abs(toInteger(2) * toInteger(3)) MATCH (a)-[:KNOWS]->(b:Person) WHERE toLower(b.name) = toLower('Bob') RETURN b.name AS name`, nil)
 	if err != nil || len(result.Rows) != 1 || result.Rows[0]["name"] != "Bob" {
 		t.Fatalf("sequential MATCH/separate expression predicates: %#v, %v", result.Rows, err)
 	}
