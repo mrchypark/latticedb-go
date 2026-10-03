@@ -417,7 +417,7 @@ func TestPageFTSDeltaChargesManualPostingDeletion(t *testing.T) {
 
 func TestPageFTSDeleteBudgetRejectsAndRollsBackLargePostingSet(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "delete-budget-reopen")
-	high := OpenOptions{Create: true, PageStorage: true, DerivedIndexBuildMaxWork: 1 << 20, DerivedIndexBuildMaxLogicalBytes: 1 << 20}
+	high := OpenOptions{Create: true, PageStorage: true, DerivedIndexBuildMaxWork: 1 << 20, DerivedIndexBuildMaxLogicalBytes: 8 << 20}
 	db, err := Open(path, high)
 	if err != nil {
 		t.Fatal(err)
@@ -470,7 +470,7 @@ func TestPageFTSDeleteBudgetRejectsAndRollsBackLargePostingSet(t *testing.T) {
 
 func TestNamedPageFTSDeleteBudgetRejectsLargePostingSet(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "named-delete-budget-reopen")
-	high := OpenOptions{Create: true, PageStorage: true, DerivedIndexBuildMaxWork: 1 << 20, DerivedIndexBuildMaxLogicalBytes: 1 << 20}
+	high := OpenOptions{Create: true, PageStorage: true, DerivedIndexBuildMaxWork: 1 << 20, DerivedIndexBuildMaxLogicalBytes: 8 << 20}
 	db, err := Open(path, high)
 	if err != nil {
 		t.Fatal(err)

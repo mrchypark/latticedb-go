@@ -34,6 +34,8 @@ A query that fits a ready index can therefore exceed its budget on a scan path.
 Named node/edge and configured-property FTS builds also admit source copies
 and decoding before allocation. They reuse each decoded record and release its
 source storage after indexing; posting staging and work remain cumulative.
+FTS write admission includes each complete physical key (including repeated
+index-name prefixes), encoded values, and readiness mutations before staging.
 FTS readiness cleanup and subsequent rebuild share the writable open's budget;
 a rejected open does not publish partial cleanup.
 

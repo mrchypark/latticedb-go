@@ -76,3 +76,17 @@ The independent fourth review verified all 412 blobs and the Git tree at `ead438
 The follow-up uses the same FTS budget for transient source storage and retained posting staging. Only the source scope's bytes are released after its visitor; work and posting staging remain cumulative. Named node/edge and configured-property rebuilds reuse their admitted records. Incremental updates use admitted point visitors, including missing-record callbacks for derived deletion.
 
 Regressions cover all three public builds with a 1 MiB unrelated property under insufficient and sufficient allowances, named-build commit rollback, 64 records whose combined source size exceeds the peak allowance, cumulative work rejection, and six rebuild/incremental paths with a malformed 1 MiB source. The latter reject on resource admission before decoding at 16 KiB and expose the decode error at 32 MiB. Lower-level node/edge point-read controls also reject before corrupt-source decoding. These are correction evidence; the final exact-head review and CI verdict remain recorded on the PR.
+
+## Round 5 follow-up
+
+The fifth review verified all 414 blobs and the Git tree at `07be25aa0114a0a2150b8d43a8b1b27abac872f0`. Its unchanged source-admission reproduction and 30 selected controls passed, closing LDB221-18. It found one additional writer-side omission:
+
+| ID | Finding | Correction |
+| --- | --- | --- |
+| LDB221-19 | Repeated physical index-name prefixes and retained encoded values are missing from FTS staging charges | Admit complete keys and bounded encoded values before posting, vocabulary, document, statistics, and readiness mutations; preserve the shared maintenance budget |
+
+The public reproduction uses a 4,096-character configured property with 64 distinct terms. It previously published 546,922 derived key/value bytes under a 128 KiB allowance. The writer now charges full keys and encoded-value upper bounds before allocation/staging, including incremental insertion/removal. Vocabulary reads and decoder allocations use the same budget. Source-scope release remains separate from retained staging.
+
+The existing 1,024-term deletion fixtures prepare their data under an 8 MiB success allowance instead of 1 MiB; their low-budget rejection and rollback assertions remain unchanged. The 64-record source-release control uses 192 KiB instead of 128 KiB to include all retained writer costs, still below its 256 KiB aggregate source bodies. Production limits were not relaxed. Final exact-head review and CI results are recorded on the PR.
+
+Long-prefix regressions now cover 128 KiB rejection, 4 MiB success, short-prefix success at 128 KiB, no partial records in all five derived buckets, unchanged source history after rejected open, incremental update/deletion rollback, and `BufferedBytes()` bounded by both charged bytes and the configured allowance.

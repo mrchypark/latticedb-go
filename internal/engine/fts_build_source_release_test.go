@@ -31,7 +31,7 @@ func TestFTSBuildReleasesSourceBytesAndRetainsWork(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	opts := OpenOptions{PageStorage: true, DerivedIndexBuildMaxWork: 8192, DerivedIndexBuildMaxLogicalBytes: 128 << 10}
+	opts := OpenOptions{PageStorage: true, DerivedIndexBuildMaxWork: 8192, DerivedIndexBuildMaxLogicalBytes: 192 << 10}
 	db, err = Open(path, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestFTSBuildReleasesSourceBytesAndRetainsWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Source bodies total 256KiB, but each source record plus retained postings fits 128KiB.
+	// Source bodies total 256KiB, but each source record plus retained postings fits 192KiB.
 	if err := db.CreateFTSIndex(def); err != nil {
 		t.Fatal(err)
 	}

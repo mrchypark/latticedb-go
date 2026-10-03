@@ -76,6 +76,26 @@ func (page *PageGraph) getFTSMaintenanceValue(ctx context.Context, bucket string
 	return data, nil
 }
 
+// Charge key construction, transaction-owned key/value copies, and record
+// staging before constructing the variable-length key or encoding its value.
+func chargeFTSWrite(ctx context.Context, index string, suffix, valueBytes uint64) error {
+	budget := FTSMaintenanceBudgetFromContext(ctx)
+	if budget == nil {
+		return nil
+	}
+	keyBytes := saturatingFTSBytesAdd(uint64(len(index))+2, suffix)
+	bytes := saturatingFTSBytesAdd(saturatingFTSBytes(keyBytes, 4), saturatingFTSBytes(valueBytes, 2))
+	return budget.ChargePageFTS(1, saturatingFTSBytesAdd(bytes, 64))
+}
+
+func chargeFTSReadKey(ctx context.Context, index string, suffix uint64) error {
+	budget := FTSMaintenanceBudgetFromContext(ctx)
+	if budget == nil {
+		return nil
+	}
+	return budget.ChargePageFTS(1, saturatingFTSBytes(saturatingFTSBytesAdd(uint64(len(index))+2, suffix), 3))
+}
+
 // PageFTSPosting is one term/document frequency from a persistent FTS index.
 type PageFTSPosting struct{ DocumentID, Frequency, Length uint64 }
 
@@ -117,6 +137,13 @@ func (page *PageGraph) FTSIndexReady(index string) (bool, error) {
 }
 
 func (page *PageGraph) SetFTSIndexReady(index string, ready bool) error {
+	return page.SetFTSIndexReadyContext(context.Background(), index, ready)
+}
+
+func (page *PageGraph) SetFTSIndexReadyContext(ctx context.Context, index string, ready bool) error {
+	if err := chargeFTSWrite(ctx, index, 0, 1); err != nil {
+		return err
+	}
 	key := pageFTSIndexPrefix(index)
 	if !ready {
 		return page.Tx.Delete(pageFTSReady, key)
@@ -164,8 +191,15 @@ func (page *PageGraph) InvalidateFTSIndexNamespace(ctx context.Context, prefix s
 }
 
 func (page *PageGraph) FTSIndexStats(index string) (PageFTSStats, error) {
+	return page.ftsIndexStatsContext(context.Background(), index)
+}
+
+func (page *PageGraph) ftsIndexStatsContext(ctx context.Context, index string) (PageFTSStats, error) {
 	var stats PageFTSStats
-	data, err := page.Tx.Get(pageFTSStats, pageFTSIndexPrefix(index))
+	if err := chargeFTSReadKey(ctx, index, 0); err != nil {
+		return stats, err
+	}
+	data, err := page.getFTSMaintenanceValue(ctx, pageFTSStats, pageFTSIndexPrefix(index))
 	if err != nil || data == nil {
 		return stats, err
 	}
@@ -231,6 +265,9 @@ func (page *PageGraph) ftsDocumentTerms(index string, id uint64) (map[string]uin
 }
 
 func (page *PageGraph) ftsDocumentTermsWithBudget(ctx context.Context, index string, id uint64, budget FTSMaintenanceBudget) (map[string]uint64, uint64, error) {
+	if err := chargeFTSReadKey(ctx, index, 8); err != nil {
+		return nil, 0, err
+	}
 	data, err := page.getFTSMaintenanceValue(ctx, pageFTSDocuments, pageFTSDocumentKey(index, id))
 	if err != nil || data == nil {
 		return nil, 0, err
@@ -340,7 +377,7 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 			return err
 		}
 	}
-	stats, err := page.FTSIndexStats(index)
+	stats, err := page.ftsIndexStatsContext(ctx, index)
 	if err != nil {
 		return err
 	}
@@ -368,9 +405,12 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 			}
 		}
 		if oldTerms == nil || oldTerms[term] == 0 {
-			if err := page.changeFTSTermDocuments(index, term, 1); err != nil {
+			if err := page.changeFTSTermDocuments(ctx, index, term, 1); err != nil {
 				return err
 			}
+		}
+		if err := chargeFTSWrite(ctx, index, 40, 26); err != nil {
+			return err
 		}
 		value, err := encodePageRecord(11, func(e *binaryEncoder) { e.u(frequency); e.u(uint64(len(tokens))) })
 		if err != nil {
@@ -390,10 +430,13 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 					return err
 				}
 			}
+			if err := chargeFTSWrite(ctx, index, 40, 0); err != nil {
+				return err
+			}
 			if err := page.Tx.Delete(pageFTSPostings, pageFTSPostingKey(index, term, id)); err != nil {
 				return err
 			}
-			if err := page.changeFTSTermDocuments(index, term, -1); err != nil {
+			if err := page.changeFTSTermDocuments(ctx, index, term, -1); err != nil {
 				return err
 			}
 		}
@@ -409,10 +452,20 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 	}
 	stats.TotalLength = stats.TotalLength - oldLength + uint64(len(tokens))
 	if remove {
+		if err := chargeFTSWrite(ctx, index, 8, 0); err != nil {
+			return err
+		}
 		if err := page.Tx.Delete(pageFTSDocuments, pageFTSDocumentKey(index, id)); err != nil {
 			return err
 		}
 	} else {
+		valueBytes := uint64(26) // Header and two maximum-width counters.
+		for term := range newTerms {
+			valueBytes = saturatingFTSBytesAdd(valueBytes, uint64(len(term))+20)
+		}
+		if err := chargeFTSWrite(ctx, index, 8, valueBytes); err != nil {
+			return err
+		}
 		terms := make([]string, 0, len(newTerms))
 		for term := range newTerms {
 			terms = append(terms, term)
@@ -435,6 +488,9 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 		if err := page.Tx.Put(pageFTSDocuments, pageFTSDocumentKey(index, id), data); err != nil {
 			return err
 		}
+	}
+	if err := chargeFTSWrite(ctx, index, 0, 26); err != nil {
+		return err
 	}
 	statsData, err := encodePageRecord(10, func(e *binaryEncoder) { e.u(stats.Documents); e.u(stats.TotalLength) })
 	if err != nil {
@@ -569,9 +625,12 @@ func (page *PageGraph) DropFTSIndexWithCharge(ctx context.Context, index string,
 	return nil
 }
 
-func (page *PageGraph) changeFTSTermDocuments(index, term string, delta int64) error {
+func (page *PageGraph) changeFTSTermDocuments(ctx context.Context, index, term string, delta int64) error {
+	if err := chargeFTSReadKey(ctx, index, 32); err != nil {
+		return err
+	}
 	key := pageFTSTermPrefix(index, term)
-	data, err := page.Tx.Get(pageFTSTerms, key)
+	data, err := page.getFTSMaintenanceValue(ctx, pageFTSTerms, key)
 	if err != nil {
 		return err
 	}
@@ -581,13 +640,16 @@ func (page *PageGraph) changeFTSTermDocuments(index, term string, delta int64) e
 		if err != nil {
 			return err
 		}
+		if budget := FTSMaintenanceBudgetFromContext(ctx); budget != nil {
+			d.admitAllocation = func(bytes uint64) error { return budget.ChargePageFTS(0, saturatingFTSBytes(bytes, 2)) }
+		}
 		storedTerm := d.str()
 		count = d.u()
-		if storedTerm != term {
-			return errors.New("FTS vocabulary hash collision")
-		}
 		if err = d.finish(); err != nil {
 			return err
+		}
+		if storedTerm != term {
+			return errors.New("FTS vocabulary hash collision")
 		}
 	}
 	if delta < 0 {
@@ -602,7 +664,13 @@ func (page *PageGraph) changeFTSTermDocuments(index, term string, delta int64) e
 		count += uint64(delta)
 	}
 	if count == 0 {
+		if err := chargeFTSWrite(ctx, index, 32, 0); err != nil {
+			return err
+		}
 		return page.Tx.Delete(pageFTSTerms, key)
+	}
+	if err := chargeFTSWrite(ctx, index, 32, uint64(len(term))+26); err != nil {
+		return err
 	}
 	encoded, err := encodePageRecord(12, func(e *binaryEncoder) { e.str(term); e.u(count) })
 	if err != nil {
@@ -644,7 +712,7 @@ func (page *PageGraph) RebuildManualFTSIndexes(ctx context.Context) error {
 		return err
 	}
 	for _, name := range []string{PageFTSManualStandard, PageFTSManualPorter} {
-		if err := page.SetFTSIndexReady(name, true); err != nil {
+		if err := page.SetFTSIndexReadyContext(ctx, name, true); err != nil {
 			return err
 		}
 	}

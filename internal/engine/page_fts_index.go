@@ -421,7 +421,7 @@ func rebuildManualPageFTS(ctx context.Context, page *store.PageGraph, graph *sto
 	if err != nil {
 		return pageStorageOpenError(err)
 	}
-	return page.SetFTSIndexReady(index, true)
+	return page.SetFTSIndexReadyContext(ctx, index, true)
 }
 
 func rebuildDeclaredPageFTS(ctx context.Context, page *store.PageGraph, def FTSIndexDefinition, index string, budget *ftsIndexBudget) error {
@@ -447,7 +447,7 @@ func rebuildDeclaredPageFTS(ctx context.Context, page *store.PageGraph, def FTSI
 			return err
 		}
 	}
-	return page.SetFTSIndexReady(index, true)
+	return page.SetFTSIndexReadyContext(ctx, index, true)
 }
 
 func rebuildConfiguredPropertyPageFTS(ctx context.Context, page *store.PageGraph, _ *store.GraphState, property string, budget *ftsIndexBudget) error {
@@ -463,7 +463,7 @@ func rebuildConfiguredPropertyPageFTS(ctx context.Context, page *store.PageGraph
 	}); err != nil {
 		return err
 	}
-	return page.SetFTSIndexReady(index, true)
+	return page.SetFTSIndexReadyContext(ctx, index, true)
 }
 
 func indexConfiguredPropertyNode(ctx context.Context, page *store.PageGraph, property, index string, id uint64, budget *ftsIndexBudget) error {
