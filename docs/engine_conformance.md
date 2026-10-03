@@ -230,20 +230,20 @@ Structural keywords are uppercase. Bindings, property names, labels, relationshi
 <!-- BEGIN supported-cypher-grammar -->
 ```text
 query          = query-part {WITH with-clause query-part} [";"]
-query-part     = match-query | create-node-query | merge-query | unwind-query | RETURN return-tail
+query-part     = match-query | create-query | merge-query | unwind-query | RETURN return-tail
 with-clause    = [DISTINCT] projection {"," projection} [WHERE predicates]
                 [ORDER BY order {"," order}] [SKIP pagination] [LIMIT pagination]
-match-query    = MATCH patterns [WHERE predicates] [match-terminal]
+match-query    = MATCH patterns [WHERE predicates] {MATCH patterns [WHERE predicates]} [match-terminal]
 match-terminal = RETURN return-tail
                 | SET assignments [RETURN return-tail]
-                | CREATE edge-create [RETURN return-tail]
+                | CREATE create-pattern {"," create-pattern} [RETURN return-tail]
                 | MERGE merge-tail
                 | REMOVE removals [RETURN return-tail]
                 | [DETACH] DELETE bindings
-create-node-query
-                = CREATE node-pattern [RETURN return-tail]
+create-query   = CREATE create-pattern {"," create-pattern} [RETURN return-tail]
+create-pattern = node-pattern | node-pattern {relationship node-pattern}
 unwind-query   = UNWIND expression AS binding RETURN return-tail
-                | UNWIND expression AS binding CREATE node-pattern [RETURN return-tail]
+                | UNWIND expression AS binding CREATE create-pattern {"," create-pattern} [RETURN return-tail]
                 | UNWIND expression AS binding MERGE merge-tail
                 | UNWIND expression AS binding match-query
 merge-query    = MERGE merge-tail
@@ -268,7 +268,7 @@ properties     = "{" [property ":" expression {"," property ":" expression}] "}"
 predicates     = and-expression {OR and-expression}
 and-expression = not-expression {AND not-expression}
 not-expression = [NOT] ("(" predicates ")" | predicate)
-predicate      = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
+predicate      = expression ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
                 | property-access IN expression
                 | property-access (STARTS WITH | ENDS WITH | CONTAINS) expression
                 | id-access "=" expression
@@ -331,13 +331,13 @@ parameter      = "$" identifier
 ```
 <!-- END supported-cypher-grammar -->
 
-Fixed and variable-length `MATCH` paths may be incoming, outgoing, or undirected. Variable-length relationships accept `*`, `*n`, `*min..max`, `*..max`, and `*min..`; zero hops are valid. Only an unquoted `*` starts the hop range, so asterisks inside backtick-quoted relationship bindings and types remain part of those identifiers. A relationship may not repeat within one expansion, but nodes may repeat. Open upper bounds use the finite number of edges; work, row, byte, and context limits still apply. A bound variable-length relationship is a list of edges, including an empty list for zero hops. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH` and `UNION` remain unsupported. List literals accept nested expressions and bindings, including in `UNWIND`, `IN`, projections, and properties. Bytes and vectors remain available through parameters.
+Consecutive `MATCH` clauses may each add patterns and their own `WHERE` filter without a `WITH`. Fixed and variable-length `MATCH` paths may be incoming, outgoing, or undirected. Variable-length relationships accept `*`, `*n`, `*min..max`, `*..max`, and `*min..`; zero hops are valid. Only an unquoted `*` starts the hop range, so asterisks inside backtick-quoted relationship bindings and types remain part of those identifiers. A relationship may not repeat within one expansion, but nodes may repeat. Open upper bounds use the finite number of edges; work, row, byte, and context limits still apply. A bound variable-length relationship is a list of edges, including an empty list for zero hops. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH` and `UNION` remain unsupported. List literals accept nested expressions and bindings, including in `UNWIND`, `IN`, projections, and properties. Bytes and vectors remain available through parameters.
 
-Function calls are limited to the built-in helpers `id`, `labels`, `type`, `properties`, `size`, `head`, `last`, `tail`, `range`, `split`, `replace`, `substring`, `trim`, `toLower`, `toUpper`, `toInteger`, `toFloat`, `toString`, `abs`, and `coalesce`. Unknown names and wrong argument counts are rejected while the query is parsed. Calls may appear wherever a value expression is accepted, including `RETURN` projections, `SET` assignments, `CREATE` property maps, and the right side of a `WHERE` comparison. The left side of a comparison remains a property access, and `ORDER BY` on a computed projection is not supported.
+Function calls are limited to the built-in helpers `id`, `labels`, `type`, `properties`, `size`, `head`, `last`, `tail`, `range`, `split`, `replace`, `substring`, `trim`, `toLower`, `toUpper`, `toInteger`, `toFloat`, `toString`, `abs`, and `coalesce`. Unknown names and wrong argument counts are rejected while the query is parsed. Calls may appear wherever a value expression is accepted, including both sides of a `WHERE` comparison, `RETURN` projections, `SET` assignments, and `CREATE` property maps. Comparison operands may include nested function calls and arithmetic, and `ORDER BY` on a computed projection is not supported.
 
 `RETURN` projections also accept the aggregate calls `count`, `sum`, `avg`, `min`, `max`, and `collect`, with `count(*)` counting rows. Rows are grouped by the non-aggregate projections, so a projection list that mixes group keys and aggregates produces one row per distinct group. An aggregate-only projection list produces exactly one row even when the match found no rows. `count(expression)` is an aggregate projection; `count(*)` or `count(binding)` on its own keeps the dedicated single-column form. `ORDER BY` may reference a projected alias when aggregating, and every ordered expression must be projected. All six aggregates accept `DISTINCT expression`. Deduplication is per aggregate and per group, using Go query value equality (including nested values and equivalent numeric types). `DISTINCT *` is invalid; normal NULL handling is unchanged.
 
-`WITH` separates a query into parts. It takes the same projection list as `RETURN` plus an optional inline `WHERE`, and optional `ORDER BY`, `SKIP`, and `LIMIT` that apply to its own output before the next part runs. A following `CREATE` or `MERGE` runs once per retained row, including zero times for an empty input. Unaliased `count(*)` does not export its display label. Only the projected names reach the following part: the name is the `AS` alias, or the binding name when the item is a plain binding, and nothing otherwise. Referencing a binding that was not projected is an error, a projected name carries the role it had in the source part, and duplicate names inside one `WITH` are rejected. `WITH` items may aggregate, with the same grouping rules as `RETURN`. `ORDER BY` after `WITH` may name a projected alias, which sorts by the projected value, or a property of a retained binding. Every `WITH` must be followed by another part; a query may not end with `WITH`, and a `WITH` filter uses the same predicate grammar as `WHERE`, so its left side is a property access. `count` may appear inside a multi-item projection list, where it behaves as an aggregate projection.
+`WITH` separates a query into parts. It takes the same projection list as `RETURN` plus an optional inline `WHERE`, and optional `ORDER BY`, `SKIP`, and `LIMIT` that apply to its own output before the next part runs. A following `CREATE` or `MERGE` runs once per retained row, including zero times for an empty input. Unaliased `count(*)` does not export its display label. Only the projected names reach the following part: the name is the `AS` alias, or the binding name when the item is a plain binding, and nothing otherwise. Referencing a binding that was not projected is an error, a projected name carries the role it had in the source part, and duplicate names inside one `WITH` are rejected. `WITH` items may aggregate, with the same grouping rules as `RETURN`. `ORDER BY` after `WITH` may name a projected alias, which sorts by the projected value, or a property of a retained binding. Every `WITH` must be followed by another part; a query may not end with `WITH`, and a `WITH` filter uses the same predicate grammar as `WHERE`, which accepts the same comparison predicate forms as `WHERE`. `count` may appear inside a multi-item projection list, where it behaves as an aggregate projection.
 
 An undirected relationship produces one row per matching orientation. A non-self edge can therefore produce two rows when both endpoints are unbound; a self-loop produces one.
 

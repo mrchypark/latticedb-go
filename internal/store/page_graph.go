@@ -24,8 +24,9 @@ const (
 // PageGraph is scoped to one storage transaction. It never caches the graph;
 // returned records own their data and scans decode one record at a time.
 type PageGraph struct {
-	Tx             *pagestore.Tx
-	MaxRecordBytes uint64
+	Tx                   *pagestore.Tx
+	MaxRecordBytes       uint64
+	SearchIndexesCurrent bool
 }
 
 func pageID(id uint64) []byte { var key [8]byte; binary.BigEndian.PutUint64(key[:], id); return key[:] }

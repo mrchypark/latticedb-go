@@ -1,6 +1,8 @@
 package latticedb
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -13,6 +15,9 @@ func TestQueryFeatureGoalsTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Query(`MATCH (a:Person) WHERE b.x = 1 MATCH (b) RETURN a`, nil); err == nil {
+		t.Fatal("WHERE accepted a binding introduced by a later MATCH")
+	}
 	if _, err := db.Query("MERGE (a:Goal {key: 1})-[:NEXT]->(b:Goal {key: 2})", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -37,5 +42,56 @@ func TestQueryFeatureGoalsTogether(t *testing.T) {
 	result, err = db.Query("RETURN (2 + 3) * 4 AS value", nil)
 	if err != nil || result.Rows[0]["value"] != int64(20) {
 		t.Fatalf("standalone RETURN: %#v, %v", result.Rows, err)
+	}
+}
+
+func TestQueryCreatePathsSequentialMatchAndExpressionPredicate(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "query-create-paths.ltdb"), OpenOptions{Create: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Query(`CREATE (a:Person {name: 'Ada', rank: 5})-[:KNOWS]->(b:Person {name: 'Bob'}), (team:Team {name: 'Ops'})`, nil); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Query(`MATCH (a:Person) WHERE abs(toInteger(a.rank) + 1) = abs(toInteger(2) * toInteger(3)) MATCH (a)-[:KNOWS]->(b:Person) WHERE toLower(b.name) = toLower('Bob') RETURN b.name AS name`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["name"] != "Bob" {
+		t.Fatalf("sequential MATCH/separate expression predicates: %#v, %v", result.Rows, err)
+	}
+
+	if _, err := db.QueryContext(context.Background(), `MATCH (a:Person {name: 'Ada'}) CREATE (a)-[:KNOWS]->(c:Person {name: $name})`, map[string]any{"name": "Cara"}, QueryOptions{}); err != nil {
+		t.Fatalf("CREATE with existing binding and parameter: %v", err)
+	}
+	result, err = db.Query(`MATCH (a:Person {name: 'Ada'})-[:KNOWS]->(c:Person {name: 'Cara'}) RETURN a.name AS from, c.name AS to`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["from"] != "Ada" || result.Rows[0]["to"] != "Cara" {
+		t.Fatalf("CREATE existing node binding: %#v, %v", result.Rows, err)
+	}
+
+	if _, err := db.Query(`CREATE (x:Rollback {value: 1}), (y:Rollback {value: toLower(1)})`, nil); err == nil {
+		t.Fatal("later CREATE expression error unexpectedly succeeded")
+	}
+	if _, err := db.Query(`CREATE (repeated:Repeated)-[:R]->(repeated {x: 1})`, nil); err == nil {
+		t.Fatal("repeated CREATE node silently discarded its property constraint")
+	}
+	result, err = db.Query(`MATCH (n:Rollback) RETURN count(n) AS count`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("later CREATE error rollback: %#v, %v", result.Rows, err)
+	}
+
+	if _, err := db.QueryContext(context.Background(), `CREATE (x:Rollback {value: 1})-[:LINK]->(y:Rollback)`, nil, QueryOptions{MaxWork: 2}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("limited CREATE error = %v, want resource limit", err)
+	}
+	result, err = db.Query(`MATCH (n:Rollback) RETURN count(n) AS count`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("failed CREATE rollback: %#v, %v", result.Rows, err)
+	}
+
+	if _, err := db.QueryContext(context.Background(), `UNWIND [1, 2] AS i CREATE (n:Limited {i: i})`, nil, QueryOptions{MaxRows: 1}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("limited row count error = %v, want resource limit", err)
+	}
+	result, err = db.Query(`MATCH (n:Limited) RETURN count(n) AS count`, nil)
+	if err != nil || result.Rows[0]["count"] != int64(0) {
+		t.Fatalf("limited rows rollback: %#v, %v", result.Rows, err)
 	}
 }

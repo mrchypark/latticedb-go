@@ -20,7 +20,7 @@ const (
 )
 
 // FTSAnalyzer selects direct FTSSearch analysis. Standard preserves the
-// stored-token behavior; EnglishPorter is an explicit scan fallback.
+// stored-token behavior; EnglishPorter uses maintained Porter postings.
 type FTSAnalyzer uint8
 
 const (
@@ -44,9 +44,7 @@ func validateFTSSearchScoring(opts FTSSearchOptions) error {
 }
 
 func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSearchOptions) ([]FTSSearchResult, error) {
-	// BM25 needs live corpus statistics. Porter has no maintained analyzed
-	// postings, so both are bounded scan paths. Add persisted analyzed postings
-	// only when measurement demonstrates this ceiling is insufficient.
+	// Unready legacy indexes and non-page stores use the bounded corpus path.
 	limit := uint64(opts.Limit)
 	if limit == 0 {
 		limit = 10
@@ -57,6 +55,19 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 	}
 	if err := budget.add(uint64(len(query))); err != nil {
 		return nil, err
+	}
+	var indexedResults []FTSSearchResult
+	var indexed bool
+	err = db.View(func(tx *Tx) error {
+		var err error
+		indexedResults, indexed, err = db.pageIndexedFTSSearch(ctx, tx.graph, query, opts, budget)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if indexed {
+		return indexedResults, nil
 	}
 	terms, termBytes, err := ftsAnalyzeQuery(ctx, query, opts.Analyzer, budget)
 	if err != nil {

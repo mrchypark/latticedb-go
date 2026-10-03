@@ -66,9 +66,11 @@ const (
 type OpenOptions struct {
 	Create   bool
 	ReadOnly bool
-	// CacheSizeMB is reserved for source compatibility. Nonzero values are unsupported and return ErrUnsupportedOption.
+	// CacheSizeMB bounds the optional page-record cache in MiB. Zero disables it.
+	// This logical bound excludes the operating system mmap cache and caller copies.
 	CacheSizeMB uint32
-	// PageSize is reserved for source compatibility. Nonzero values are unsupported and return ErrUnsupportedOption.
+	// PageSize selects a power of two from 1024 to 65536 for new disk databases.
+	// Zero uses the native default. Existing databases must match a nonzero request.
 	PageSize uint32
 	// EnableWAL is reserved for compatibility; true is unsupported because WAL is always enabled. Leave false (the default).
 	EnableWAL bool
@@ -85,7 +87,7 @@ type OpenOptions struct {
 	VectorDimensions uint16
 	VectorNamespaces []VectorNamespace
 	// FTSProperties configures complete top-level node-string property postings
-	// for this open in the legacy engine; page-backed queries scan records.
+	// for this open. Disk databases persist these derived postings.
 	// It is separate from manual FTS indexing.
 	FTSProperties []string
 	Durability    DurabilityMode

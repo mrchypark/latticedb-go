@@ -36,7 +36,10 @@ global dimension setting: a namespace descriptor with `Dimensions: 0`
 normalizes to that global dimension, while a nonzero value must match it.
 `VectorNamespaces` configures derived indexes for that open; namespace
 definitions are not persisted in snapshots. Callers must resupply the same
-descriptors when reopening, coordinated with the persistence work in #48.
+descriptors when reopening. Disk databases persist derived HNSW records, but
+serialized graph snapshots contain source data rather than HNSW state.
+A writable HNSW open builds missing or stale configured indexes; a read-only
+HNSW open requires compatible current records.
 
 The descriptor must match a configured property and label scope exactly,
 including dimensions and metric. An explicit namespace still requires at most
@@ -73,7 +76,8 @@ Run the benchmark after the namespace implementation is stable:
 go test ./internal/engine -run '^$' -bench '^BenchmarkVectorNamespaceSearch10K$' -benchmem -benchtime=3x -count=3
 ```
 
-Candidate medians from darwin/arm64, Apple M3:
+Historical medians from the earlier resident implementation on darwin/arm64,
+Apple M3; these measurements do not validate the new page-backed implementation:
 
 | Case | Pool nodes | Time/op | Heap B/op | Allocs/op |
 | --- | ---: | ---: | ---: | ---: |

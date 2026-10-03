@@ -1,6 +1,6 @@
 # Page-backed storage status and completion criteria
 
-Public `Open` and `OpenContext` select the bbolt page backend. Graph records
+Disk-backed `Open` and `OpenContext` select the bbolt page backend. Graph records
 and postings are read on demand, so total database size can exceed RAM. The
 legacy resident engine remains an internal migration and testing helper.
 
@@ -21,8 +21,12 @@ PageCommit applies records and their derived entries, catalog history, and the
 archive outbox in one bbolt write transaction. A bbolt commit publishes them
 atomically. Property-index lookup streams ordered posting IDs and checks each
 candidate against its actual record, preserving exact results when hashed keys
-collide. Existing exact search paths can scan page records; no new search
-features or page-backed HNSW implementation is included.
+collide. Exact vector search scans page records. HNSW nodes and full-text postings are
+persisted and accessed on demand. Derived search state is tied to the source
+commit history; mutations publish canonical records and derived changes in the
+same native write transaction. Writable opens rebuild stale indexes within
+configured work and byte budgets. Read-only full-text search can fall back to
+a bounded scan; read-only HNSW requires a current compatible index.
 
 An older v5 state/WAL database is migrated to a staged `state.json.pages`
 sidecar, then the staged file is published after import and validation. The
@@ -82,4 +86,17 @@ for their returned values. Use streamed snapshots/exports for large databases.
 `MaxDatabaseSnapshotBytes=0` does not cap total database size. An explicit value
 is checked at open and commit. Query/search budgets remain logical work and
 allocation limits. bbolt reuses freed pages but `Checkpoint` does not shrink
-the file. Search optimization and page-backed HNSW remain deferred.
+the file. `Compact` rewrites live pages and returns unused space to the filesystem.
+Close transactions, snapshots, and export leases before compaction. `Compact`
+rejects an occupied writer slot; `CompactContext` waits until cancellation. Both
+require a writable database with path locking enabled. The operation preserves
+commit history and backup ancestry. Publication failures can require close and
+reopen before further work. Cancellation is checked before publication; copying
+need not stop immediately. Publication and reopening then finish without cancellation.
+Windows retains its existing platform durability limits; directory sync is not
+advertised there.
+
+Search index builds and rebuilds are bounded maintenance operations. Large
+builds can return `ErrResourceLimit`; page-backed storage does not promise an
+unbounded single transaction or constant-memory index construction. The earlier
+constrained-memory run above did not include the new search implementations.

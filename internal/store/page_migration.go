@@ -24,19 +24,24 @@ const pageMigrationBufferedBytes = 8 << 20
 // ImportPageCheckpoint streams one binary v5 checkpoint into a privately
 // staged page database and publishes it at pagePath only after validation.
 func ImportPageCheckpoint(ctx context.Context, input io.Reader, pagePath string) error {
-	return importPageFiles(ctx, input, nil, pagePath, 0, 0, false, false, false, nil, nil, nil, false)
+	return importPageFiles(ctx, input, nil, pagePath, 0, 0, false, false, false, nil, nil, nil, false, 0)
 }
 
 // ImportPageCheckpointWithWAL is the shared streaming importer used by restore
 // and native-store migration. maxBytes, when nonzero, bounds total checkpoint
 // plus WAL input bytes. expectedCommitID, when nonzero, must match the result.
 func ImportPageCheckpointWithWAL(ctx context.Context, input io.Reader, segments []string, pagePath string, expectedCommitID, maxBytes uint64) error {
-	return importPageFiles(ctx, input, segments, pagePath, expectedCommitID, maxBytes, true, expectedCommitID != 0, false, nil, nil, nil, false)
+	return importPageFiles(ctx, input, segments, pagePath, expectedCommitID, maxBytes, true, expectedCommitID != 0, false, nil, nil, nil, false, 0)
 }
 
 // MigrateToPages copies the current native checkpoint and its WAL prefix into
 // a new page database. The source files are opened read-only and left intact.
 func MigrateToPages(ctx context.Context, files DatabaseFiles, pagePath string, limits ...RecoveryLimits) error {
+	return MigrateToPagesWithPageSize(ctx, files, pagePath, 0, limits...)
+}
+
+// MigrateToPagesWithPageSize applies the requested page size before staging or publication.
+func MigrateToPagesWithPageSize(ctx context.Context, files DatabaseFiles, pagePath string, pageSize int, limits ...RecoveryLimits) error {
 	if len(limits) > 1 {
 		return errors.New("migration accepts at most one recovery limit set")
 	}
@@ -71,7 +76,7 @@ func MigrateToPages(ctx context.Context, files DatabaseFiles, pagePath string, l
 	if files.IDs != "" {
 		reservation = &files
 	}
-	return importPageFiles(ctx, checkpoint, segments, pagePath, 0, 0, true, false, false, reservation, nil, recovery, bootstrap)
+	return importPageFiles(ctx, checkpoint, segments, pagePath, 0, 0, true, false, false, reservation, nil, recovery, bootstrap, pageSize)
 }
 
 // RestorePageBackup installs a checkpoint and ordered WAL segments using the
@@ -86,10 +91,10 @@ func RestorePageBackup(ctx context.Context, basePath string, segments []string, 
 		return fmt.Errorf("open backup checkpoint: %w", err)
 	}
 	defer base.Close()
-	return importPageFiles(ctx, base, segments, pagePath, commitID, maxBytes, true, true, true, nil, histories, nil, false)
+	return importPageFiles(ctx, base, segments, pagePath, commitID, maxBytes, true, true, true, nil, histories, nil, false, 0)
 }
 
-func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []string, target string, expectedCommitID, maxBytes uint64, replay, verifyCommit, strictReplay bool, reservation *DatabaseFiles, histories [][32]byte, recovery *recoveryBudget, bootstrap bool) (result error) {
+func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []string, target string, expectedCommitID, maxBytes uint64, replay, verifyCommit, strictReplay bool, reservation *DatabaseFiles, histories [][32]byte, recovery *recoveryBudget, bootstrap bool, pageSize int) (result error) {
 	if ctx == nil {
 		return errors.New("nil page import context")
 	}
@@ -137,7 +142,7 @@ func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []strin
 	defer func() {
 		_ = os.Remove(stagePath)
 	}()
-	db, err := pagestore.Open(stagePath, pagestore.Options{})
+	db, err := pagestore.Open(stagePath, pagestore.Options{PageSize: pageSize})
 	if err != nil {
 		return err
 	}
@@ -396,7 +401,7 @@ func (p *pageImporter) clear() error {
 	if err := p.closeBatch(); err != nil {
 		return err
 	}
-	buckets := []string{"nodes", "edges", "outgoing", "incoming", "edge-types", "edge-order", "labels", "counts", "fts", "metadata", pageNodePropertyIndexes, pageEdgePropertyIndexes, pageNodePropertyPostings, pageEdgePropertyPostings, pageStreamCatalog, pageStreamRecords, pageStreamOffsets, "archive-outbox", "commit-history", pageCatalogBucket}
+	buckets := []string{"nodes", "edges", "outgoing", "incoming", "edge-types", "edge-order", "labels", "counts", "fts", "metadata", pageNodePropertyIndexes, pageEdgePropertyIndexes, pageNodePropertyPostings, pageEdgePropertyPostings, pageStreamCatalog, pageStreamRecords, pageStreamOffsets, "archive-outbox", "commit-history", pageCatalogBucket, pageVectorBucket, pageFTSPostings, pageFTSDocuments, pageFTSStats, pageFTSReady, pageFTSTerms, "search-generation"}
 	for _, bucket := range buckets {
 		for {
 			rtx, err := p.db.Begin(false)

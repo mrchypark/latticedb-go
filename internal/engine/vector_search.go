@@ -34,6 +34,29 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 	}
 	queryVector := vector
 	capacity := limit
+	if graph.PageBase != nil && graph.Nodes.Len() == 0 && graph.DeletedNodes.Len() == 0 && !opts.Exact && !disableIndex {
+		if !graph.PageBase.SearchIndexesCurrent {
+			return nil, false, ErrVectorIndexMaintenanceRequired
+		}
+		pageIndex := store.PageVectorIndex{Tx: graph.PageBase.Tx, Namespace: pageVectorNamespaceKey(graph.VectorNamespace)}
+		hasIndex, err := pageIndex.HasMeta()
+		if err != nil {
+			return nil, false, err
+		}
+		if !hasIndex {
+			return nil, false, fmt.Errorf("%w: page HNSW index is missing", ErrVectorIndexMaintenanceRequired)
+		}
+		ef := int(opts.EfSearch)
+		if ef == 0 {
+			ef = vectorIndexSearchEF
+		}
+		ef = max(ef, int(limit))
+		pageResults, err := pageVectorSearch(budget.ctx, pageIndex, queryVector, int(limit), ef, configuredVectorIndexM(graph), budget)
+		if err != nil {
+			return nil, false, err
+		}
+		return pageResults, false, nil
+	}
 	exactFallbackUsed := graph.PageBase != nil && !opts.Exact && !disableIndex
 	if graph.PageBase == nil && !opts.Exact && !disableIndex && graph.VectorIndex.Nodes.Len() > 0 {
 		capacity = min(limit, graph.VectorLiveCount)

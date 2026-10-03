@@ -61,7 +61,7 @@ func main() {
 - Pure Go on Linux, macOS, and Windows
 - ACID write transactions with crash recovery and page checkpoints
 - Transaction-scoped queries and binary-safe application metadata
-- Property indexes, full-text search, and exact or HNSW vector search; page-backed opens preserve exact results, while HNSW is not page-backed
+- Property indexes, persistent full-text postings, and exact or page-backed HNSW vector search
 - Online frozen-generation backups through `BeginSnapshot` and opt-in per-commit backup archives
 - JSON, JSONL, CSV, and DOT export
 - Context cancellation and row, work, and logical-byte budgets
@@ -108,7 +108,7 @@ Important boundaries:
 - On mutation queries, `SKIP` and `LIMIT` restrict returned rows, not writes. With `RETURN DISTINCT`, every `ORDER BY` expression must also be projected.
 - An undirected match can return both orientations of an edge; a self-loop returns one. Use explicit `ORDER BY` when application behavior depends on result order.
 
-Query search predicates score candidate rows and sort matches before `LIMIT`. Configured `FTSProperties` can accelerate eligible `@@` predicates; `ApproximateVector` opts eligible queries into HNSW candidates. See [query search candidates](docs/query-search-candidates.md) for exact defaults and fallback rules. Direct `VectorSearch` supports the global vector space and [configured namespaces](docs/vector-namespaces.md); direct `FTSSearch` uses explicitly indexed node text. HNSW is a validated, disposable in-memory cache; page-backed opens currently preserve exact vector results by scanning records and do not persist HNSW state.
+Query search predicates score candidate rows and sort matches before `LIMIT`. Configured `FTSProperties` can accelerate eligible `@@` predicates; `ApproximateVector` opts eligible queries into HNSW candidates. See [query search candidates](docs/query-search-candidates.md) for exact defaults and fallback rules. Direct `VectorSearch` supports the global vector space and [configured namespaces](docs/vector-namespaces.md); direct `FTSSearch` uses explicitly indexed node text. Disk databases persist HNSW nodes and read neighbors on demand. Search indexes are derived data tied to the source commit history; writable opens rebuild stale indexes within configured budgets. A read-only HNSW open requires a current index. Exact vector search remains available without HNSW.
 
 Direct full-text search can opt into BM25 and English stemming without changing
 existing frequency ranking or query `@@` semantics:
@@ -122,10 +122,26 @@ hits, err := db.FTSSearch("running", latticedb.FTSSearchOptions{
 ```
 
 BM25 uses `k1=1.2`, `b=0.75`, and all explicitly indexed text as its corpus.
-It scans the corpus for statistics; stemming analyzes original text on demand.
+Disk databases maintain manual-text postings and corpus statistics for standard and Porter analysis. Named indexes select a node label or edge type and a text property; named Porter search uses a bounded scan.
 Use `FTSSearchContext` and work/byte limits for large corpora. HNSW construction
 accepts `OpenOptions.VectorM` in `2..64` (zero selects 16); larger values increase
-index memory and construction work. Changing M rebuilds the disposable cache.
+index memory and construction work. Changing M rebuilds the derived index.
+
+Named full-text indexes select a label or edge type and one text property:
+
+```go
+err = db.CreateFTSIndex(latticedb.FTSIndexDefinition{
+    Name: "article_body", Kind: latticedb.FTSIndexNode,
+    Scope: "Article", Property: "body",
+})
+articleHits, err := db.FTSSearchIndex("article_body", "database", latticedb.FTSSearchOptions{
+    Limit: 10, Scoring: latticedb.FTSScoringBM25,
+})
+```
+
+Use `FTSIndexEdge` to index a relationship type. Definitions survive serialization
+and incremental backup, including commits that change only the schema. Use
+`Tx.CreateFTSIndex` or `Tx.DropFTSIndex` to combine schema and data changes.
 
 Use parameters for application values and explicit aliases for result columns. Queries default to 1,000,000 rows, 10,000,000 work units, and 64 MiB of live logical bytes. Use `QueryContext` with a deadline and explicit `QueryOptions` limits for your workload; logical byte budgets do not measure process RSS. Query text is limited to 32 KiB.
 
@@ -135,6 +151,11 @@ See the [query semantics and full grammar](docs/engine_conformance.md#query-sema
 
 ### Opening and sizing
 
+`Open(":memory:", opts)` and `Deserialize` keep the database in memory without
+creating a WAL, lock file, or temporary database. Explicit snapshot backup can
+write a chosen destination. Automatic `BackupDirectory` archives and nonstandard
+durability modes are rejected for memory databases.
+
 - The database uses one active writer. `BeginWriteContext` waits for the writer slot until cancellation; `Begin(false)` and `Update` can return `ErrWriteTxActive` on contention.
 - Opt-in `Batch`/`BatchContext` groups concurrent callbacks into one durable transaction. Peer failure rolls back the group; see the [group commit contract](docs/group-commit.md).
 - `MaxDatabaseSnapshotBytes`, when nonzero, limits canonical snapshot bytes at open and commit. Zero leaves total page-backed database size unlimited. This option does not bound process RSS.
@@ -143,10 +164,10 @@ See the [query semantics and full grammar](docs/engine_conformance.md#query-sema
   `MaxInt64+1` is reserved as the high-water exhaustion sentinel and is never
   allocated.
 - The legacy native-engine options `OpenOptions.EnableWAL`, `DisableWAL`, and `EnableAdjacencyCache` must remain false (their default); true requests return `ErrUnsupportedOption`. Public page-backed commits use atomic bbolt transactions.
-- `OpenOptions.CacheSizeMB` and `PageSize` are compatibility fields only. They must remain zero (their default); every nonzero request, including former `100` and `4096` values, returns `ErrUnsupportedOption`.
-- Public `Open` always uses the page backend. A new directory database stores bbolt pages in `state.json`. A legacy v5 state/WAL database is imported into a staged `state.json.pages` sidecar while preserving its source files; a read-only open without that sidecar imports to a private temporary directory. The v5 state/WAL formats remain migration and interchange formats, not the normal page-backed runtime. See [storage format and legacy limits](docs/binary-storage.md).
-- Page-backed storage persists graph records, label/type/adjacency postings, equality property postings, stream records, and consumer offsets in bbolt. Existing exact search paths scan pages as needed. HNSW page storage and new search work remain pending. Application metadata is persisted but is still loaded into the in-memory graph catalog.
-- Page storage currently runs on Linux, macOS, and Windows. AIX and Solaris cross-compilation is checked; runtime validation on those systems is not yet available. JS/WASI and Plan 9 compile through an explicit unsupported stub; opening a database there returns an unsupported-platform error.
+- `OpenOptions.CacheSizeMB` enables a bounded read-record cache in MiB; zero disables it. The limit covers logical cached records and does not include the OS page cache, caller-owned results, or total process RSS. `PageSize` accepts powers of two from 1024 through 65536 for new files and legacy migration. Zero uses the native default or stored size; a nonzero value must match an existing file.
+- Disk-backed `Open` uses the page backend. A new directory database stores bbolt pages in `state.json`. A legacy v5 state/WAL database is imported into a staged `state.json.pages` sidecar while preserving its source files; a read-only open without that sidecar imports to a private temporary directory. The v5 state/WAL formats remain migration and interchange formats, not the normal page-backed runtime. See [storage format and legacy limits](docs/binary-storage.md).
+- Page-backed storage persists graph records, label/type/adjacency postings, equality property postings, stream records, and consumer offsets in bbolt. Exact search scans pages as needed; HNSW nodes and full-text postings are also stored in page buckets. Application metadata is persisted but is still loaded into the in-memory graph catalog.
+- Page storage currently runs on Linux, macOS, and Windows. AIX and Solaris cross-compilation is checked; runtime validation on those systems is not yet available. JS/WASI and Plan 9 compile through an explicit unsupported stub; opening a disk-backed database there returns an unsupported-platform error.
 
 ### Continuous backup and restore
 
@@ -178,10 +199,15 @@ See the [archive storage contract](docs/binary-storage.md#opt-in-backup-archive)
 The page backend passed creation, indexing, reopen, updates, deletion, backup,
 streaming migration, and incremental restore for a 1.42 GB database under a
 256 MiB memory cap with swap disabled. Individual transactions and resident
-metadata/catalogs still need to fit in RAM. HNSW remains deferred. See
+metadata/catalogs still need to fit in RAM. This earlier measurement does not cover the new search indexes. See
 [page storage and constrained-memory evidence](docs/disk-storage.md).
 
 ### Transactions, snapshots, and maintenance
+
+`Compact` reclaims unused file space after readers, snapshots, and exports close.
+It requires a writable database with path locking. `CompactContext` waits for
+the writer slot and checks cancellation before file publication. The copy phase
+can delay cancellation; publication and reopening then finish together.
 
 - A `Tx` is single-owner and must not be used concurrently.
 - `Commit` and `CommitContext` are one-shot: the transaction becomes inactive whether the commit succeeds or fails.

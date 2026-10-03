@@ -31,6 +31,9 @@ func (page *PageGraph) PutFTSContext(ctx context.Context, id uint64, record *FTS
 		if old == nil {
 			return nil
 		}
+		if err := page.indexManualFTSDocument(ctx, id, nil); err != nil {
+			return err
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -62,12 +65,41 @@ func (page *PageGraph) PutFTSContext(ctx context.Context, id uint64, record *FTS
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := page.indexManualFTSDocument(ctx, id, record); err != nil {
+		return err
+	}
 	if old == nil {
 		if err := page.changeCount("fts", true); err != nil {
 			return err
 		}
 	}
 	return page.Tx.Put("fts", pageID(id), data)
+}
+
+func (page *PageGraph) indexManualFTSDocument(ctx context.Context, id uint64, record *FTSRecord) error {
+	for _, index := range []struct {
+		name   string
+		tokens []string
+	}{{PageFTSManualStandard, nil}, {PageFTSManualPorter, nil}} {
+		if record == nil {
+			if err := page.DeleteFTSDocument(ctx, index.name, id); err != nil {
+				return err
+			}
+			continue
+		}
+		tokens := record.Tokens
+		if index.name == PageFTSManualPorter {
+			var err error
+			tokens, err = search.AnalyzeEnglishPorterContextWithLimit(ctx, record.Text, page.recordLimit())
+			if err != nil {
+				return err
+			}
+		}
+		if err := page.ReplaceFTSDocument(ctx, index.name, id, tokens); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // TokenizeFTSContext applies both the caller's indexing budget and this page

@@ -1,7 +1,9 @@
 package latticedb
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 
 	"github.com/mrchypark/latticedb-go/internal/engine"
 )
@@ -66,12 +68,18 @@ func (tx *Tx) PutAppMetadata(key, value []byte) error {
 	if err := tx.requireInner(); err != nil {
 		return err
 	}
+	if bytes.HasPrefix(key, []byte("latticedb:fts-index:")) {
+		return wrapError(fmt.Errorf("%w: reserved FTS index metadata key", ErrInvalidArgument))
+	}
 	return wrapError(tx.inner.PutAppMetadata(key, value))
 }
 
 func (tx *Tx) DeleteAppMetadata(key []byte) error {
 	if err := tx.requireInner(); err != nil {
 		return err
+	}
+	if bytes.HasPrefix(key, []byte("latticedb:fts-index:")) {
+		return wrapError(fmt.Errorf("%w: reserved FTS index metadata key", ErrInvalidArgument))
 	}
 	return wrapError(tx.inner.DeleteAppMetadata(key))
 }

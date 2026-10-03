@@ -308,7 +308,7 @@ func loadVectorCache(ctx context.Context, files store.DatabaseFiles, graph *stor
 }
 
 func (db *DB) saveVectorCache(ctx context.Context, graph *store.GraphState, commitID uint64) {
-	if db.readOnly || db.temporary || db.disableVectorIndex || graph.VectorDimensions == 0 {
+	if db.memory || db.readOnly || db.temporary || db.disableVectorIndex || graph.VectorDimensions == 0 {
 		return
 	}
 	// Cache failures must never turn a successful canonical checkpoint into an error.

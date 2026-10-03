@@ -1,18 +1,18 @@
 query          = query-part {WITH with-clause query-part} [";"]
-query-part     = match-query | create-node-query | merge-query | unwind-query | RETURN return-tail
+query-part     = match-query | create-query | merge-query | unwind-query | RETURN return-tail
 with-clause    = [DISTINCT] projection {"," projection} [WHERE predicates]
                 [ORDER BY order {"," order}] [SKIP pagination] [LIMIT pagination]
-match-query    = MATCH patterns [WHERE predicates] [match-terminal]
+match-query    = MATCH patterns [WHERE predicates] {MATCH patterns [WHERE predicates]} [match-terminal]
 match-terminal = RETURN return-tail
                 | SET assignments [RETURN return-tail]
-                | CREATE edge-create [RETURN return-tail]
+                | CREATE create-pattern {"," create-pattern} [RETURN return-tail]
                 | MERGE merge-tail
                 | REMOVE removals [RETURN return-tail]
                 | [DETACH] DELETE bindings
-create-node-query
-                = CREATE node-pattern [RETURN return-tail]
+create-query   = CREATE create-pattern {"," create-pattern} [RETURN return-tail]
+create-pattern = node-pattern | node-pattern {relationship node-pattern}
 unwind-query   = UNWIND expression AS binding RETURN return-tail
-                | UNWIND expression AS binding CREATE node-pattern [RETURN return-tail]
+                | UNWIND expression AS binding CREATE create-pattern {"," create-pattern} [RETURN return-tail]
                 | UNWIND expression AS binding MERGE merge-tail
                 | UNWIND expression AS binding match-query
 merge-query    = MERGE merge-tail
@@ -37,7 +37,7 @@ properties     = "{" [property ":" expression {"," property ":" expression}] "}"
 predicates     = and-expression {OR and-expression}
 and-expression = not-expression {AND not-expression}
 not-expression = [NOT] ("(" predicates ")" | predicate)
-predicate      = property-access ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
+predicate      = expression ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
                 | property-access IN expression
                 | property-access (STARTS WITH | ENDS WITH | CONTAINS) expression
                 | id-access "=" expression

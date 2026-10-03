@@ -256,6 +256,88 @@ func TestFTSCandidateSkipsWidePostingsForNarrowLabel(t *testing.T) {
 	}
 }
 
+func TestPageQueryUsesOnlyCurrentScopedFTSIndex(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "page-fts-candidate"), OpenOptions{
+		Create: true, PageStorage: true, FTSProperties: []string{"text"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var matchID uint64
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 300; i++ {
+			text := "ordinary"
+			if i == 173 {
+				text = "needle"
+			}
+			node, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Person"}, Properties: map[string]any{"text": text}})
+			if err != nil {
+				return err
+			}
+			if i == 173 {
+				matchID = node.ID
+			}
+		}
+		return tx.CreateFTSIndex(FTSIndexDefinition{Name: "person-text", Kind: FTSIndexNode, Scope: "Person", Property: "text"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query := `MATCH (n:Person) WHERE n.text @@ 'needle' RETURN id(n) AS id`
+	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 500, MaxBytes: 1024})
+	if err != nil || len(result.Rows) != 1 || result.Rows[0]["id"] != int64(matchID) {
+		t.Fatalf("scoped page FTS rows=%v err=%v", result.Rows, err)
+	}
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.graph.PageBase.SearchIndexesCurrent = false
+	_, err = tx.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 500, MaxBytes: 1024})
+	_ = tx.Rollback()
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("stale page FTS query error=%v, want exact scan resource limit", err)
+	}
+}
+
+func TestPageApproximateVectorCandidateUsesPagedIndex(t *testing.T) {
+	namespace := VectorNamespace{Property: "embedding", Scope: "Group", Dimensions: 2, Metric: VectorMetricL2}
+	db, err := Open(filepath.Join(t.TempDir(), "page-vector-candidate"), OpenOptions{
+		Create: true, PageStorage: true, EnableVector: true, VectorDimensions: 2,
+		VectorIndexMode: VectorIndexHNSWSynchronous, VectorNamespaces: []VectorNamespace{namespace},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < 30; i++ {
+			if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Group"}, Properties: map[string]any{
+				"embedding": []float32{float32(i + 1), 0},
+			}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query := `MATCH (n:Group) WHERE n.embedding <=> $v RETURN n LIMIT 3`
+	params := map[string]any{"v": []float32{0, 0}}
+	result, err := db.QueryContext(t.Context(), query, params, QueryOptions{
+		MaxWork: 256, VectorNamespace: &namespace, ApproximateVector: true, VectorEfSearch: 3,
+	})
+	if err != nil || len(result.Rows) != 3 {
+		t.Fatalf("paged approximate query rows=%d err=%v", len(result.Rows), err)
+	}
+	if _, err := db.QueryContext(t.Context(), query, params, QueryOptions{
+		MaxWork: 32, VectorNamespace: &namespace,
+	}); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("exact page vector query error=%v, want resource limit", err)
+	}
+}
+
 func queryResultNodeIDs(result QueryResult) []uint64 {
 	ids := make([]uint64, len(result.Rows))
 	for i, row := range result.Rows {
