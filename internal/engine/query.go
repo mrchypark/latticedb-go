@@ -5934,6 +5934,8 @@ func (clause *setClause) apply(tx *Tx, rows []queryRow, params map[string]any, b
 }
 
 func refreshRowBindings(tx *Tx, row *queryRow, budget *queryBudget) error {
+	root := budget.rowSources([]queryRow{*row})
+	defer root.close(budget)
 	for slot, binding := range row.slots {
 		if !binding.Bound {
 			continue

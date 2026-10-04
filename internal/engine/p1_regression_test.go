@@ -341,13 +341,38 @@ func TestPageRestoreRejectsDuplicateInventoryCommit(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// Start a later independent base, so duplicated base0 is not a dependency.
+	db, err = Open(source, OpenOptions{PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := db.Update(func(tx *Tx) error { _, err := tx.CreateNode(CreateNodeOptions{}); return err }); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(source, OpenOptions{PageStorage: true, BackupDirectory: archive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if metadata, err := RestoreBackup(context.Background(), archive, filepath.Join(root, "valid"), BackupRestoreOptions{}); err != nil || metadata.CommitID != 4 {
+		t.Fatalf("independent base fixture: commit=%d err=%v", metadata.CommitID, err)
+	}
+
 	entries, err := readArchiveEntries(context.Background(), archive, db.graph.DatabaseID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var old backupEntry
 	for _, entry := range entries {
-		if !entry.segment {
+		if !entry.segment && entry.metadata.CommitID == 0 {
 			old = entry
 			break
 		}
@@ -364,7 +389,7 @@ func TestPageRestoreRejectsDuplicateInventoryCommit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(archive, backupFilename(duplicate, old.digest)), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RestoreBackup(context.Background(), archive, filepath.Join(root, "restore"), BackupRestoreOptions{}); err == nil {
-		t.Fatal("unselected duplicate commit accepted")
+	if _, err := RestoreBackup(context.Background(), archive, filepath.Join(root, "restore"), BackupRestoreOptions{}); err == nil || !strings.Contains(err.Error(), "conflicting commit entries") {
+		t.Fatalf("unselected duplicate commit: %v", err)
 	}
 }

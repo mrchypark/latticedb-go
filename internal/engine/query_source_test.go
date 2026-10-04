@@ -823,3 +823,65 @@ func TestQueryEdgeExpansionProtectsUnpublishedRowsDuringAdmissionRetry(t *testin
 		t.Fatal(err)
 	}
 }
+
+func TestQueryMergeCloneRefreshProtectsEveryAllocation(t *testing.T) {
+	db := querySourceFixture(t, 1, 64<<10)
+	if err := db.View(func(tx *Tx) error {
+		b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 900 << 10, MaxWork: 100 << 20})
+		defer releaseQueryBudget(b)
+		scope := b.sourceScope()
+		node, err := b.readNode(tx.graph, 1)
+		if err != nil {
+			scope.close()
+			return err
+		}
+		b.escapeSource(node)
+		scope.close()
+		plan, err := parseQuery(`MATCH (a), (b) RETURN id(a)`)
+		if err != nil {
+			return err
+		}
+		incoming := plan.newRow()
+		incoming.set("a", boundValue{Node: node})
+		incoming.set("b", boundValue{Node: node})
+		root := b.rowSources([]queryRow{incoming})
+		defer root.close(b)
+		clone := incoming.clone()
+		err = refreshRowBindings(tx, &clone, b)
+		if err != nil && !errors.Is(err, ErrResourceLimit) {
+			return err
+		}
+		if err == nil {
+			for _, name := range []string{"a", "b"} {
+				binding, _ := clone.get(name)
+				if b.source.records[binding.Node] == nil {
+					t.Fatalf("clone %s lost live allocation", name)
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryMergeCurrentMatchesRemainChargedDuringSet(t *testing.T) {
+	db := querySourceFixture(t, 2, 64<<10)
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 900 << 10, MaxWork: 100 << 20})
+	defer releaseQueryBudget(b)
+	tx.queryBudget = b
+	defer func() { tx.queryBudget = nil }()
+	plan, err := parseQuery(`MERGE (n:Doc) ON MATCH SET n.key = 2 RETURN id(n)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = plan.mergeClause.apply(tx, []queryRow{plan.newRow()}, nil, b)
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("current match dropped during writable-node read: %v", err)
+	}
+}

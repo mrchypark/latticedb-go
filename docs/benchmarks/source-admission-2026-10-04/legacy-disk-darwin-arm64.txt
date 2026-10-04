@@ -1,0 +1,9 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkReadRequests/query-2         	  546841	      3202 ns/op	    2392 B/op	      43 allocs/op
+BenchmarkReadRequests/query-2         	  622867	      2013 ns/op	    2392 B/op	      43 allocs/op
+BenchmarkReadRequests/query-2         	  598551	      2045 ns/op	    2392 B/op	      43 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go	4.928s

@@ -71,6 +71,7 @@ var cpuSuffix = regexp.MustCompile(`-\d+$`)
 func parse(r io.Reader) (result, error) {
 	results := result{}
 	scanner := bufio.NewScanner(r)
+	var marked, unmarked bool
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 4 || !strings.HasPrefix(fields[0], "Benchmark") {
@@ -81,6 +82,29 @@ func parse(r io.Reader) (result, error) {
 		name = strings.Replace(name, "BenchmarkVectorIndexBuildZigHarness", "BenchmarkVectorIndexBuildClustered128D", 1)
 		if results[name] == nil {
 			results[name] = map[string][]float64{}
+		}
+		markerCount := 0
+		for i, field := range fields {
+			if field == "source-admission-contract" {
+				markerCount++
+				if name != "BenchmarkReadRequests/query" || i < 3 || i%2 == 0 || markerCount != 1 {
+					return nil, fmt.Errorf("benchmark %s: malformed source-admission marker", name)
+				}
+				marker, err := strconv.ParseFloat(fields[i-1], 64)
+				if err != nil || marker != 1 {
+					return nil, fmt.Errorf("benchmark %s: invalid source-admission marker %q", name, fields[i-1])
+				}
+			}
+		}
+		if name == "BenchmarkReadRequests/query" {
+			if markerCount == 1 {
+				marked = true
+			} else {
+				unmarked = true
+			}
+			if marked && unmarked {
+				return nil, fmt.Errorf("benchmark %s: mixed source-admission contracts", name)
+			}
 		}
 		for i := 2; i+1 < len(fields); i += 2 {
 			value, err := strconv.ParseFloat(fields[i], 64)
@@ -215,6 +239,10 @@ func checkGates(current, previous result, stderr io.Writer) error {
 		}
 		previousValue, previousOK := value(previous[gate.benchmark], gate.unit)
 		if !previousOK {
+			if previousContract == 1 && gate.benchmark == "BenchmarkReadRequests/query" {
+				failures = append(failures, fmt.Sprintf("%s %s missing from admitted baseline", gate.benchmark, gate.unit))
+				continue
+			}
 			fmt.Fprintf(stderr, "performance gate skipped: %s %s has no compatible baseline\n", gate.benchmark, gate.unit)
 			continue
 		}
@@ -223,7 +251,7 @@ func checkGates(current, previous result, stderr io.Writer) error {
 			continue
 		}
 		if transition && gate.benchmark == "BenchmarkReadRequests/query" {
-			// Darwin/arm64 paired measurements: +20 allocs/op, +1177 B/op.
+			// Darwin/arm64 paired measurements: +20 allocs/op, +1176 B/op.
 			// Keep a fixed ceiling with byte headroom, not a percentage relaxation.
 			allowance := float64(1280)
 			if gate.unit == "allocs/op" {
@@ -267,6 +295,16 @@ func withDiskBaseline(previous, disk result) result {
 	}
 	for _, benchmark := range diskBaselineBenchmarks {
 		comparison[benchmark] = disk[benchmark]
+	}
+	return comparison
+}
+
+// Historical reports retain the archived page-engine baseline. Gates must
+// instead preserve an admitted previous main query, including its marker.
+func withDiskGateBaseline(previous, disk result) result {
+	comparison := withDiskBaseline(previous, disk)
+	if len(previous["BenchmarkReadRequests/query"]["source-admission-contract"]) != 0 {
+		comparison["BenchmarkReadRequests/query"] = previous["BenchmarkReadRequests/query"]
 	}
 	return comparison
 }
@@ -468,7 +506,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-			previous = withDiskBaseline(previous, disk)
+			previous = withDiskGateBaseline(previous, disk)
 		}
 		if err := checkGates(current, previous, os.Stderr); err != nil {
 			fmt.Fprintln(os.Stderr, err)

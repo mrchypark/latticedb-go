@@ -126,8 +126,11 @@ func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any
 			budget.releaseRows(len(output))
 		}
 	}()
+	currentRoot := budget.rowSources(nil)
+	defer currentRoot.close(budget)
 	for _, incoming := range input {
 		row := incoming.clone()
+		currentRoot.setRows([]queryRow{row})
 		if err = refreshRowBindings(tx, &row, budget); err != nil {
 			return output, err
 		}
@@ -141,6 +144,7 @@ func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any
 			budget.releaseTemporary(temporary)
 			return output, matchErr
 		}
+		currentRoot.setRows(matches)
 		sets := clause.OnMatch
 		if len(matches) == 0 {
 			if err = budget.check(1, len(output)+1); err == nil {
@@ -151,6 +155,7 @@ func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any
 				return output, err
 			}
 			matches = []queryRow{row}
+			currentRoot.setRows(matches)
 			err = createMergePattern(tx, &matches[0], patterns, budget)
 			sets = clause.OnCreate
 		}
@@ -169,6 +174,7 @@ func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any
 			return output, err
 		}
 		output = append(output, matches...)
+		currentRoot.setRows(nil)
 	}
 	return output, nil
 }
