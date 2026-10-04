@@ -1,0 +1,146 @@
+{
+  "results": {
+    "go-common-bm25": {
+      "queries": 300,
+      "samples": 900,
+      "ndcg10": 0.6606631024091881,
+      "recall10": 0.7876111111111112,
+      "mrr10": 0.6273267195767196,
+      "median_ms": 5.9299789999999994,
+      "p95_ms": 11.913042,
+      "round_median_ms": [
+        5.834312499999999,
+        5.991958500000001,
+        5.910354
+      ],
+      "round_p95_ms": [
+        10.969708,
+        12.170834,
+        12.333709
+      ],
+      "sha256": "4cee411dff5734af7e03952122c8bebdcffc7b318ed1aa121cd8cc09490c3276"
+    },
+    "zig-common-bm25": {
+      "queries": 300,
+      "samples": 900,
+      "ndcg10": 0.6606631024091881,
+      "recall10": 0.7876111111111112,
+      "mrr10": 0.6273267195767196,
+      "median_ms": 2.3114165,
+      "p95_ms": 4.839792,
+      "round_median_ms": [
+        2.506813,
+        2.24425,
+        2.2338335000000002
+      ],
+      "round_p95_ms": [
+        5.883208,
+        4.062,
+        3.982042
+      ],
+      "sha256": "7078150dd72cf9657e3dcb76d0132da8e203fc98600d246c232128bef3adb71b"
+    },
+    "go-raw-frequency": {
+      "queries": 300,
+      "samples": 900,
+      "ndcg10": 0.09593134315916463,
+      "recall10": 0.175,
+      "mrr10": 0.071994708994709,
+      "median_ms": 6.158917000000001,
+      "p95_ms": 12.892166,
+      "round_median_ms": [
+        6.083978999999999,
+        6.150354500000001,
+        6.1757915
+      ],
+      "round_p95_ms": [
+        13.092083,
+        13.133291,
+        12.35475
+      ],
+      "sha256": "866135c79306b0b743b620fc965f10701bb19aaed33b42c0003d0541dfc317cf"
+    },
+    "go-raw-bm25": {
+      "queries": 300,
+      "samples": 900,
+      "ndcg10": 0.6616762967340877,
+      "recall10": 0.7909444444444444,
+      "mrr10": 0.6276177248677248,
+      "median_ms": 6.287042,
+      "p95_ms": 12.161167,
+      "round_median_ms": [
+        6.268104,
+        6.3419795,
+        6.2810835
+      ],
+      "round_p95_ms": [
+        12.081958,
+        12.127459,
+        12.177125
+      ],
+      "sha256": "c9608aa343866f21f8da70df876f71f65b92b9d27e896c42789f736e6c55e606"
+    },
+    "go-raw-porter-bm25": {
+      "queries": 300,
+      "samples": 900,
+      "ndcg10": 0.6888789638359757,
+      "recall10": 0.8221666666666667,
+      "mrr10": 0.6523346560846561,
+      "median_ms": 6.8588335,
+      "p95_ms": 14.509084,
+      "round_median_ms": [
+        6.721958,
+        7.2479165000000005,
+        6.7541665
+      ],
+      "round_p95_ms": [
+        13.044625,
+        17.850375,
+        13.7375
+      ],
+      "sha256": "c5ced798a34aa7b6319d8eb95d806a4ff2ad8bf9e6c9f8d8bb920c3c4e23aa0a"
+    }
+  },
+  "comparisons": {
+    "go-common-bm25 vs zig-common-bm25": {
+      "identical_rankings": 300,
+      "mean_overlap10": 1.0
+    },
+    "go-common-bm25 vs go-raw-frequency": {
+      "identical_rankings": 0,
+      "mean_overlap10": 0.06333333333333334
+    },
+    "go-common-bm25 vs go-raw-bm25": {
+      "identical_rankings": 249,
+      "mean_overlap10": 0.9816666666666667
+    },
+    "go-common-bm25 vs go-raw-porter-bm25": {
+      "identical_rankings": 3,
+      "mean_overlap10": 0.6856666666666666
+    },
+    "zig-common-bm25 vs go-raw-frequency": {
+      "identical_rankings": 0,
+      "mean_overlap10": 0.06333333333333334
+    },
+    "zig-common-bm25 vs go-raw-bm25": {
+      "identical_rankings": 249,
+      "mean_overlap10": 0.9816666666666667
+    },
+    "zig-common-bm25 vs go-raw-porter-bm25": {
+      "identical_rankings": 3,
+      "mean_overlap10": 0.6856666666666666
+    },
+    "go-raw-frequency vs go-raw-bm25": {
+      "identical_rankings": 0,
+      "mean_overlap10": 0.06466666666666666
+    },
+    "go-raw-frequency vs go-raw-porter-bm25": {
+      "identical_rankings": 0,
+      "mean_overlap10": 0.057666666666666665
+    },
+    "go-raw-bm25 vs go-raw-porter-bm25": {
+      "identical_rankings": 3,
+      "mean_overlap10": 0.6903333333333334
+    }
+  }
+}

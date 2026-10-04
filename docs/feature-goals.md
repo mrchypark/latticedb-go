@@ -43,6 +43,8 @@ LatticeDB Go는 외부 DB 서버나 cgo 없이 Go 애플리케이션에서 그�
 
 이번 보완 작업은 true-memory 실행, 물리 compaction, 저장 옵션, 남은 쿼리 문법, 페이지 기반 검색 인덱스를 포함한다. 검색 인덱스는 원본 graph의 commit history와 연결해 오래된 writer가 남긴 인덱스를 그대로 사용하지 않도록 한다. 최종 통합 검증 결과는 아래에 별도로 기록한다.
 
+FTS의 실제 문서 품질·성능 검증은 [SciFact 평가](benchmarks/fts-scifact-2026-10-04/REPORT.md)에 기록한다. 기능 구현 여부와 품질·지연의 실측을 구분하며, 기본 frequency 점수는 유지한다.
+
 새 쿼리 기능의 공개 API 조합 검사는 루트의 `TestQueryFeatureGoalsTogether`가 담당한다. 개별 기능이 동작하는 것과 함께, WITH 경계·중첩 관계 반환·조건부 수정·집계가 연결되는지도 검증한다.
 
 ## 명시적 의미와 경계
