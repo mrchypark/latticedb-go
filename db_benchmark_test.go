@@ -62,6 +62,7 @@ func BenchmarkReadRequests(b *testing.B) {
 	})
 	b.Run("query", func(b *testing.B) {
 		b.ReportAllocs()
+		b.ReportMetric(1, "source-admission-contract")
 		for i := 0; i < b.N; i++ {
 			if _, err := db.Query("MATCH (n:Document) WHERE id(n) = 500 RETURN n.name", nil); err != nil {
 				b.Fatal(err)

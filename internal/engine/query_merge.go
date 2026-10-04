@@ -118,7 +118,9 @@ func (clause *mergeClause) validate(bind func(string, bindingRole) error, requir
 }
 
 func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any, budget *queryBudget) (output []queryRow, err error) {
-	defer budget.sourceRows(func() []queryRow { return output })()
+	if !budget.residentSources {
+		defer budget.sourceRows(func() []queryRow { return output })()
+	}
 	defer func() {
 		if err != nil {
 			budget.releaseRows(len(output))

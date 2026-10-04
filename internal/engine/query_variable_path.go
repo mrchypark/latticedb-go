@@ -45,7 +45,9 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 	defer budget.releaseTemporary(boundBytes)
 
 	var rows []queryRow
-	defer budget.sourceRows(func() []queryRow { return rows })()
+	if !budget.residentSources {
+		defer budget.sourceRows(func() []queryRow { return rows })()
+	}
 	start := func(node *store.NodeRecord, reverse bool) error {
 		if err := budget.check(1, len(rows)); err != nil {
 			return err
@@ -66,13 +68,15 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 		}
 		stack := []variablePathState{{node: node, bytes: variablePathStateBytes}}
 		var current *store.NodeRecord
-		defer budget.sourceRoot(func(visit func(any)) {
-			visit(node)
-			visit(current)
-			for _, s := range stack {
-				visit(s.node)
-			}
-		})()
+		if !budget.residentSources {
+			defer budget.sourceRoot(func(visit func(any)) {
+				visit(node)
+				visit(current)
+				for _, s := range stack {
+					visit(s.node)
+				}
+			})()
+		}
 		defer func() {
 			for _, state := range stack {
 				budget.releaseTemporary(state.bytes)
@@ -155,7 +159,9 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 					copy(nextEdges, state.edges)
 					nextEdges[len(state.edges)] = edgeID
 				}
-				budget.escapeSource(next)
+				if budget.source != nil {
+					budget.escapeSource(next)
+				}
 				stack = append(stack, variablePathState{node: next, edges: nextEdges, bytes: bytes})
 				return nil
 			}
@@ -431,6 +437,8 @@ func (pattern edgePattern) appendVariableRow(tx *Tx, row queryRow, params map[st
 		return rows, err
 	}
 	*retained += bytes
-	budget.escapeSource(nextRow)
+	if budget.source != nil {
+		budget.escapeSource(nextRow)
+	}
 	return append(rows, nextRow), nil
 }

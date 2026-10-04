@@ -73,6 +73,8 @@ type queryBudget struct {
 	bytes    uint32
 	// Source storage has a separate ledger: expression scratch checkpoints
 	// must never release a disk record retained by a row or path.
+	sourceContext     context.Context
+	residentSources   bool
 	sourceBytes       uint64
 	mutationBytes     uint64
 	source            *querySources
@@ -381,10 +383,8 @@ type sliceQueryIterator struct {
 
 func (it *sliceQueryIterator) Next() (queryRow, bool, error) {
 	it.handoff = queryRow{}
-	if it.budget.sourceBytes > uint64(it.budget.maxBytes)/2 {
-		if err := it.budget.sweepSources(); err != nil {
-			return queryRow{}, false, err
-		}
+	if err := it.budget.maybeSweepSources(); err != nil {
+		return queryRow{}, false, err
 	}
 	if len(it.rows) == 0 {
 		return queryRow{}, false, nil
@@ -484,10 +484,8 @@ func (it *whereQueryIterator) Close() {
 
 func (it *whereQueryIterator) Next() (queryRow, bool, error) {
 	it.handoff = queryRow{}
-	if it.budget.sourceBytes > uint64(it.budget.maxBytes)/2 {
-		if err := it.budget.sweepSources(); err != nil {
-			return queryRow{}, false, err
-		}
+	if err := it.budget.maybeSweepSources(); err != nil {
+		return queryRow{}, false, err
 	}
 	for {
 		if len(it.pending) != 0 {
@@ -514,10 +512,8 @@ func (it *whereQueryIterator) Next() (queryRow, bool, error) {
 
 func (it *patternQueryIterator) Next() (queryRow, bool, error) {
 	it.handoff = queryRow{}
-	if it.budget.sourceBytes > uint64(it.budget.maxBytes)/2 {
-		if err := it.budget.sweepSources(); err != nil {
-			return queryRow{}, false, err
-		}
+	if err := it.budget.maybeSweepSources(); err != nil {
+		return queryRow{}, false, err
 	}
 	for {
 		if len(it.pending) != 0 {
@@ -627,11 +623,14 @@ func newPatternQueryIterator(plan *queryPlan, tx *Tx, input queryIterator, patte
 }
 
 func applyWhereQueryStream(stream queryIterator, tx *Tx, params map[string]any, budget *queryBudget, clauses []*whereClause, predicate wherePredicate) (queryIterator, error) {
-	defer budget.sourceRoot(func(visit func(any)) { visitIteratorSources(stream, visit) })()
+	streamRoot := budget.iteratorSources(stream)
+	defer streamRoot.close(budget)
 	for _, clause := range clauses {
 		if clause.Kind == whereVector || clause.Kind == whereFTS {
 			var rows []queryRow
-			defer budget.sourceRows(func() []queryRow { return rows })()
+			if !budget.residentSources {
+				defer budget.sourceRows(func() []queryRow { return rows })()
+			}
 			for {
 				row, ok, err := stream.Next()
 				if err != nil {
@@ -654,9 +653,11 @@ func applyWhereQueryStream(stream queryIterator, tx *Tx, params map[string]any, 
 			}
 			budget.releaseRows(inputRows - len(rows))
 			stream = &sliceQueryIterator{rows: rows, budget: budget}
+			streamRoot.setIterator(stream)
 			continue
 		}
 		stream = &whereQueryIterator{input: stream, tx: tx, clause: clause, params: params, budget: budget}
+		streamRoot.setIterator(stream)
 	}
 	if predicate != nil {
 		predicateWork := uint64(len(wherePredicateClauses(predicate)))
@@ -693,8 +694,12 @@ func (it *limitQueryIterator) Next() (queryRow, bool, error) {
 
 func collectQueryRows(it queryIterator, budget *queryBudget) ([]queryRow, error) {
 	var rows []queryRow
-	defer budget.sourceRows(func() []queryRow { return rows })()
-	defer budget.sourceRoot(func(visit func(any)) { visitIteratorSources(it, visit) })()
+	if !budget.residentSources {
+		defer budget.sourceRows(func() []queryRow { return rows })()
+	}
+	if !budget.residentSources {
+		defer budget.sourceRoot(func(visit func(any)) { visitIteratorSources(it, visit) })()
+	}
 	for {
 		row, ok, err := it.Next()
 		if err != nil {
@@ -721,11 +726,13 @@ const queryTopKCandidateBytes = 128
 func (plan *queryPlan) collectTopKRows(it queryIterator, skip, limit int, budget *queryBudget) ([]queryRow, error) {
 	candidateLimit := skip + limit
 	var candidates []orderedQueryRow
-	defer budget.sourceRoot(func(visit func(any)) {
-		for _, c := range candidates {
-			visit(c.row)
-		}
-	})()
+	if !budget.residentSources {
+		defer budget.sourceRoot(func(visit func(any)) {
+			for _, c := range candidates {
+				visit(c.row)
+			}
+		})()
+	}
 	var candidateBytes uint64
 	defer func() { budget.releaseTemporary(candidateBytes) }()
 	for sequence := 0; ; sequence++ {
@@ -1947,6 +1954,7 @@ func parsePlanReturn(plan *queryPlan, text string) error {
 
 func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudget) (QueryResult, error) {
 	previous := tx.queryBudget
+	budget.residentSources = tx.graph.PageBase == nil
 	tx.queryBudget = budget
 	defer func() { tx.queryBudget = previous; budget.closeSources() }()
 	return plan.executeWithInput(tx, params, budget, nil)
@@ -1979,16 +1987,19 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		return QueryResult{}, err
 	}
 	rows := input
-	defer budget.sourceRows(func() []queryRow { return rows })()
+	rowRoot := budget.rowSources(rows)
+	defer rowRoot.close(budget)
 	if rows == nil {
 		rows = []queryRow{plan.newRow()}
 		if err := budget.chargeRows(len(rows)); err != nil {
 			return QueryResult{}, err
 		}
 	}
+	rowRoot.setRows(rows)
 	var stream queryIterator = &sliceQueryIterator{rows: rows, budget: budget}
 	defer func() { stream.Close() }()
-	defer budget.sourceRoot(func(visit func(any)) { visitIteratorSources(stream, visit) })()
+	streamRoot := budget.iteratorSources(stream)
+	defer streamRoot.close(budget)
 	if plan.unwindClause != nil {
 		nextRows, err := plan.unwindClause.apply(rows, params, budget)
 		if err != nil {
@@ -1998,7 +2009,9 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 			return QueryResult{}, err
 		}
 		rows = nextRows
+		rowRoot.setRows(rows)
 		stream = &sliceQueryIterator{rows: rows, budget: budget}
+		streamRoot.setIterator(stream)
 	}
 	patterns, err := plan.orderedMatchPatterns(tx, params, budget)
 	if err != nil {
@@ -2009,7 +2022,8 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		return QueryResult{}, err
 	}
 	match := stream
-	defer budget.sourceRoot(func(visit func(any)) { visitIteratorSources(match, visit) })()
+	matchRoot := budget.iteratorSources(match)
+	defer matchRoot.close(budget)
 	if len(plan.matchWhereScopes) > 1 {
 		for _, scope := range plan.matchWhereScopes {
 			// Index lookup may prune candidates from the predicates attached to
@@ -2020,8 +2034,10 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 			scopePlan.wherePredicate = scope.predicate
 			for _, pattern := range scope.patterns {
 				match = newPatternQueryIterator(&scopePlan, tx, match, pattern, params, limit, skip, budget, nil)
+				matchRoot.setIterator(match)
 			}
 			match, err = applyWhereQueryStream(match, tx, params, budget, scope.clauses, scope.predicate)
+			matchRoot.setIterator(match)
 			if err != nil {
 				return QueryResult{}, err
 			}
@@ -2036,17 +2052,20 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 				}
 			}
 			match = newPatternQueryIterator(plan, tx, match, pattern, params, limit, skip, budget, candidate)
+			matchRoot.setIterator(match)
 		}
 		clauses, predicate := plan.whereClauses, plan.wherePredicate
 		if len(plan.matchWhereScopes) == 1 {
 			clauses, predicate = plan.matchWhereScopes[0].clauses, plan.matchWhereScopes[0].predicate
 		}
 		match, err = applyWhereQueryStream(match, tx, params, budget, clauses, predicate)
+		matchRoot.setIterator(match)
 		if err != nil {
 			return QueryResult{}, err
 		}
 	}
 	stream = match
+	streamRoot.setIterator(stream)
 	if plan.returnClause != nil && input == nil && plan.next == nil && !plan.mutates() && len(plan.orderClauses) == 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() {
 		iteratorLimit := limit
 		if plan.limitExpr == nil {
@@ -2071,6 +2090,7 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		return result, nil
 	}
 	rows, err = collectQueryRows(stream, budget)
+	rowRoot.setRows(rows)
 	if err != nil {
 		return QueryResult{}, err
 	}
@@ -2083,6 +2103,7 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		}
 		budget.releaseRows(len(rows))
 		rows = nextRows
+		rowRoot.setRows(rows)
 	}
 	if len(plan.createPatterns) != 0 {
 		if err := applyCreatePatterns(tx, rows, params, plan.createPatterns, budget); err != nil {
@@ -2098,6 +2119,7 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 			return QueryResult{}, err
 		}
 		rows = nextRows
+		rowRoot.setRows(rows)
 	}
 	if plan.createClause != nil {
 		if err := plan.createClause.apply(tx, rows, params, budget); err != nil {
@@ -2136,8 +2158,10 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		}
 		stream.Close()
 		match = nil
+		matchRoot.setIterator(nil)
 		input = nil
 		rows = nil
+		rowRoot.setRows(nil)
 		unroot := budget.sourceRows(func() []queryRow { return projected })
 		defer unroot()
 		if err := budget.sweepSources(); err != nil {
@@ -2697,7 +2721,13 @@ func queryScanContext(budget *queryBudget) context.Context {
 	if budget == nil {
 		return context.Background()
 	}
-	return store.WithPageReadBudget(budget.ctx, budget)
+	if budget.residentSources {
+		return budget.ctx
+	}
+	if budget.sourceContext == nil {
+		budget.sourceContext = store.WithPageReadBudget(budget.ctx, budget)
+	}
+	return budget.sourceContext
 }
 
 func queryScanCharge(budget *queryBudget) func() error {
@@ -3533,7 +3563,9 @@ func (clause *unwindClause) apply(rows []queryRow, params map[string]any, budget
 				binding = boundValue{Value: item, HasValue: true}
 			}
 			nextRow.set(clause.Var, binding)
-			budget.escapeSource(nextRow)
+			if budget.source != nil {
+				budget.escapeSource(nextRow)
+			}
 			nextRows = append(nextRows, nextRow)
 		}
 	}
@@ -4834,7 +4866,9 @@ func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecor
 		if pattern.Var != "" {
 			nextRow.set(pattern.Var, boundValue{Node: node})
 		}
-		budget.escapeSource(nextRow)
+		if budget.source != nil {
+			budget.escapeSource(nextRow)
+		}
 		nextRows = append(nextRows, nextRow)
 	}
 	return nextRows, nil
@@ -5141,7 +5175,9 @@ func (pattern edgePattern) appendEdgeRow(row queryRow, edge *store.EdgeRecord, l
 	if pattern.EdgeVar != "" {
 		nextRow.set(pattern.EdgeVar, boundValue{Edge: edge})
 	}
-	budget.escapeSource(nextRow)
+	if budget.source != nil {
+		budget.escapeSource(nextRow)
+	}
 	return append(rows, nextRow), nil
 }
 
@@ -5913,7 +5949,9 @@ func refreshQueryEntities(tx *Tx, value any, budget *queryBudget) (any, error) {
 			}
 			if current != nil {
 				value.Node = current
-				budget.escapeSource(value)
+				if budget.source != nil {
+					budget.escapeSource(value)
+				}
 			}
 		case value.Edge != nil:
 			current, err := budget.readEdge(tx.graph, value.Edge.ID)
@@ -5922,7 +5960,9 @@ func refreshQueryEntities(tx *Tx, value any, budget *queryBudget) (any, error) {
 			}
 			if current != nil {
 				value.Edge = current
-				budget.escapeSource(value)
+				if budget.source != nil {
+					budget.escapeSource(value)
+				}
 			}
 		case value.HasValue:
 			var err error
@@ -5996,7 +6036,9 @@ func (clause *createNodeClause) apply(tx *Tx, rows []queryRow, params map[string
 			}
 			nextRow.set(clause.Var, boundValue{Node: record})
 		}
-		budget.escapeSource(nextRow)
+		if budget.source != nil {
+			budget.escapeSource(nextRow)
+		}
 		nextRows = append(nextRows, nextRow)
 	}
 	return nextRows, nil

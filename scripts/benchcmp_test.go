@@ -356,3 +356,39 @@ func TestCheckGatesSkipsNewRowsUntilBaselineExists(t *testing.T) {
 		t.Fatalf("diagnostics = %q, want baseline skip", diagnostics.String())
 	}
 }
+
+func TestSourceAdmissionContractTransitionIsBoundedAndOneTime(t *testing.T) {
+	previous := gateFixture(nil)
+	current := gateFixture(map[string]float64{"BenchmarkReadRequests/query B/op": 1380, "BenchmarkReadRequests/query allocs/op": 120})
+	current["BenchmarkReadRequests/query"]["source-admission-contract"] = []float64{1, 1}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range []string{"B/op", "allocs/op"} {
+		current["BenchmarkReadRequests/query"][unit][0]++
+		if err := checkGates(current, previous, new(bytes.Buffer)); err == nil {
+			t.Fatalf("unbounded transition %s", unit)
+		}
+		current["BenchmarkReadRequests/query"][unit][0]--
+	}
+	// A versioned main baseline immediately restores the original strict gates.
+	previous["BenchmarkReadRequests/query"]["source-admission-contract"] = []float64{1}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err == nil {
+		t.Fatal("migration allowance reapplied within contract 1")
+	}
+	current["BenchmarkReadRequests/query"]["B/op"] = []float64{100}
+	current["BenchmarkReadRequests/query"]["allocs/op"] = []float64{100}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err != nil {
+		t.Fatal(err)
+	}
+	delete(current["BenchmarkReadRequests/query"], "source-admission-contract")
+	if err := checkGates(current, previous, new(bytes.Buffer)); err == nil {
+		t.Fatal("marker removal bypassed admission gates")
+	}
+	for _, samples := range [][]float64{{0}, {2}, {1, 0}, {math.NaN()}} {
+		current["BenchmarkReadRequests/query"]["source-admission-contract"] = samples
+		if err := checkGates(current, previous, new(bytes.Buffer)); err == nil {
+			t.Fatalf("accepted invalid contract %v", samples)
+		}
+	}
+}

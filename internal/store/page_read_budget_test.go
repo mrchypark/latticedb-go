@@ -128,3 +128,78 @@ func TestPageReadBudgetReleasesEachRecordAndVisitorErrors(t *testing.T) {
 		t.Fatalf("cancel=%v held=%d", err, budget.bytes)
 	}
 }
+
+func TestPropertyPostingsAdmitPrefixRawAndDecode(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "postings"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	page := &PageGraph{Tx: tx}
+	text := strings.Repeat("x", 1<<20)
+	if err := page.PutNode(&NodeRecord{ID: 1, Labels: []string{"Doc"}, Properties: PropertiesFromMap(map[string]any{"body": text})}); err != nil {
+		t.Fatal(err)
+	}
+	if err := page.PutEdge(&EdgeRecord{ID: 1, SourceID: 1, TargetID: 1, Type: "LINK", Properties: PropertiesFromMap(map[string]any{"body": text})}); err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range []bool{true, false} {
+		scope := "Doc"
+		if !node {
+			scope = "LINK"
+		}
+		definition := PropertyIndexDefinition{Scope: scope, Property: "body"}
+		if err := page.CreatePropertyIndex(context.Background(), node, definition); err != nil {
+			t.Fatal(err)
+		}
+		indexes, err := page.LoadPropertyIndexes(context.Background(), node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, hit := range []bool{true, false} {
+			key := text
+			if !hit {
+				key = strings.Repeat("y", len(text))
+			}
+			for _, limit := range []uint64{4096, 2 << 20, 3 << 20, 16 << 20} {
+				b := &recordReadTestBudget{maxBytes: limit, maxWork: 64 << 20}
+				calls := 0
+				_, err := indexes.VisitContext(WithPageReadBudget(context.Background(), b), definition, key, nil, func(id uint64) error { calls++; return nil })
+				// Misses still need prefix scratch admission, but do not read a posting.
+				rejected := limit < 16<<20 && hit || limit <= 2<<20 && !hit
+				if rejected {
+					if !errors.Is(err, errRecordReadTestBudget) || calls != 0 {
+						t.Fatalf("node=%v hit=%v limit=%d calls=%d err=%v", node, hit, limit, calls, err)
+					}
+				} else if err != nil || hit && calls != 1 || !hit && calls != 0 {
+					t.Fatalf("node=%v hit=%v limit=%d calls=%d err=%v", node, hit, limit, calls, err)
+				}
+				if b.bytes != 0 {
+					t.Fatalf("posting source retained %d bytes", b.bytes)
+				}
+			}
+		}
+		for _, canceled := range []bool{false, true} {
+			b := &recordReadTestBudget{maxBytes: 16 << 20, maxWork: 64 << 20}
+			ctx, cancel := context.WithCancel(WithPageReadBudget(context.Background(), b))
+			if canceled {
+				cancel()
+			}
+			stop := errors.New("visitor stop")
+			_, err := indexes.VisitContext(ctx, definition, text, nil, func(uint64) error { return stop })
+			cancel()
+			expected := stop
+			if canceled {
+				expected = context.Canceled
+			}
+			if !errors.Is(err, expected) || b.bytes != 0 {
+				t.Fatalf("cleanup canceled=%v err=%v bytes=%d", canceled, err, b.bytes)
+			}
+		}
+	}
+}

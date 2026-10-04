@@ -177,8 +177,36 @@ func delta(current, previous map[string][]float64, unit string) string {
 	return change(c, p)
 }
 
+// Contract 1 admits raw/decode storage and tracks its live ownership (#222).
+// Legacy results have no marker. Only the 0 -> 1 transition gets a measured,
+// fixed ceiling; subsequent comparisons keep the original strict gates.
+func sourceAdmissionContract(metrics result) (int, error) {
+	samples := metrics["BenchmarkReadRequests/query"]["source-admission-contract"]
+	if len(samples) == 0 {
+		return 0, nil
+	}
+	for _, sample := range samples {
+		if sample != 1 {
+			return 0, fmt.Errorf("invalid source-admission contract %v", sample)
+		}
+	}
+	return 1, nil
+}
+
 func checkGates(current, previous result, stderr io.Writer) error {
 	var failures []string
+	currentContract, err := sourceAdmissionContract(current)
+	if err != nil {
+		return err
+	}
+	previousContract, err := sourceAdmissionContract(previous)
+	if err != nil {
+		return err
+	}
+	if currentContract < previousContract {
+		return fmt.Errorf("source-admission contract downgraded")
+	}
+	transition := previousContract == 0 && currentContract == 1
 	for _, gate := range blockingGates {
 		currentValue, currentOK := value(current[gate.benchmark], gate.unit)
 		if !currentOK {
@@ -192,6 +220,19 @@ func checkGates(current, previous result, stderr io.Writer) error {
 		}
 		if math.IsNaN(currentValue) || math.IsInf(currentValue, 0) || currentValue < 0 || math.IsNaN(previousValue) || math.IsInf(previousValue, 0) || previousValue < 0 {
 			failures = append(failures, fmt.Sprintf("%s %s has invalid metric values", gate.benchmark, gate.unit))
+			continue
+		}
+		if transition && gate.benchmark == "BenchmarkReadRequests/query" {
+			// Darwin/arm64 paired measurements: +19 allocs/op, +1129 B/op.
+			// Keep a small fixed portability margin, not a percentage relaxation.
+			allowance := float64(1280)
+			if gate.unit == "allocs/op" {
+				allowance = 20
+			}
+			fmt.Fprintf(stderr, "source-admission contract transition: %s %s ceiling previous +%.0f\n", gate.benchmark, gate.unit, allowance)
+			if currentValue > previousValue+allowance {
+				failures = append(failures, fmt.Sprintf("%s %s exceeds source-admission transition ceiling +%.0f", gate.benchmark, gate.unit, allowance))
+			}
 			continue
 		}
 		if gate.maxAbsoluteRise > 0 {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPageBackupRestoresStreamOperations(t *testing.T) {
@@ -206,6 +207,38 @@ func TestPageRestoreIgnoresPrunedIndependentChain(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	// Continuing this source needs base4 and its future WALs, not the old chain.
+	d = open(a)
+	add(d)
+	if e := d.Close(); e != nil {
+		t.Fatal(e)
+	}
+	metadata, e := RestoreBackup(context.Background(), a, filepath.Join(r, "restore-after-resume"), BackupRestoreOptions{})
+	if e != nil || metadata.CommitID != 5 {
+		t.Fatalf("resumed restore=%+v err=%v", metadata, e)
+	}
+	files, e = os.ReadDir(a)
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, file := range files {
+		if !strings.HasSuffix(file.Name(), backupSegmentSuffix) {
+			continue
+		}
+		entry, e := parseBackupSegment(file.Name())
+		if e != nil {
+			t.Fatal(e)
+		}
+		if entry.metadata.CommitID == 5 {
+			if e := os.WriteFile(filepath.Join(a, file.Name()), []byte("corrupt"), 0600); e != nil {
+				t.Fatal(e)
+			}
+		}
+	}
+	if reopened, err := Open(p, OpenOptions{PageStorage: true, BackupDirectory: a}); err == nil {
+		reopened.Close()
+		t.Fatal("source reopen accepted required-chain corruption")
+	}
 }
 
 func TestPageBackupRestoresAutomaticChangefeedTrim(t *testing.T) {
@@ -290,5 +323,48 @@ func TestPageStreamLongPollReleasesGeneration(t *testing.T) {
 	}
 	if leases != 0 {
 		t.Fatalf("long poll retained %d leases", leases)
+	}
+}
+
+func TestPageRestoreRejectsDuplicateInventoryCommit(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	archive := filepath.Join(root, "archive")
+	db, err := Open(source, OpenOptions{Create: true, PageStorage: true, BackupDirectory: archive})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error { _, err := tx.CreateNode(CreateNodeOptions{}); return err }); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := readArchiveEntries(context.Background(), archive, db.graph.DatabaseID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var old backupEntry
+	for _, entry := range entries {
+		if !entry.segment {
+			old = entry
+			break
+		}
+	}
+	if old.path == "" {
+		t.Fatal("missing full base")
+	}
+	data, err := os.ReadFile(old.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := old.metadata
+	duplicate.CapturedAt = duplicate.CapturedAt.Add(time.Nanosecond)
+	if err := os.WriteFile(filepath.Join(archive, backupFilename(duplicate, old.digest)), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreBackup(context.Background(), archive, filepath.Join(root, "restore"), BackupRestoreOptions{}); err == nil {
+		t.Fatal("unselected duplicate commit accepted")
 	}
 }

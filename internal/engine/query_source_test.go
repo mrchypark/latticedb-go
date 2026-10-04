@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
 	"github.com/mrchypark/latticedb-go/internal/store"
 	"path/filepath"
 	"strings"
@@ -522,5 +524,206 @@ func TestQueryMergeEarlierOutputLedger(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestQueryOverlayCountUsesOnlyWriteSetWork(t *testing.T) {
+	db := querySourceFixture(t, 128, 1<<10)
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err := tx.SetProperty(1, "key", int64(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.DeleteNode(2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.CreateNode(CreateNodeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 32, MaxWork: 4})
+	defer releaseQueryBudget(b)
+	count, err := tx.graph.NodeCountContext(queryScanContext(b))
+	if err != nil || count != 128 || b.sourceBytes != 0 {
+		t.Fatalf("count=%d source=%d work=%d err=%v", count, b.sourceBytes, b.work, err)
+	}
+}
+
+func TestQueryCollectorSweepWorkIsLinear(t *testing.T) {
+	db := querySourceFixture(t, 4096, 0)
+	for _, count := range []int{1024, 2048, 4096} {
+		if err := db.View(func(tx *Tx) error {
+			b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 64 << 20, MaxWork: 100 << 20})
+			defer releaseQueryBudget(b)
+			plan, err := parseQuery(`MATCH (n) RETURN count(*)`)
+			if err != nil {
+				return err
+			}
+			rows := make([]queryRow, 0, count)
+			for id := 1; id <= count; id++ {
+				scope := b.sourceScope()
+				node, err := b.readNode(tx.graph, uint64(id))
+				if err != nil {
+					scope.close()
+					return err
+				}
+				row := plan.newRow()
+				row.set("n", boundValue{Node: node})
+				b.escapeSource(row)
+				rows = append(rows, row)
+				scope.close()
+			}
+			if err := b.chargeRows(count); err != nil {
+				return err
+			}
+			// The live batch fits but exceeds the old half-budget sweep threshold.
+			b.maxBytes = uint32(2*b.sourceBytes - 1)
+			before := b.work
+			b.maxWork = before + uint32(count)
+			got, err := collectQueryRows(&sliceQueryIterator{rows: rows, budget: b}, b)
+			if err != nil {
+				return err
+			}
+			if len(got) != count || len(b.source.records) != count || b.work-before > uint32(count) {
+				t.Fatalf("count=%d rows=%d sources=%d sweep work=%d", count, len(got), len(b.source.records), b.work-before)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("count=%d: %v", count, err)
+		}
+	}
+}
+
+func TestQueryOwnedReadReclaimsOnlyDroppedSources(t *testing.T) {
+	db := querySourceFixture(t, 2, 64<<10)
+	if err := db.View(func(tx *Tx) error {
+		for _, live := range []bool{false, true} {
+			b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 650 << 10, MaxWork: 100 << 20})
+			scope := b.sourceScope()
+			first, err := b.readNode(tx.graph, 1)
+			if err != nil {
+				scope.close()
+				releaseQueryBudget(b)
+				return err
+			}
+			b.escapeSource(first)
+			scope.close()
+			root := b.sourceRoot(func(visit func(any)) {
+				if live {
+					visit(first)
+				}
+			})
+			_, err = b.readNode(tx.graph, 2)
+			if live && !errors.Is(err, ErrResourceLimit) {
+				t.Fatalf("live predecessor lost its allowance: %v", err)
+			}
+			if !live && err != nil {
+				t.Fatalf("dropped predecessor blocked pure-read retry: %v", err)
+			}
+			if len(b.source.records) != 1 {
+				t.Fatalf("retained sources=%d live=%v", len(b.source.records), live)
+			}
+			root()
+			releaseQueryBudget(b)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryUnregisterClearsSourceVisitor(t *testing.T) {
+	b := newQueryBudget(context.Background(), QueryOptions{})
+	defer releaseQueryBudget(b)
+	unregister := b.sourceRoot(func(visit func(any)) { visit("projection") })
+	var root *querySourceRoot
+	for candidate := range b.source.roots {
+		root = candidate
+	}
+	unregister()
+	unregister()
+	if root.visit != nil || len(b.source.roots) != 0 {
+		t.Fatal("unregistered root still owns its visitor")
+	}
+}
+
+// Damaged payloads make an accidental full-record existence read observable.
+// Statement bookkeeping needs the key, and must not decode these payloads.
+func TestQueryStatementMergeUsesOnlyRecordKeys(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "keys"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	disk, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disk.Rollback()
+	key := make([]byte, 8)
+	binary.BigEndian.PutUint64(key, 1)
+	for _, bucket := range []string{"nodes", "edges", "fts"} {
+		if err := disk.Put(bucket, key, []byte("invalid payload")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := store.NewGraphState()
+	original.PageBase = &store.PageGraph{Tx: disk}
+	if _, err := original.ReadNode(1); err == nil {
+		t.Fatal("node fixture must fail decoding")
+	}
+	if _, err := original.ReadEdge(1); err == nil {
+		t.Fatal("edge fixture must fail decoding")
+	}
+	if _, err := original.ReadFTS(1); err == nil {
+		t.Fatal("FTS fixture must fail decoding")
+	}
+	final := store.CloneGraphStateShallow(original)
+	final.DeletedNodes.Set(1, true)
+	final.DeletedEdges.Set(1, true)
+	final.DeletedFTS.Set(1, true)
+	parent := &Tx{base: original, graph: original, changes: &txChanges{}}
+	changes := &txChanges{deleteNodes: map[uint64]struct{}{1: {}}, deleteEdges: map[uint64]struct{}{1: {}}, deleteFTS: map[uint64]struct{}{1: {}}}
+	if err := mergeStatementChanges(context.Background(), parent, final, changes); err != nil {
+		t.Fatal(err)
+	}
+	if len(parent.changes.deleteNodes) != 1 || len(parent.changes.deleteEdges) != 1 || len(parent.changes.deleteFTS) != 1 {
+		t.Fatal("key-only merge lost original existence")
+	}
+}
+
+func TestQueryCountDoesNotRepeatLiveSweep(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "count")
+	db, err := Open(path, OpenOptions{Create: true, PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for range 30000 {
+			if _, err := tx.CreateNode(CreateNodeOptions{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	result, err := db.QueryContext(context.Background(), `MATCH (n) RETURN count(*) AS total`, nil, QueryOptions{MaxBytes: 12 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0]["total"] != int64(30000) {
+		t.Fatalf("count=%v", result)
 	}
 }

@@ -161,12 +161,7 @@ func (graph *GraphState) NodeCountContext(ctx context.Context) (uint64, error) {
 	if graph.PageBase == nil {
 		return uint64(graph.Nodes.Len()), nil
 	}
-	if graph.Nodes.Len() == 0 && graph.DeletedNodes.Len() == 0 {
-		return graph.PageBase.count(pageNodes)
-	}
-	var count uint64
-	err := graph.VisitNodeIDs(ctx, func(uint64) error { count++; return nil })
-	return count, err
+	return pageOverlayCount(ctx, graph.PageBase, pageNodes, &graph.Nodes, &graph.DeletedNodes)
 }
 
 func (graph *GraphState) ReadEdge(id uint64) (*EdgeRecord, error) {
@@ -200,12 +195,53 @@ func (graph *GraphState) EdgeCountContext(ctx context.Context) (uint64, error) {
 	if graph.PageBase == nil {
 		return uint64(graph.Edges.Len()), nil
 	}
-	if graph.Edges.Len() == 0 && graph.DeletedEdges.Len() == 0 {
-		return graph.PageBase.count(pageEdges)
+	return pageOverlayCount(ctx, graph.PageBase, pageEdges, &graph.Edges, &graph.DeletedEdges)
+}
+
+// Counting an overlay needs key presence only. Keep work proportional to the
+// write set, rather than scanning or decoding the whole base graph.
+func pageOverlayCount[V any](ctx context.Context, page *PageGraph, bucket string, overlay *PagedMap[V], deleted *PagedMap[bool]) (uint64, error) {
+	count, err := page.count(bucket)
+	if err != nil {
+		return 0, err
 	}
-	var count uint64
-	err := graph.VisitEdgeIDs(ctx, func(uint64) error { count++; return nil })
-	return count, err
+	has := func(id uint64) (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if budget := pageReadBudgetFromContext(ctx); budget != nil {
+			if err := budget.ReservePageRead(1, 16); err != nil {
+				return false, err
+			}
+			defer budget.ReleasePageRead(16)
+		}
+		return page.Tx.Has(bucket, pageID(id))
+	}
+	for id, removed := range deleted.All() {
+		if !removed {
+			continue
+		}
+		exists, err := has(id)
+		if err != nil {
+			return 0, err
+		}
+		if exists {
+			count--
+		}
+	}
+	for id := range overlay.All() {
+		if deleted.Get(id) {
+			continue
+		}
+		exists, err := has(id)
+		if err != nil {
+			return 0, err
+		}
+		if !exists {
+			count++
+		}
+	}
+	return count, ctx.Err()
 }
 
 func (graph *GraphState) VisitLabel(ctx context.Context, label string, visit func(uint64) error) error {

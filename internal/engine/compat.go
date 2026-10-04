@@ -141,25 +141,22 @@ func mergeStatementChanges(ctx context.Context, tx *Tx, final *store.GraphState,
 		if graph == nil {
 			return false, nil
 		}
-		node, err := graph.ReadNode(id)
-		return node != nil, err
+		return graph.HasRecord(id, true)
 	}
 	readEdge := func(graph *store.GraphState, id uint64) (bool, error) {
 		if graph == nil {
 			return false, nil
 		}
-		edge, err := graph.ReadEdge(id)
-		return edge != nil, err
+		return graph.HasRecord(id, false)
 	}
 	readFTS := func(graph *store.GraphState, id uint64) (bool, error) {
 		if graph == nil {
 			return false, nil
 		}
-		record, err := graph.ReadFTS(id)
-		return record != nil, err
+		return graph.HasFTS(id)
 	}
 
-	// Read every affected base and final record before changing parent state.
+	// Check every affected key before changing parent state; payloads are not needed.
 	nodes, err := collect(changes.upsertNodes, changes.deleteNodes,
 		func(id uint64) (bool, error) { return readNode(final, id) },
 		func(id uint64) (bool, error) { return readNode(tx.base, id) })
