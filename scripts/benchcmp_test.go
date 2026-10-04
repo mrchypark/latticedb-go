@@ -401,7 +401,7 @@ func TestSourceAdmissionContractTransitionIsBoundedAndOneTime(t *testing.T) {
 func TestParseSourceAdmissionMarkerPerSample(t *testing.T) {
 	legacy := "BenchmarkReadRequests/query-2 1 100 ns/op 3500 B/op 60 allocs/op"
 	admitted := legacy + " 1 source-admission-contract"
-	for _, input := range []string{legacy + "\n" + legacy, admitted + "\n" + admitted} {
+	for _, input := range []string{legacy + "\n" + legacy, admitted + "\n" + admitted, legacy + "\nBenchmarkReadRequests/query-2"} {
 		if _, err := parse(strings.NewReader(input)); err != nil {
 			t.Fatalf("valid samples: %v", err)
 		}
@@ -418,6 +418,10 @@ func TestParseSourceAdmissionMarkerPerSample(t *testing.T) {
 		legacy + "\n" + admitted,
 		admitted + " 1 source-admission-contract\n" + legacy,
 		legacy + " source-admission-contract",
+		legacy + "\nBenchmarkReadRequests/query-2 source-admission-contract",
+		legacy + "\nBenchmarkReadRequests/query-2 1 source-admission-contract",
+		admitted + "\nBenchmarkReadRequests/query-2 source-admission-contract",
+		admitted + "\nBenchmarkReadRequests/query-2 1 source-admission-contract",
 	} {
 		if _, err := parse(strings.NewReader(input)); err == nil {
 			t.Fatalf("accepted malformed/mixed sample: %s", input)
@@ -482,6 +486,11 @@ func TestSourceAdmissionWorkflowCLIUsesCompatibleGateBaseline(t *testing.T) {
 	query := "BenchmarkReadRequests/query"
 	current[query] = map[string][]float64{"B/op": {1480}, "allocs/op": {40}, "source-admission-contract": {1}}
 	run(text(previous), text(current), true)
+	shortMarkers := []string{"BenchmarkReadRequests/query-2 source-admission-contract\n", "BenchmarkReadRequests/query-2 1 source-admission-contract\n"}
+	for _, malformed := range shortMarkers {
+		run(text(previous)+malformed, text(current), false)
+		run(text(previous), text(current)+malformed, false)
+	}
 	current[query]["B/op"][0]++
 	run(text(previous), text(current), false)
 	current[query]["B/op"][0]--
@@ -489,7 +498,7 @@ func TestSourceAdmissionWorkflowCLIUsesCompatibleGateBaseline(t *testing.T) {
 	run(text(previous), text(current), false)
 	previous[query] = map[string][]float64{"B/op": {3500}, "allocs/op": {60}, "source-admission-contract": {1}}
 	current[query] = map[string][]float64{"B/op": {3600}, "allocs/op": {65}, "source-admission-contract": {1}}
-	// These figures fit the legacy migration ceiling, but regress admitted main.
+	// The admitted main metrics must survive historical baseline selection.
 	run(text(previous), text(current), false)
 	current[query]["B/op"] = []float64{3535}
 	current[query]["allocs/op"] = []float64{60}
@@ -503,6 +512,10 @@ func TestSourceAdmissionWorkflowCLIUsesCompatibleGateBaseline(t *testing.T) {
 	run(text(previous), text(current), false)
 	current[query] = cloneMetricSet(previous[query])
 	run(text(previous), text(current), true)
+	for _, malformed := range shortMarkers {
+		run(text(previous)+malformed, text(current), false)
+		run(text(previous), text(current)+malformed, false)
+	}
 	legacy := "BenchmarkReadRequests/query-2 1 100 ns/op 3500 B/op 60 allocs/op\n"
 	run(text(previous)+legacy, text(current), false)
 	run(text(previous), text(current)+legacy, false)

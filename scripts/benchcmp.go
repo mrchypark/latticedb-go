@@ -74,15 +74,12 @@ func parse(r io.Reader) (result, error) {
 	var marked, unmarked bool
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
-		if len(fields) < 4 || !strings.HasPrefix(fields[0], "Benchmark") {
+		if len(fields) == 0 || !strings.HasPrefix(fields[0], "Benchmark") {
 			continue
 		}
 		name := cpuSuffix.ReplaceAllString(fields[0], "")
 		name = strings.Replace(name, "BenchmarkVectorSearchZigHarness", "BenchmarkVectorSearchClustered128D", 1)
 		name = strings.Replace(name, "BenchmarkVectorIndexBuildZigHarness", "BenchmarkVectorIndexBuildClustered128D", 1)
-		if results[name] == nil {
-			results[name] = map[string][]float64{}
-		}
 		markerCount := 0
 		for i, field := range fields {
 			if field == "source-admission-contract" {
@@ -95,6 +92,12 @@ func parse(r io.Reader) (result, error) {
 					return nil, fmt.Errorf("benchmark %s: invalid source-admission marker %q", name, fields[i-1])
 				}
 			}
+		}
+		if len(fields) < 4 {
+			continue
+		}
+		if results[name] == nil {
+			results[name] = map[string][]float64{}
 		}
 		if name == "BenchmarkReadRequests/query" {
 			if markerCount == 1 {
