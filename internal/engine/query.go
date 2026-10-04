@@ -6389,7 +6389,7 @@ func (clause *returnClause) render(rows []queryRow, params map[string]any, budge
 				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 					return QueryResult{}, err
 				}
-				resultRow[projection.Alias] = publicProjectionValue(value)
+				resultRow[projection.Alias] = publicPropertyProjectionValue(binding, value)
 			case projectionValue:
 				binding, ok := row.get(projection.Var)
 				if !ok {
@@ -6476,7 +6476,7 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 			if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 				return nil, err
 			}
-			resultRow[projection.Alias] = publicProjectionValue(value)
+			resultRow[projection.Alias] = publicPropertyProjectionValue(binding, value)
 		case projectionValue:
 			switch {
 			case !bound:
@@ -6510,6 +6510,18 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 		}
 	}
 	return resultRow, nil
+}
+
+// publicPropertyProjectionValue preserves stored-property cloning while
+// converting query-map fields into public values.
+func publicPropertyProjectionValue(binding boundValue, value any) any {
+	if binding.Node != nil || binding.Edge != nil {
+		// Stored properties cannot contain entity bindings. Clone mutable values
+		// while retaining immutable strings, as in the other entity projections.
+		return store.CloneValue(value)
+	}
+	// Query maps can contain entity bindings and string views into larger inputs.
+	return publicProjectionValue(value)
 }
 
 // publicProjectionValue converts an evaluated expression result into the public
@@ -6571,7 +6583,7 @@ func (clause *returnClause) projectionValue(projection projection, row queryRow,
 		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 			return nil, err
 		}
-		return publicProjectionValue(value), nil
+		return publicPropertyProjectionValue(binding, value), nil
 	case projectionExpr:
 		before := budget.bytes
 		value, err := evalQueryExpr(projection.Expr, row, params, budget)
