@@ -225,6 +225,53 @@ func (graph *GraphState) ReadFTS(id uint64) (*FTSRecord, error) {
 	}
 	return graph.PageBase.decodeFTS(id, data)
 }
+
+func (graph *GraphState) HasFTS(id uint64) (bool, error) {
+	if graph.DeletedNodes.Get(id) || graph.DeletedFTS.Get(id) {
+		return false, nil
+	}
+	if graph.FTS.Get(id) != nil {
+		return true, nil
+	}
+	if graph.PageBase == nil {
+		return false, nil
+	}
+	return graph.PageBase.Tx.Has("fts", pageID(id))
+}
+
+// VisitFTSRecord keeps the decoded text and token reservations through callback.
+func (graph *GraphState) VisitFTSRecord(ctx context.Context, id uint64, visit func(*FTSRecord) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if graph.DeletedNodes.Get(id) || graph.DeletedFTS.Get(id) {
+		return visit(nil)
+	}
+	if record := graph.FTS.Get(id); record != nil {
+		return visit(record)
+	}
+	if graph.PageBase == nil {
+		return visit(nil)
+	}
+	if pageReadBudgetFromContext(ctx) == nil {
+		record, err := graph.ReadFTS(id)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	}
+	page := graph.PageBase
+	return page.visitReadRecord(ctx, "fts", id, pageID(id), func(id uint64, data []byte, scope *pageReadScope) error {
+		if data == nil {
+			return visit(nil)
+		}
+		record, err := page.decodeFTSRead(ctx, id, data, scope)
+		if err != nil {
+			return err
+		}
+		return visit(record)
+	})
+}
 func (graph *GraphState) VisitFTS(ctx context.Context, visit func(uint64, *FTSRecord) error) error {
 	// FTS overlays are bounded by the current write transaction.
 	var overlay PagedMap[pageFTSEntry]

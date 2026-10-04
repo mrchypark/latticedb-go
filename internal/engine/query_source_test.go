@@ -365,3 +365,70 @@ func TestQueryCOWLeaseAndCancellationCleanup(t *testing.T) {
 		t.Fatal("transaction payload changed during query cleanup")
 	}
 }
+
+func TestQueryDetachDeleteAdmitsIncidentSources(t *testing.T) {
+	for _, source := range []string{"edge", "fts"} {
+		t.Run(source, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "delete-source")
+			db, err := Open(path, OpenOptions{Create: true, PageStorage: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Update(func(tx *Tx) error {
+				for range 2 {
+					if _, err := tx.CreateNode(CreateNodeOptions{}); err != nil {
+						return err
+					}
+				}
+				if source == "fts" {
+					return tx.FTSIndex(1, strings.Repeat("x", 1<<20))
+				}
+				_, err := tx.CreateEdge(1, 2, "LINK", CreateEdgeOptions{Properties: map[string]any{"body": strings.Repeat("x", 1<<20)}})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err = Open(path, OpenOptions{PageStorage: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			q := "MATCH (n) WHERE id(n) = 1 DETACH DELETE n"
+			if _, err := db.QueryContext(context.Background(), q, nil, QueryOptions{MaxBytes: 16 << 10, MaxWork: 100 << 20}); !errors.Is(err, ErrResourceLimit) {
+				t.Fatalf("unadmitted %s deletion: %v", source, err)
+			}
+			if err := db.View(func(tx *Tx) error {
+				exists, err := tx.NodeExists(1)
+				if err == nil && !exists {
+					t.Fatal("failed query published deletion")
+				}
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.QueryContext(context.Background(), q, nil, QueryOptions{MaxBytes: 32 << 20, MaxWork: 100 << 20}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.View(func(tx *Tx) error {
+				exists, err := tx.NodeExists(1)
+				if err == nil && exists {
+					t.Fatal("successful query did not delete node")
+				}
+				edges, err := tx.graph.EdgeCount()
+				if err == nil && edges != 0 {
+					t.Fatal("incident edge remains")
+				}
+				fts, err := tx.graph.HasFTS(1)
+				if err == nil && fts {
+					t.Fatal("FTS document remains")
+				}
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

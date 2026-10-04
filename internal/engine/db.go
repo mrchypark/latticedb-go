@@ -3829,7 +3829,11 @@ func (tx *Tx) deleteNodeWithBudget(nodeID uint64, budget *queryBudget) error {
 	if err := validateEntityID(nodeID); err != nil {
 		return err
 	}
-	node, err := tx.graph.ReadNode(nodeID)
+	if budget != nil {
+		scope := budget.sourceScope()
+		defer scope.close()
+	}
+	node, err := budget.readNode(tx.graph, nodeID)
 	if err != nil {
 		return err
 	}
@@ -3837,28 +3841,18 @@ func (tx *Tx) deleteNodeWithBudget(nodeID uint64, budget *queryBudget) error {
 	if err != nil {
 		return err
 	}
-	oldFTS, err := tx.graph.ReadFTS(nodeID)
-	if err != nil {
-		return err
-	}
-	var baseFTS *store.FTSRecord
+	baseFTS := false
 	if tx.base != nil {
-		baseFTS, err = tx.base.ReadFTS(nodeID)
+		baseFTS, err = tx.base.HasFTS(nodeID)
 		if err != nil {
 			return err
 		}
 	}
-	if node != nil {
-		for _, label := range node.Labels {
-			tx.graph.Labels.Remove(label, nodeID)
+	ctx := queryScanContext(budget)
+	if err := tx.graph.VisitFTSRecord(ctx, nodeID, func(oldFTS *store.FTSRecord) error {
+		if oldFTS == nil {
+			return nil
 		}
-	}
-	tx.ensureNodesWritable(nodeID)
-	tx.graph.Nodes.Delete(nodeID)
-	tx.graph.DeletedNodes.CloneShardOnce(nodeID)
-	tx.graph.DeletedNodes.Set(nodeID, true)
-	tx.markDelete(&tx.changes.upsertNodes, &tx.changes.deleteNodes, existed, nodeID)
-	if oldFTS != nil {
 		for _, token := range oldFTS.Tokens {
 			if budget != nil {
 				if err := budget.check(1, 0); err != nil {
@@ -3871,8 +3865,21 @@ func (tx *Tx) deleteNodeWithBudget(nodeID uint64, budget *queryBudget) error {
 		tx.graph.FTS.Delete(nodeID)
 		tx.graph.DeletedFTS.CloneShardOnce(nodeID)
 		tx.graph.DeletedFTS.Set(nodeID, true)
-		tx.markDelete(&tx.changes.upsertFTS, &tx.changes.deleteFTS, baseFTS != nil, nodeID)
+		tx.markDelete(&tx.changes.upsertFTS, &tx.changes.deleteFTS, baseFTS, nodeID)
+		return nil
+	}); err != nil {
+		return err
 	}
+	if node != nil {
+		for _, label := range node.Labels {
+			tx.graph.Labels.Remove(label, nodeID)
+		}
+	}
+	tx.ensureNodesWritable(nodeID)
+	tx.graph.Nodes.Delete(nodeID)
+	tx.graph.DeletedNodes.CloneShardOnce(nodeID)
+	tx.graph.DeletedNodes.Set(nodeID, true)
+	tx.markDelete(&tx.changes.upsertNodes, &tx.changes.deleteNodes, existed, nodeID)
 	edges := make(map[uint64]struct{})
 	visit := func(edgeID uint64) error {
 		if budget != nil {
@@ -3882,10 +3889,6 @@ func (tx *Tx) deleteNodeWithBudget(nodeID uint64, budget *queryBudget) error {
 		}
 		edges[edgeID] = struct{}{}
 		return nil
-	}
-	ctx := context.Background()
-	if budget != nil && budget.ctx != nil {
-		ctx = budget.ctx
 	}
 	if err := tx.graph.VisitOutgoing(ctx, nodeID, visit); err != nil {
 		return err
@@ -4503,7 +4506,11 @@ func (tx *Tx) edgesByTypeView(nodeID uint64, outgoing bool, edgeType string, lim
 }
 
 func (tx *Tx) deleteEdge(edgeID uint64) error {
-	edge, err := tx.graph.ReadEdge(edgeID)
+	if tx.queryBudget != nil {
+		scope := tx.queryBudget.sourceScope()
+		defer scope.close()
+	}
+	edge, err := tx.queryBudget.readEdge(tx.graph, edgeID)
 	if err != nil {
 		return err
 	}
@@ -4540,18 +4547,22 @@ func (tx *Tx) deleteEdge(edgeID uint64) error {
 func (tx *Tx) deleteEdgesBatchWithBudget(edgeIDs map[uint64]struct{}, budget *queryBudget) error {
 	outgoing := map[uint64][]uint64{}
 	incoming := map[uint64][]uint64{}
-	for edgeID := range edgeIDs {
+	remove := func(edgeID uint64) error {
 		if budget != nil {
 			if err := budget.check(1, 0); err != nil {
 				return err
 			}
 		}
-		edge, err := tx.graph.ReadEdge(edgeID)
+		if budget != nil {
+			scope := budget.sourceScope()
+			defer scope.close()
+		}
+		edge, err := budget.readEdge(tx.graph, edgeID)
 		if err != nil {
 			return err
 		}
 		if edge == nil {
-			continue
+			return nil
 		}
 		existed, err := idExists(tx.base, edgeID, false)
 		if err != nil {
@@ -4565,6 +4576,12 @@ func (tx *Tx) deleteEdgesBatchWithBudget(edgeIDs map[uint64]struct{}, budget *qu
 		tx.markDelete(&tx.changes.upsertEdges, &tx.changes.deleteEdges, existed, edgeID)
 		outgoing[edge.SourceID] = append(outgoing[edge.SourceID], edgeID)
 		incoming[edge.TargetID] = append(incoming[edge.TargetID], edgeID)
+		return nil
+	}
+	for edgeID := range edgeIDs {
+		if err := remove(edgeID); err != nil {
+			return err
+		}
 	}
 	for nodeID, ids := range outgoing {
 		if budget != nil {
@@ -4746,12 +4763,7 @@ func idExists(base *store.GraphState, id uint64, node bool) (bool, error) {
 	if base == nil {
 		return false, nil
 	}
-	if node {
-		record, err := base.ReadNode(id)
-		return record != nil, err
-	}
-	record, err := base.ReadEdge(id)
-	return record != nil, err
+	return base.HasRecord(id, node)
 }
 
 func mapKeys(values map[uint64]struct{}) []uint64 {
@@ -4846,7 +4858,7 @@ func (tx *Tx) trackNodeProperty(id uint64, key string) {
 		if tx.base.Nodes.Get(id) == nil {
 			return
 		}
-	} else if node, err := tx.base.ReadNode(id); err != nil || node == nil {
+	} else if exists, err := tx.base.HasRecord(id, true); err != nil || !exists {
 		return
 	}
 	if tx.changes.nodePropertyKeys == nil {
@@ -4874,7 +4886,7 @@ func (tx *Tx) trackEdgeProperty(id uint64, key string) {
 		if tx.base.Edges.Get(id) == nil {
 			return
 		}
-	} else if edge, err := tx.base.ReadEdge(id); err != nil || edge == nil {
+	} else if exists, err := tx.base.HasRecord(id, false); err != nil || !exists {
 		return
 	}
 	if tx.changes.edgePropertyKeys == nil {

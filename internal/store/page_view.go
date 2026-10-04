@@ -82,6 +82,33 @@ func (graph *GraphState) ReadNode(id uint64) (*NodeRecord, error) {
 	return nil, nil
 }
 
+// HasRecord checks existence for mutation bookkeeping without decoding payload.
+func (graph *GraphState) HasRecord(id uint64, node bool) (bool, error) {
+	if node {
+		if graph.DeletedNodes.Get(id) {
+			return false, nil
+		}
+		if graph.Nodes.Get(id) != nil {
+			return true, nil
+		}
+	} else {
+		if graph.DeletedEdges.Get(id) {
+			return false, nil
+		}
+		if graph.Edges.Get(id) != nil {
+			return true, nil
+		}
+	}
+	if graph.PageBase == nil {
+		return false, nil
+	}
+	bucket := pageEdges
+	if node {
+		bucket = pageNodes
+	}
+	return graph.PageBase.Tx.Has(bucket, pageID(id))
+}
+
 // VisitNode admits disk allocations for the callback lifetime. Overlay records
 // are already resident and are not charged as newly decoded page storage.
 func (graph *GraphState) VisitNode(ctx context.Context, id uint64, visit func(*NodeRecord) error) error {
