@@ -43,6 +43,28 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(terms[:32], ['repeated'] + ['t' + str(i) for i in range(31)])
         self.assertEqual(tokens('x' * 64 + ' ' + 'y' * 65), ['x' * 64])
 
+    def test_latency_resolution_and_invalid_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            qrels = root / 'qrels.json'; qrels.write_text(json.dumps({'q': {'a': 1}}))
+            manifest = root / 'manifest.json'; manifest.write_text(json.dumps({'document_ids': {'a': 'original'}}))
+            result = root / 'result.json'
+            rows = [{'repeat': r, 'query_id': 'q', 'elapsed_ns': 0, 'results': []} for r in range(3)]
+            result.write_text(json.dumps({'runs': rows}))
+            got = evaluate(qrels, manifest, [result])['results']['result']
+            self.assertEqual(got['median_ms'], 0)
+            self.assertEqual(got['p95_ms'], 0)
+            for value in [-1, None, True, '0', .5, float('nan'), float('inf')]:
+                with self.subTest(value=value):
+                    rows[0]['elapsed_ns'] = value
+                    result.write_text(json.dumps({'runs': rows}))
+                    with self.assertRaisesRegex(ValueError, 'latency'):
+                        evaluate(qrels, manifest, [result])
+            del rows[0]['elapsed_ns']
+            result.write_text(json.dumps({'runs': rows}))
+            with self.assertRaisesRegex(ValueError, 'latency'):
+                evaluate(qrels, manifest, [result])
+
     def test_archive_pin_before_output(self):
         with tempfile.TemporaryDirectory() as d:
             archive = Path(d) / 'bad.zip'; archive.write_bytes(b'not the pinned archive')

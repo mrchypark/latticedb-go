@@ -44,6 +44,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_fts_corpus.py
 
 ## Measurement contract
 
+Elapsed time is recorded as nonnegative integer nanoseconds. A zero sample means the query completed within the clock resolution; it is retained without clamping. Missing, negative, or non-integer timing values fail evaluation. The archived measurements used the source hashes in `environment.json` at commit `e431660ebde4f4ce7accacc4997df4011bfaa9b0`. The later validator correction accepts zero samples; it does not change the archived samples or their statistics.
+
 The common-input experiment extracts lowercase ASCII `[a-z0-9]+` tokens and drops entire tokens longer than 64 characters. Document token multiplicity is preserved. Both query inputs remove `and`, `or`, and `not`, which the Zig query parser treats as keywords regardless of its stopword setting. Query terms are deduplicated in input order, then limited to 32. No query in this dataset exceeds that limit. No other stopwords, stemming, or fuzzy matching are used in the common-input comparison. BM25 uses OR semantics, k1=1.2, b=0.75 and IDF `log(1+(N-df+0.5)/(df+0.5))`.
 
 Go's raw-input configurations use the original Unicode text and original query. These measure frequency, BM25 and BM25 with English Porter stemming as product choices. They are not presented as tokenizer-equivalent to Zig. No default scoring or fuzzy behavior changes are made.

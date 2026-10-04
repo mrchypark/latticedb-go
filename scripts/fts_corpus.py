@@ -126,9 +126,11 @@ def evaluate(qrels, manifest, results):
             ids = [str(h['id']) for h in row['results']]
             if not set(ids) <= docs or any(not math.isfinite(h['score']) for h in row['results']):
                 raise ValueError('Unknown document or nonfinite score')
-            if row['elapsed_ns'] <= 0:
-                raise ValueError('Missing or nonpositive latency')
-            group[qid] = (ids, metrics(ids, relevance[qid]), row['elapsed_ns'] / 1e6)
+            elapsed = row.get('elapsed_ns')
+            # Zero is valid when the query completes within one clock tick.
+            if type(elapsed) is not int or elapsed < 0:
+                raise ValueError('Missing or invalid latency: require nonnegative integer nanoseconds')
+            group[qid] = (ids, metrics(ids, relevance[qid]), elapsed / 1e6)
         if set(by_repeat) != {0, 1, 2}:
             raise ValueError(f'{path}: require exactly repeats0,1,2')
         for group in by_repeat.values():

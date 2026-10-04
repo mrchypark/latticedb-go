@@ -23,8 +23,9 @@ func TestReopenedBM25AndTiming(t *testing.T) {
 		t.Fatal(out.Runs[0].Results, expected)
 	}
 	for _, r := range out.Runs {
-		if r.ElapsedNS <= 0 {
-			t.Fatal("missing timing")
+		// A fast query can complete within one clock tick, notably on Windows.
+		if r.ElapsedNS < 0 {
+			t.Fatal("negative timing")
 		}
 	}
 }
