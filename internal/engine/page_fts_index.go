@@ -629,7 +629,7 @@ func pageFTSPostingTerms(ctx context.Context, page *store.PageGraph, index strin
 	}
 	vocab := make(map[string]struct{})
 	held := mapBaseBytes
-	err := page.VisitFTSVocabularyWithLimit(ctx, index, budget.maxBytes-budget.bytes, func(token string) error {
+	err := page.VisitFTSVocabularyWithLimit(store.WithPageReadBudget(ctx, budget), index, budget.maxBytes-budget.bytes, func(token string) error {
 		if err := budget.add(1); err != nil {
 			return err
 		}

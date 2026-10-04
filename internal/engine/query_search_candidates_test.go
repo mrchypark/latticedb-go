@@ -283,7 +283,7 @@ func TestPageFTSCandidateSkipsWidePostingsForNarrowLabels(t *testing.T) {
 		`MATCH (n:Rare) WHERE n.text @@ "needle" RETURN id(n) AS id`,
 		`MATCH (n:Common:Rare) WHERE n.text @@ "needle" RETURN id(n) AS id`,
 	} {
-		options := QueryOptions{MaxBytes: 1 << 10}
+		options := QueryOptions{MaxBytes: 4 << 10}
 		if i == 0 {
 			options.MaxWork = 32
 		}
@@ -326,7 +326,7 @@ func TestPageFTSCandidateKeepsSelectiveGlobalPostingUnderLowWork(t *testing.T) {
 	}
 
 	result, err := db.QueryContext(t.Context(), `MATCH (n) WHERE n.text @@ "needle" RETURN id(n) AS id`, nil, QueryOptions{
-		MaxWork: 32, MaxBytes: 1 << 10,
+		MaxWork: 32, MaxBytes: 4 << 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -365,7 +365,7 @@ func TestPageFTSCandidateKeepsSelectivePostingWithLargeLabelUnderLowWork(t *test
 	}
 
 	result, err := db.QueryContext(t.Context(), `MATCH (n:Common) WHERE n.text @@ "needle" RETURN id(n) AS id`, nil, QueryOptions{
-		MaxWork: 32, MaxBytes: 1 << 10,
+		MaxWork: 32, MaxBytes: 4 << 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -405,7 +405,7 @@ func TestPageFTSCandidateKeepsTenMatchesWithLargeLabelUnderLowWork(t *testing.T)
 	}
 
 	result, err := db.QueryContext(t.Context(), `MATCH (n:Common) WHERE n.text @@ "`+needle+`" RETURN id(n) AS id`, nil, QueryOptions{
-		MaxWork: 768, MaxBytes: 1 << 12,
+		MaxWork: 768, MaxBytes: 32 << 10,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -509,7 +509,7 @@ func TestPageQueryUsesOnlyCurrentScopedFTSIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := `MATCH (n:Person) WHERE n.text @@ 'needle' RETURN id(n) AS id`
-	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 500, MaxBytes: 1024})
+	result, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 500, MaxBytes: 4096})
 	if err != nil || len(result.Rows) != 1 || result.Rows[0]["id"] != int64(matchID) {
 		t.Fatalf("scoped page FTS rows=%v err=%v", result.Rows, err)
 	}
@@ -519,7 +519,7 @@ func TestPageQueryUsesOnlyCurrentScopedFTSIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	tx.graph.PageBase.SearchIndexesCurrent = false
-	_, err = tx.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 500, MaxBytes: 1024})
+	_, err = tx.QueryContext(t.Context(), query, nil, QueryOptions{MaxWork: 500, MaxBytes: 4096})
 	_ = tx.Rollback()
 	if !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("stale page FTS query error=%v, want exact scan resource limit", err)

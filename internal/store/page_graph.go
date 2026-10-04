@@ -191,7 +191,7 @@ func (graph *PageGraph) VisitIncoming(ctx context.Context, id uint64, visit func
 // PutNode and PutEdge update their lookup entries in the same physical
 // transaction. A caller must roll back the transaction after a write error.
 func (graph *PageGraph) PutNode(node *NodeRecord) error {
-	data, err := encodePageNode(node)
+	data, err := encodePageNodeBounded(node, graph.recordLimit())
 	if err != nil {
 		return err
 	}
@@ -231,7 +231,7 @@ func (graph *PageGraph) PutNode(node *NodeRecord) error {
 	return nil
 }
 func (graph *PageGraph) PutEdge(edge *EdgeRecord) error {
-	data, err := encodePageEdge(edge)
+	data, err := encodePageEdgeBounded(edge, graph.recordLimit())
 	if err != nil {
 		return err
 	}

@@ -12,6 +12,7 @@ func (*DB) Begin(bool) (*Tx, error)                           { return nil, ErrU
 func (*DB) Close() error                                      { return ErrUnsupportedPlatform }
 func (*DB) Sync() error                                       { return ErrUnsupportedPlatform }
 func (*Tx) Get(string, []byte) ([]byte, error)                { return nil, ErrUnsupportedPlatform }
+func (*Tx) Has(string, []byte) (bool, error)                  { return false, ErrUnsupportedPlatform }
 func (*Tx) GetBounded(string, []byte, uint64) ([]byte, error) { return nil, ErrUnsupportedPlatform }
 func (*Tx) GetBoundedWithCharge(string, []byte, uint64, func(uint64) error) ([]byte, error) {
 	return nil, ErrUnsupportedPlatform

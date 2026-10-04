@@ -28,9 +28,24 @@ const (
 )
 
 type binaryEncoder struct {
-	out     io.Writer
-	scratch [10]byte
-	err     error
+	out io.Writer
+	// When enabled by page writers, mirror the decoder allocation bound.
+	allocationLimit uint64
+	allocationBytes uint64
+	scratch         [10]byte
+	err             error
+}
+
+func (e *binaryEncoder) admitDecoded(count, size uint64) {
+	if e.allocationLimit == 0 || e.err != nil {
+		return
+	}
+	bytes := multiplySaturated(count, size)
+	if bytes > e.allocationLimit-e.allocationBytes {
+		e.err = fmt.Errorf("%w: page record decoder allocation exceeds limit", ErrLoadResourceLimit)
+		return
+	}
+	e.allocationBytes += bytes
 }
 
 func (e *binaryEncoder) write(data []byte) {
@@ -53,6 +68,7 @@ func (e *binaryEncoder) i(value int64) {
 }
 func (e *binaryEncoder) tag(value byte) { e.scratch[0] = value; e.write(e.scratch[:1]) }
 func (e *binaryEncoder) str(value string) {
+	e.admitDecoded(uint64(len(value)), 2)
 	e.u(uint64(len(value)))
 	if e.err != nil {
 		return
@@ -64,6 +80,7 @@ func (e *binaryEncoder) str(value string) {
 	}
 }
 func (e *binaryEncoder) bytes(value []byte) {
+	e.admitDecoded(uint64(len(value)), 1)
 	if value == nil {
 		e.u(0)
 		return
@@ -72,6 +89,7 @@ func (e *binaryEncoder) bytes(value []byte) {
 	e.write(value)
 }
 func (e *binaryEncoder) strings(values []string) {
+	e.admitDecoded(uint64(len(values)), 16)
 	if e.err != nil {
 		return
 	}
@@ -88,6 +106,7 @@ func (e *binaryEncoder) strings(values []string) {
 	}
 }
 func (e *binaryEncoder) ids(values []uint64) {
+	e.admitDecoded(uint64(len(values)), 8)
 	if e.err != nil {
 		return
 	}
@@ -104,6 +123,7 @@ func (e *binaryEncoder) ids(values []uint64) {
 	}
 }
 func (e *binaryEncoder) properties(values map[string]persistedValue, depth int) {
+	e.admitDecoded(uint64(len(values)), 208)
 	if e.err != nil {
 		return
 	}
@@ -167,6 +187,7 @@ func (e *binaryEncoder) value(value persistedValue, depth int) {
 		e.tag(binaryBytesValue)
 		e.bytes(value.Bytes)
 	case "vector":
+		e.admitDecoded(uint64(len(value.Vector)), 4)
 		e.tag(binaryVectorValue)
 		if value.Vector == nil {
 			e.u(0)
@@ -185,6 +206,7 @@ func (e *binaryEncoder) value(value persistedValue, depth int) {
 			}
 		}
 	case "list":
+		e.admitDecoded(uint64(len(value.List)), 136)
 		e.tag(binaryListValue)
 		if value.List == nil {
 			e.u(0)

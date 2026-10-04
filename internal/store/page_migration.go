@@ -1391,9 +1391,13 @@ func (p *pageImporter) applyDelta(delta persistedDelta, frameHeader, framePayloa
 	} else {
 		ops := make([]StreamOperation, 0, len(delta.StreamOperations))
 		for _, op := range delta.StreamOperations {
-			payload, err := decodeStreamValue(op.Stream, op.Payload)
-			if err != nil {
-				return err
+			var payload any
+			if op.Type == "publish" {
+				var err error
+				payload, err = decodeStreamValue(op.Stream, op.Payload)
+				if err != nil {
+					return err
+				}
 			}
 			ops = append(ops, StreamOperation{Type: op.Type, Stream: op.Stream, Consumer: op.Consumer, Sequence: op.Sequence, Kind: op.Kind, Payload: payload})
 		}

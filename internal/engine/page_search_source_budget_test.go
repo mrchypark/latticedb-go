@@ -160,3 +160,82 @@ func TestStaleFTSScanReleasesBytesButSharesBM25Work(t *testing.T) {
 		t.Fatalf("BM25 passes reset cumulative work=%v", err)
 	}
 }
+
+func TestPageFuzzyVocabularyAdmitsRawAndDecodedTerm(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "vocab"), OpenOptions{Create: true, PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Update(func(tx *Tx) error {
+		n, err := tx.CreateNode(CreateNodeOptions{})
+		if err != nil {
+			return err
+		}
+		return tx.FTSIndex(n.ID, strings.Repeat("a", 1<<20))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	opts := FTSSearchOptions{Limit: 1, MaxDistance: 1, MinTermLength: 2, MaxBytes: (1 << 20) + 1024, MaxWork: 32 << 20}
+	if _, err = db.FTSSearchContext(context.Background(), "x", opts); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("raw plus decoded term admission=%v", err)
+	}
+	opts.MaxBytes = 8 << 20
+	if got, err := db.FTSSearchContext(context.Background(), "x", opts); err != nil || len(got) != 0 {
+		t.Fatalf("sufficient budget=%v err=%v", got, err)
+	}
+}
+
+func TestPageStreamAdmitsPayloadBeforeDecode(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "stream"), OpenOptions{Create: true, PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Update(func(tx *Tx) error { return tx.PublishStream("events", "event", strings.Repeat("x", 1<<20)) }); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.ReadStreamContext(context.Background(), "events", 0, StreamReadOptions{Limit: 1000000, MaxBytes: 1024})
+	if err != nil || !got.ByteLimited || len(got.Records) != 0 || cap(got.Records) > 22 {
+		t.Fatalf("small budget=%+v err=%v", got, err)
+	}
+	got, err = db.ReadStreamContext(context.Background(), "events", 0, StreamReadOptions{Limit: 1, MaxBytes: 16 << 20})
+	if err != nil || got.ByteLimited || len(got.Records) != 1 {
+		t.Fatalf("sufficient budget: count=%d limited=%v err=%v", len(got.Records), got.ByteLimited, err)
+	}
+}
+
+func TestPageVectorMaintenanceAdmitsSource(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "maintenance"), OpenOptions{Create: true, PageStorage: true, EnableVector: true, VectorDimensions: 2, VectorM: 2, VectorIndexMode: VectorIndexHNSWSynchronous})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"embedding": []float32{1, 1}, "body": strings.Repeat("x", 1<<20)}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.vectorIndexBuildMaxLogicalBytes = 128 << 10
+	if err = db.RebuildVectorIndexContext(context.Background()); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("rebuild admission=%v", err)
+	}
+	write, err := db.pages.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := &directSearchBudget{ctx: context.Background(), maxWork: 32 << 20, maxBytes: 128 << 10}
+	err = applyPageVectorChanges(context.Background(), &store.PageGraph{Tx: write}, db.graph, db.graph, []uint64{1}, budget)
+	write.Rollback()
+	if !errors.Is(err, ErrResourceLimit) || budget.bytes != 0 {
+		t.Fatalf("maintenance admission=%v retained=%d", err, budget.bytes)
+	}
+	db.vectorIndexBuildMaxLogicalBytes = 32 << 20
+	if err = db.RebuildVectorIndexContext(context.Background()); err != nil {
+		t.Fatalf("sufficient rebuild=%v", err)
+	}
+	if err = db.Update(func(tx *Tx) error { return tx.SetProperty(1, "embedding", []float32{2, 2}) }); err != nil {
+		t.Fatalf("sufficient maintenance=%v", err)
+	}
+}

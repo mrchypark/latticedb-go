@@ -9,6 +9,8 @@ import (
 	"io"
 	"iter"
 	"slices"
+
+	"github.com/mrchypark/latticedb-go/internal/pagestore"
 )
 
 const (
@@ -206,7 +208,22 @@ func (backend pagePropertyBackend) visit(ctx context.Context, definition Propert
 		ctx = context.Background()
 	}
 	_, bucket := pagePropertyBuckets(backend.node)
+	if budget := pageReadBudgetFromContext(ctx); budget != nil {
+		textBytes := addSaturated(uint64(len(definition.Scope)+len(definition.Property)), uint64(len(key.text)))
+		scratch := multiplySaturated(addSaturated(textBytes, 64), 2)
+		if err := budget.ReservePageRead(max(uint64(1), textBytes), addSaturated(scratch, 256)); err != nil {
+			return err
+		}
+		defer budget.ReleasePageRead(256)
+		prefix := pagePropertyPostingPrefix(definition, key)
+		budget.ReleasePageRead(scratch)
+		return backend.visitPrefix(ctx, bucket, prefix, definition, value, key, added, removed, charge, visit)
+	}
 	prefix := pagePropertyPostingPrefix(definition, key)
+	return backend.visitPrefix(ctx, bucket, prefix, definition, value, key, added, removed, charge, visit)
+}
+
+func (backend pagePropertyBackend) visitPrefix(ctx context.Context, bucket string, prefix []byte, definition PropertyIndexDefinition, value any, key propertyValueKey, added, removed propertyPosting, charge func() error, visit func(uint64) error) error {
 	nextAdded, stopAdded := iter.Pull(added.all())
 	defer stopAdded()
 	var addID uint64
@@ -229,7 +246,7 @@ func (backend pagePropertyBackend) visit(ctx context.Context, definition Propert
 		if removed.has(id) {
 			return nil
 		}
-		valid, err := backend.matches(id, definition, value, key)
+		valid, err := backend.matches(ctx, id, definition, value, key)
 		if err != nil {
 			return err
 		}
@@ -244,7 +261,7 @@ func (backend pagePropertyBackend) visit(ctx context.Context, definition Propert
 		}
 		return nil
 	}
-	err := backend.graph.Tx.Scan(ctx, bucket, prefix, pagePrefixEnd(prefix), func(rowKey, rowValue []byte) error {
+	err := backend.graph.visitPropertyPostings(ctx, bucket, prefix, func(rowKey, rowValue []byte) error {
 		if charge != nil {
 			if err := charge(); err != nil {
 				return err
@@ -304,37 +321,72 @@ func (backend pagePropertyBackend) visit(ctx context.Context, definition Propert
 	return nil
 }
 
-func (backend pagePropertyBackend) matches(id uint64, definition PropertyIndexDefinition, value any, key propertyValueKey) (bool, error) {
-	var properties Properties
-	var scopes []string
+// Posting strings can be as large as the indexed property. Admit both the raw
+// value and its decoder scratch before parsing or validating the canonical row.
+func (graph *PageGraph) visitPropertyPostings(ctx context.Context, bucket string, prefix []byte, visit func([]byte, []byte) error) error {
+	budget := pageReadBudgetFromContext(ctx)
+	if budget == nil {
+		return graph.Tx.Scan(ctx, bucket, prefix, pagePrefixEnd(prefix), visit)
+	}
+	return graph.Tx.ScanKeysWithCharge(ctx, bucket, prefix, pagePrefixEnd(prefix), uint64(len(prefix)+8), func(size uint64) error {
+		return budget.ReservePageRead(1, 2*size)
+	}, func(key []byte) error {
+		defer budget.ReleasePageRead(uint64(2 * len(key)))
+		scope := &pageReadScope{budget: budget}
+		defer func() { budget.ReleasePageRead(scope.held) }()
+		if err := scope.reserve(0, 256); err != nil {
+			return err
+		}
+		data, err := graph.Tx.GetBoundedWithCharge(bucket, key, graph.recordLimit(), func(size uint64) error { return scope.reserve(size, size) })
+		if errors.Is(err, pagestore.ErrValueTooLarge) {
+			return ErrLoadResourceLimit
+		}
+		if err != nil {
+			return err
+		}
+		if data == nil {
+			return nil
+		}
+		// readPageString owns a byte scratch and string; encodedKey adds a copy.
+		// Three times the raw length bounds those decoded representations.
+		if err := scope.reserve(0, multiplySaturated(uint64(len(data)), 3)); err != nil {
+			return err
+		}
+		return visit(key, data)
+	})
+}
+
+func (backend pagePropertyBackend) matches(ctx context.Context, id uint64, definition PropertyIndexDefinition, value any, key propertyValueKey) (bool, error) {
+	var matched bool
+	check := func(properties Properties, scopes []string) error {
+		if !propertyIndexMatches(definition, scopes, properties) {
+			return nil
+		}
+		actual, _ := properties.Lookup(definition.Property)
+		actualKey, err := makePropertyValueKey(actual)
+		if err != nil {
+			return err
+		}
+		matched = actualKey == key && propertyIndexValuesEqual(actual, value)
+		return nil
+	}
+	var err error
 	if backend.node {
-		record, err := backend.graph.GetNode(id)
-		if err != nil {
-			return false, err
-		}
-		if record == nil {
-			return false, nil
-		}
-		properties, scopes = record.Properties, record.Labels
+		err = backend.graph.VisitNode(ctx, id, func(record *NodeRecord) error {
+			if record == nil {
+				return nil
+			}
+			return check(record.Properties, record.Labels)
+		})
 	} else {
-		record, err := backend.graph.GetEdge(id)
-		if err != nil {
-			return false, err
-		}
-		if record == nil {
-			return false, nil
-		}
-		properties, scopes = record.Properties, []string{record.Type}
+		err = backend.graph.VisitEdge(ctx, id, func(record *EdgeRecord) error {
+			if record == nil {
+				return nil
+			}
+			return check(record.Properties, []string{record.Type})
+		})
 	}
-	if !propertyIndexMatches(definition, scopes, properties) {
-		return false, nil
-	}
-	actual, _ := properties.Lookup(definition.Property)
-	actualKey, err := makePropertyValueKey(actual)
-	if err != nil {
-		return false, err
-	}
-	return actualKey == key && propertyIndexValuesEqual(actual, value), nil
+	return matched, err
 }
 
 func (backend pagePropertyBackend) lookup(definition PropertyIndexDefinition, value any, key propertyValueKey, added, removed propertyPosting) ([]uint64, bool, error) {

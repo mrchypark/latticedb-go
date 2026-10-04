@@ -4,6 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -354,5 +359,179 @@ func TestCheckGatesSkipsNewRowsUntilBaselineExists(t *testing.T) {
 	}
 	if !strings.Contains(diagnostics.String(), "no compatible baseline") {
 		t.Fatalf("diagnostics = %q, want baseline skip", diagnostics.String())
+	}
+}
+
+func TestSourceAdmissionContractTransitionIsBoundedAndOneTime(t *testing.T) {
+	previous := gateFixture(nil)
+	current := gateFixture(map[string]float64{"BenchmarkReadRequests/query B/op": 1380, "BenchmarkReadRequests/query allocs/op": 120})
+	current["BenchmarkReadRequests/query"]["source-admission-contract"] = []float64{1, 1}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range []string{"B/op", "allocs/op"} {
+		current["BenchmarkReadRequests/query"][unit][0]++
+		if err := checkGates(current, previous, new(bytes.Buffer)); err == nil {
+			t.Fatalf("unbounded transition %s", unit)
+		}
+		current["BenchmarkReadRequests/query"][unit][0]--
+	}
+	// A versioned main baseline immediately restores the original strict gates.
+	previous["BenchmarkReadRequests/query"]["source-admission-contract"] = []float64{1}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err == nil {
+		t.Fatal("migration allowance reapplied within contract 1")
+	}
+	current["BenchmarkReadRequests/query"]["B/op"] = []float64{100}
+	current["BenchmarkReadRequests/query"]["allocs/op"] = []float64{100}
+	if err := checkGates(current, previous, new(bytes.Buffer)); err != nil {
+		t.Fatal(err)
+	}
+	delete(current["BenchmarkReadRequests/query"], "source-admission-contract")
+	if err := checkGates(current, previous, new(bytes.Buffer)); err == nil {
+		t.Fatal("marker removal bypassed admission gates")
+	}
+	for _, samples := range [][]float64{{0}, {2}, {1, 0}, {math.NaN()}} {
+		current["BenchmarkReadRequests/query"]["source-admission-contract"] = samples
+		if err := checkGates(current, previous, new(bytes.Buffer)); err == nil {
+			t.Fatalf("accepted invalid contract %v", samples)
+		}
+	}
+}
+
+func TestParseSourceAdmissionMarkerPerSample(t *testing.T) {
+	legacy := "BenchmarkReadRequests/query-2 1 100 ns/op 3500 B/op 60 allocs/op"
+	admitted := legacy + " 1 source-admission-contract"
+	for _, input := range []string{legacy + "\n" + legacy, admitted + "\n" + admitted, legacy + "\nBenchmarkReadRequests/query-2"} {
+		if _, err := parse(strings.NewReader(input)); err != nil {
+			t.Fatalf("valid samples: %v", err)
+		}
+	}
+	for _, input := range []string{
+		legacy + " broken source-admission-contract",
+		legacy + " 0 source-admission-contract",
+		legacy + " 2 source-admission-contract",
+		legacy + " 1.5 source-admission-contract",
+		legacy + " NaN source-admission-contract",
+		legacy + " +Inf source-admission-contract",
+		admitted + " 1 source-admission-contract",
+		admitted + "\n" + legacy,
+		legacy + "\n" + admitted,
+		admitted + " 1 source-admission-contract\n" + legacy,
+		legacy + " source-admission-contract",
+		legacy + "\nBenchmarkReadRequests/query-2 source-admission-contract",
+		legacy + "\nBenchmarkReadRequests/query-2 1 source-admission-contract",
+		admitted + "\nBenchmarkReadRequests/query-2 source-admission-contract",
+		admitted + "\nBenchmarkReadRequests/query-2 1 source-admission-contract",
+	} {
+		if _, err := parse(strings.NewReader(input)); err == nil {
+			t.Fatalf("accepted malformed/mixed sample: %s", input)
+		}
+	}
+}
+
+func TestSourceAdmissionWorkflowCLIUsesCompatibleGateBaseline(t *testing.T) {
+	directory := t.TempDir()
+	executable := filepath.Join(directory, "benchcmp")
+	if runtime.GOOS == "windows" {
+		executable += ".exe"
+	}
+	if output, err := exec.Command("go", "build", "-o", executable, "benchcmp.go").CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v %s", err, output)
+	}
+	text := func(metrics result) string {
+		names := make([]string, 0, len(metrics))
+		for name := range metrics {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		var out strings.Builder
+		for _, name := range names {
+			fmt.Fprintf(&out, "%s-2 1 100 ns/op", name)
+			units := make([]string, 0, len(metrics[name]))
+			for unit := range metrics[name] {
+				if unit != "ns/op" {
+					units = append(units, unit)
+				}
+			}
+			sort.Strings(units)
+			for _, unit := range units {
+				v, _ := value(metrics[name], unit)
+				fmt.Fprintf(&out, " %g %s", v, unit)
+			}
+			out.WriteByte('\n')
+		}
+		return out.String()
+	}
+	disk := diskBaselineFixture()
+	previous := gateFixture(nil)
+	current := gateFixture(nil)
+	for _, name := range diskBaselineBenchmarks {
+		current[name] = cloneMetricSet(disk[name])
+	}
+	write := func(name, content string) string {
+		path := filepath.Join(directory, name)
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	diskPath := write("disk.txt", text(disk))
+	run := func(previousText, currentText string, passes bool) {
+		t.Helper()
+		output, err := exec.Command(executable, "-current", write("current.txt", currentText), "-previous", write("previous.txt", previousText), "-disk-baseline", diskPath, "-check").CombinedOutput()
+		if (err == nil) != passes {
+			t.Fatalf("passes=%v err=%v output=%s", passes, err, output)
+		}
+	}
+	query := "BenchmarkReadRequests/query"
+	current[query] = map[string][]float64{"B/op": {1480}, "allocs/op": {40}, "source-admission-contract": {1}}
+	run(text(previous), text(current), true)
+	shortMarkers := []string{"BenchmarkReadRequests/query-2 source-admission-contract\n", "BenchmarkReadRequests/query-2 1 source-admission-contract\n"}
+	for _, malformed := range shortMarkers {
+		run(text(previous)+malformed, text(current), false)
+		run(text(previous), text(current)+malformed, false)
+	}
+	current[query]["B/op"][0]++
+	run(text(previous), text(current), false)
+	current[query]["B/op"][0]--
+	current[query]["allocs/op"][0]++
+	run(text(previous), text(current), false)
+	previous[query] = map[string][]float64{"B/op": {3500}, "allocs/op": {60}, "source-admission-contract": {1}}
+	current[query] = map[string][]float64{"B/op": {3600}, "allocs/op": {65}, "source-admission-contract": {1}}
+	// The admitted main metrics must survive historical baseline selection.
+	run(text(previous), text(current), false)
+	current[query]["B/op"] = []float64{3535}
+	current[query]["allocs/op"] = []float64{60}
+	run(text(previous), text(current), true)
+	current[query]["B/op"][0]++
+	run(text(previous), text(current), false)
+	current[query]["B/op"] = []float64{3500}
+	current[query]["allocs/op"][0]++
+	run(text(previous), text(current), false)
+	current[query] = map[string][]float64{"B/op": {10}, "allocs/op": {10}}
+	run(text(previous), text(current), false)
+	current[query] = cloneMetricSet(previous[query])
+	run(text(previous), text(current), true)
+	for _, malformed := range shortMarkers {
+		run(text(previous)+malformed, text(current), false)
+		run(text(previous), text(current)+malformed, false)
+	}
+	legacy := "BenchmarkReadRequests/query-2 1 100 ns/op 3500 B/op 60 allocs/op\n"
+	run(text(previous)+legacy, text(current), false)
+	run(text(previous), text(current)+legacy, false)
+	run(strings.Replace(text(previous), "1 source-admission-contract", "broken source-admission-contract", 1), text(current), false)
+	delete(previous[query], "B/op")
+	run(text(previous), text(current), false)
+	// Reporting still compares against the archived disk fixture, not gate main.
+	reportPath := filepath.Join(directory, "report.md")
+	if output, err := exec.Command(executable, "-current", write("current.txt", text(current)), "-previous", write("previous.txt", text(gateFixture(nil))), "-disk-baseline", diskPath, "-output", reportPath).CombinedOutput(); err != nil {
+		t.Fatalf("report CLI: %v %s", err, output)
+	}
+	report, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "| `BenchmarkReadRequests/query` | 1 / 1 | 100 | 100 | +0.0% | 3500 | 200 | +1650.0% |") {
+		t.Fatalf("historical report changed: %s", report)
 	}
 }

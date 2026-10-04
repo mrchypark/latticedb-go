@@ -251,6 +251,11 @@ func (result *StreamReadResult) appendCtx(ctx context.Context, record StreamReco
 		result.ByteLimited = true
 		return nil
 	}
+	if budget := pageReadBudgetFromContext(ctx); budget != nil {
+		if err := budget.ReservePageRead(0, bytes); err != nil {
+			return err
+		}
+	}
 	cloned, err := CloneValueContext(ctx, record.Payload)
 	if err != nil {
 		return err

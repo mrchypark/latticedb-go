@@ -118,13 +118,19 @@ func (clause *mergeClause) validate(bind func(string, bindingRole) error, requir
 }
 
 func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any, budget *queryBudget) (output []queryRow, err error) {
+	if !budget.residentSources {
+		defer budget.sourceRows(func() []queryRow { return output })()
+	}
 	defer func() {
 		if err != nil {
 			budget.releaseRows(len(output))
 		}
 	}()
+	currentRoot := budget.rowSources(nil)
+	defer currentRoot.close(budget)
 	for _, incoming := range input {
 		row := incoming.clone()
+		currentRoot.setRows([]queryRow{row})
 		if err = refreshRowBindings(tx, &row, budget); err != nil {
 			return output, err
 		}
@@ -138,6 +144,7 @@ func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any
 			budget.releaseTemporary(temporary)
 			return output, matchErr
 		}
+		currentRoot.setRows(matches)
 		sets := clause.OnMatch
 		if len(matches) == 0 {
 			if err = budget.check(1, len(output)+1); err == nil {
@@ -148,6 +155,7 @@ func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any
 				return output, err
 			}
 			matches = []queryRow{row}
+			currentRoot.setRows(matches)
 			err = createMergePattern(tx, &matches[0], patterns, budget)
 			sets = clause.OnCreate
 		}
@@ -166,6 +174,7 @@ func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any
 			return output, err
 		}
 		output = append(output, matches...)
+		currentRoot.setRows(nil)
 	}
 	return output, nil
 }
@@ -235,10 +244,24 @@ func mergeMatchRows(tx *Tx, row queryRow, patterns []matchPattern, params map[st
 		iterator = &patternQueryIterator{plan: plan, tx: tx, input: iterator, pattern: pattern, params: params, limit: ^uint(0), budget: budget}
 	}
 	defer iterator.Close()
-	return collectQueryRows(iterator)
+	return collectQueryRows(iterator, budget)
 }
 
 func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *queryBudget) error {
+	var temporary uint64
+	defer func() { budget.releaseTemporary(temporary) }()
+	retainProperties := func(properties map[string]any) (map[string]any, error) {
+		retained := make(map[string]any, len(properties))
+		for key, value := range properties {
+			normalized, bytes, err := normalizeRetainedMutationValue(value, budget)
+			if err != nil {
+				return nil, err
+			}
+			temporary = saturatingAdd(temporary, bytes)
+			retained[key] = normalized
+		}
+		return retained, nil
+	}
 	// Collect repeated node declarations before creating anything, so a cycle's
 	// shared endpoint receives all its labels and properties.
 	nodes := map[string]nodePattern{}
@@ -304,11 +327,15 @@ func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *
 			}
 			continue
 		}
-		node, err := tx.CreateNode(CreateNodeOptions{Labels: pattern.Labels, Properties: pattern.Properties})
+		properties, err := retainProperties(pattern.Properties)
 		if err != nil {
 			return err
 		}
-		record, err := tx.graph.ReadNode(node.ID)
+		node, err := tx.CreateNode(CreateNodeOptions{Labels: pattern.Labels, Properties: properties})
+		if err != nil {
+			return err
+		}
+		record, err := budget.readNode(tx.graph, node.ID)
 		if err != nil {
 			return err
 		}
@@ -338,11 +365,15 @@ func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *
 			}
 			continue
 		}
-		edge, err := tx.CreateEdge(left.Node.ID, right.Node.ID, pattern.EdgeType, CreateEdgeOptions{Properties: pattern.Properties})
+		properties, err := retainProperties(pattern.Properties)
 		if err != nil {
 			return err
 		}
-		record, err := tx.graph.ReadEdge(edge.ID)
+		edge, err := tx.CreateEdge(left.Node.ID, right.Node.ID, pattern.EdgeType, CreateEdgeOptions{Properties: properties})
+		if err != nil {
+			return err
+		}
+		record, err := budget.readEdge(tx.graph, edge.ID)
 		if err != nil {
 			return err
 		}

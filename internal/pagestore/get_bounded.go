@@ -7,6 +7,20 @@ import (
 	"fmt"
 )
 
+// Has checks key presence without copying or caching the value.
+func (tx *Tx) Has(bucket string, key []byte) (bool, error) {
+	if tx == nil {
+		return false, ErrClosed
+	}
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if err := tx.check(); err != nil {
+		return false, err
+	}
+	b := tx.tx.Bucket([]byte(bucket))
+	return b != nil && b.Get(key) != nil, nil
+}
+
 // GetBounded returns an owned value only when its stored size is within maxBytes.
 // It checks the bbolt slice length before cloning or admitting it to the cache.
 func (tx *Tx) GetBounded(bucket string, key []byte, maxBytes uint64) ([]byte, error) {

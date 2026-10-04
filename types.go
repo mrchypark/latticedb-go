@@ -184,7 +184,8 @@ type QueryOptions struct {
 	// MaxWork bounds logical execution work, including comparisons and mutations.
 	MaxWork uint64
 	// MaxBytes limits owned query working storage and results, including normalized
-	// parameter copies. It does not bound process RSS or committed database size.
+	// parameter copies and disk source read/decode storage retained by rows and
+	// paths. It does not bound process RSS or committed database size.
 	MaxBytes uint64
 	// VectorNamespace selects the namespace for every vector comparison in the
 	// query. Nil preserves the legacy global vector behavior.
@@ -221,8 +222,10 @@ type FTSSearchOptions struct {
 	Analyzer FTSAnalyzer
 }
 
-// StreamReadOptions limits records and their logical size. Zero MaxBytes
-// preserves the legacy unbounded byte behavior.
+// StreamReadOptions limits records and their logical size. On disk, MaxBytes
+// also admits source read/decode scratch while retained results remain live.
+// A next record that cannot be admitted sets ByteLimited without advancing its
+// sequence. Zero MaxBytes preserves the legacy unbounded byte behavior.
 type StreamReadOptions struct {
 	Limit    uint
 	MaxBytes uint64

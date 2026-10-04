@@ -25,7 +25,7 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 		}
 	}()
 	maxHops := pattern.MaxHops
-	edgeCount, err := tx.graph.EdgeCount()
+	edgeCount, err := tx.graph.EdgeCountContext(queryScanContext(budget))
 	if err != nil {
 		return nil, err
 	}
@@ -45,6 +45,9 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 	defer budget.releaseTemporary(boundBytes)
 
 	var rows []queryRow
+	if !budget.residentSources {
+		defer budget.sourceRows(func() []queryRow { return rows })()
+	}
 	start := func(node *store.NodeRecord, reverse bool) error {
 		if err := budget.check(1, len(rows)); err != nil {
 			return err
@@ -64,6 +67,16 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 			return err
 		}
 		stack := []variablePathState{{node: node, bytes: variablePathStateBytes}}
+		var current *store.NodeRecord
+		if !budget.residentSources {
+			defer budget.sourceRoot(func(visit func(any)) {
+				visit(node)
+				visit(current)
+				for _, s := range stack {
+					visit(s.node)
+				}
+			})()
+		}
 		defer func() {
 			for _, state := range stack {
 				budget.releaseTemporary(state.bytes)
@@ -71,6 +84,8 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 		}()
 		for len(stack) != 0 {
 			state := stack[len(stack)-1]
+			current = state.node
+			stack[len(stack)-1] = variablePathState{}
 			stack = stack[:len(stack)-1]
 			matches, err := pattern.variableNodeMatches(row, endPattern, state.node, budget)
 			if err != nil {
@@ -90,13 +105,19 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 			}
 			if len(state.edges) == maxHops || edgeBound && len(state.edges) == len(boundEdges) {
 				budget.releaseTemporary(state.bytes)
+				current = nil
+				if err := budget.sweepSources(); err != nil {
+					return err
+				}
 				continue
 			}
 			push := func(edgeID uint64, next *store.NodeRecord) error {
+				scope := budget.sourceScope()
+				defer scope.close()
 				if err := budget.check(1, len(rows)); err != nil {
 					return err
 				}
-				edge, err := tx.graph.ReadEdge(edgeID)
+				edge, err := budget.readEdge(tx.graph, edgeID)
 				if err != nil {
 					return err
 				}
@@ -138,6 +159,9 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 					copy(nextEdges, state.edges)
 					nextEdges[len(state.edges)] = edgeID
 				}
+				if budget.source != nil {
+					budget.escapeSource(next)
+				}
 				stack = append(stack, variablePathState{node: next, edges: nextEdges, bytes: bytes})
 				return nil
 			}
@@ -164,6 +188,10 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 				}
 			}
 			budget.releaseTemporary(state.bytes)
+			current = nil
+			if err := budget.sweepSources(); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -181,7 +209,7 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 		success = true
 		return rows, nil
 	}
-	if err := tx.graph.VisitNodes(budget.ctx, func(node *store.NodeRecord) error {
+	if err := budget.visitNodes(tx.graph, func(node *store.NodeRecord) error {
 		return start(node, false)
 	}); err != nil {
 		return nil, err
@@ -191,11 +219,13 @@ func (pattern edgePattern) applyVariable(tx *Tx, row queryRow, params map[string
 }
 
 func (pattern edgePattern) variablePropertiesMatch(row queryRow, params map[string]any, edgeIDs []uint64, tx *Tx, budget *queryBudget) (bool, error) {
+	scope := budget.sourceScope()
+	defer scope.close()
 	for _, edgeID := range edgeIDs {
 		if err := budget.check(1, 0); err != nil {
 			return false, err
 		}
-		edge, err := tx.graph.ReadEdge(edgeID)
+		edge, err := budget.readEdge(tx.graph, edgeID)
 		if err != nil {
 			return false, err
 		}
@@ -218,11 +248,14 @@ func (pattern edgePattern) variablePropertiesMatch(row queryRow, params map[stri
 				return match, err
 			}
 		}
+		scope.reset()
 	}
 	return true, nil
 }
 
 func (pattern edgePattern) variableEdgeBinding(tx *Tx, row queryRow, budget *queryBudget) ([]uint64, uint64, bool, error) {
+	scope := budget.sourceScope()
+	defer scope.close()
 	if pattern.EdgeVar == "" {
 		return nil, 0, false, nil
 	}
@@ -249,7 +282,7 @@ func (pattern edgePattern) variableEdgeBinding(tx *Tx, row queryRow, budget *que
 			budget.releaseTemporary(bytes)
 			return nil, 0, false, fmt.Errorf("binding %q must contain edges", pattern.EdgeVar)
 		}
-		edge, err := tx.graph.ReadEdge(edgeValue.Edge.ID)
+		edge, err := budget.readEdge(tx.graph, edgeValue.Edge.ID)
 		if err != nil {
 			budget.releaseTemporary(bytes)
 			return nil, 0, false, err
@@ -268,16 +301,19 @@ func (pattern edgePattern) variableEdgeBinding(tx *Tx, row queryRow, budget *que
 			return nil, 0, false, fmt.Errorf("binding %q reuses edge %d", pattern.EdgeVar, edge.ID)
 		}
 		ids[index] = edge.ID
+		scope.reset()
 	}
 	return ids, bytes, true, nil
 }
 
 func variablePathEdges(tx *Tx, node *store.NodeRecord, outgoing, skipSelf bool, visit func(uint64, *store.NodeRecord) error, budget *queryBudget) error {
 	visitEdge := func(edgeID uint64) error {
+		scope := budget.sourceScope()
+		defer scope.close()
 		if err := budget.check(1, 0); err != nil {
 			return err
 		}
-		edge, err := tx.graph.ReadEdge(edgeID)
+		edge, err := budget.readEdge(tx.graph, edgeID)
 		if err != nil {
 			return err
 		}
@@ -299,7 +335,7 @@ func variablePathEdges(tx *Tx, node *store.NodeRecord, outgoing, skipSelf bool, 
 			}
 			nextID = edge.SourceID
 		}
-		next, err := tx.graph.ReadNode(nextID)
+		next, err := budget.readNode(tx.graph, nextID)
 		if err != nil {
 			return err
 		}
@@ -349,6 +385,8 @@ func (pattern edgePattern) variableNodeMatches(row queryRow, nodePattern nodePat
 }
 
 func (pattern edgePattern) appendVariableRow(tx *Tx, row queryRow, params map[string]any, source, target *store.NodeRecord, edgeIDs []uint64, rows []queryRow, retained *uint64, budget *queryBudget) ([]queryRow, error) {
+	scope := budget.sourceScope()
+	defer scope.close()
 	if pattern.Left.Var != "" && pattern.Left.Var == pattern.Right.Var && source.ID != target.ID {
 		return rows, nil
 	}
@@ -379,7 +417,7 @@ func (pattern edgePattern) appendVariableRow(tx *Tx, row queryRow, params map[st
 					budget.releaseTemporary(bytes)
 					return nil, err
 				}
-				edge, err := tx.graph.ReadEdge(edgeID)
+				edge, err := budget.readEdge(tx.graph, edgeID)
 				if err != nil {
 					budget.releaseTemporary(bytes)
 					return nil, err
@@ -399,5 +437,8 @@ func (pattern edgePattern) appendVariableRow(tx *Tx, row queryRow, params map[st
 		return rows, err
 	}
 	*retained += bytes
+	if budget.source != nil {
+		budget.escapeSource(nextRow)
+	}
 	return append(rows, nextRow), nil
 }

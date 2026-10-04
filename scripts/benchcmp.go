@@ -71,16 +71,43 @@ var cpuSuffix = regexp.MustCompile(`-\d+$`)
 func parse(r io.Reader) (result, error) {
 	results := result{}
 	scanner := bufio.NewScanner(r)
+	var marked, unmarked bool
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
-		if len(fields) < 4 || !strings.HasPrefix(fields[0], "Benchmark") {
+		if len(fields) == 0 || !strings.HasPrefix(fields[0], "Benchmark") {
 			continue
 		}
 		name := cpuSuffix.ReplaceAllString(fields[0], "")
 		name = strings.Replace(name, "BenchmarkVectorSearchZigHarness", "BenchmarkVectorSearchClustered128D", 1)
 		name = strings.Replace(name, "BenchmarkVectorIndexBuildZigHarness", "BenchmarkVectorIndexBuildClustered128D", 1)
+		markerCount := 0
+		for i, field := range fields {
+			if field == "source-admission-contract" {
+				markerCount++
+				if name != "BenchmarkReadRequests/query" || i < 3 || i%2 == 0 || markerCount != 1 {
+					return nil, fmt.Errorf("benchmark %s: malformed source-admission marker", name)
+				}
+				marker, err := strconv.ParseFloat(fields[i-1], 64)
+				if err != nil || marker != 1 {
+					return nil, fmt.Errorf("benchmark %s: invalid source-admission marker %q", name, fields[i-1])
+				}
+			}
+		}
+		if len(fields) < 4 {
+			continue
+		}
 		if results[name] == nil {
 			results[name] = map[string][]float64{}
+		}
+		if name == "BenchmarkReadRequests/query" {
+			if markerCount == 1 {
+				marked = true
+			} else {
+				unmarked = true
+			}
+			if marked && unmarked {
+				return nil, fmt.Errorf("benchmark %s: mixed source-admission contracts", name)
+			}
 		}
 		for i := 2; i+1 < len(fields); i += 2 {
 			value, err := strconv.ParseFloat(fields[i], 64)
@@ -177,8 +204,36 @@ func delta(current, previous map[string][]float64, unit string) string {
 	return change(c, p)
 }
 
+// Contract 1 admits raw/decode storage and tracks its live ownership (#222).
+// Legacy results have no marker. Only the 0 -> 1 transition gets a measured,
+// fixed ceiling; subsequent comparisons keep the original strict gates.
+func sourceAdmissionContract(metrics result) (int, error) {
+	samples := metrics["BenchmarkReadRequests/query"]["source-admission-contract"]
+	if len(samples) == 0 {
+		return 0, nil
+	}
+	for _, sample := range samples {
+		if sample != 1 {
+			return 0, fmt.Errorf("invalid source-admission contract %v", sample)
+		}
+	}
+	return 1, nil
+}
+
 func checkGates(current, previous result, stderr io.Writer) error {
 	var failures []string
+	currentContract, err := sourceAdmissionContract(current)
+	if err != nil {
+		return err
+	}
+	previousContract, err := sourceAdmissionContract(previous)
+	if err != nil {
+		return err
+	}
+	if currentContract < previousContract {
+		return fmt.Errorf("source-admission contract downgraded")
+	}
+	transition := previousContract == 0 && currentContract == 1
 	for _, gate := range blockingGates {
 		currentValue, currentOK := value(current[gate.benchmark], gate.unit)
 		if !currentOK {
@@ -187,11 +242,28 @@ func checkGates(current, previous result, stderr io.Writer) error {
 		}
 		previousValue, previousOK := value(previous[gate.benchmark], gate.unit)
 		if !previousOK {
+			if previousContract == 1 && gate.benchmark == "BenchmarkReadRequests/query" {
+				failures = append(failures, fmt.Sprintf("%s %s missing from admitted baseline", gate.benchmark, gate.unit))
+				continue
+			}
 			fmt.Fprintf(stderr, "performance gate skipped: %s %s has no compatible baseline\n", gate.benchmark, gate.unit)
 			continue
 		}
 		if math.IsNaN(currentValue) || math.IsInf(currentValue, 0) || currentValue < 0 || math.IsNaN(previousValue) || math.IsInf(previousValue, 0) || previousValue < 0 {
 			failures = append(failures, fmt.Sprintf("%s %s has invalid metric values", gate.benchmark, gate.unit))
+			continue
+		}
+		if transition && gate.benchmark == "BenchmarkReadRequests/query" {
+			// Darwin/arm64 paired measurements: +20 allocs/op, +1176 B/op.
+			// Keep a fixed ceiling with byte headroom, not a percentage relaxation.
+			allowance := float64(1280)
+			if gate.unit == "allocs/op" {
+				allowance = 20
+			}
+			fmt.Fprintf(stderr, "source-admission contract transition: %s %s ceiling previous +%.0f\n", gate.benchmark, gate.unit, allowance)
+			if currentValue > previousValue+allowance {
+				failures = append(failures, fmt.Sprintf("%s %s exceeds source-admission transition ceiling +%.0f", gate.benchmark, gate.unit, allowance))
+			}
 			continue
 		}
 		if gate.maxAbsoluteRise > 0 {
@@ -226,6 +298,16 @@ func withDiskBaseline(previous, disk result) result {
 	}
 	for _, benchmark := range diskBaselineBenchmarks {
 		comparison[benchmark] = disk[benchmark]
+	}
+	return comparison
+}
+
+// Historical reports retain the archived page-engine baseline. Gates must
+// instead preserve an admitted previous main query, including its marker.
+func withDiskGateBaseline(previous, disk result) result {
+	comparison := withDiskBaseline(previous, disk)
+	if len(previous["BenchmarkReadRequests/query"]["source-admission-contract"]) != 0 {
+		comparison["BenchmarkReadRequests/query"] = previous["BenchmarkReadRequests/query"]
 	}
 	return comparison
 }
@@ -427,7 +509,7 @@ func main() {
 				fmt.Fprintln(os.Stderr, err)
 				os.Exit(1)
 			}
-			previous = withDiskBaseline(previous, disk)
+			previous = withDiskGateBaseline(previous, disk)
 		}
 		if err := checkGates(current, previous, os.Stderr); err != nil {
 			fmt.Fprintln(os.Stderr, err)

@@ -95,7 +95,7 @@ func (plan *queryPlan) searchCandidate(tx *Tx, patterns []matchPattern, params m
 		return nil, nil
 	}
 	remainingWork := uint64(budget.maxWork - budget.work)
-	remainingBytes := uint64(budget.maxBytes - budget.bytes)
+	remainingBytes := budget.RemainingPageReadBytes()
 	if remainingWork == 0 || remainingBytes == 0 {
 		return nil, fmt.Errorf("%w: query search budget exhausted", ErrResourceLimit)
 	}
@@ -252,7 +252,7 @@ func pageFTSSearchCandidate(tx *Tx, node nodePattern, clause *whereClause, param
 	}
 	var population uint64
 	if len(node.Labels) == 0 {
-		population, err = tx.graph.NodeCount()
+		population, err = tx.graph.NodeCountContext(queryScanContext(budget))
 	} else {
 		// Summed document frequencies bound the posting union. Probe labels
 		// only far enough to show that this union can narrow them.
@@ -336,7 +336,7 @@ func pageFTSSearchCandidate(tx *Tx, node nodePattern, clause *whereClause, param
 			// Account for the ID slice and its deduplication entry while the
 			// union is being built. The map portion is released below once
 			// the final sorted candidate slice is retained.
-			if uint64(budget.maxBytes-budget.bytes) < 24 {
+			if budget.RemainingPageReadBytes() < 24 {
 				memoryLimited = true
 				return io.EOF
 			}

@@ -266,7 +266,7 @@ func prepareInterruptedPendingBase(t *testing.T, fixture pageBackupFixture) ([]b
 	if rollbackErr != nil {
 		t.Fatal(rollbackErr)
 	}
-	entries, err := readArchiveEntries(context.Background(), fixture.archivePath, fixture.databaseID)
+	entries, err := readArchiveEntries(context.Background(), fixture.archivePath, fixture.databaseID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func TestPageBackupResumesOutboxAndRepairsEntryBeforeHeadCrash(t *testing.T) {
 	if restored, err := RestoreBackup(ctx, fixture.archivePath, destination, BackupRestoreOptions{}); err != nil || restored.CommitID != 2 {
 		t.Fatalf("page restore = %+v, %v", restored, err)
 	}
-	entries, err := readArchiveEntries(ctx, fixture.archivePath, fixture.databaseID)
+	entries, err := readArchiveEntries(ctx, fixture.archivePath, fixture.databaseID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +551,7 @@ func TestPageBackupRestoreRejectsMismatchedSourceHistoryBeforePublish(t *testing
 		t.Fatal(err)
 	}
 
-	entries, err := readArchiveEntries(ctx, fixture.archivePath, fixture.databaseID)
+	entries, err := readArchiveEntries(ctx, fixture.archivePath, fixture.databaseID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
