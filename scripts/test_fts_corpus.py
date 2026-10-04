@@ -1,8 +1,13 @@
 import math
 import json
+import hashlib
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
+import zipfile
 from fts_corpus import metrics, tokens, prepare, evaluate, query_tokens
 
 
@@ -71,6 +76,30 @@ class MetricsTests(unittest.TestCase):
             out = Path(d) / 'out'
             with self.assertRaisesRegex(ValueError, 'SHA256'): prepare(archive, out)
             self.assertFalse(out.exists())
+
+    def test_prepare_unicode_without_utf8_locale(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            archive = root / 'fixture.zip'
+            # Exercise the full preparation path with the required record counts.
+            with zipfile.ZipFile(archive, 'w') as z:
+                for name, count in [('corpus', 5183), ('queries', 300)]:
+                    rows = [{'_id': str(i), 'text': 'science \u2265 \u03b2'} for i in range(count)]
+                    z.writestr('scifact/' + name + '.jsonl', '\n'.join(json.dumps(r, ensure_ascii=False) for r in rows).encode('utf-8'))
+                z.writestr('scifact/qrels/test.tsv', 'query-id\tcorpus-id\tscore\n' + ''.join(f'{i}\t0\t1\n' for i in range(300)))
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            code = ('import sys, fts_corpus; '
+                    'fts_corpus.SHA256 = sys.argv[3]; '
+                    'fts_corpus.prepare(sys.argv[1], sys.argv[2])')
+            out = root / 'data'
+            completed = subprocess.run([sys.executable, '-c', code, str(archive), str(out), digest],
+                cwd=Path(__file__).resolve().parent,
+                env={**os.environ, 'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0', 'LC_ALL': 'C'},
+                capture_output=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode('utf-8', errors='replace'))
+            for name in ['corpus', 'queries']:
+                rows = (out / (name + '-raw.jsonl')).read_text(encoding='utf-8').splitlines()
+                self.assertEqual(json.loads(rows[0])['text'], 'science \u2265 \u03b2')
 
 
 if __name__ == '__main__': unittest.main()

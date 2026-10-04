@@ -33,10 +33,10 @@ def prepare(archive, output):
     out.mkdir(parents=True, exist_ok=False)
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         def records(name):
-            return [json.loads(line) for line in z.read('scifact/' + name).decode().splitlines()]
+            return [json.loads(line) for line in z.read('scifact/' + name).decode('utf-8').splitlines()]
         docs = sorted(records('corpus.jsonl'), key=lambda r: r['_id'])
         all_queries = {r['_id']: r for r in records('queries.jsonl')}
-        qrels = list(csv.DictReader(io.StringIO(z.read('scifact/qrels/test.tsv').decode()), delimiter='\t'))
+        qrels = list(csv.DictReader(io.StringIO(z.read('scifact/qrels/test.tsv').decode('utf-8')), delimiter='\t'))
     ids = {r['_id']: str(i + 1) for i, r in enumerate(docs)}
     query_ids = sorted({r['query-id'] for r in qrels})
     queries = [all_queries[q] for q in query_ids]
@@ -63,16 +63,16 @@ def prepare(archive, output):
             raw.append({'id': str(i + 1), 'text': text})
             common.append({'id': str(i + 1), 'text': ' '.join(ts)})
         for variant, prepared in [('raw', raw), ('common', common)]:
-            (out / f'{kind}-{variant}.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in prepared))
-        (out / f'{kind}-common.tsv').write_text(''.join(r['id'] + '\t' + r['text'] + '\n' for r in common))
+            (out / f'{kind}-{variant}.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in prepared), encoding='utf-8')
+        (out / f'{kind}-common.tsv').write_text(''.join(r['id'] + '\t' + r['text'] + '\n' for r in common), encoding='utf-8')
     if empty:
         raise ValueError(f'Empty normalized inputs: {empty}')
-    (out / 'qrels.json').write_text(json.dumps(relevance, indent=2) + '\n')
+    (out / 'qrels.json').write_text(json.dumps(relevance, indent=2) + '\n', encoding='utf-8')
     manifest = {'source': URL, 'archive_sha256': SHA256, 'documents': len(docs), 'queries': len(queries),
                 'document_ids': {v: k for k, v in ids.items()}, 'query_ids': {v: k for k, v in qids.items()},
                 'truncated_queries': truncated, 'normalization': 'ASCII [a-z0-9]+, lowercase, token length1..64; queries remove reserved and/or/not then unique first32; no other stopwords or stemming',
                 'files': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(out.iterdir())}}
-    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
     print(json.dumps({k: manifest[k] for k in ['documents', 'queries', 'truncated_queries', 'archive_sha256']}, indent=2))
 
 
@@ -90,9 +90,9 @@ def metrics(ranking, relevance):
 
 def read_result(path):
     if path.suffix == '.json':
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding='utf-8'))
     rows = {}
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding='utf-8').splitlines():
         parts = line.split('\t')
         if parts[0] not in ('hit', 'time'):
             continue
@@ -110,8 +110,8 @@ def read_result(path):
 
 
 def evaluate(qrels, manifest, results):
-    relevance = json.loads(Path(qrels).read_text())
-    docs = set(json.loads(Path(manifest).read_text())['document_ids'])
+    relevance = json.loads(Path(qrels).read_text(encoding='utf-8'))
+    docs = set(json.loads(Path(manifest).read_text(encoding='utf-8'))['document_ids'])
     summaries, rankings = {}, {}
     for filename in results:
         path = Path(filename)
