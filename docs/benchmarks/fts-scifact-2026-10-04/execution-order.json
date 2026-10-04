@@ -1,0 +1,293 @@
+[
+  {
+    "round": 0,
+    "configuration": "go-common-bm25",
+    "started_unix": 1791073297.855978,
+    "finished_unix": 1791073310.6378062,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-common.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-common.jsonl",
+      "-mode",
+      "bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-common-bm25-0.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-common-bm25-0.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 0,
+    "configuration": "zig-common-bm25",
+    "started_unix": 1791073310.638093,
+    "finished_unix": 1791073319.025856,
+    "command": [
+      "/tmp/latticedb-fts-zig",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-common.tsv",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-common.tsv",
+      "/private/tmp/latticedb-fts-results-v2/zig-common-bm25-0.db",
+      "1"
+    ]
+  },
+  {
+    "round": 0,
+    "configuration": "go-raw-frequency",
+    "started_unix": 1791073319.026012,
+    "finished_unix": 1791073331.5888698,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "frequency",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-frequency-0.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-frequency-0.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 0,
+    "configuration": "go-raw-bm25",
+    "started_unix": 1791073331.589195,
+    "finished_unix": 1791073344.498435,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-bm25-0.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-bm25-0.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 0,
+    "configuration": "go-raw-porter-bm25",
+    "started_unix": 1791073344.498739,
+    "finished_unix": 1791073357.881839,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "porter-bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-porter-bm25-0.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-porter-bm25-0.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 1,
+    "configuration": "zig-common-bm25",
+    "started_unix": 1791073357.882118,
+    "finished_unix": 1791073365.931256,
+    "command": [
+      "/tmp/latticedb-fts-zig",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-common.tsv",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-common.tsv",
+      "/private/tmp/latticedb-fts-results-v2/zig-common-bm25-1.db",
+      "1"
+    ]
+  },
+  {
+    "round": 1,
+    "configuration": "go-raw-frequency",
+    "started_unix": 1791073365.931447,
+    "finished_unix": 1791073378.797763,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "frequency",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-frequency-1.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-frequency-1.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 1,
+    "configuration": "go-raw-bm25",
+    "started_unix": 1791073378.79828,
+    "finished_unix": 1791073391.55229,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-bm25-1.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-bm25-1.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 1,
+    "configuration": "go-raw-porter-bm25",
+    "started_unix": 1791073391.553241,
+    "finished_unix": 1791073404.9146829,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "porter-bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-porter-bm25-1.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-porter-bm25-1.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 1,
+    "configuration": "go-common-bm25",
+    "started_unix": 1791073404.9151528,
+    "finished_unix": 1791073417.0236511,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-common.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-common.jsonl",
+      "-mode",
+      "bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-common-bm25-1.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-common-bm25-1.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 2,
+    "configuration": "go-raw-frequency",
+    "started_unix": 1791073417.0240278,
+    "finished_unix": 1791073429.8795378,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "frequency",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-frequency-2.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-frequency-2.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 2,
+    "configuration": "go-raw-bm25",
+    "started_unix": 1791073429.8798158,
+    "finished_unix": 1791073442.896499,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-bm25-2.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-bm25-2.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 2,
+    "configuration": "go-raw-porter-bm25",
+    "started_unix": 1791073442.896908,
+    "finished_unix": 1791073456.478281,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-raw.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-raw.jsonl",
+      "-mode",
+      "porter-bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-porter-bm25-2.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-raw-porter-bm25-2.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 2,
+    "configuration": "go-common-bm25",
+    "started_unix": 1791073456.4786408,
+    "finished_unix": 1791073469.299131,
+    "command": [
+      "/tmp/latticedb-fts-go",
+      "-corpus",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-common.jsonl",
+      "-queries",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-common.jsonl",
+      "-mode",
+      "bm25",
+      "-db",
+      "/private/tmp/latticedb-fts-results-v2/go-common-bm25-2.db",
+      "-output",
+      "/private/tmp/latticedb-fts-results-v2/go-common-bm25-2.json",
+      "-repeats",
+      "1"
+    ]
+  },
+  {
+    "round": 2,
+    "configuration": "zig-common-bm25",
+    "started_unix": 1791073469.299372,
+    "finished_unix": 1791073477.403285,
+    "command": [
+      "/tmp/latticedb-fts-zig",
+      "/private/tmp/latticedb-fts-corpus-v2/corpus-common.tsv",
+      "/private/tmp/latticedb-fts-corpus-v2/queries-common.tsv",
+      "/private/tmp/latticedb-fts-results-v2/zig-common-bm25-2.db",
+      "1"
+    ]
+  }
+]
