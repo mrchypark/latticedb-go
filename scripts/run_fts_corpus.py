@@ -29,7 +29,7 @@ def run(go, zig, data, output):
                 subprocess.run(cmd, env={**os.environ, 'GOMAXPROCS': '2'}, check=True)
             else:
                 cmd = [zig, str(data / 'corpus-common.tsv'), str(data / 'queries-common.tsv'), str(db), '1']
-                with path.open('w', encoding='utf-8') as f:
+                with path.open('w', encoding='utf-8', newline='\n') as f:
                     subprocess.run(cmd, stdout=f, stderr=f, check=True)
             result = read_result(path)
             for row in result['runs']:
@@ -38,9 +38,9 @@ def run(go, zig, data, output):
                 row['repeat'] = rep
                 merged[name]['runs'].append(row)
             merged[name]['round_metadata'].append({k: v for k, v in result.items() if k != 'runs'})
-            (out / f'{name}.json').write_text(json.dumps(merged[name], indent=2) + '\n', encoding='utf-8')
+            (out / f'{name}.json').write_text(json.dumps(merged[name], indent=2) + '\n', encoding='utf-8', newline='\n')
             order.append({'round': rep, 'configuration': name, 'started_unix': started, 'finished_unix': time.time(), 'command': cmd})
-            (out / 'execution-order.json').write_text(json.dumps(order, indent=2) + '\n', encoding='utf-8')
+            (out / 'execution-order.json').write_text(json.dumps(order, indent=2) + '\n', encoding='utf-8', newline='\n')
 
 
 if __name__ == '__main__':

@@ -44,7 +44,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_fts_corpus.py
 
 ## Measurement contract
 
-Elapsed time is recorded as nonnegative integer nanoseconds. A zero sample means the query completed within the clock resolution; it is retained without clamping. Missing, negative, or non-integer timing values fail evaluation. Text files use UTF-8 regardless of the host locale. The archived measurements used the source hashes in `environment.json` at commit `e431660ebde4f4ce7accacc4997df4011bfaa9b0`. Later corrections accept zero samples and make UTF-8 explicit; they do not change the archived samples or their statistics.
+Elapsed time is recorded as nonnegative integer nanoseconds. A zero sample means the query completed within the clock resolution; it is retained without clamping. Missing, negative, or non-integer timing values fail evaluation. Text files use UTF-8 with LF newlines regardless of the host locale or platform. The archived measurements used the source hashes in `environment.json` at commit `e431660ebde4f4ce7accacc4997df4011bfaa9b0`. Later corrections accept zero samples and make UTF-8/LF explicit; they do not change the archived samples or their statistics.
 
 The common-input experiment extracts lowercase ASCII `[a-z0-9]+` tokens and drops entire tokens longer than 64 characters. Document token multiplicity is preserved. Both query inputs remove `and`, `or`, and `not`, which the Zig query parser treats as keywords regardless of its stopword setting. Query terms are deduplicated in input order, then limited to 32. No query in this dataset exceeds that limit. No other stopwords, stemming, or fuzzy matching are used in the common-input comparison. BM25 uses OR semantics, k1=1.2, b=0.75 and IDF `log(1+(N-df+0.5)/(df+0.5))`.
 

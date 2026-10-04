@@ -100,6 +100,11 @@ class MetricsTests(unittest.TestCase):
             for name in ['corpus', 'queries']:
                 rows = (out / (name + '-raw.jsonl')).read_text(encoding='utf-8').splitlines()
                 self.assertEqual(json.loads(rows[0])['text'], 'science \u2265 \u03b2')
+            manifest = json.loads((out / 'manifest.json').read_text(encoding='utf-8'))
+            for name, expected in manifest['files'].items():
+                data = (out / name).read_bytes()
+                self.assertNotIn(b'\r', data, name)
+                self.assertEqual(hashlib.sha256(data).hexdigest(), expected, name)
 
 
 if __name__ == '__main__': unittest.main()

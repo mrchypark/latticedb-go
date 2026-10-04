@@ -63,16 +63,16 @@ def prepare(archive, output):
             raw.append({'id': str(i + 1), 'text': text})
             common.append({'id': str(i + 1), 'text': ' '.join(ts)})
         for variant, prepared in [('raw', raw), ('common', common)]:
-            (out / f'{kind}-{variant}.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in prepared), encoding='utf-8')
-        (out / f'{kind}-common.tsv').write_text(''.join(r['id'] + '\t' + r['text'] + '\n' for r in common), encoding='utf-8')
+            (out / f'{kind}-{variant}.jsonl').write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in prepared), encoding='utf-8', newline='\n')
+        (out / f'{kind}-common.tsv').write_text(''.join(r['id'] + '\t' + r['text'] + '\n' for r in common), encoding='utf-8', newline='\n')
     if empty:
         raise ValueError(f'Empty normalized inputs: {empty}')
-    (out / 'qrels.json').write_text(json.dumps(relevance, indent=2) + '\n', encoding='utf-8')
+    (out / 'qrels.json').write_text(json.dumps(relevance, indent=2) + '\n', encoding='utf-8', newline='\n')
     manifest = {'source': URL, 'archive_sha256': SHA256, 'documents': len(docs), 'queries': len(queries),
                 'document_ids': {v: k for k, v in ids.items()}, 'query_ids': {v: k for k, v in qids.items()},
                 'truncated_queries': truncated, 'normalization': 'ASCII [a-z0-9]+, lowercase, token length1..64; queries remove reserved and/or/not then unique first32; no other stopwords or stemming',
                 'files': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(out.iterdir())}}
-    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+    (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8', newline='\n')
     print(json.dumps({k: manifest[k] for k in ['documents', 'queries', 'truncated_queries', 'archive_sha256']}, indent=2))
 
 
