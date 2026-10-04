@@ -44,3 +44,5 @@ MaxBytes는 살아 있는 논리적 소유권의 예산이다. RSS 상한을 뜻
 | 이식성·fixture | 32비트 정수와 무효 형식으로 우연히 성공하는 오류 검사 | wasm 컴파일, binary 유효 대조군, semantic mutation 실험 | native int overflow 및 현재 형식 fixture | 수정·검증 완료 |
 
 머지 준비에는 PR 최신 후보의 3개 OS test workflow와 100K benchmark workflow 성공, 충돌 부재, 미해결 리뷰 스레드 부재를 확인한다. 로컬 통과 기록으로 원격 게이트를 대체하지 않는다. 최종 원격 결과는 PR에 기록한다.
+
+PR #250의 첫 Windows CI에서 새 리터럴 conformance 테스트가 DB를 닫지 않아 임시 디렉터리 삭제에 실패했다. `defer closeDB(t, db)`를 추가해 파일을 먼저 닫도록 수정했다. 제품 코드와 리터럴 기대값은 변경하지 않았다. 후속 커밋의 원격 CI에서 확인한다.

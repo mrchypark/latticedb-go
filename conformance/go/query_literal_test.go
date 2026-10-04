@@ -8,6 +8,7 @@ import (
 
 func TestProjectionLiteralPrecedence(t *testing.T) {
 	db := openDB(t, filepath.Join(t.TempDir(), "literals.ltdb"), OpenOptions{Create: true})
+	defer closeDB(t, db)
 	for _, tc := range []struct {
 		query string
 		want  any
