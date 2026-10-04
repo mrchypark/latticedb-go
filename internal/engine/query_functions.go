@@ -247,18 +247,32 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budget *queryBudg
 			}
 			parts := make([]any, 0, len(text))
 			for i := range len(text) {
+				if budget != nil && i%queryOrderComparisonChunk == 0 {
+					if err := budget.check(uint64((min(queryOrderComparisonChunk, len(text)-i)+63)/64), 0); err != nil {
+						return nil, err
+					}
+				}
 				parts = append(parts, text[i:i+1])
 			}
 			return parts, nil
 		}
-		if err := reserveExpression(budget, uint64(strings.Count(text, delimiter)+1)*32); err != nil {
+		count := 1
+		if err := visitQueryStringMatches(text, delimiter, budget, func(int) (bool, error) { count++; return true, nil }); err != nil {
 			return nil, err
 		}
-		parts := strings.Split(text, delimiter)
-		values := make([]any, 0, len(parts))
-		for _, part := range parts {
-			values = append(values, part)
+		if err := reserveExpression(budget, uint64(count)*16); err != nil {
+			return nil, err
 		}
+		values := make([]any, 0, count)
+		start := 0
+		if err := visitQueryStringMatches(text, delimiter, budget, func(index int) (bool, error) {
+			values = append(values, text[start:index])
+			start = index + len(delimiter)
+			return true, nil
+		}); err != nil {
+			return nil, err
+		}
+		values = append(values, text[start:])
 		return values, nil
 
 	case "replace":
@@ -285,14 +299,40 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budget *queryBudg
 			return text, nil
 		}
 		size := uint64(len(text))
-		count := uint64(strings.Count(text, search))
+		var count uint64
+		if err := visitQueryStringMatches(text, search, budget, func(int) (bool, error) { count++; return true, nil }); err != nil {
+			return nil, err
+		}
 		if len(replacement) > len(search) {
-			size += count * uint64(len(replacement)-len(search))
+			growth := uint64(len(replacement) - len(search))
+			if count > (^uint64(0)-size)/growth {
+				return nil, ErrResourceLimit
+			}
+			size += count * growth
 		}
 		if err := reserveExpression(budget, size); err != nil {
 			return nil, err
 		}
-		return strings.ReplaceAll(text, search, replacement), nil
+		var output strings.Builder
+		output.Grow(int(size))
+		outputScan := queryStringScan{budget: budget}
+		start := 0
+		if err := visitQueryStringMatches(text, search, budget, func(index int) (bool, error) {
+			if err := writeQueryString(&output, text[start:index], &outputScan); err != nil {
+				return false, err
+			}
+			if err := writeQueryString(&output, replacement, &outputScan); err != nil {
+				return false, err
+			}
+			start = index + len(search)
+			return true, nil
+		}); err != nil {
+			return nil, err
+		}
+		if err := writeQueryString(&output, text[start:], &outputScan); err != nil {
+			return nil, err
+		}
+		return output.String(), nil
 
 	case "substring":
 		args, err := expr.evalArgs(2, 3, row, params, budget)
@@ -344,7 +384,7 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budget *queryBudg
 			return nil, expr.typeError("a string", args[0])
 		}
 		// Upstream trims exactly these four characters, not unicode space.
-		return strings.Trim(text, " \t\n\r"), nil
+		return trimQueryString(text, budget)
 
 	case "toLower":
 		return expr.evalASCIIString(false, row, params, budget)
@@ -434,13 +474,19 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budget *queryBudg
 		}
 		switch value := args[0].(type) {
 		case int64:
+			if value == math.MinInt64 {
+				return nil, fmt.Errorf("integer arithmetic overflow")
+			}
 			if value < 0 {
 				return -value, nil
 			}
 			return value, nil
 		case int:
+			if int64(value) == math.MinInt64 {
+				return nil, fmt.Errorf("integer arithmetic overflow")
+			}
 			if value < 0 {
-				return int64(-value), nil
+				return -int64(value), nil
 			}
 			return int64(value), nil
 		case float64:
@@ -553,16 +599,29 @@ func (expr callExpr) evalASCIIString(upper bool, row queryRow, params map[string
 	if err := reserveExpression(budget, uint64(len(text))*2); err != nil {
 		return nil, err
 	}
-	out := []byte(text)
-	for i, char := range out {
-		switch {
-		case upper && char >= 'a' && char <= 'z':
-			out[i] = char - ('a' - 'A')
-		case !upper && char >= 'A' && char <= 'Z':
-			out[i] = char + ('a' - 'A')
+	var output strings.Builder
+	output.Grow(len(text))
+	var chunk [queryOrderComparisonChunk]byte
+	for start := 0; start < len(text); start += len(chunk) {
+		end := min(start+len(chunk), len(text))
+		if budget != nil {
+			if err := budget.check(uint64((end-start+63)/64), 0); err != nil {
+				return nil, err
+			}
 		}
+		for i := start; i < end; i++ {
+			char := text[i]
+			switch {
+			case upper && char >= 'a' && char <= 'z':
+				char -= 'a' - 'A'
+			case !upper && char >= 'A' && char <= 'Z':
+				char += 'a' - 'A'
+			}
+			chunk[i-start] = char
+		}
+		output.Write(chunk[:end-start])
 	}
-	return string(out), nil
+	return output.String(), nil
 }
 
 func (expr callExpr) typeError(want string, value any) error {

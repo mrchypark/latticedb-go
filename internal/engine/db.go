@@ -765,9 +765,9 @@ func OpenContext(ctx context.Context, path string, opts OpenOptions) (*DB, error
 			_ = lock.close()
 			return nil, fmt.Errorf("%w: BackupDirectory requires a writable open", ErrInvalidArgument)
 		}
-		archive, archiveErr := openBackupArchive(opts.BackupDirectory, files.State, graph.DatabaseID)
+		archive, archiveErr := openBackupArchive(ctx, opts.BackupDirectory, files.State, graph.DatabaseID)
 		if archiveErr == nil {
-			_, archiveErr = archive.captureAt(db.timeNow(), graph, nextNodeID, nextEdgeID, commitID, db.maxDatabaseSnapshotBytes)
+			_, archiveErr = archive.captureAt(ctx, db.timeNow(), graph, nextNodeID, nextEdgeID, commitID, db.maxDatabaseSnapshotBytes)
 		}
 		if archiveErr != nil {
 			if archive != nil {
@@ -1301,7 +1301,25 @@ func (db *DB) closeWithWriterHeld() error {
 	db.mu.Unlock()
 	if db.memory {
 		db.stopCheckpointWorker()
+		db.mu.Lock()
+		defer db.mu.Unlock()
+		db.clearCheckpointState()
 		db.clearAdjacencyCompactor()
+		db.adjacencyMaintenanceQueue = nil
+		db.adjacencyMaintenanceQueued = nil
+		db.graph = nil
+		// A canceled rebuild owns its private graph until it exits. Detach it
+		// here; the closed check prevents that worker from publishing a result.
+		db.vectorRebuild = nil
+		db.vectorRebuildBeforeBuild = nil
+		db.generationLeases = nil
+		db.generationOrderHead, db.generationOrderTail = nil, nil
+		db.activeTransactions, db.activeLeases, db.writerWaits = nil, nil, nil
+		db.streamNotify = nil
+		db.cacheMu.Lock()
+		db.queryCache, db.queryCacheSources = nil, nil
+		db.queryCacheKeys, db.queryCacheSourceKeys = [queryCacheEntries]string{}, [queryCacheEntries]string{}
+		db.cacheMu.Unlock()
 		return nil
 	}
 
@@ -3095,6 +3113,10 @@ func (db *DB) RebuildVectorIndexNamespaceContext(ctx context.Context, namespace 
 		ctx = context.Background()
 	}
 	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return ErrDatabaseClosed
+	}
 	resolved, err := resolveVectorNamespace(db.graph, &namespace)
 	db.mu.RUnlock()
 	if err != nil {
@@ -3410,6 +3432,12 @@ func (db *DB) cachedQueryPlan(query string) (*queryPlan, error) {
 	}
 
 	db.cacheMu.Lock()
+	// Memory Close disables the cache under the same lock. A parse that
+	// started before shutdown must not restore its references afterward.
+	if db.queryCache == nil {
+		db.cacheMu.Unlock()
+		return nil, ErrDatabaseClosed
+	}
 	if cached, loaded := db.queryCache[key]; loaded {
 		db.cacheHits.Add(1)
 		plan = cached
@@ -3602,7 +3630,7 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 			err = wal.CopyCommittedWALRangeTo(output, archiveStart, end, tx.graph.DatabaseID, nextCommitID-1, nextCommitID)
 			return err == nil, err
 		}
-		if _, err := archive.captureAt(tx.db.timeNow(), tx.graph, nextNodeID, nextEdgeID, nextCommitID, tx.db.maxDatabaseSnapshotBytes, copyCommit); err != nil {
+		if _, err := archive.captureAt(context.Background(), tx.db.timeNow(), tx.graph, nextNodeID, nextEdgeID, nextCommitID, tx.db.maxDatabaseSnapshotBytes, copyCommit); err != nil {
 			tx.db.mu.Lock()
 			tx.db.recoveryRequired = true
 			tx.db.mu.Unlock()

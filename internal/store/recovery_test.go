@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -685,7 +686,7 @@ func TestWALV2TruncationAndCorruption(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := json.Marshal(snapshot)
+	payload, err := encodeBinaryWALPayload(walPayload{Kind: "snapshot", Snapshot: &snapshot})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,7 +860,7 @@ func TestWALV2RejectsCommitRegressionAndDatabaseMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	encode := func(snapshot persistedState) []byte {
-		payload, err := json.Marshal(snapshot)
+		payload, err := encodeBinaryWALPayload(walPayload{Kind: "snapshot", Snapshot: &snapshot})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -880,6 +881,7 @@ func TestWALV2RejectsCommitRegressionAndDatabaseMismatch(t *testing.T) {
 	}
 
 	for name, second := range map[string]persistedState{
+		"valid sequence":    func() persistedState { next := first; next.CommitID = 2; return next }(),
 		"commit regression": first,
 		"commit gap":        gap,
 		"database mismatch": mismatch,
@@ -890,8 +892,13 @@ func TestWALV2RejectsCommitRegressionAndDatabaseMismatch(t *testing.T) {
 			if err := os.WriteFile(walFilePath(dbPath), data, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if _, _, _, _, err := LoadGraphState(dbPath); err == nil {
-				t.Fatal("expected invalid WAL history to fail")
+			_, _, _, _, err := LoadGraphState(dbPath)
+			if name == "valid sequence" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "WAL snapshot history regression") {
+				t.Fatalf("history error = %v", err)
 			}
 		})
 	}
@@ -934,7 +941,7 @@ func TestWALV2RejectsCommitGap(t *testing.T) {
 	}
 	delta := persistedDelta{DatabaseID: snapshot.DatabaseID, CommitID: 3, NextNodeID: 1, NextEdgeID: 1}
 	encode := func(payload walPayload, commitID uint64) []byte {
-		data, err := json.Marshal(payload)
+		data, err := encodeBinaryWALPayload(payload)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -949,8 +956,8 @@ func TestWALV2RejectsCommitGap(t *testing.T) {
 	if err := os.WriteFile(walFilePath(dbPath), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, err := LoadGraphState(dbPath); err == nil {
-		t.Fatal("WAL commit gap was accepted")
+	if _, _, _, _, err := LoadGraphState(dbPath); err == nil || !strings.Contains(err.Error(), "WAL delta history regression") {
+		t.Fatalf("commit gap error = %v", err)
 	}
 }
 
@@ -965,7 +972,7 @@ func TestWALV2RejectsSemanticallyInvalidDelta(t *testing.T) {
 		t.Fatal(err)
 	}
 	encode := func(payload walPayload, databaseID string, commitID uint64) []byte {
-		data, err := json.Marshal(payload)
+		data, err := encodeBinaryWALPayload(payload)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -978,6 +985,7 @@ func TestWALV2RejectsSemanticallyInvalidDelta(t *testing.T) {
 	baseRecord := encode(walPayload{Kind: "snapshot", Snapshot: &snapshot}, snapshot.DatabaseID, 1)
 	emptyNode := persistedNode{ID: 3, Properties: map[string]persistedValue{}}
 	for name, delta := range map[string]persistedDelta{
+		"valid delta": {DatabaseID: snapshot.DatabaseID, CommitID: 2, NextNodeID: 4, NextEdgeID: 2, UpsertNodes: []persistedNode{emptyNode}},
 		"duplicate operation": {
 			DatabaseID: snapshot.DatabaseID, CommitID: 2, NextNodeID: 4, NextEdgeID: 2,
 			UpsertNodes: []persistedNode{emptyNode, emptyNode},
@@ -1000,8 +1008,14 @@ func TestWALV2RejectsSemanticallyInvalidDelta(t *testing.T) {
 			if err := os.WriteFile(walFilePath(dbPath), data, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if _, _, _, _, err := LoadGraphState(dbPath); err == nil {
-				t.Fatal("expected invalid delta to fail")
+			_, _, _, _, err := LoadGraphState(dbPath)
+			want := map[string]string{"duplicate operation": "duplicate ID", "node with incident edge": "incident edges", "orphan FTS": "references missing node", "ID high-water regression": "high-water mark regressed"}[name]
+			if name == "valid delta" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("delta error = %v, want %s", err, want)
 			}
 		})
 	}
@@ -1015,9 +1029,16 @@ func deeplyNestedPersistedValue(depth int) persistedValue {
 	return value
 }
 
+func binaryStateFixture(snapshot persistedState) ([]byte, error) {
+	var output bytes.Buffer
+	encoder := binaryEncoder{out: &output}
+	encoder.state(snapshot)
+	return output.Bytes(), encoder.err
+}
+
 func serializedPersistedState(t *testing.T, snapshot persistedState) []byte {
 	t.Helper()
-	payload, err := json.Marshal(snapshot)
+	payload, err := binaryStateFixture(snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1033,6 +1054,9 @@ func TestDeserializeRejectsInvalidPersistedSemantics(t *testing.T) {
 	base := persistedState{DatabaseID: databaseID, CommitID: 1, NextNodeID: 2, NextEdgeID: 2,
 		Nodes: []persistedNode{{ID: 1, Properties: map[string]persistedValue{}}},
 		Edges: []persistedEdge{{ID: 1, SourceID: 1, TargetID: 1, Type: "edge", Properties: map[string]persistedValue{}}}}
+	if _, _, _, _, err := DeserializeGraphState(serializedPersistedState(t, base), maxStateFileBytes, ^uint64(0), ^uint64(0)); err != nil {
+		t.Fatalf("valid state: %v", err)
+	}
 	for name, mutate := range map[string]func(*persistedState){
 		"empty label":     func(state *persistedState) { state.Nodes[0].Labels = []string{""} },
 		"duplicate label": func(state *persistedState) { state.Nodes[0].Labels = []string{"tag", "tag"} },
@@ -1046,8 +1070,10 @@ func TestDeserializeRejectsInvalidPersistedSemantics(t *testing.T) {
 			snapshot.Nodes = slices.Clone(base.Nodes)
 			snapshot.Edges = slices.Clone(base.Edges)
 			mutate(&snapshot)
-			if _, _, _, _, err := DeserializeGraphState(serializedPersistedState(t, snapshot), maxStateFileBytes, ^uint64(0), ^uint64(0)); err == nil {
-				t.Fatal("invalid persisted state was accepted")
+			_, _, _, _, err := DeserializeGraphState(serializedPersistedState(t, snapshot), maxStateFileBytes, ^uint64(0), ^uint64(0))
+			want := map[string]string{"empty label": "labels:", "duplicate label": "labels:", "empty edge type": "type:", "deep property": "decode node 1 properties:"}[name]
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("state error = %v, want %s", err, want)
 			}
 		})
 	}
@@ -1209,7 +1235,7 @@ func TestCompactionCrashMatrixPreservesAcknowledgedCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	basePayload, err := json.Marshal(walPayload{Kind: "snapshot", Snapshot: &base})
+	basePayload, err := encodeBinaryWALPayload(walPayload{Kind: "snapshot", Snapshot: &base})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -186,11 +186,11 @@ func TestPageVectorDimensionsEnablePersistAndBackupRestore(t *testing.T) {
 	if !catalog.ArchiveBasePending {
 		t.Fatal("vector configuration did not leave a pending archive base")
 	}
-	backup, err := openBackupArchive(archive, files.State, catalog.DatabaseID)
+	backup, err := openBackupArchive(context.Background(), archive, files.State, catalog.DatabaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := backup.publishBase(time.Now(), graph, catalog.NextNodeID, catalog.NextEdgeID, catalog.CommitID, backupSourceHistory{databaseID: catalog.DatabaseID, history: catalog.History}); err != nil {
+	if _, err := backup.publishBase(context.Background(), time.Now(), graph, catalog.NextNodeID, catalog.NextEdgeID, catalog.CommitID, backupSourceHistory{databaseID: catalog.DatabaseID, history: catalog.History}); err != nil {
 		t.Fatal(err)
 	}
 	if err := backup.close(); err != nil {

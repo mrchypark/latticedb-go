@@ -310,7 +310,7 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 		if opts.ReadOnly {
 			return nil, fmt.Errorf("%w: BackupDirectory requires a writable open", ErrInvalidArgument)
 		}
-		archive, e := openBackupArchive(opts.BackupDirectory, files.State, graph.DatabaseID)
+		archive, e := openBackupArchive(ctx, opts.BackupDirectory, files.State, graph.DatabaseID)
 		if e != nil {
 			return nil, e
 		}

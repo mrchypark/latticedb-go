@@ -14,6 +14,16 @@ import (
 // WriteGraphState streams a checkpoint through a temporary payload file so
 // callers can hash and publish large bases without retaining them in memory.
 func WriteGraphState(output io.Writer, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) error {
+	return WriteGraphStateContext(context.Background(), output, graph, nextNodeID, nextEdgeID, commitID)
+}
+
+func WriteGraphStateContext(ctx context.Context, output io.Writer, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := ensureDatabaseID(graph); err != nil {
 		return err
 	}
@@ -25,7 +35,7 @@ func WriteGraphState(output io.Writer, graph *GraphState, nextNodeID, nextEdgeID
 	defer os.Remove(name)
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateBinary(io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateBinaryContext(ctx, io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	info, err := payload.Stat()
@@ -36,7 +46,7 @@ func WriteGraphState(output io.Writer, graph *GraphState, nextNodeID, nextEdgeID
 	if err != nil {
 		return err
 	}
-	written, err := output.Write(header[:])
+	written, err := (contextWriter{ctx: ctx, Writer: output}).Write(header[:])
 	if err != nil {
 		return err
 	}
@@ -46,13 +56,13 @@ func WriteGraphState(output io.Writer, graph *GraphState, nextNodeID, nextEdgeID
 	if _, err := payload.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	_, err = io.Copy(output, payload)
+	_, err = io.Copy(contextWriter{ctx: ctx, Writer: output}, &contextReader{ctx: ctx, reader: payload})
 	return err
 }
 
-func backupRangeChecksum(file *os.File, offset, size int64) (uint32, error) {
+func backupRangeChecksum(ctx context.Context, file *os.File, offset, size int64) (uint32, error) {
 	hash := crc32.NewIEEE()
-	if _, err := io.CopyN(hash, io.NewSectionReader(file, offset, size), size); err != nil {
+	if _, err := io.CopyN(hash, &contextReader{ctx: ctx, reader: io.NewSectionReader(file, offset, size)}, size); err != nil {
 		return 0, err
 	}
 	return hash.Sum32(), nil
@@ -101,7 +111,7 @@ func (writer *WALWriter) CopyCommittedWALRangeTo(output io.Writer, startTail, en
 		if string(bytes.TrimRight(header[walDatabaseIDAt:legacyWALHeaderSize], "\x00")) != databaseID || frameCommit != commit+1 {
 			return errors.New("committed WAL database ID or commit sequence mismatch")
 		}
-		checksum, err := backupRangeChecksum(writer.file, offset+walHeaderSize, int64(length))
+		checksum, err := backupRangeChecksum(context.Background(), writer.file, offset+walHeaderSize, int64(length))
 		if err != nil || checksum != binary.BigEndian.Uint32(header[28:32]) {
 			return errors.Join(errors.New("committed WAL frame checksum mismatch"), err)
 		}
@@ -127,6 +137,16 @@ func (writer *WALWriter) CopyCommittedWALRangeTo(output io.Writer, startTail, en
 // ValidateBackupWALSegmentFile verifies segment frames with bounded payload
 // memory, independent of the total WAL history represented by the archive.
 func ValidateBackupWALSegmentFile(path, databaseID string, afterCommit, throughCommit uint64) error {
+	return ValidateBackupWALSegmentFileContext(context.Background(), path, databaseID, afterCommit, throughCommit)
+}
+
+func ValidateBackupWALSegmentFileContext(ctx context.Context, path, databaseID string, afterCommit, throughCommit uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open backup WAL segment: %w", err)
@@ -139,6 +159,9 @@ func ValidateBackupWALSegmentFile(path, databaseID string, afterCommit, throughC
 	var header [walHeaderSize]byte
 	offset, commit := int64(0), afterCommit
 	for offset < info.Size() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if info.Size()-offset < walHeaderSize {
 			return errors.New("truncated backup WAL frame header")
 		}
@@ -153,7 +176,7 @@ func ValidateBackupWALSegmentFile(path, databaseID string, afterCommit, throughC
 		if string(bytes.TrimRight(header[walDatabaseIDAt:legacyWALHeaderSize], "\x00")) != databaseID || frameCommit != commit+1 {
 			return errors.New("backup WAL database ID or commit sequence mismatch")
 		}
-		checksum, err := backupRangeChecksum(file, offset+walHeaderSize, int64(length))
+		checksum, err := backupRangeChecksum(ctx, file, offset+walHeaderSize, int64(length))
 		if err != nil || checksum != binary.BigEndian.Uint32(header[28:32]) {
 			return errors.Join(errors.New("backup WAL frame checksum mismatch"), err)
 		}
@@ -195,7 +218,7 @@ func replayBackupWALFiles(ctx context.Context, basePath string, segmentPaths []s
 	}
 	defer os.RemoveAll(directory)
 	files := DirectoryDatabaseFiles(directory)
-	if err := CheckpointGraphStateAndWALFilesContext(ctx, files, baseGraph, baseNextNodeID, baseNextEdgeID, baseCommitID); err != nil {
+	if err := writeCheckpointGraphStateAndWALFilesContext(ctx, files, baseGraph, baseNextNodeID, baseNextEdgeID, baseCommitID, 0, nil, true); err != nil {
 		return nil, 0, 0, 0, err
 	}
 	wal, err := os.OpenFile(files.WAL, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -218,7 +241,17 @@ func replayBackupWALFiles(ctx context.Context, basePath string, segmentPaths []s
 // ValidateBackupWALChain checks that an archived base and its linked frames
 // recover natively through the advertised endpoint before restart rebasing.
 func ValidateBackupWALChain(basePath string, segmentPaths []string, commitID, maxSnapshotBytes uint64) error {
-	_, _, _, actualCommit, err := replayBackupWALFiles(context.Background(), basePath, segmentPaths, maxSnapshotBytes)
+	return ValidateBackupWALChainContext(context.Background(), basePath, segmentPaths, commitID, maxSnapshotBytes)
+}
+
+func ValidateBackupWALChainContext(ctx context.Context, basePath string, segmentPaths []string, commitID, maxSnapshotBytes uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, _, _, actualCommit, err := replayBackupWALFiles(ctx, basePath, segmentPaths, maxSnapshotBytes)
 	if err == nil && actualCommit != commitID {
 		return errors.New("backup WAL chain ends at unexpected commit")
 	}
@@ -229,22 +262,33 @@ func ValidateBackupWALChain(basePath string, segmentPaths []string, commitID, ma
 // recovered source when reopening at the same commit. It is not used on the
 // per-commit path and does not claim ancestry for a missing WAL range.
 func ValidateBackupWALFiles(basePath string, segmentPaths []string, expected *GraphState, sourceNextNodeID, sourceNextEdgeID, commitID, maxSnapshotBytes uint64) error {
-	replayed, replayNextNodeID, replayNextEdgeID, replayedCommit, err := replayBackupWALFiles(context.Background(), basePath, segmentPaths, maxSnapshotBytes)
+	return ValidateBackupWALFilesContext(context.Background(), basePath, segmentPaths, expected, sourceNextNodeID, sourceNextEdgeID, commitID, maxSnapshotBytes)
+}
+
+func ValidateBackupWALFilesContext(ctx context.Context, basePath string, segmentPaths []string, expected *GraphState, sourceNextNodeID, sourceNextEdgeID, commitID, maxSnapshotBytes uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	replayed, replayNextNodeID, replayNextEdgeID, replayedCommit, err := replayBackupWALFiles(ctx, basePath, segmentPaths, maxSnapshotBytes)
 	if err != nil {
 		return err
 	}
 	if replayedCommit != commitID || replayed.DatabaseID != expected.DatabaseID || replayNextNodeID > sourceNextNodeID || replayNextEdgeID > sourceNextEdgeID {
 		return errors.New("backup archive counters or commit do not match recovered source")
 	}
-	actual, err := SerializeGraphState(replayed, replayNextNodeID, replayNextEdgeID, commitID)
+	var actual, want bytes.Buffer
+	err = writePersistedStateBinaryContext(ctx, &actual, replayed, replayNextNodeID, replayNextEdgeID, commitID)
 	if err != nil {
 		return err
 	}
-	want, err := SerializeGraphState(expected, replayNextNodeID, replayNextEdgeID, commitID)
+	err = writePersistedStateBinaryContext(ctx, &want, expected, replayNextNodeID, replayNextEdgeID, commitID)
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(actual, want) {
+	if !bytes.Equal(actual.Bytes(), want.Bytes()) {
 		return errors.New("backup archive state differs from recovered source")
 	}
 	return nil

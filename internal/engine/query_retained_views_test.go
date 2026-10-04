@@ -60,3 +60,41 @@ func TestProjectionDetachesStringViews(t *testing.T) {
 		}
 	}
 }
+
+func TestMapFieldProjectionDetachesStringViews(t *testing.T) {
+	text := strings.Repeat("x", 8192)
+	row := queryRow{
+		index: map[string]int{"m": 0},
+		slots: []boundValue{{Bound: true, HasValue: true, Value: map[string]any{"text": text[:1]}}},
+	}
+	item := projection{Kind: projectionProperty, Var: "m", Property: "text", Alias: "v"}
+	clause := returnClause{Projections: []projection{item}}
+	for _, path := range []string{"rows", "row", "value"} {
+		t.Run(path, func(t *testing.T) {
+			budget := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 256 << 10})
+			defer releaseQueryBudget(budget)
+			var value any
+			var err error
+			switch path {
+			case "rows":
+				var result QueryResult
+				result, err = clause.render([]queryRow{row}, nil, budget)
+				if err == nil {
+					value = result.Rows[0]["v"]
+				}
+			case "row":
+				var result map[string]any
+				result, err = clause.renderRow(row, nil, budget)
+				value = result["v"]
+			case "value":
+				value, err = clause.projectionValue(item, row, nil, budget)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if value != "x" || unsafe.StringData(value.(string)) == unsafe.StringData(text) {
+				t.Fatal("map field retained original string backing")
+			}
+		})
+	}
+}

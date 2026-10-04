@@ -4314,7 +4314,7 @@ func parseReturnClause(text string) (*returnClause, error) {
 		countVar := countVarText
 		if countVarText != "*" {
 			parsed, err := parseQueryIdentifier(countVarText)
-			if err != nil {
+			if err != nil || isQueryKeywordLiteral(countVarText) {
 				// count(expression) is evaluated as an aggregate projection.
 				countVar = ""
 			} else {
@@ -4401,7 +4401,7 @@ func parseReturnClause(text string) (*returnClause, error) {
 			})
 			continue
 		}
-		if name, err := parseQueryIdentifier(exprText); err != nil {
+		if name, err := parseQueryIdentifier(exprText); err != nil || isQueryKeywordLiteral(exprText) {
 			expr, exprErr := parseValueExpr(exprText)
 			if exprErr != nil {
 				return nil, fmt.Errorf("invalid RETURN projection %q: %w", exprText, exprErr)
@@ -4423,6 +4423,10 @@ func parseReturnClause(text string) (*returnClause, error) {
 		}
 	}
 	return &returnClause{Projections: projections, Distinct: distinct}, nil
+}
+
+func isQueryKeywordLiteral(text string) bool {
+	return text == "null" || text == "true" || text == "false"
 }
 
 // parseAggregateProjection parses `name(expression)` for an aggregate function
@@ -5419,7 +5423,10 @@ func (clause *whereClause) eval(row queryRow, params map[string]any, budget *que
 			}
 			return predicateBool(equal), err
 		}
-		comparison, comparable := compareQueryValues(left, right)
+		comparison, comparable, err := compareQueryValuesWithBudget(left, right, budget)
+		if err != nil {
+			return predicateUnknown, err
+		}
 		if !comparable {
 			return predicateUnknown, nil
 		}
@@ -5466,7 +5473,10 @@ func (clause *whereClause) eval(row queryRow, params map[string]any, budget *que
 		if err != nil || !exists {
 			return predicateUnknown, err
 		}
-		comparison, comparable := compareQueryValues(value, expected)
+		comparison, comparable, err := compareQueryValuesWithBudget(value, expected, budget)
+		if err != nil {
+			return predicateUnknown, err
+		}
 		if !comparable {
 			return predicateUnknown, nil
 		}
@@ -5510,11 +5520,21 @@ func (clause *whereClause) eval(row queryRow, params map[string]any, budget *que
 		}
 		switch clause.Kind {
 		case whereStartsWith:
-			return predicateBool(strings.HasPrefix(actualText, expectedText)), nil
+			if len(actualText) < len(expectedText) {
+				return predicateFalse, nil
+			}
+			comparison, err := compareOrderStringWithBudget(actualText[:len(expectedText)], expectedText, budget)
+			return predicateBool(comparison == 0), err
 		case whereEndsWith:
-			return predicateBool(strings.HasSuffix(actualText, expectedText)), nil
+			if len(actualText) < len(expectedText) {
+				return predicateFalse, nil
+			}
+			comparison, err := compareOrderStringWithBudget(actualText[len(actualText)-len(expectedText):], expectedText, budget)
+			return predicateBool(comparison == 0), err
 		default:
-			return predicateBool(strings.Contains(actualText, expectedText)), nil
+			found := expectedText == ""
+			err := visitQueryStringMatches(actualText, expectedText, budget, func(int) (bool, error) { found = true; return false, nil })
+			return predicateBool(found), err
 		}
 	default:
 		return predicateUnknown, fmt.Errorf("unsupported boolean WHERE kind %q", clause.Kind)
@@ -5557,6 +5577,17 @@ func predicateBool(value bool) predicateTruth {
 		return predicateTrue
 	}
 	return predicateFalse
+}
+
+func compareQueryValuesWithBudget(left, right any, budget *queryBudget) (int, bool, error) {
+	if text, ok := left.(string); ok {
+		if other, ok := right.(string); ok {
+			comparison, err := compareOrderStringWithBudget(text, other, budget)
+			return comparison, true, err
+		}
+	}
+	comparison, comparable := compareQueryValues(left, right)
+	return comparison, comparable, nil
 }
 
 func compareQueryValues(left, right any) (int, bool) {
@@ -6358,7 +6389,7 @@ func (clause *returnClause) render(rows []queryRow, params map[string]any, budge
 				if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 					return QueryResult{}, err
 				}
-				resultRow[projection.Alias] = store.CloneValue(value)
+				resultRow[projection.Alias] = publicPropertyProjectionValue(binding, value)
 			case projectionValue:
 				binding, ok := row.get(projection.Var)
 				if !ok {
@@ -6445,7 +6476,7 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 			if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 				return nil, err
 			}
-			resultRow[projection.Alias] = store.CloneValue(value)
+			resultRow[projection.Alias] = publicPropertyProjectionValue(binding, value)
 		case projectionValue:
 			switch {
 			case !bound:
@@ -6479,6 +6510,18 @@ func (clause *returnClause) renderRow(row queryRow, params map[string]any, budge
 		}
 	}
 	return resultRow, nil
+}
+
+// publicPropertyProjectionValue preserves stored-property cloning while
+// converting query-map fields into public values.
+func publicPropertyProjectionValue(binding boundValue, value any) any {
+	if binding.Node != nil || binding.Edge != nil {
+		// Stored properties cannot contain entity bindings. Clone mutable values
+		// while retaining immutable strings, as in the other entity projections.
+		return store.CloneValue(value)
+	}
+	// Query maps can contain entity bindings and string views into larger inputs.
+	return publicProjectionValue(value)
 }
 
 // publicProjectionValue converts an evaluated expression result into the public
@@ -6540,7 +6583,7 @@ func (clause *returnClause) projectionValue(projection projection, row queryRow,
 		if err := budget.chargeResult(queryValueBytes(value)); err != nil {
 			return nil, err
 		}
-		return store.CloneValue(value), nil
+		return publicPropertyProjectionValue(binding, value), nil
 	case projectionExpr:
 		before := budget.bytes
 		value, err := evalQueryExpr(projection.Expr, row, params, budget)
@@ -6887,26 +6930,39 @@ func (clause *returnClause) aggregateWithRows(rows []queryRow, next *queryPlan, 
 
 // distinctWithRows drops duplicate projected rows by their item values.
 func (clause *returnClause) distinctWithRows(rows []queryRow, budget *queryBudget) ([]queryRow, error) {
+	// Keys and public-value clones are scratch. The projected rows retain their
+	// original bindings, so none of this workspace survives the clause.
+	initialBytes := budget.bytes
+	defer func() { budget.releaseTemporary(uint64(budget.bytes - initialBytes)) }()
 	seen := map[string]struct{}{}
 	out := rows[:0]
 	for _, row := range rows {
+		rowBytes := budget.bytes
 		var keyBuilder strings.Builder
 		for _, projection := range clause.Projections {
 			binding, ok := row.get(projectionSlotName(projection))
 			var value any
+			var cloneBytes uint64
 			if ok {
-				if err := budget.chargeResult(queryValueBytes(binding)); err != nil {
+				cloneBytes = queryValueBytes(binding)
+				if err := budget.chargeTemporary(cloneBytes); err != nil {
 					return nil, err
 				}
 				value = publicProjectionValue(binding)
 			}
-			if err := writeDistinctValueKey(&keyBuilder, value, budget); err != nil {
+			err := writeDistinctValueKey(&keyBuilder, value, budget)
+			budget.releaseTemporary(cloneBytes)
+			if err != nil {
 				return nil, err
 			}
 		}
 		key := keyBuilder.String()
 		if _, ok := seen[key]; ok {
+			budget.releaseTemporary(uint64(budget.bytes - rowBytes))
 			continue
+		}
+		if err := budget.chargeTemporary(16); err != nil {
+			return nil, err
 		}
 		seen[key] = struct{}{}
 		out = append(out, row)
@@ -7513,15 +7569,18 @@ func (expr mapLiteralExpr) eval(row queryRow, params map[string]any, budget *que
 	}
 	out := make(map[string]any, len(expr.Entries))
 	for key, item := range expr.Entries {
+		if budget != nil {
+			if err := budget.check(1, 0); err != nil {
+				return nil, err
+			}
+		}
 		value, err := item.eval(row, params, budget)
 		if err != nil {
 			return nil, err
 		}
-		normalized, err := store.NormalizeValueWithReserve(value, func(bytes uint64) error { return reserveExpression(budget, bytes) })
-		if err != nil {
-			return nil, err
-		}
-		out[key] = normalized
+		// Query maps can contain entity bindings, like query lists. Property
+		// writes normalize values separately at the storage boundary.
+		out[key] = value
 	}
 	return out, nil
 }

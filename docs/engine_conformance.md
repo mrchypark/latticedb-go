@@ -343,6 +343,8 @@ An undirected relationship produces one row per matching orientation. A non-self
 
 ### Expressions
 
+In expression positions, unquoted `true`, `false`, and `null` are literals, including in `RETURN`, `WITH`, and `count(expression)`. Use backticks to reference a binding with one of these names. Query maps and lists may contain nodes and relationships, and projecting their fields preserves the public entity value. Stored properties must still use supported property types. `abs` reports integer overflow for the minimum `int64` value.
+
 Standalone `RETURN` and projections accept scalar, parameter, map, list, function, and arithmetic expressions. Numeric operators are `+`, `-`, `*`, `/`, `%`, and `^`, with unary signs and parentheses. Exponentiation is right-associative and binds more tightly than a unary sign; multiplication/division/remainder bind more tightly than addition/subtraction. Integer operations retain `int64` where possible; division produces `float64`, as do mixed float operands and negative powers. Overflow, division/remainder by zero, non-finite results, and nonnumeric operands are execution errors. Arithmetic operators do not require whitespace. Computed values may be aliased through `WITH` for filtering and ordering with the existing clause grammar.
 
 ### MERGE
