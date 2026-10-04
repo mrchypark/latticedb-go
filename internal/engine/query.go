@@ -4743,12 +4743,15 @@ func (plan *queryPlan) compareOrderedQueryRows(left, right orderedQueryRow) int 
 
 func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
 	nextRows := make([]queryRow, 0)
+	outputRoot := budget.rowSources(nextRows)
+	defer outputRoot.close(budget)
 	if len(rows) == 0 {
 		return nextRows, nil
 	}
 	visitNode := func(node *store.NodeRecord) error {
 		var err error
 		nextRows, err = pattern.appendNodeRows(rows, node, nextRows, budget)
+		outputRoot.setRows(nextRows)
 		return err
 	}
 	if len(pattern.Labels) == 0 {
@@ -4798,6 +4801,7 @@ func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) (
 				continue
 			}
 			nextRows, err = pattern.appendNodeRows(rows, node, nextRows, budget)
+			outputRoot.setRows(nextRows)
 			if err != nil {
 				return nil, err
 			}
@@ -4820,6 +4824,8 @@ func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) (
 }
 
 func (pattern nodePattern) applyID(tx *Tx, rows []queryRow, nodeID uint64, nextRows []queryRow, budget *queryBudget) ([]queryRow, error) {
+	outputRoot := budget.rowSources(nextRows)
+	defer outputRoot.close(budget)
 	scope := budget.sourceScope()
 	defer scope.close()
 	node, err := budget.readNode(tx.graph, nodeID)
@@ -4967,6 +4973,8 @@ func (pattern edgePattern) applyAdjacentPaged(tx *Tx, row queryRow, nodeID uint6
 }
 
 func (pattern edgePattern) applyAdjacentEdge(tx *Tx, row queryRow, edgeID uint64, reverse bool, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
+	outputRoot := budget.rowSources(rows)
+	defer outputRoot.close(budget)
 	scope := budget.sourceScope()
 	defer scope.close()
 	if err := budget.check(1, len(rows)); err != nil {
@@ -5052,6 +5060,8 @@ func (pattern edgePattern) applyAllMemory(tx *Tx, rows []queryRow, edgeType stri
 
 func (pattern edgePattern) applyAllPaged(tx *Tx, rows []queryRow, edgeType string, budget *queryBudget) ([]queryRow, error) {
 	nextRows := make([]queryRow, 0)
+	outputRoot := budget.rowSources(nextRows)
+	defer outputRoot.close(budget)
 	if len(rows) == 0 {
 		return nextRows, nil
 	}
@@ -5059,6 +5069,7 @@ func (pattern edgePattern) applyAllPaged(tx *Tx, rows []queryRow, edgeType strin
 		visit := func(edge *store.EdgeRecord) error {
 			var err error
 			nextRows, err = pattern.applyEdgeRecord(tx, row, edge, nextRows, budget)
+			outputRoot.setRows(nextRows)
 			return err
 		}
 		var err error
@@ -5083,6 +5094,8 @@ func (pattern edgePattern) applyAllPaged(tx *Tx, rows []queryRow, edgeType strin
 }
 
 func (pattern edgePattern) applyEdgeRecord(tx *Tx, row queryRow, edge *store.EdgeRecord, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
+	outputRoot := budget.rowSources(rows)
+	defer outputRoot.close(budget)
 	scope := budget.sourceScope()
 	defer scope.close()
 	if edge == nil {
@@ -8403,6 +8416,8 @@ func cloneRetainedQueryValue(value any) any {
 }
 
 func (pattern edgePattern) applyEdgeID(tx *Tx, row queryRow, id uint64, rows []queryRow, budget *queryBudget) ([]queryRow, error) {
+	outputRoot := budget.rowSources(rows)
+	defer outputRoot.close(budget)
 	scope := budget.sourceScope()
 	defer scope.close()
 	edge, err := budget.readEdge(tx.graph, id)

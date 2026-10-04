@@ -727,3 +727,99 @@ func TestQueryCountDoesNotRepeatLiveSweep(t *testing.T) {
 		t.Fatalf("count=%v", result)
 	}
 }
+
+func TestQueryExpansionProtectsUnpublishedRowsDuringAdmissionRetry(t *testing.T) {
+	db := querySourceFixture(t, 2, 64<<10)
+	if err := db.View(func(tx *Tx) error {
+		for _, indexed := range []bool{false, true} {
+			b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 650 << 10, MaxWork: 100 << 20})
+			plan, err := parseQuery(`MATCH (n) RETURN id(n)`)
+			if err != nil {
+				return err
+			}
+			input := []queryRow{plan.newRow()}
+			pattern := nodePattern{Var: "n"}
+			var rows []queryRow
+			if indexed {
+				rows, err = pattern.applyID(tx, input, 1, nil, b)
+				if err == nil {
+					rows, err = pattern.applyID(tx, input, 2, rows, b)
+				}
+			} else {
+				rows, err = pattern.apply(tx, input, b)
+			}
+			if !errors.Is(err, ErrResourceLimit) {
+				t.Fatalf("indexed=%v: live output reclaimed during expansion, rows=%d err=%v", indexed, len(rows), err)
+			}
+			releaseQueryBudget(b)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryEdgeExpansionProtectsUnpublishedRowsDuringAdmissionRetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "edges")
+	db, err := Open(path, OpenOptions{Create: true, PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for range 2 {
+			if _, err := tx.CreateNode(CreateNodeOptions{}); err != nil {
+				return err
+			}
+		}
+		for range 2 {
+			if _, err := tx.CreateEdge(1, 2, "LINK", CreateEdgeOptions{Properties: map[string]any{"body": strings.Repeat("x", 64<<10)}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		for _, mode := range []string{"all", "adjacent", "indexed"} {
+			b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 650 << 10, MaxWork: 100 << 20})
+			plan, err := parseQuery(`MATCH (a)-[r:LINK]->(b) RETURN id(r)`)
+			if err != nil {
+				return err
+			}
+			input := []queryRow{plan.newRow()}
+			pattern := edgePattern{Left: nodePattern{Var: "a"}, Right: nodePattern{Var: "b"}, EdgeVar: "r", EdgeType: "LINK"}
+			if mode == "adjacent" {
+				node, err := b.readNode(tx.graph, 1)
+				if err != nil {
+					return err
+				}
+				input[0].set("a", boundValue{Node: node})
+			}
+			inputRoot := b.rowSources(input)
+			var rows []queryRow
+			if mode == "indexed" {
+				rows, err = pattern.applyIDs(tx, input, []uint64{1, 2}, b)
+			} else {
+				rows, err = pattern.apply(tx, input, b)
+			}
+			if !errors.Is(err, ErrResourceLimit) {
+				t.Fatalf("mode=%s: live edge output reclaimed, rows=%d err=%v", mode, len(rows), err)
+			}
+			inputRoot.close(b)
+			releaseQueryBudget(b)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

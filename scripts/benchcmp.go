@@ -223,8 +223,8 @@ func checkGates(current, previous result, stderr io.Writer) error {
 			continue
 		}
 		if transition && gate.benchmark == "BenchmarkReadRequests/query" {
-			// Darwin/arm64 paired measurements: +19 allocs/op, +1129 B/op.
-			// Keep a small fixed portability margin, not a percentage relaxation.
+			// Darwin/arm64 paired measurements: +20 allocs/op, +1177 B/op.
+			// Keep a fixed ceiling with byte headroom, not a percentage relaxation.
 			allowance := float64(1280)
 			if gate.unit == "allocs/op" {
 				allowance = 20
