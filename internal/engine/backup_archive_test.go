@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -56,7 +57,7 @@ func TestBackupArchiveCaptureClockSurvivesReopen(t *testing.T) {
 	archive := db.backupArchive
 	initial := archive.head
 	regressed := initial.CapturedAt.Add(-time.Hour)
-	first, err := archive.captureAt(regressed, db.graph, db.nextNodeID, db.nextEdgeID, 1, db.maxDatabaseSnapshotBytes)
+	first, err := archive.captureAt(context.Background(), regressed, db.graph, db.nextNodeID, db.nextEdgeID, 1, db.maxDatabaseSnapshotBytes)
 	if err != nil || !first.CapturedAt.Equal(initial.CapturedAt.Add(time.Nanosecond)) {
 		t.Fatalf("regressed capture = %v, %v", first, err)
 	}
@@ -65,16 +66,16 @@ func TestBackupArchiveCaptureClockSurvivesReopen(t *testing.T) {
 	}
 	// Reopen the archive directly to verify its persisted clock. The source DB
 	// deliberately stays at commit 0; production Open would reject that lineage.
-	archive, err = openBackupArchive(archive.directory, db.files.State, db.graph.DatabaseID)
+	archive, err = openBackupArchive(context.Background(), archive.directory, db.files.State, db.graph.DatabaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer archive.close()
-	same, err := archive.captureAt(regressed, db.graph, db.nextNodeID, db.nextEdgeID, 1, db.maxDatabaseSnapshotBytes)
+	same, err := archive.captureAt(context.Background(), regressed, db.graph, db.nextNodeID, db.nextEdgeID, 1, db.maxDatabaseSnapshotBytes)
 	if err != nil || same.CommitID != first.CommitID || !same.CapturedAt.Equal(first.CapturedAt) {
 		t.Fatalf("idempotent capture = %v, %v, want %v", same, err, first)
 	}
-	next, err := archive.captureAt(regressed, db.graph, db.nextNodeID, db.nextEdgeID, 2, db.maxDatabaseSnapshotBytes)
+	next, err := archive.captureAt(context.Background(), regressed, db.graph, db.nextNodeID, db.nextEdgeID, 2, db.maxDatabaseSnapshotBytes)
 	if err != nil || !next.CapturedAt.Equal(first.CapturedAt.Add(time.Nanosecond)) {
 		t.Fatalf("reopened capture clock = %v, %v", next, err)
 	}

@@ -189,7 +189,7 @@ func TestPageBackupPublicConfigForkPreservesExistingArchive(t *testing.T) {
 func TestPageBackupRejectsConflictingSameCommitBaseWithoutChangingArchive(t *testing.T) {
 	fixture := newPageBackupFixture(t)
 	read, graph := fixture.readGraph(t)
-	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestPageBackupRejectsConflictingSameCommitBaseWithoutChangingArchive(t *tes
 	fixture.setPendingDimensions(t, 2)
 	read, graph = fixture.readGraph(t)
 	defer read.Rollback()
-	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err = openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestPageBackupRejectsConflictingSameCommitBaseWithoutChangingArchive(t *tes
 func prepareInterruptedPendingBase(t *testing.T, fixture pageBackupFixture) ([]byte, string) {
 	t.Helper()
 	read, graph := fixture.readGraph(t)
-	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,12 +249,12 @@ func prepareInterruptedPendingBase(t *testing.T, fixture pageBackupFixture) ([]b
 		_ = read.Rollback()
 		t.Fatal(err)
 	}
-	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err = openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		_ = read.Rollback()
 		t.Fatal(err)
 	}
-	metadata, err := archive.publishBase(time.Unix(401, 0), graph, catalog.NextNodeID, catalog.NextEdgeID, catalog.CommitID, backupSourceHistory{databaseID: catalog.DatabaseID, history: catalog.History})
+	metadata, err := archive.publishBase(context.Background(), time.Unix(401, 0), graph, catalog.NextNodeID, catalog.NextEdgeID, catalog.CommitID, backupSourceHistory{databaseID: catalog.DatabaseID, history: catalog.History})
 	closeErr := archive.close()
 	rollbackErr := read.Rollback()
 	if err != nil {
@@ -295,7 +295,7 @@ func TestPageBackupRepairsPendingBaseAnchorAfterCrash(t *testing.T) {
 
 			read, graph := fixture.readGraph(t)
 			defer read.Rollback()
-			archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+			archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -331,7 +331,7 @@ func TestPageBackupAnchorFailureKeepsPendingArchiveUnready(t *testing.T) {
 	prepareInterruptedPendingBase(t, fixture)
 	read, graph := fixture.readGraph(t)
 	defer read.Rollback()
-	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +362,7 @@ func TestPageBackupResumesOutboxAndRepairsEntryBeforeHeadCrash(t *testing.T) {
 	fixture := newPageBackupFixture(t)
 	ctx := context.Background()
 	read, graph := fixture.readGraph(t)
-	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +379,7 @@ func TestPageBackupResumesOutboxAndRepairsEntryBeforeHeadCrash(t *testing.T) {
 
 	fixture.commitNode(t, 1, 1)
 	read, graph = fixture.readGraph(t)
-	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err = openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestPageBackupResumesOutboxAndRepairsEntryBeforeHeadCrash(t *testing.T) {
 
 	fixture.commitNode(t, 2, 2)
 	read, graph = fixture.readGraph(t)
-	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err = openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +430,7 @@ func TestPageBackupResumesOutboxAndRepairsEntryBeforeHeadCrash(t *testing.T) {
 	defer os.Remove(stagePath)
 	identity := backupSourceHistory{databaseID: catalog.DatabaseID, history: catalog.History}
 	metadata := BackupMetadata{CommitID: 2, CapturedAt: time.Unix(102, 0)}
-	if _, err := publishStagedSegment(fixture.archivePath, stagePath, 2, metadata, archive.headDigest, identity); err != nil {
+	if _, err := publishStagedSegment(context.Background(), fixture.archivePath, stagePath, 2, metadata, archive.headDigest, identity); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(fixture.archivePath, backupHeadFile), oldHead, 0o600); err != nil {
@@ -444,7 +444,7 @@ func TestPageBackupResumesOutboxAndRepairsEntryBeforeHeadCrash(t *testing.T) {
 	}
 
 	read, graph = fixture.readGraph(t)
-	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err = openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +521,7 @@ func TestPageBackupRestoreRejectsMismatchedSourceHistoryBeforePublish(t *testing
 	fixture := newPageBackupFixture(t)
 	ctx := context.Background()
 	read, graph := fixture.readGraph(t)
-	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +537,7 @@ func TestPageBackupRestoreRejectsMismatchedSourceHistoryBeforePublish(t *testing
 
 	fixture.commitNode(t, 1, 1)
 	read, graph = fixture.readGraph(t)
-	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err = openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -596,7 +596,7 @@ func TestPageBackupRestoreRejectsMismatchedSourceHistoryBeforePublish(t *testing
 func TestPageBackupRejectsEqualCommitWithDivergentHistory(t *testing.T) {
 	fixture := newPageBackupFixture(t)
 	read, graph := fixture.readGraph(t)
-	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +632,7 @@ func TestPageBackupRejectsEqualCommitWithDivergentHistory(t *testing.T) {
 
 	read, graph = fixture.readGraph(t)
 	defer read.Rollback()
-	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err = openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +645,7 @@ func TestPageBackupRejectsEqualCommitWithDivergentHistory(t *testing.T) {
 func TestPageBackupRejectsCorruptHeadBaseOnReopen(t *testing.T) {
 	fixture := newPageBackupFixture(t)
 	read, graph := fixture.readGraph(t)
-	archive, err := openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,7 +681,7 @@ func TestPageBackupRejectsCorruptHeadBaseOnReopen(t *testing.T) {
 
 	read, graph = fixture.readGraph(t)
 	defer read.Rollback()
-	archive, err = openBackupArchive(fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	archive, err = openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
 	if err != nil {
 		t.Fatal(err)
 	}

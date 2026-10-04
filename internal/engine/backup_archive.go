@@ -359,7 +359,7 @@ func writeArchiveHead(directory string, entry backupEntry) error {
 		oldEntryPath := filepath.Join(directory, old.Entry)
 		oldInfo, oldStatErr := os.Lstat(oldEntryPath)
 		oldDigest, decodeErr := hex.DecodeString(old.Digest)
-		actualDigest, hashErr := hashArchiveFile(oldEntryPath)
+		actualDigest, hashErr := hashArchiveFile(context.Background(), oldEntryPath)
 		entryMetadata, entryDigest, parseErr := parseBackupEntry(old.Entry)
 		if strings.HasSuffix(old.Entry, backupSegmentSuffix) {
 			parsed, err := parseBackupSegment(old.Entry)
@@ -393,7 +393,10 @@ func writeArchiveHead(directory string, entry backupEntry) error {
 	return syncPathDirectory(directory)
 }
 
-func publishArchiveEntry(directory string, metadata BackupMetadata, start uint64, previous [sha256.Size]byte, segment bool, gapStart time.Time, write func(io.Writer) error, sourceHistory ...backupSourceHistory) (backupEntry, error) {
+func publishArchiveEntry(ctx context.Context, directory string, metadata BackupMetadata, start uint64, previous [sha256.Size]byte, segment bool, gapStart time.Time, write func(io.Writer) error, sourceHistory ...backupSourceHistory) (backupEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return backupEntry{}, err
+	}
 	temp, err := os.CreateTemp(directory, ".latticedb-backup-entry-*")
 	if err != nil {
 		return backupEntry{}, err
@@ -401,7 +404,7 @@ func publishArchiveEntry(directory string, metadata BackupMetadata, start uint64
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
 	hash := sha256.New()
-	if err := write(io.MultiWriter(temp, hash)); err != nil {
+	if err := write(backupContextWriter{ctx: ctx, writer: io.MultiWriter(temp, hash)}); err != nil {
 		_ = temp.Close()
 		return backupEntry{}, err
 	}
@@ -423,6 +426,11 @@ func publishArchiveEntry(directory string, metadata BackupMetadata, start uint64
 	if len(sourceHistory) > 1 {
 		return backupEntry{}, errors.New("multiple backup source histories")
 	}
+	// Preparation is cancelable. Once a proof or entry becomes durable, finish
+	// the head publication so a committed source never reports a false rollback.
+	if err := ctx.Err(); err != nil {
+		return backupEntry{}, err
+	}
 	if len(sourceHistory) == 1 {
 		entry.sourceHistory = sourceHistory[0].history
 		entry.hasSourceHistory = true
@@ -433,7 +441,7 @@ func publishArchiveEntry(directory string, metadata BackupMetadata, start uint64
 	if err := os.Link(tempPath, path); err != nil && !errors.Is(err, os.ErrExist) {
 		return backupEntry{}, err
 	} else if errors.Is(err, os.ErrExist) {
-		actual, readErr := hashArchiveFile(path)
+		actual, readErr := hashArchiveFile(context.Background(), path)
 		if readErr != nil || actual != digest {
 			return backupEntry{}, errors.Join(errors.New("backup entry collision"), readErr)
 		}
@@ -447,14 +455,14 @@ func publishArchiveEntry(directory string, metadata BackupMetadata, start uint64
 	return entry, nil
 }
 
-func hashArchiveFile(path string) ([sha256.Size]byte, error) {
+func hashArchiveFile(ctx context.Context, path string) ([sha256.Size]byte, error) {
 	var digest [sha256.Size]byte
 	file, err := os.Open(path)
 	if err != nil {
 		return digest, err
 	}
 	hash := sha256.New()
-	_, copyErr := io.Copy(hash, file)
+	_, copyErr := io.Copy(hash, &backupContextReader{ctx: ctx, reader: file})
 	closeErr := file.Close()
 	if err := errors.Join(copyErr, closeErr); err != nil {
 		return digest, err
@@ -463,7 +471,7 @@ func hashArchiveFile(path string) ([sha256.Size]byte, error) {
 	return digest, nil
 }
 
-func publishStagedSegment(directory, stagedPath string, start uint64, metadata BackupMetadata, previous [sha256.Size]byte, sourceHistory ...backupSourceHistory) (backupEntry, error) {
+func publishStagedSegment(ctx context.Context, directory, stagedPath string, start uint64, metadata BackupMetadata, previous [sha256.Size]byte, sourceHistory ...backupSourceHistory) (backupEntry, error) {
 	info, err := os.Stat(stagedPath)
 	if err != nil {
 		return backupEntry{}, err
@@ -471,7 +479,7 @@ func publishStagedSegment(directory, stagedPath string, start uint64, metadata B
 	if info.Size() <= 0 || info.Size() > maxBackupSegmentBytes {
 		return backupEntry{}, fmt.Errorf("%w: backup WAL segment size is out of range", ErrResourceLimit)
 	}
-	digest, err := hashArchiveFile(stagedPath)
+	digest, err := hashArchiveFile(ctx, stagedPath)
 	if err != nil {
 		return backupEntry{}, err
 	}
@@ -479,6 +487,9 @@ func publishStagedSegment(directory, stagedPath string, start uint64, metadata B
 	entry := backupEntry{metadata: metadata, start: start, digest: digest, previous: previous, path: path, segment: true}
 	if len(sourceHistory) > 1 {
 		return backupEntry{}, errors.New("multiple backup source histories")
+	}
+	if err := ctx.Err(); err != nil {
+		return backupEntry{}, err
 	}
 	if len(sourceHistory) == 1 {
 		entry.sourceHistory = sourceHistory[0].history
@@ -490,7 +501,7 @@ func publishStagedSegment(directory, stagedPath string, start uint64, metadata B
 	if err := os.Link(stagedPath, path); err != nil && !errors.Is(err, os.ErrExist) {
 		return backupEntry{}, err
 	} else if errors.Is(err, os.ErrExist) {
-		actual, err := hashArchiveFile(path)
+		actual, err := hashArchiveFile(context.Background(), path)
 		if err != nil || actual != digest {
 			return backupEntry{}, errors.Join(errors.New("backup segment collision"), err)
 		}
@@ -568,6 +579,9 @@ func readArchiveEntries(ctx context.Context, directory, databaseID string, valid
 		}
 		batch, readErr := file.ReadDir(128)
 		for _, item := range batch {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			name := item.Name()
 			if !strings.HasPrefix(name, backupPrefix) || !strings.HasSuffix(name, backupSuffix) && !strings.HasSuffix(name, backupSegmentSuffix) {
 				continue
@@ -592,7 +606,7 @@ func readArchiveEntries(ctx context.Context, directory, databaseID string, valid
 				}
 			}
 			if validate {
-				if err := validateArchiveEntry(&entry, databaseID); err != nil {
+				if err := validateArchiveEntry(ctx, &entry, databaseID); err != nil {
 					return nil, err
 				}
 			}
@@ -609,7 +623,7 @@ func readArchiveEntries(ctx context.Context, directory, databaseID string, valid
 }
 
 // validateArchiveEntry reads content only after a restore dependency is selected.
-func validateArchiveEntry(entry *backupEntry, databaseID string) error {
+func validateArchiveEntry(ctx context.Context, entry *backupEntry, databaseID string) error {
 	if entry.segment {
 		info, err := os.Lstat(entry.path)
 		if err != nil {
@@ -618,14 +632,14 @@ func validateArchiveEntry(entry *backupEntry, databaseID string) error {
 		if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxBackupSegmentBytes {
 			return fmt.Errorf("%w: invalid backup WAL segment size", ErrResourceLimit)
 		}
-		actual, err := hashArchiveFile(entry.path)
+		actual, err := hashArchiveFile(ctx, entry.path)
 		if err != nil {
 			return err
 		}
 		if actual != entry.digest {
 			return errors.New("backup WAL segment checksum mismatch")
 		}
-		if err := store.ValidateBackupWALSegmentFile(entry.path, databaseID, entry.start-1, entry.metadata.CommitID); err != nil {
+		if err := store.ValidateBackupWALSegmentFileContext(ctx, entry.path, databaseID, entry.start-1, entry.metadata.CommitID); err != nil {
 			return err
 		}
 	}
@@ -666,7 +680,10 @@ func validateBackupOrder(entries []backupEntry) error {
 	return nil
 }
 
-func openBackupArchive(directory, source, databaseID string) (*backupArchive, error) {
+func openBackupArchive(ctx context.Context, directory, source, databaseID string) (*backupArchive, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	archive, err := canonicalSnapshotPath(directory)
 	if err != nil {
 		return nil, err
@@ -735,6 +752,11 @@ func openBackupArchive(directory, source, databaseID string) (*backupArchive, er
 		return nil, err
 	}
 	for directory := archive; ; directory = filepath.Dir(directory) {
+		if err := ctx.Err(); err != nil {
+			_ = unlockFile(lock)
+			_ = lock.Close()
+			return nil, err
+		}
 		if err := syncPathDirectory(directory); err != nil {
 			_ = unlockFile(lock)
 			_ = lock.Close()
@@ -745,7 +767,7 @@ func openBackupArchive(directory, source, databaseID string) (*backupArchive, er
 		}
 	}
 	result := &backupArchive{directory: archive, lock: lock}
-	result.entries, err = readArchiveEntries(context.Background(), archive, databaseID, false)
+	result.entries, err = readArchiveEntries(ctx, archive, databaseID, false)
 	if err == nil {
 		sort.Slice(result.entries, func(i, j int) bool {
 			if result.entries[i].metadata.CommitID != result.entries[j].metadata.CommitID {
@@ -768,7 +790,7 @@ func openBackupArchive(directory, source, databaseID string) (*backupArchive, er
 	}
 	if err == nil {
 		if result.headPath != "" {
-			_, _, head, validationErr := result.validatedChain(databaseID, backupEntry{path: result.headPath})
+			_, _, head, validationErr := result.validatedChain(ctx, databaseID, backupEntry{path: result.headPath})
 			err = validationErr
 			if err == nil {
 				result.headSourceHistory, result.hasHeadSourceHistory = head.sourceHistory, head.hasSourceHistory
@@ -852,7 +874,7 @@ func (archive *backupArchive) chainFor(head backupEntry) (backupEntry, []string,
 }
 
 // validatedChain validates only the dependencies of the selected recovery point.
-func (archive *backupArchive) validatedChain(databaseID string, selectedEntry backupEntry) (backupEntry, []string, backupEntry, error) {
+func (archive *backupArchive) validatedChain(ctx context.Context, databaseID string, selectedEntry backupEntry) (backupEntry, []string, backupEntry, error) {
 	base, segments, err := archive.chainFor(selectedEntry)
 	if err != nil {
 		return backupEntry{}, nil, backupEntry{}, err
@@ -868,7 +890,10 @@ func (archive *backupArchive) validatedChain(databaseID string, selectedEntry ba
 		if !required[entry.path] {
 			continue
 		}
-		if err := validateArchiveEntry(&entry, databaseID); err != nil {
+		if err := ctx.Err(); err != nil {
+			return backupEntry{}, nil, backupEntry{}, err
+		}
+		if err := validateArchiveEntry(ctx, &entry, databaseID); err != nil {
 			return backupEntry{}, nil, backupEntry{}, err
 		}
 		chain = append(chain, entry)
@@ -885,7 +910,7 @@ func (archive *backupArchive) validatedChain(databaseID string, selectedEntry ba
 	return base, segments, selectedEntry, nil
 }
 
-func (archive *backupArchive) publishBase(now time.Time, graph *store.GraphState, nextNodeID, nextEdgeID, commitID uint64, sourceHistory ...backupSourceHistory) (BackupMetadata, error) {
+func (archive *backupArchive) publishBase(ctx context.Context, now time.Time, graph *store.GraphState, nextNodeID, nextEdgeID, commitID uint64, sourceHistory ...backupSourceHistory) (BackupMetadata, error) {
 	captured, err := archive.captureTime(now)
 	if err != nil {
 		return BackupMetadata{}, err
@@ -895,8 +920,8 @@ func (archive *backupArchive) publishBase(now time.Time, graph *store.GraphState
 	if archive.headPath != "" {
 		gapStart = archive.head.CapturedAt
 	}
-	entry, err := publishArchiveEntry(archive.directory, metadata, 0, [sha256.Size]byte{}, false, gapStart, func(output io.Writer) error {
-		return store.WriteGraphState(output, graph, nextNodeID, nextEdgeID, commitID)
+	entry, err := publishArchiveEntry(ctx, archive.directory, metadata, 0, [sha256.Size]byte{}, false, gapStart, func(output io.Writer) error {
+		return store.WriteGraphStateContext(ctx, output, graph, nextNodeID, nextEdgeID, commitID)
 	}, sourceHistory...)
 	if err != nil {
 		return BackupMetadata{}, err
@@ -923,17 +948,17 @@ func (archive *backupArchive) captureTime(now time.Time) (time.Time, error) {
 // captureAt accepts a range copier so the WAL bytes can flow directly into the
 // durable staging file. A nil/absent copier means the source WAL cannot prove
 // continuity and starts a separate full-base generation.
-func (archive *backupArchive) captureAt(now time.Time, graph *store.GraphState, nextNodeID, nextEdgeID, commitID, maxSnapshotBytes uint64, frameRanges ...func(io.Writer) (bool, error)) (BackupMetadata, error) {
+func (archive *backupArchive) captureAt(ctx context.Context, now time.Time, graph *store.GraphState, nextNodeID, nextEdgeID, commitID, maxSnapshotBytes uint64, frameRanges ...func(io.Writer) (bool, error)) (BackupMetadata, error) {
 	if archive == nil {
 		return BackupMetadata{}, nil
 	}
 	if !archive.ready {
-		if err := archive.initialize(graph, nextNodeID, nextEdgeID, commitID, maxSnapshotBytes); err != nil {
+		if err := archive.initialize(ctx, graph, nextNodeID, nextEdgeID, commitID, maxSnapshotBytes); err != nil {
 			return BackupMetadata{}, err
 		}
 	}
 	if archive.rebaseOnOpen {
-		metadata, err := archive.publishBase(now, graph, nextNodeID, nextEdgeID, commitID)
+		metadata, err := archive.publishBase(ctx, now, graph, nextNodeID, nextEdgeID, commitID)
 		if err == nil {
 			archive.rebaseOnOpen = false
 		}
@@ -948,7 +973,7 @@ func (archive *backupArchive) captureAt(now time.Time, graph *store.GraphState, 
 		}
 	}
 	if archive.headPath == "" || len(frameRanges) == 0 || frameRanges[0] == nil {
-		return archive.publishBase(now, graph, nextNodeID, nextEdgeID, commitID)
+		return archive.publishBase(ctx, now, graph, nextNodeID, nextEdgeID, commitID)
 	}
 	if commitID != archive.head.CommitID+1 {
 		return BackupMetadata{}, fmt.Errorf("backup commit %d does not immediately follow archive head %d", commitID, archive.head.CommitID)
@@ -959,7 +984,7 @@ func (archive *backupArchive) captureAt(now time.Time, graph *store.GraphState, 
 	}
 	stagePath := stage.Name()
 	defer os.Remove(stagePath)
-	present, copyErr := frameRanges[0](stage)
+	present, copyErr := frameRanges[0](backupContextWriter{ctx: ctx, writer: stage})
 	if copyErr != nil {
 		_ = stage.Close()
 		return BackupMetadata{}, copyErr
@@ -975,7 +1000,7 @@ func (archive *backupArchive) captureAt(now time.Time, graph *store.GraphState, 
 	if err := stage.Close(); err != nil {
 		return BackupMetadata{}, err
 	}
-	if err := store.ValidateBackupWALSegmentFile(stagePath, graph.DatabaseID, archive.head.CommitID, commitID); err != nil {
+	if err := store.ValidateBackupWALSegmentFileContext(ctx, stagePath, graph.DatabaseID, archive.head.CommitID, commitID); err != nil {
 		return BackupMetadata{}, fmt.Errorf("backup WAL commit frame is invalid: %w", err)
 	}
 	segmentStart := archive.head.CommitID + 1
@@ -984,7 +1009,7 @@ func (archive *backupArchive) captureAt(now time.Time, graph *store.GraphState, 
 		return BackupMetadata{}, err
 	}
 	metadata := BackupMetadata{CommitID: commitID, CapturedAt: captured}
-	entry, err := publishStagedSegment(archive.directory, stagePath, segmentStart, metadata, archive.headDigest)
+	entry, err := publishStagedSegment(ctx, archive.directory, stagePath, segmentStart, metadata, archive.headDigest)
 	if err != nil {
 		return BackupMetadata{}, err
 	}
@@ -992,7 +1017,7 @@ func (archive *backupArchive) captureAt(now time.Time, graph *store.GraphState, 
 	return metadata, nil
 }
 
-func (archive *backupArchive) initialize(graph *store.GraphState, nextNodeID, nextEdgeID, commitID, maxSnapshotBytes uint64) error {
+func (archive *backupArchive) initialize(ctx context.Context, graph *store.GraphState, nextNodeID, nextEdgeID, commitID, maxSnapshotBytes uint64) error {
 	if archive.headPath == "" {
 		archive.ready = true
 		return nil
@@ -1004,15 +1029,15 @@ func (archive *backupArchive) initialize(graph *store.GraphState, nextNodeID, ne
 	if err != nil {
 		return err
 	}
-	if err := validateArchiveFile(context.Background(), base.path, base.metadata, maxSnapshotBytes, graph.DatabaseID); err != nil {
+	if err := validateArchiveFile(ctx, base.path, base.metadata, maxSnapshotBytes, graph.DatabaseID); err != nil {
 		return err
 	}
 	if commitID > archive.head.CommitID {
-		if err := store.ValidateBackupWALChain(base.path, segments, archive.head.CommitID, maxSnapshotBytes); err != nil {
+		if err := store.ValidateBackupWALChainContext(ctx, base.path, segments, archive.head.CommitID, maxSnapshotBytes); err != nil {
 			return fmt.Errorf("backup archive WAL chain is corrupt: %w", err)
 		}
 		archive.rebaseOnOpen = true
-	} else if err := store.ValidateBackupWALFiles(base.path, segments, graph, nextNodeID, nextEdgeID, commitID, maxSnapshotBytes); err != nil {
+	} else if err := store.ValidateBackupWALFilesContext(ctx, base.path, segments, graph, nextNodeID, nextEdgeID, commitID, maxSnapshotBytes); err != nil {
 		return fmt.Errorf("backup archive head differs from recovered source: %w", err)
 	}
 	archive.ready = true
@@ -1083,7 +1108,7 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 		return BackupMetadata{}, os.ErrNotExist
 	}
 	archiveState := &backupArchive{directory: archive, entries: entries}
-	base, segments, selectedEntry, err := archiveState.validatedChain(owner.DatabaseID, selectedEntry)
+	base, segments, selectedEntry, err := archiveState.validatedChain(ctx, owner.DatabaseID, selectedEntry)
 	if err != nil {
 		return BackupMetadata{}, err
 	}

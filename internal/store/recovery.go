@@ -655,7 +655,7 @@ func checkpointGraphStateFilesContext(ctx context.Context, files DatabaseFiles, 
 	defer os.Remove(payloadPath)
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateBinary(contextWriter{ctx: ctx, Writer: io.MultiWriter(payload, checksum)}, graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateBinaryContext(ctx, io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	if _, err := payload.Seek(0, io.SeekStart); err != nil {
@@ -836,7 +836,7 @@ func prepareCheckpointFilesContext(ctx context.Context, files DatabaseFiles, gra
 	// Keep the candidate self-contained. Publishing a separately generated
 	// WAL base introduces a crash window where state and WAL can refer to
 	// different bases; the live WAL remains untouched until publication.
-	if err := checkpointGraphStateAndWALFilesContext(ctx, stagedFiles, graph, nextNodeID, nextEdgeID, commitID, 0, nil); err != nil {
+	if err := writeCheckpointGraphStateAndWALFilesContext(ctx, stagedFiles, graph, nextNodeID, nextEdgeID, commitID, 0, nil, true); err != nil {
 		_ = os.RemoveAll(staging)
 		return nil, err
 	}
@@ -844,7 +844,7 @@ func prepareCheckpointFilesContext(ctx context.Context, files DatabaseFiles, gra
 		_ = os.RemoveAll(staging)
 		return nil, err
 	}
-	if err := rewriteWALStatePayload(stagedFiles, nil, graph.DatabaseID, commitID, nil, stagedFiles.WALBase); err != nil {
+	if err := rewriteWALStatePayloadContext(ctx, stagedFiles, nil, graph.DatabaseID, commitID, nil, stagedFiles.WALBase); err != nil {
 		_ = os.RemoveAll(staging)
 		return nil, err
 	}
@@ -1001,6 +1001,12 @@ func checkpointGraphStateAndWALFiles(files DatabaseFiles, graph *GraphState, nex
 }
 
 func checkpointGraphStateAndWALFilesContext(ctx context.Context, files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, maxWALBytes uint64, fault CheckpointFault) error {
+	return writeCheckpointGraphStateAndWALFilesContext(ctx, files, graph, nextNodeID, nextEdgeID, commitID, maxWALBytes, fault, false)
+}
+
+// Private staging files remain cancelable after their state file is written.
+// Live files must finish the WAL rewrite after state publication has started.
+func writeCheckpointGraphStateAndWALFilesContext(ctx context.Context, files DatabaseFiles, graph *GraphState, nextNodeID uint64, nextEdgeID uint64, commitID uint64, maxWALBytes uint64, fault CheckpointFault, privateFiles bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1018,7 +1024,7 @@ func checkpointGraphStateAndWALFilesContext(ctx context.Context, files DatabaseF
 	defer os.Remove(payloadPath)
 	defer payload.Close()
 	checksum := crc32.NewIEEE()
-	if err := writePersistedStateBinary(contextWriter{ctx: ctx, Writer: io.MultiWriter(payload, checksum)}, graph, nextNodeID, nextEdgeID, commitID); err != nil {
+	if err := writePersistedStateBinaryContext(ctx, io.MultiWriter(payload, checksum), graph, nextNodeID, nextEdgeID, commitID); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -1027,15 +1033,19 @@ func checkpointGraphStateAndWALFilesContext(ctx context.Context, files DatabaseF
 	if err := publishStatePayloadContext(ctx, files, payload, graph.DatabaseID, commitID, checksum.Sum32(), fault); err != nil {
 		return err
 	}
+	walCtx := context.Background()
+	if privateFiles {
+		walCtx = ctx
+	}
 	if info, err := payload.Stat(); err != nil {
 		return err
 	} else if maxWALBytes != 0 && uint64(info.Size()) > maxWALBytes {
-		if err := rewriteWALStatePayload(files, payload, graph.DatabaseID, commitID, fault, files.WALBase); err != nil {
+		if err := rewriteWALStatePayloadContext(walCtx, files, payload, graph.DatabaseID, commitID, fault, files.WALBase); err != nil {
 			return err
 		}
-		return rewriteWALStatePayload(files, nil, graph.DatabaseID, commitID, fault, files.WAL)
+		return rewriteWALStatePayloadContext(walCtx, files, nil, graph.DatabaseID, commitID, fault, files.WAL)
 	}
-	if err := rewriteWALStatePayload(files, payload, graph.DatabaseID, commitID, fault, files.WAL); err != nil {
+	if err := rewriteWALStatePayloadContext(walCtx, files, payload, graph.DatabaseID, commitID, fault, files.WAL); err != nil {
 		return err
 	}
 	if err := os.Remove(files.WALBase); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1053,7 +1063,23 @@ func (writer contextWriter) Write(data []byte) (int, error) {
 	if err := writer.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return writer.Writer.Write(data)
+	written := 0
+	for len(data) != 0 {
+		if err := writer.ctx.Err(); err != nil {
+			return written, err
+		}
+		chunk := data[:min(len(data), 64<<10)]
+		n, err := writer.Writer.Write(chunk)
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n != len(chunk) {
+			return written, io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return written, nil
 }
 
 func publishStatePayloadContext(ctx context.Context, files DatabaseFiles, payload *os.File, databaseID string, commitID uint64, checksum uint32, fault CheckpointFault) error {
@@ -1126,6 +1152,13 @@ func publishStatePayloadContext(ctx context.Context, files DatabaseFiles, payloa
 }
 
 func rewriteWALStatePayload(files DatabaseFiles, statePayload *os.File, databaseID string, commitID uint64, fault CheckpointFault, targetPath string) error {
+	return rewriteWALStatePayloadContext(context.Background(), files, statePayload, databaseID, commitID, fault, targetPath)
+}
+
+func rewriteWALStatePayloadContext(ctx context.Context, files DatabaseFiles, statePayload *os.File, databaseID string, commitID uint64, fault CheckpointFault, targetPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	payload, err := os.CreateTemp(files.Directory, databaseTempPattern(files, "wal-payload"))
 	if err != nil {
 		return err
@@ -1146,7 +1179,7 @@ func rewriteWALStatePayload(files DatabaseFiles, statePayload *os.File, database
 		if _, err := output.Write([]byte{binaryWALSnapshot}); err != nil {
 			return err
 		}
-		if _, err := io.Copy(output, statePayload); err != nil {
+		if _, err := io.Copy(contextWriter{ctx: ctx, Writer: output}, &contextReader{ctx: ctx, reader: statePayload}); err != nil {
 			return err
 		}
 	}
@@ -1182,7 +1215,7 @@ func rewriteWALStatePayload(files DatabaseFiles, statePayload *os.File, database
 		_ = temp.Close()
 		return err
 	}
-	if _, err := io.Copy(temp, payload); err != nil {
+	if _, err := io.Copy(contextWriter{ctx: ctx, Writer: temp}, &contextReader{ctx: ctx, reader: payload}); err != nil {
 		_ = temp.Close()
 		return err
 	}
@@ -1191,6 +1224,9 @@ func rewriteWALStatePayload(files DatabaseFiles, statePayload *os.File, database
 		return err
 	}
 	if err := syncCloseCheckpointFile(temp, "wal", fault); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := runCheckpointFault(fault, "wal-rename", false); err != nil {
@@ -3806,7 +3842,7 @@ func (reader *contextReader) Read(buffer []byte) (int, error) {
 	if err := reader.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return reader.reader.Read(buffer)
+	return reader.reader.Read(buffer[:min(len(buffer), 64<<10)])
 }
 
 func unmarshalContext(ctx context.Context, data []byte, value any) error {

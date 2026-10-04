@@ -338,7 +338,11 @@ type pageFTSEntry struct {
 }
 
 func (graph *GraphState) FTSCount() (uint64, error) {
+	return graph.FTSCountContext(context.Background())
+}
+
+func (graph *GraphState) FTSCountContext(ctx context.Context) (uint64, error) {
 	var count uint64
-	err := graph.VisitFTS(context.Background(), func(uint64, *FTSRecord) error { count++; return nil })
+	err := graph.VisitFTS(ctx, func(uint64, *FTSRecord) error { count++; return nil })
 	return count, err
 }

@@ -48,7 +48,7 @@ func (archive *backupArchive) capturePage(ctx context.Context, now time.Time, gr
 		return BackupMetadata{}, errors.New("page catalog history does not match commit history")
 	}
 	if archive.headPath == "" {
-		metadata, err := archive.publishBase(now, graph, nextNodeID, nextEdgeID, commitID, identity)
+		metadata, err := archive.publishBase(ctx, now, graph, nextNodeID, nextEdgeID, commitID, identity)
 		if err == nil {
 			archive.ready = true
 		}
@@ -91,7 +91,7 @@ func (archive *backupArchive) capturePage(ctx context.Context, now time.Time, gr
 		if archive.head.CommitID == commitID {
 			return BackupMetadata{}, fmt.Errorf("backup archive already contains a different page base for commit %d", commitID)
 		}
-		metadata, err := archive.publishBase(now, graph, nextNodeID, nextEdgeID, commitID, identity)
+		metadata, err := archive.publishBase(ctx, now, graph, nextNodeID, nextEdgeID, commitID, identity)
 		if err == nil {
 			archive.ready = true
 		}
@@ -108,7 +108,7 @@ func (archive *backupArchive) capturePage(ctx context.Context, now time.Time, gr
 		return archive.head, nil
 	}
 	if commitID != archive.head.CommitID+1 {
-		metadata, err := archive.publishBase(now, graph, nextNodeID, nextEdgeID, commitID, identity)
+		metadata, err := archive.publishBase(ctx, now, graph, nextNodeID, nextEdgeID, commitID, identity)
 		if err == nil {
 			archive.ready = true
 		}
@@ -119,7 +119,7 @@ func (archive *backupArchive) capturePage(ctx context.Context, now time.Time, gr
 		return BackupMetadata{}, err
 	}
 	if frame == nil {
-		metadata, err := archive.publishBase(now, graph, nextNodeID, nextEdgeID, commitID, identity)
+		metadata, err := archive.publishBase(ctx, now, graph, nextNodeID, nextEdgeID, commitID, identity)
 		if err == nil {
 			archive.ready = true
 		}
@@ -227,7 +227,7 @@ func (archive *backupArchive) publishPageSegment(ctx context.Context, now time.T
 	}
 	stagePath := stage.Name()
 	defer os.Remove(stagePath)
-	written, writeErr := stage.Write(frame)
+	written, writeErr := (backupContextWriter{ctx: ctx, writer: stage}).Write(frame)
 	if writeErr == nil && written != len(frame) {
 		writeErr = io.ErrShortWrite
 	}
@@ -240,7 +240,7 @@ func (archive *backupArchive) publishPageSegment(ctx context.Context, now time.T
 	if writeErr != nil {
 		return BackupMetadata{}, writeErr
 	}
-	if err := store.ValidateBackupWALSegmentFile(stagePath, identity.databaseID, commitID-1, commitID); err != nil {
+	if err := store.ValidateBackupWALSegmentFileContext(ctx, stagePath, identity.databaseID, commitID-1, commitID); err != nil {
 		return BackupMetadata{}, fmt.Errorf("backup WAL commit frame is invalid: %w", err)
 	}
 	captured, err := archive.captureTime(now)
@@ -248,7 +248,7 @@ func (archive *backupArchive) publishPageSegment(ctx context.Context, now time.T
 		return BackupMetadata{}, err
 	}
 	metadata := BackupMetadata{CommitID: commitID, CapturedAt: captured}
-	entry, err := publishStagedSegment(archive.directory, stagePath, commitID, metadata, archive.headDigest, identity)
+	entry, err := publishStagedSegment(ctx, archive.directory, stagePath, commitID, metadata, archive.headDigest, identity)
 	if err != nil {
 		return BackupMetadata{}, err
 	}

@@ -18,7 +18,7 @@ func TestBackupResumeRejectsTimeInsideCoverageGap(t *testing.T) {
 	defer db.Close()
 	old := db.backupArchive.head
 	// No historical frames are supplied: only the resumed endpoint is known.
-	resumed, err := db.backupArchive.captureAt(old.CapturedAt.Add(time.Hour), db.graph, db.nextNodeID, db.nextEdgeID, 3, db.maxDatabaseSnapshotBytes)
+	resumed, err := db.backupArchive.captureAt(context.Background(), old.CapturedAt.Add(time.Hour), db.graph, db.nextNodeID, db.nextEdgeID, 3, db.maxDatabaseSnapshotBytes)
 	if err != nil {
 		t.Fatal(err)
 	}

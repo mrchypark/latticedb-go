@@ -144,6 +144,8 @@ and incremental backup, including commits that change only the schema. Use
 
 Use parameters for application values and explicit aliases for result columns. Queries default to 1,000,000 rows, 10,000,000 work units, and 64 MiB of live logical bytes. Use `QueryContext` with a deadline and explicit `QueryOptions` limits for your workload; logical byte budgets do not measure process RSS. Query text is limited to 32 KiB.
 
+String scans and comparisons charge work by input processed (one unit per 64 bytes or comparisons) and check cancellation at intervals of at most 4096 bytes or comparisons. Long substring searches also reserve their temporary matching table. DISTINCT releases comparison keys when the clause finishes and discards duplicate keys immediately.
+
 `MaxBytes` includes disk read buffers and decoded records, even when a query returns only IDs. Records remain charged while rows, paths, aggregates, or transaction changes retain their payloads. A record that cannot fit is rejected before its buffer or decoded value is allocated. Stream reads also include source decoding in their byte budget; if the next record cannot fit, `ByteLimited` is true and its sequence is not consumed. The record allowance includes fixed bookkeeping overhead. Counters describe active logical ownership, rather than the Go allocator capacity retained by tracking containers; tracking maps stay within the statement’s maximum live record count and are discarded at statement cleanup.
 
 See the [query semantics and full grammar](docs/engine_conformance.md#query-semantics) for exact clause combinations and behavior. The [canonical grammar](internal/engine/testdata/query_grammar.ebnf) and [accepted/rejected syntax tests](internal/engine/query_grammar_test.go) are checked against the parser.
@@ -196,6 +198,8 @@ the older points. Intermediate commits from that interval are unavailable:
 WAL v5 does not persist enough ancestry and timestamp information to prove them.
 Time selectors inside a recorded coverage gap return an error.
 See the [archive storage contract](docs/binary-storage.md#opt-in-backup-archive).
+
+Archive validation and full-base preparation honor `OpenContext` and restore cancellation, including file copy and checksum chunks of at most 64 KiB. Cancellation before publication removes staging files. After the source commit becomes durable, archive publication finishes without cancellation to preserve commit outcome semantics.
 
 The page backend passed creation, indexing, reopen, updates, deletion, backup,
 streaming migration, and incremental restore for a 1.42 GB database under a

@@ -262,7 +262,13 @@ func (a *aggregateAccumulator) addExpr(expr valueExpr, row queryRow, params map[
 			return nil
 		}
 		if a.seen {
-			comparison, ordered := compareAggregateValues(value, a.extreme)
+			comparison, ordered, err := compareQueryValuesWithBudget(value, a.extreme, budget)
+			if err != nil {
+				return err
+			}
+			if !ordered {
+				comparison, ordered = compareAggregateValues(value, a.extreme)
+			}
 			if !ordered || a.kind == aggregateMin && comparison >= 0 || a.kind == aggregateMax && comparison <= 0 {
 				return nil
 			}
@@ -276,6 +282,11 @@ func (a *aggregateAccumulator) addExpr(expr valueExpr, row queryRow, params map[
 	}
 	if a.kind == aggregateCollect || a.kind == aggregateMin || a.kind == aggregateMax {
 		value = cloneRetainedQueryValue(value)
+	}
+	if a.kind == aggregateMin || a.kind == aggregateMax {
+		// The budgeted comparison above already selected this value.
+		a.extreme, a.seen = value, true
+		return nil
 	}
 	return a.add(value, value != nil)
 }

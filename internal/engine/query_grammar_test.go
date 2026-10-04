@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "5d7525f30bb30eac0c7c251699a0d069b36f2d4e1ab5e739a6081beddf2b96b6"
+const auditedCypherParserDigest = "f05c96a366e2a48990945c153232a37907566f44c8df2447f336a7c86559d141"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -328,6 +328,11 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"with order by alias":                  `MATCH (n) WITH n.age AS age ORDER BY age DESC LIMIT 1 RETURN age AS age`,
 		"list literal":                         `MATCH (n) WHERE n.kind IN ["a", "b"] RETURN n`,
 		"count with projection list":           `MATCH (n) RETURN count(n), n.name`,
+		"boolean projections":                 `RETURN true AS yes, false AS no`,
+		"null projection":                     `RETURN null AS missing`,
+		"literal with":                        `WITH true AS yes, false AS no, null AS missing RETURN yes, no, missing`,
+		"literal count":                       `RETURN count(null) AS missing`,
+		"quoted literal binding":              "WITH 7 AS `null` RETURN `null` AS value, count(`null`) AS present",
 	}
 	for name, query := range accepted {
 		t.Run("accept/"+name, func(t *testing.T) {

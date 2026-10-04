@@ -56,6 +56,13 @@ func (d *binaryDecoder) state() persistedState {
 // Checkpoints write one entity at a time, without materializing a second graph
 // or an encoded whole-state byte buffer.
 func writePersistedStateBinary(output io.Writer, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) error {
+	return writePersistedStateBinaryContext(context.Background(), output, graph, nextNodeID, nextEdgeID, commitID)
+}
+
+func writePersistedStateBinaryContext(ctx context.Context, output io.Writer, graph *GraphState, nextNodeID, nextEdgeID, commitID uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	nextNodeID, nextEdgeID = max(nextNodeID, 1), max(nextEdgeID, 1)
 	if err := ValidateIDHighWater(nextNodeID); err != nil {
 		return err
@@ -67,7 +74,7 @@ func writePersistedStateBinary(output io.Writer, graph *GraphState, nextNodeID, 
 	if err != nil {
 		return err
 	}
-	buffered := bufio.NewWriterSize(output, 64<<10)
+	buffered := bufio.NewWriterSize(contextWriter{ctx: ctx, Writer: output}, 64<<10)
 	e := binaryEncoder{out: buffered}
 	e.str(graph.DatabaseID)
 	e.u(uint64(graph.VectorDimensions))
@@ -75,12 +82,12 @@ func writePersistedStateBinary(output io.Writer, graph *GraphState, nextNodeID, 
 	e.u(nextNodeID)
 	e.u(nextEdgeID)
 	e.metadata(metadata)
-	nodes, err := graph.NodeCount()
+	nodes, err := graph.NodeCountContext(ctx)
 	if err != nil {
 		return err
 	}
 	e.u(nodes + 1)
-	if err := graph.VisitNodes(context.Background(), func(node *NodeRecord) error {
+	if err := graph.VisitNodes(ctx, func(node *NodeRecord) error {
 		if err := ValidateEntityID(node.ID); err != nil {
 			return err
 		}
@@ -96,12 +103,12 @@ func writePersistedStateBinary(output io.Writer, graph *GraphState, nextNodeID, 
 	}); err != nil {
 		return err
 	}
-	edges, err := graph.EdgeCount()
+	edges, err := graph.EdgeCountContext(ctx)
 	if err != nil {
 		return err
 	}
 	e.u(edges + 1)
-	if err := graph.VisitEdges(context.Background(), func(edge *EdgeRecord) error {
+	if err := graph.VisitEdges(ctx, func(edge *EdgeRecord) error {
 		for _, id := range []uint64{edge.ID, edge.SourceID, edge.TargetID} {
 			if err := ValidateEntityID(id); err != nil {
 				return err
@@ -119,12 +126,12 @@ func writePersistedStateBinary(output io.Writer, graph *GraphState, nextNodeID, 
 	}); err != nil {
 		return err
 	}
-	ftsCount, err := graph.FTSCount()
+	ftsCount, err := graph.FTSCountContext(ctx)
 	if err != nil {
 		return err
 	}
 	e.u(ftsCount + 1)
-	if err := graph.VisitFTS(context.Background(), func(id uint64, record *FTSRecord) error {
+	if err := graph.VisitFTS(ctx, func(id uint64, record *FTSRecord) error {
 		if err := ValidateEntityID(id); err != nil {
 			return err
 		}
