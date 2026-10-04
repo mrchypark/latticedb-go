@@ -399,6 +399,7 @@ type vectorRebuildState struct {
 }
 
 type Tx struct {
+	queryBudget            *queryBudget
 	db                     *DB
 	readOnly               bool
 	base                   *store.GraphState
@@ -4616,7 +4617,7 @@ func (tx *Tx) requireNode(nodeID uint64) (*store.NodeRecord, error) {
 	if err := validateEntityID(nodeID); err != nil {
 		return nil, err
 	}
-	node, err := tx.graph.ReadNode(nodeID)
+	node, err := tx.queryBudget.readNode(tx.graph, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -4633,7 +4634,7 @@ func (tx *Tx) requireEdge(edgeID uint64) (*store.EdgeRecord, error) {
 	if err := validateEntityID(edgeID); err != nil {
 		return nil, err
 	}
-	edge, err := tx.graph.ReadEdge(edgeID)
+	edge, err := tx.queryBudget.readEdge(tx.graph, edgeID)
 	if err != nil {
 		return nil, err
 	}
@@ -4656,6 +4657,7 @@ func (tx *Tx) writableNode(nodeID uint64, propertiesOnly bool) (*store.NodeRecor
 		return nil, err
 	}
 	if tx.graph.Nodes.Get(nodeID) == nil || tx.base != nil && tx.graph.Nodes.Get(nodeID) == tx.base.Nodes.Get(nodeID) {
+		tx.queryBudget.pinSource(node)
 		node = &store.NodeRecord{
 			ID:         node.ID,
 			Labels:     slices.Clone(node.Labels),
@@ -4677,6 +4679,7 @@ func (tx *Tx) writableEdge(edgeID uint64, propertiesOnly bool) (*store.EdgeRecor
 		return nil, err
 	}
 	if tx.graph.Edges.Get(edgeID) == nil || tx.base != nil && tx.graph.Edges.Get(edgeID) == tx.base.Edges.Get(edgeID) {
+		tx.queryBudget.pinSource(edge)
 		edge = &store.EdgeRecord{
 			ID:         edge.ID,
 			SourceID:   edge.SourceID,

@@ -378,7 +378,11 @@ func rebuildPageVectorIndexWithBudget(ctx context.Context, graph *store.PageGrap
 	meta := store.PageVectorMeta{}
 	meta.M, meta.Dimensions, meta.Valid = uint16(m), dimensions, true
 	var buildErr error
-	err := graph.VisitNodes(ctx, func(node *store.NodeRecord) error {
+	sourceCtx := ctx
+	if budget != nil {
+		sourceCtx = store.WithPageReadBudget(ctx, budget)
+	}
+	err := graph.VisitNodes(sourceCtx, func(node *store.NodeRecord) error {
 		if buildErr != nil {
 			return buildErr
 		}
@@ -479,36 +483,39 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 				return err
 			}
 		}
-		oldNode, err := before.ReadNode(id)
-		if err != nil {
-			return err
+		sourceCtx := ctx
+		if budget != nil {
+			sourceCtx = store.WithPageReadBudget(ctx, budget)
 		}
-		newNode, err := after.ReadNode(id)
-		if err != nil {
-			return err
-		}
-		oldVector, oldOK := selectedVector(before, oldNode)
-		newVector, newOK := selectedVector(after, newNode)
-		if oldOK != newOK || !slices.Equal(oldVector, newVector) {
-			if err := chargeChange("default", after.VectorDimensions, id, !oldOK && newOK); err != nil {
-				return err
-			}
-		}
-		for _, ns := range namespaces {
-			if budget != nil {
-				if err := budget.add(1); err != nil {
-					return err
+		if err := before.VisitNode(sourceCtx, id, func(oldNode *store.NodeRecord) error {
+			return after.VisitNode(sourceCtx, id, func(newNode *store.NodeRecord) error {
+				oldVector, oldOK := selectedVector(before, oldNode)
+				newVector, newOK := selectedVector(after, newNode)
+				if oldOK != newOK || !slices.Equal(oldVector, newVector) {
+					if err := chargeChange("default", after.VectorDimensions, id, !oldOK && newOK); err != nil {
+						return err
+					}
 				}
-			}
-			oldView, newView := vectorNamespaceFacade(before, ns), vectorNamespaceFacade(after, ns)
-			oldView.VectorDimensions, newView.VectorDimensions = ns.Dimensions, ns.Dimensions
-			oldVector, oldOK = selectedVector(oldView, oldNode)
-			newVector, newOK = selectedVector(newView, newNode)
-			if oldOK != newOK || !slices.Equal(oldVector, newVector) {
-				if err := chargeChange(pageVectorNamespaceKey(&ns), ns.Dimensions, id, !oldOK && newOK); err != nil {
-					return err
+				for _, ns := range namespaces {
+					if budget != nil {
+						if err := budget.add(1); err != nil {
+							return err
+						}
+					}
+					oldView, newView := vectorNamespaceFacade(before, ns), vectorNamespaceFacade(after, ns)
+					oldView.VectorDimensions, newView.VectorDimensions = ns.Dimensions, ns.Dimensions
+					oldVector, oldOK = selectedVector(oldView, oldNode)
+					newVector, newOK = selectedVector(newView, newNode)
+					if oldOK != newOK || !slices.Equal(oldVector, newVector) {
+						if err := chargeChange(pageVectorNamespaceKey(&ns), ns.Dimensions, id, !oldOK && newOK); err != nil {
+							return err
+						}
+					}
 				}
-			}
+				return nil
+			})
+		}); err != nil {
+			return err
 		}
 	}
 	if err := invalidateInactivePageVectorIndexesBudget(ctx, page, sortedVectorNamespaces(after.VectorNamespaces), budget, buildBudget); err != nil {
@@ -523,39 +530,42 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 				return err
 			}
 		}
-		oldNode, err := before.ReadNode(id)
-		if err != nil {
-			return err
+		sourceCtx := ctx
+		if budget != nil {
+			sourceCtx = store.WithPageReadBudget(ctx, budget)
 		}
-		newNode, err := after.ReadNode(id)
-		if err != nil {
-			return err
-		}
-		oldVector, oldOK := selectedVector(before, oldNode)
-		newVector, newOK := selectedVector(after, newNode)
-		if oldOK != newOK || !slices.Equal(oldVector, newVector) {
-			if err := applyPageVectorChange(ctx, page, "default", id, newVector, newOK, m, budget, buildBudget); err != nil {
-				return err
-			}
-		}
-		for _, ns := range namespaces {
-			if budget != nil {
-				if err := budget.add(1); err != nil {
-					return err
+		if err := before.VisitNode(sourceCtx, id, func(oldNode *store.NodeRecord) error {
+			return after.VisitNode(sourceCtx, id, func(newNode *store.NodeRecord) error {
+				oldVector, oldOK := selectedVector(before, oldNode)
+				newVector, newOK := selectedVector(after, newNode)
+				if oldOK != newOK || !slices.Equal(oldVector, newVector) {
+					if err := applyPageVectorChange(ctx, page, "default", id, newVector, newOK, m, budget, buildBudget); err != nil {
+						return err
+					}
 				}
-			}
-			newView := vectorNamespaceFacade(after, ns)
-			newView.VectorDimensions = ns.Dimensions
-			oldView := vectorNamespaceFacade(before, ns)
-			oldView.VectorDimensions = ns.Dimensions
-			oldVector, oldOK = selectedVector(oldView, oldNode)
-			newVector, newOK = selectedVector(newView, newNode)
-			if oldOK == newOK && slices.Equal(oldVector, newVector) {
-				continue
-			}
-			if err := applyPageVectorChange(ctx, page, pageVectorNamespaceKey(&ns), id, newVector, newOK, m, budget, buildBudget); err != nil {
-				return err
-			}
+				for _, ns := range namespaces {
+					if budget != nil {
+						if err := budget.add(1); err != nil {
+							return err
+						}
+					}
+					newView := vectorNamespaceFacade(after, ns)
+					newView.VectorDimensions = ns.Dimensions
+					oldView := vectorNamespaceFacade(before, ns)
+					oldView.VectorDimensions = ns.Dimensions
+					oldVector, oldOK = selectedVector(oldView, oldNode)
+					newVector, newOK = selectedVector(newView, newNode)
+					if oldOK == newOK && slices.Equal(oldVector, newVector) {
+						continue
+					}
+					if err := applyPageVectorChange(ctx, page, pageVectorNamespaceKey(&ns), id, newVector, newOK, m, budget, buildBudget); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}); err != nil {
+			return err
 		}
 	}
 	return nil

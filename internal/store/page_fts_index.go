@@ -537,7 +537,7 @@ func (page *PageGraph) VisitFTSVocabularyWithLimit(ctx context.Context, index st
 	} else {
 		maxTermBytes = termBudget + overhead
 	}
-	err := page.Tx.ScanBounded(ctx, pageFTSTerms, prefix, pagePrefixEnd(prefix), maxTermBytes, func(key, value []byte) error {
+	visitValue := func(key, value []byte, scope *pageReadScope) error {
 		if len(key) != len(prefix)+sha256.Size {
 			return errors.New("invalid FTS vocabulary key")
 		}
@@ -559,19 +559,40 @@ func (page *PageGraph) VisitFTSVocabularyWithLimit(ctx context.Context, index st
 		if err != nil {
 			return err
 		}
-		term := d.str()
-		if count := d.u(); count == 0 {
-			return errors.New("invalid FTS term document count")
+		if scope != nil {
+			d.admitAllocation = func(bytes uint64) error { return scope.reserve(0, bytes) }
 		}
+		term := d.str()
+		count := d.u()
 		if err := d.finish(); err != nil {
 			return err
+		}
+		if count == 0 {
+			return errors.New("invalid FTS term document count")
 		}
 		digest := sha256.Sum256([]byte(term))
 		if uint64(len(term)) != termLength || !bytes.Equal(digest[:], key[len(prefix):]) {
 			return errors.New("FTS vocabulary hash mismatch")
 		}
 		return visit(term)
-	})
+	}
+	var err error
+	if budget := pageReadBudgetFromContext(ctx); budget != nil {
+		err = page.Tx.ScanKeysWithCharge(ctx, pageFTSTerms, prefix, pagePrefixEnd(prefix), uint64(len(prefix)+sha256.Size), func(size uint64) error {
+			return budget.ReservePageRead(1, 2*size)
+		}, func(key []byte) error {
+			defer budget.ReleasePageRead(uint64(2 * len(key)))
+			scope := &pageReadScope{budget: budget}
+			defer func() { budget.ReleasePageRead(scope.held) }()
+			value, err := page.Tx.GetBoundedWithCharge(pageFTSTerms, key, maxTermBytes, func(size uint64) error { return scope.reserve(size, size) })
+			if err != nil {
+				return err
+			}
+			return visitValue(key, value, scope)
+		})
+	} else {
+		err = page.Tx.ScanBounded(ctx, pageFTSTerms, prefix, pagePrefixEnd(prefix), maxTermBytes, func(key, value []byte) error { return visitValue(key, value, nil) })
+	}
 	if errors.Is(err, pagestore.ErrValueTooLarge) {
 		return ErrLoadResourceLimit
 	}

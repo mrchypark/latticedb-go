@@ -555,7 +555,7 @@ func validateArchiveFileWithLimits(ctx context.Context, path string, metadata Ba
 	return nil
 }
 
-func readArchiveEntries(ctx context.Context, directory, databaseID string) ([]backupEntry, error) {
+func readArchiveEntries(ctx context.Context, directory, databaseID string, validate bool) ([]backupEntry, error) {
 	file, err := os.Open(directory)
 	if err != nil {
 		return nil, err
@@ -583,23 +583,7 @@ func readArchiveEntries(ctx context.Context, directory, databaseID string) ([]ba
 					return nil, err
 				}
 				entry.path = path
-				info, statErr := os.Lstat(path)
-				if statErr != nil {
-					return nil, statErr
-				}
-				if info.Size() <= 0 || info.Size() > maxBackupSegmentBytes {
-					return nil, fmt.Errorf("%w: invalid backup WAL segment size", ErrResourceLimit)
-				}
-				actual, readErr := hashArchiveFile(path)
-				if readErr != nil {
-					return nil, readErr
-				}
-				if actual != entry.digest {
-					return nil, errors.New("backup WAL segment checksum mismatch")
-				}
-				if err := store.ValidateBackupWALSegmentFile(path, databaseID, entry.start-1, entry.metadata.CommitID); err != nil {
-					return nil, err
-				}
+
 			} else {
 				entry.metadata, entry.digest, err = parseBackupEntry(name)
 				entry.gapStart, _ = backupGapStart(name)
@@ -607,9 +591,10 @@ func readArchiveEntries(ctx context.Context, directory, databaseID string) ([]ba
 					return nil, err
 				}
 			}
-			entry.sourceHistory, entry.hasSourceHistory, err = readSourceHistoryProof(entry, databaseID)
-			if err != nil {
-				return nil, err
+			if validate {
+				if err := validateArchiveEntry(&entry, databaseID); err != nil {
+					return nil, err
+				}
 			}
 			entries = append(entries, entry)
 		}
@@ -621,6 +606,32 @@ func readArchiveEntries(ctx context.Context, directory, databaseID string) ([]ba
 		}
 	}
 	return entries, nil
+}
+
+// validateArchiveEntry reads content only after a restore dependency is selected.
+func validateArchiveEntry(entry *backupEntry, databaseID string) error {
+	if entry.segment {
+		info, err := os.Lstat(entry.path)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxBackupSegmentBytes {
+			return fmt.Errorf("%w: invalid backup WAL segment size", ErrResourceLimit)
+		}
+		actual, err := hashArchiveFile(entry.path)
+		if err != nil {
+			return err
+		}
+		if actual != entry.digest {
+			return errors.New("backup WAL segment checksum mismatch")
+		}
+		if err := store.ValidateBackupWALSegmentFile(entry.path, databaseID, entry.start-1, entry.metadata.CommitID); err != nil {
+			return err
+		}
+	}
+	var err error
+	entry.sourceHistory, entry.hasSourceHistory, err = readSourceHistoryProof(*entry, databaseID)
+	return err
 }
 
 const maxBackupSegmentBytes = 1 << 30
@@ -727,7 +738,7 @@ func openBackupArchive(directory, source, databaseID string) (*backupArchive, er
 		}
 	}
 	result := &backupArchive{directory: archive, lock: lock}
-	result.entries, err = readArchiveEntries(context.Background(), archive, databaseID)
+	result.entries, err = readArchiveEntries(context.Background(), archive, databaseID, true)
 	if err == nil {
 		sort.Slice(result.entries, func(i, j int) bool {
 			if result.entries[i].metadata.CommitID != result.entries[j].metadata.CommitID {
@@ -988,7 +999,7 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 	if err != nil {
 		return BackupMetadata{}, err
 	}
-	entries, err := readArchiveEntries(ctx, archive, owner.DatabaseID)
+	entries, err := readArchiveEntries(ctx, archive, owner.DatabaseID, false)
 	if err != nil {
 		return BackupMetadata{}, err
 	}
@@ -998,9 +1009,6 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 		}
 		return entries[i].metadata.CapturedAt.Before(entries[j].metadata.CapturedAt)
 	})
-	if err := validateBackupChain(entries); err != nil {
-		return BackupMetadata{}, err
-	}
 	if err := verifyBackupHeadAnchor(archive, entries); err != nil {
 		return BackupMetadata{}, err
 	}
@@ -1024,6 +1032,31 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 	archiveState := &backupArchive{directory: archive, entries: entries}
 	base, segments, err := archiveState.chainFor(selectedEntry)
 	if err != nil {
+		return BackupMetadata{}, err
+	}
+	// Validate only this base and its dependent WAL files. Older independent
+	// chains may have been pruned without invalidating this restore point.
+	required := map[string]bool{base.path: true}
+	for _, path := range segments {
+		required[path] = true
+	}
+	var chain []backupEntry
+	for _, entry := range entries {
+		if !required[entry.path] {
+			continue
+		}
+		if err := validateArchiveEntry(&entry, owner.DatabaseID); err != nil {
+			return BackupMetadata{}, err
+		}
+		chain = append(chain, entry)
+		if entry.path == base.path {
+			base = entry
+		}
+		if entry.path == selectedEntry.path {
+			selectedEntry = entry
+		}
+	}
+	if err := validateBackupChain(chain); err != nil {
 		return BackupMetadata{}, err
 	}
 	pageArchive := selectedEntry.hasSourceHistory

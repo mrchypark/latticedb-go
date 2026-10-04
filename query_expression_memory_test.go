@@ -25,6 +25,8 @@ func TestQueryExpressionScratchLifetime(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// MATCH retains 100 decoded disk records. Leave less than one additional
+	// full payload copy per row, so leaked expression scratch still exceeds it.
 	for _, tc := range []struct {
 		query string
 		rows  int
@@ -38,7 +40,7 @@ func TestQueryExpressionScratchLifetime(t *testing.T) {
 		{"MATCH (n:Big) RETURN max(size(n.blob)) AS value", 1, int64(8192)},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
-			r, err := db.QueryContext(context.Background(), tc.query, nil, latticedb.QueryOptions{MaxBytes: 256 << 10})
+			r, err := db.QueryContext(context.Background(), tc.query, nil, latticedb.QueryOptions{MaxBytes: 3 << 20})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -59,7 +61,7 @@ func TestQueryExpressionScratchLifetime(t *testing.T) {
 		"MATCH (n:Big) WITH max(n.blob) AS blob RETURN blob",
 	} {
 		t.Run(query, func(t *testing.T) {
-			result, err := db.QueryContext(context.Background(), query, nil, latticedb.QueryOptions{MaxBytes: 256 << 10})
+			result, err := db.QueryContext(context.Background(), query, nil, latticedb.QueryOptions{MaxBytes: 3 << 20})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -76,7 +78,7 @@ func TestQueryExpressionScratchLifetime(t *testing.T) {
 		"MATCH (n:Big) RETURN collect(n.blob) AS value",
 		"MATCH (n:Big) WITH collect(n.blob) AS value RETURN value",
 	} {
-		if _, err := db.QueryContext(context.Background(), query, nil, latticedb.QueryOptions{MaxBytes: 256 << 10}); !errors.Is(err, latticedb.ErrResourceLimit) {
+		if _, err := db.QueryContext(context.Background(), query, nil, latticedb.QueryOptions{MaxBytes: 3 << 20}); !errors.Is(err, latticedb.ErrResourceLimit) {
 			t.Fatalf("%s: %v", query, err)
 		}
 	}

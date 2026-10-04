@@ -56,11 +56,14 @@ func pageStreamOffsetKey(stream, consumer string) []byte {
 }
 
 func encodePageStreamRecord(record StreamRecord) ([]byte, error) {
+	return encodePageStreamRecordBounded(record, (&PageGraph{}).recordLimit())
+}
+func encodePageStreamRecordBounded(record StreamRecord, maxBytes uint64) ([]byte, error) {
 	payload, err := encodeValue(record.Payload)
 	if err != nil {
 		return nil, err
 	}
-	return encodePageRecord(3, func(e *binaryEncoder) {
+	return encodePageRecordBounded(3, maxBytes, func(e *binaryEncoder) {
 		e.u(record.Sequence)
 		e.str(record.Kind)
 		e.value(payload, 0)
@@ -68,10 +71,14 @@ func encodePageStreamRecord(record StreamRecord) ([]byte, error) {
 }
 
 func decodePageStreamRecord(data []byte, name string, sequence, maxBytes uint64) (StreamRecord, error) {
+	return decodePageStreamRecordAdmitted(data, name, sequence, maxBytes, nil)
+}
+func decodePageStreamRecordAdmitted(data []byte, name string, sequence, maxBytes uint64, admit func(uint64) error) (StreamRecord, error) {
 	d, err := decodePageRecord(data, 3, maxBytes)
 	if err != nil {
 		return StreamRecord{}, err
 	}
+	d.admitAllocation = admit
 	record := StreamRecord{Sequence: d.u(), Kind: d.str()}
 	payload := d.value(0)
 	if err := d.finish(); err != nil {
@@ -190,17 +197,67 @@ func (store StreamStore) pageRecord(ctx context.Context, name string, sequence u
 	return store.overlayRecord(name, sequence)
 }
 
+// streamPageBudget bounds live result plus page-read scratch. A refused next
+// record has the same ByteLimited result as a refused output payload.
+type streamPageBudget struct{ max, bytes uint64 }
+
+var errStreamPageBudget = errors.New("stream page read exceeds byte limit")
+
+func (b *streamPageBudget) ReservePageRead(_, bytes uint64) error {
+	if bytes > b.max-b.bytes {
+		return errStreamPageBudget
+	}
+	b.bytes += bytes
+	return nil
+}
+func (b *streamPageBudget) ReleasePageRead(bytes uint64)   { b.bytes -= bytes }
+func (b *streamPageBudget) RemainingPageReadBytes() uint64 { return b.max - b.bytes }
+
 func (store StreamStore) readPageBounded(ctx context.Context, name string, after uint64, limit uint, maxBytes uint64) (StreamReadResult, error) {
 	log := store.streams[name]
 	start := max(after+1, log.first)
 	end := log.first + log.count - 1
-	result := StreamReadResult{Records: make([]StreamRecord, 0, min(uint64(limit), log.count))}
+	take := min(uint64(limit), end-start+1)
+	if maxBytes != 0 {
+		take = min(take, maxBytes/48+1)
+	}
+	result := StreamReadResult{Records: make([]StreamRecord, 0, take)}
+	var budget *streamPageBudget
+	if maxBytes != 0 {
+		budget = &streamPageBudget{max: maxBytes}
+		ctx = WithPageReadBudget(ctx, budget)
+	}
 	for sequence := start; sequence <= end && uint(len(result.Records)) < limit; sequence++ {
-		record, err := store.pageRecord(ctx, name, sequence)
-		if err != nil {
-			return result, err
+		appendRecord := func(record StreamRecord) error {
+			if err := result.appendCtx(ctx, record, maxBytes); err != nil {
+				return err
+			}
+			return nil
 		}
-		if err := result.appendCtx(ctx, record, maxBytes); err != nil {
+		var err error
+		if budget != nil && sequence < log.first+log.diskCount {
+			err = store.page.graph.visitReadRecord(ctx, pageStreamRecords, sequence, pageStreamRecordKey(name, sequence), func(_ uint64, data []byte, scope *pageReadScope) error {
+				if data == nil {
+					return fmt.Errorf("missing page stream record %q sequence %d", name, sequence)
+				}
+				record, err := decodePageStreamRecordAdmitted(data, name, sequence, store.page.graph.recordLimit(), scope.decoded)
+				if err != nil {
+					return err
+				}
+				return appendRecord(record)
+			})
+		} else {
+			var record StreamRecord
+			record, err = store.pageRecord(ctx, name, sequence)
+			if err == nil {
+				err = appendRecord(record)
+			}
+		}
+		if errors.Is(err, errStreamPageBudget) {
+			result.ByteLimited = true
+			break
+		}
+		if err != nil {
 			return result, err
 		}
 		if result.ByteLimited {
@@ -319,7 +376,7 @@ func (graph *PageGraph) ApplyStreamOperations(ctx context.Context, operations []
 			if err := ValidateStreamKind(op.Kind); err != nil {
 				return err
 			}
-			data, err := encodePageStreamRecord(StreamRecord{Sequence: op.Sequence, Kind: op.Kind, Payload: op.Payload})
+			data, err := encodePageStreamRecordBounded(StreamRecord{Sequence: op.Sequence, Kind: op.Kind, Payload: op.Payload}, graph.recordLimit())
 			if err != nil {
 				return err
 			}

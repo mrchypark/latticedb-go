@@ -428,7 +428,7 @@ func TestReadStreamContextByteLimit(t *testing.T) {
 	if err != nil || len(result.Records) != 0 || result.LastSequence != 0 || !result.ByteLimited {
 		t.Fatalf("small budget result = %#v, %v", result, err)
 	}
-	result, err = db.ReadStreamContext(context.Background(), "events", 0, StreamReadOptions{Limit: 2, MaxBytes: 10_000})
+	result, err = db.ReadStreamContext(context.Background(), "events", 0, StreamReadOptions{Limit: 2, MaxBytes: 16_000})
 	if err != nil || len(result.Records) != 1 || result.LastSequence != 1 || !result.ByteLimited {
 		t.Fatalf("partial budget result = %#v, %v", result, err)
 	}

@@ -125,3 +125,69 @@ func (page *PageGraph) decodeFTSRead(ctx context.Context, id uint64, data []byte
 	}
 	return &FTSRecord{Text: record.Text, Tokens: tokens}, nil
 }
+
+// PageReadLease owns a conservative decoder allowance until the caller drops
+// the decoded record. It never pins a storage transaction. Release is idempotent.
+type PageReadLease struct {
+	budget PageReadBudget
+	bytes  uint64
+}
+
+func (lease *PageReadLease) Release() {
+	if lease == nil || lease.budget == nil {
+		return
+	}
+	lease.budget.ReleasePageRead(lease.bytes)
+	lease.budget = nil
+	lease.bytes = 0
+}
+func (scope *pageReadScope) take(rawBytes uint64) *PageReadLease {
+	// Decoded strings/collections own their backing storage, not the raw buffer.
+	scope.budget.ReleasePageRead(rawBytes)
+	lease := &PageReadLease{budget: scope.budget, bytes: scope.held - rawBytes}
+	scope.held = 0
+	return lease
+}
+
+func (page *PageGraph) ReadNodeOwned(ctx context.Context, id uint64) (*NodeRecord, *PageReadLease, error) {
+	if pageReadBudgetFromContext(ctx) == nil {
+		n, err := page.GetNode(id)
+		return n, nil, err
+	}
+	var node *NodeRecord
+	var lease *PageReadLease
+	err := page.visitReadRecord(ctx, pageNodes, id, pageID(id), func(id uint64, data []byte, scope *pageReadScope) error {
+		if data == nil {
+			return nil
+		}
+		var err error
+		node, err = decodePageNodeAdmitted(data, id, page.recordLimit(), scope.decoded)
+		if err != nil {
+			return err
+		}
+		lease = scope.take(uint64(len(data)))
+		return nil
+	})
+	return node, lease, err
+}
+func (page *PageGraph) ReadEdgeOwned(ctx context.Context, id uint64) (*EdgeRecord, *PageReadLease, error) {
+	if pageReadBudgetFromContext(ctx) == nil {
+		e, err := page.GetEdge(id)
+		return e, nil, err
+	}
+	var edge *EdgeRecord
+	var lease *PageReadLease
+	err := page.visitReadRecord(ctx, pageEdges, id, pageID(id), func(id uint64, data []byte, scope *pageReadScope) error {
+		if data == nil {
+			return nil
+		}
+		var err error
+		edge, err = decodePageEdgeAdmitted(data, id, page.recordLimit(), scope.decoded)
+		if err != nil {
+			return err
+		}
+		lease = scope.take(uint64(len(data)))
+		return nil
+	})
+	return edge, lease, err
+}

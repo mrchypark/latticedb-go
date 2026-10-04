@@ -76,23 +76,33 @@ func (db *DB) readStream(ctx context.Context, stream string, afterSequence uint6
 			default:
 			}
 		}
-		db.mu.RLock()
+		db.mu.Lock()
 		if db.closed {
-			db.mu.RUnlock()
+			db.mu.Unlock()
 			return StreamReadResult{}, ErrDatabaseClosed
 		}
 		if db.recoveryRequired {
-			db.mu.RUnlock()
+			db.mu.Unlock()
 			return StreamReadResult{}, ErrRecoveryRequired
 		}
 		// Keep the immutable stream generation with the lock boundary used to
 		// subscribe below. Writers fork the store, so payload copying does not
 		// need to hold the DB lock.
 		generation := db.graph
+		var lease *GenerationLease
+		if generation.PageBase != nil {
+			var err error
+			lease, err = db.acquireGenerationLeaseLocked(generation, false)
+			if err != nil {
+				db.mu.Unlock()
+				return StreamReadResult{}, err
+			}
+		}
 		streams := generation.Streams
 		nextSequence := streams.NextSequence(stream)
-		db.mu.RUnlock()
+		db.mu.Unlock()
 		read, readErr := streams.ReadBoundedContext(ctx, stream, afterSequence, opts.Limit, opts.MaxBytes)
+		lease.Release()
 		if readErr != nil {
 			return StreamReadResult{}, readErr
 		}

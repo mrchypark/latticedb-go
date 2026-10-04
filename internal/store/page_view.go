@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"io"
 	"iter"
 	"slices"
@@ -79,6 +81,40 @@ func (graph *GraphState) ReadNode(id uint64) (*NodeRecord, error) {
 	}
 	return nil, nil
 }
+
+// VisitNode admits disk allocations for the callback lifetime. Overlay records
+// are already resident and are not charged as newly decoded page storage.
+func (graph *GraphState) VisitNode(ctx context.Context, id uint64, visit func(*NodeRecord) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if graph.DeletedNodes.Get(id) {
+		return visit(nil)
+	}
+	if value := graph.Nodes.Get(id); value != nil {
+		return visit(value)
+	}
+	if graph.PageBase != nil {
+		return graph.PageBase.VisitNode(ctx, id, visit)
+	}
+	return visit(nil)
+}
+func (graph *GraphState) VisitEdge(ctx context.Context, id uint64, visit func(*EdgeRecord) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if graph.DeletedEdges.Get(id) {
+		return visit(nil)
+	}
+	if value := graph.Edges.Get(id); value != nil {
+		return visit(value)
+	}
+	if graph.PageBase != nil {
+		return graph.PageBase.VisitEdge(ctx, id, visit)
+	}
+	return visit(nil)
+}
+
 func (graph *GraphState) VisitNodes(ctx context.Context, visit func(*NodeRecord) error) error {
 	var base func(func(uint64, *NodeRecord) error) error
 	if graph.PageBase != nil {
@@ -89,38 +125,21 @@ func (graph *GraphState) VisitNodes(ctx context.Context, visit func(*NodeRecord)
 	return visitOverlay(ctx, &graph.Nodes, &graph.DeletedNodes, base, visit)
 }
 func (graph *GraphState) NodeCount() (uint64, error) {
+	return graph.NodeCountContext(context.Background())
+}
+func (graph *GraphState) NodeCountContext(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if graph.PageBase == nil {
 		return uint64(graph.Nodes.Len()), nil
 	}
-	count, err := graph.PageBase.count(pageNodes)
-	if err != nil {
-		return 0, err
+	if graph.Nodes.Len() == 0 && graph.DeletedNodes.Len() == 0 {
+		return graph.PageBase.count(pageNodes)
 	}
-	for id, deleted := range graph.DeletedNodes.All() {
-		if !deleted {
-			continue
-		}
-		record, err := graph.PageBase.GetNode(id)
-		if err != nil {
-			return 0, err
-		}
-		if record != nil {
-			count--
-		}
-	}
-	for id := range graph.Nodes.All() {
-		if graph.DeletedNodes.Get(id) {
-			continue
-		}
-		record, err := graph.PageBase.GetNode(id)
-		if err != nil {
-			return 0, err
-		}
-		if record == nil {
-			count++
-		}
-	}
-	return count, nil
+	var count uint64
+	err := graph.VisitNodeIDs(ctx, func(uint64) error { count++; return nil })
+	return count, err
 }
 
 func (graph *GraphState) ReadEdge(id uint64) (*EdgeRecord, error) {
@@ -145,38 +164,21 @@ func (graph *GraphState) VisitEdges(ctx context.Context, visit func(*EdgeRecord)
 	return visitOverlay(ctx, &graph.Edges, &graph.DeletedEdges, base, visit)
 }
 func (graph *GraphState) EdgeCount() (uint64, error) {
+	return graph.EdgeCountContext(context.Background())
+}
+func (graph *GraphState) EdgeCountContext(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if graph.PageBase == nil {
 		return uint64(graph.Edges.Len()), nil
 	}
-	count, err := graph.PageBase.count(pageEdges)
-	if err != nil {
-		return 0, err
+	if graph.Edges.Len() == 0 && graph.DeletedEdges.Len() == 0 {
+		return graph.PageBase.count(pageEdges)
 	}
-	for id, deleted := range graph.DeletedEdges.All() {
-		if !deleted {
-			continue
-		}
-		record, err := graph.PageBase.GetEdge(id)
-		if err != nil {
-			return 0, err
-		}
-		if record != nil {
-			count--
-		}
-	}
-	for id := range graph.Edges.All() {
-		if graph.DeletedEdges.Get(id) {
-			continue
-		}
-		record, err := graph.PageBase.GetEdge(id)
-		if err != nil {
-			return 0, err
-		}
-		if record == nil {
-			count++
-		}
-	}
-	return count, nil
+	var count uint64
+	err := graph.VisitEdgeIDs(ctx, func(uint64) error { count++; return nil })
+	return count, err
 }
 
 func (graph *GraphState) VisitLabel(ctx context.Context, label string, visit func(uint64) error) error {
@@ -260,12 +262,14 @@ func (graph *GraphState) LabelCountContext(ctx context.Context, label string, ch
 		if graph.DeletedNodes.Get(id) || !slices.Contains(record.Labels, label) {
 			continue
 		}
-		base, err := graph.PageBase.GetNode(id)
+		err := graph.PageBase.VisitNode(ctx, id, func(base *NodeRecord) error {
+			if base == nil || !slices.Contains(base.Labels, label) {
+				count++
+			}
+			return nil
+		})
 		if err != nil {
 			return 0, err
-		}
-		if base == nil || !slices.Contains(base.Labels, label) {
-			count++
 		}
 	}
 	return count, err
@@ -353,12 +357,14 @@ func (graph *GraphState) EdgeTypeCountContext(ctx context.Context, kind string, 
 		if graph.DeletedEdges.Get(id) || record.Type != kind {
 			continue
 		}
-		base, err := graph.PageBase.GetEdge(id)
+		err := graph.PageBase.VisitEdge(ctx, id, func(base *EdgeRecord) error {
+			if base == nil || base.Type != kind {
+				count++
+			}
+			return nil
+		})
 		if err != nil {
 			return 0, err
-		}
-		if base == nil || base.Type != kind {
-			count++
 		}
 	}
 	return count, err
@@ -467,12 +473,14 @@ func (graph *GraphState) OutgoingCountContext(ctx context.Context, nodeID uint64
 		if graph.DeletedEdges.Get(id) || edge.SourceID != nodeID {
 			continue
 		}
-		base, err := graph.PageBase.GetEdge(id)
+		err := graph.PageBase.VisitEdge(ctx, id, func(base *EdgeRecord) error {
+			if base == nil || base.SourceID != nodeID {
+				count++
+			}
+			return nil
+		})
 		if err != nil {
 			return 0, err
-		}
-		if base == nil || base.SourceID != nodeID {
-			count++
 		}
 	}
 	return count, nil
@@ -581,13 +589,116 @@ func (graph *GraphState) IncomingCountContext(ctx context.Context, nodeID uint64
 		if graph.DeletedEdges.Get(id) || edge.TargetID != nodeID {
 			continue
 		}
-		base, err := graph.PageBase.GetEdge(id)
+		err := graph.PageBase.VisitEdge(ctx, id, func(base *EdgeRecord) error {
+			if base == nil || base.TargetID != nodeID {
+				count++
+			}
+			return nil
+		})
 		if err != nil {
 			return 0, err
 		}
-		if base == nil || base.TargetID != nodeID {
-			count++
-		}
 	}
 	return count, nil
+}
+
+func (graph *GraphState) ReadNodeOwned(ctx context.Context, id uint64) (*NodeRecord, *PageReadLease, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if graph.DeletedNodes.Get(id) {
+		return nil, nil, nil
+	}
+	if n := graph.Nodes.Get(id); n != nil {
+		return n, nil, nil
+	}
+	if graph.PageBase != nil {
+		return graph.PageBase.ReadNodeOwned(ctx, id)
+	}
+	return nil, nil, nil
+}
+func (graph *GraphState) ReadEdgeOwned(ctx context.Context, id uint64) (*EdgeRecord, *PageReadLease, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if graph.DeletedEdges.Get(id) {
+		return nil, nil, nil
+	}
+	if e := graph.Edges.Get(id); e != nil {
+		return e, nil, nil
+	}
+	if graph.PageBase != nil {
+		return graph.PageBase.ReadEdgeOwned(ctx, id)
+	}
+	return nil, nil, nil
+}
+
+// Merge keys before loading canonical values. Shadowed or deleted page records
+// must not consume a query's source allowance when only the overlay is needed.
+func visitGraphIDs[V any](ctx context.Context, page *PageGraph, bucket string, overlay *PagedMap[V], deleted *PagedMap[bool], visit func(uint64) error) error {
+	next, stop := iter.Pull2(overlay.Ordered())
+	defer stop()
+	id, _, ok := next()
+	emit := func(id uint64) error {
+		if deleted.Get(id) {
+			return nil
+		}
+		return visit(id)
+	}
+	if page != nil {
+		budget := pageReadBudgetFromContext(ctx)
+		charge := func(size uint64) error {
+			if budget != nil {
+				return budget.ReservePageRead(1, 2*size)
+			}
+			return nil
+		}
+		stopped := false
+		err := page.Tx.ScanKeysWithCharge(ctx, bucket, nil, nil, 8, charge, func(key []byte) error {
+			if budget != nil {
+				defer budget.ReleasePageRead(uint64(2 * len(key)))
+			}
+			if len(key) != 8 {
+				return errors.New("invalid page record key")
+			}
+			baseID := binary.BigEndian.Uint64(key)
+			for ok && id < baseID {
+				if err := emit(id); err != nil {
+					stopped = err == io.EOF
+					return err
+				}
+				id, _, ok = next()
+			}
+			if ok && id == baseID {
+				id, _, ok = next()
+			}
+			err := emit(baseID)
+			stopped = err == io.EOF
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		if stopped {
+			return nil
+		}
+	}
+	for ok {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := emit(id); err == io.EOF {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		id, _, ok = next()
+	}
+	return ctx.Err()
+}
+func (graph *GraphState) VisitNodeIDs(ctx context.Context, visit func(uint64) error) error {
+	return visitGraphIDs(ctx, graph.PageBase, pageNodes, &graph.Nodes, &graph.DeletedNodes, visit)
+}
+func (graph *GraphState) VisitEdgeIDs(ctx context.Context, visit func(uint64) error) error {
+	return visitGraphIDs(ctx, graph.PageBase, pageEdges, &graph.Edges, &graph.DeletedEdges, visit)
 }

@@ -235,7 +235,7 @@ func mergeMatchRows(tx *Tx, row queryRow, patterns []matchPattern, params map[st
 		iterator = &patternQueryIterator{plan: plan, tx: tx, input: iterator, pattern: pattern, params: params, limit: ^uint(0), budget: budget}
 	}
 	defer iterator.Close()
-	return collectQueryRows(iterator)
+	return collectQueryRows(iterator, budget)
 }
 
 func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *queryBudget) error {
@@ -308,7 +308,7 @@ func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *
 		if err != nil {
 			return err
 		}
-		record, err := tx.graph.ReadNode(node.ID)
+		record, err := budget.readNode(tx.graph, node.ID)
 		if err != nil {
 			return err
 		}
@@ -342,7 +342,7 @@ func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *
 		if err != nil {
 			return err
 		}
-		record, err := tx.graph.ReadEdge(edge.ID)
+		record, err := budget.readEdge(tx.graph, edge.ID)
 		if err != nil {
 			return err
 		}

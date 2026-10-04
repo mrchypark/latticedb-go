@@ -15,14 +15,21 @@ const pageNodeRecord = 1
 const pageEdgeRecord = 2
 
 func encodePageRecord(kind byte, encode func(*binaryEncoder)) ([]byte, error) {
+	return encodePageRecordBounded(kind, (&PageGraph{}).recordLimit(), encode)
+}
+
+func encodePageRecordBounded(kind byte, maxBytes uint64, encode func(*binaryEncoder)) ([]byte, error) {
 	var output bytes.Buffer
 	output.Write([]byte{pageRecordVersion, kind, 0, 0, 0, 0})
-	encoder := binaryEncoder{out: &output}
+	encoder := binaryEncoder{out: &output, allocationLimit: multiplySaturated(maxBytes, 2)}
 	encode(&encoder)
 	if encoder.err != nil {
 		return nil, encoder.err
 	}
 	data := output.Bytes()
+	if uint64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%w: page record exceeds limit", ErrLoadResourceLimit)
+	}
 	binary.BigEndian.PutUint32(data[2:6], crc32.ChecksumIEEE(data[6:]))
 	return data, nil
 }
@@ -41,6 +48,9 @@ func decodePageRecord(data []byte, kind byte, maxBytes uint64) (*binaryDecoder, 
 }
 
 func encodePageNode(node *NodeRecord) ([]byte, error) {
+	return encodePageNodeBounded(node, (&PageGraph{}).recordLimit())
+}
+func encodePageNodeBounded(node *NodeRecord, maxBytes uint64) ([]byte, error) {
 	if node == nil {
 		return nil, errors.New("nil page node")
 	}
@@ -54,7 +64,7 @@ func encodePageNode(node *NodeRecord) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return encodePageRecord(pageNodeRecord, func(e *binaryEncoder) {
+	return encodePageRecordBounded(pageNodeRecord, maxBytes, func(e *binaryEncoder) {
 		e.node(persistedNode{ID: node.ID, Labels: node.Labels, Properties: properties})
 	})
 }
@@ -90,6 +100,9 @@ func decodePageNodeAdmitted(data []byte, id, maxBytes uint64, admit func(uint64)
 }
 
 func encodePageEdge(edge *EdgeRecord) ([]byte, error) {
+	return encodePageEdgeBounded(edge, (&PageGraph{}).recordLimit())
+}
+func encodePageEdgeBounded(edge *EdgeRecord, maxBytes uint64) ([]byte, error) {
 	if edge == nil {
 		return nil, errors.New("nil page edge")
 	}
@@ -105,7 +118,7 @@ func encodePageEdge(edge *EdgeRecord) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return encodePageRecord(pageEdgeRecord, func(e *binaryEncoder) {
+	return encodePageRecordBounded(pageEdgeRecord, maxBytes, func(e *binaryEncoder) {
 		e.edge(persistedEdge{ID: edge.ID, SourceID: edge.SourceID, TargetID: edge.TargetID, Type: edge.Type, Properties: properties})
 	})
 }

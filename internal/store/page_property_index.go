@@ -229,7 +229,7 @@ func (backend pagePropertyBackend) visit(ctx context.Context, definition Propert
 		if removed.has(id) {
 			return nil
 		}
-		valid, err := backend.matches(id, definition, value, key)
+		valid, err := backend.matches(ctx, id, definition, value, key)
 		if err != nil {
 			return err
 		}
@@ -304,37 +304,37 @@ func (backend pagePropertyBackend) visit(ctx context.Context, definition Propert
 	return nil
 }
 
-func (backend pagePropertyBackend) matches(id uint64, definition PropertyIndexDefinition, value any, key propertyValueKey) (bool, error) {
-	var properties Properties
-	var scopes []string
+func (backend pagePropertyBackend) matches(ctx context.Context, id uint64, definition PropertyIndexDefinition, value any, key propertyValueKey) (bool, error) {
+	var matched bool
+	check := func(properties Properties, scopes []string) error {
+		if !propertyIndexMatches(definition, scopes, properties) {
+			return nil
+		}
+		actual, _ := properties.Lookup(definition.Property)
+		actualKey, err := makePropertyValueKey(actual)
+		if err != nil {
+			return err
+		}
+		matched = actualKey == key && propertyIndexValuesEqual(actual, value)
+		return nil
+	}
+	var err error
 	if backend.node {
-		record, err := backend.graph.GetNode(id)
-		if err != nil {
-			return false, err
-		}
-		if record == nil {
-			return false, nil
-		}
-		properties, scopes = record.Properties, record.Labels
+		err = backend.graph.VisitNode(ctx, id, func(record *NodeRecord) error {
+			if record == nil {
+				return nil
+			}
+			return check(record.Properties, record.Labels)
+		})
 	} else {
-		record, err := backend.graph.GetEdge(id)
-		if err != nil {
-			return false, err
-		}
-		if record == nil {
-			return false, nil
-		}
-		properties, scopes = record.Properties, []string{record.Type}
+		err = backend.graph.VisitEdge(ctx, id, func(record *EdgeRecord) error {
+			if record == nil {
+				return nil
+			}
+			return check(record.Properties, []string{record.Type})
+		})
 	}
-	if !propertyIndexMatches(definition, scopes, properties) {
-		return false, nil
-	}
-	actual, _ := properties.Lookup(definition.Property)
-	actualKey, err := makePropertyValueKey(actual)
-	if err != nil {
-		return false, err
-	}
-	return actualKey == key && propertyIndexValuesEqual(actual, value), nil
+	return matched, err
 }
 
 func (backend pagePropertyBackend) lookup(definition PropertyIndexDefinition, value any, key propertyValueKey, added, removed propertyPosting) ([]uint64, bool, error) {
