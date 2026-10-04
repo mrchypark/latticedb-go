@@ -4209,6 +4209,10 @@ func (tx *Tx) CreateEdge(sourceID uint64, targetID uint64, edgeType string, opts
 	if err := store.ValidateEdgeType(edgeType); err != nil {
 		return Edge{}, err
 	}
+	if tx.queryBudget != nil {
+		scope := tx.queryBudget.sourceScope()
+		defer scope.close()
+	}
 	if _, err := tx.requireNode(sourceID); err != nil {
 		return Edge{}, err
 	}

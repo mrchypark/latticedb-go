@@ -432,3 +432,95 @@ func TestQueryDetachDeleteAdmitsIncidentSources(t *testing.T) {
 		})
 	}
 }
+
+func TestQueryCreateEdgeReleasesEndpointValidationSources(t *testing.T) {
+	db := querySourceFixture(t, 2, 64<<10)
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 900 << 10, MaxWork: 100 << 20})
+	defer releaseQueryBudget(b)
+	tx.queryBudget = b
+	defer func() { tx.queryBudget = nil }()
+	for range 8 {
+		if _, err := tx.CreateEdge(1, 2, "LINK", CreateEdgeOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if b.sourceBytes != 0 {
+			t.Fatalf("endpoint validations remain charged: %d", b.sourceBytes)
+		}
+	}
+}
+
+func TestQueryMergeDetachesCreatedPropertySources(t *testing.T) {
+	db := querySourceFixture(t, 1, 64<<10)
+	tx, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 2 << 20, MaxWork: 100 << 20})
+	defer releaseQueryBudget(b)
+	tx.queryBudget = b
+	defer func() { tx.queryBudget = nil }()
+	scope := b.sourceScope()
+	source, err := b.readNode(tx.graph, 1)
+	if err != nil {
+		scope.close()
+		t.Fatal(err)
+	}
+	body, _ := source.Properties.Lookup("body")
+	row := queryRow{slots: make([]boundValue, 1), index: map[string]int{"n": 0}}
+	if err := createMergePattern(tx, &row, []matchPattern{nodePattern{Var: "n", Labels: []string{"Copy"}, Properties: map[string]any{"body": body}}}, b); err != nil {
+		scope.close()
+		t.Fatal(err)
+	}
+	scope.close()
+	if b.mutationBytes < uint64(len(body.(string))) || b.sourceBytes != b.mutationBytes {
+		t.Fatalf("created payload not retained separately: source=%d mutation=%d", b.sourceBytes, b.mutationBytes)
+	}
+	if err := b.sweepSources(); err != nil {
+		t.Fatal(err)
+	}
+	binding, _ := row.get("n")
+	value, _ := binding.Node.Properties.Lookup("body")
+	if value != body {
+		t.Fatal("created property changed after dropping source")
+	}
+	b.closeSources()
+	if b.sourceBytes != 0 {
+		t.Fatal("created payload allowance leaked")
+	}
+}
+
+func TestQueryMergeEarlierOutputLedger(t *testing.T) {
+	db := querySourceFixture(t, 1, 64<<10)
+	err := db.View(func(tx *Tx) error {
+		b := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 2 << 20, MaxWork: 100 << 20})
+		defer releaseQueryBudget(b)
+		clause := &mergeClause{Patterns: []matchPattern{nodePattern{Var: "n", Labels: []string{"Doc"}, Properties: map[string]any{"key": int64(1)}}}}
+		input := make([]queryRow, 4)
+		for i := range input {
+			input[i] = queryRow{slots: make([]boundValue, 1), index: map[string]int{"n": 0}}
+		}
+		output, err := clause.apply(tx, input, nil, b)
+		if err != nil {
+			return err
+		}
+		if len(output) != len(input) {
+			t.Fatalf("outputs=%d", len(output))
+		}
+		for _, row := range output {
+			binding, _ := row.get("n")
+			if b.source.records[binding.Node] == nil {
+				t.Fatal("MERGE output retains an uncharged record")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

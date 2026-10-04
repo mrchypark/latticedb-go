@@ -118,6 +118,7 @@ func (clause *mergeClause) validate(bind func(string, bindingRole) error, requir
 }
 
 func (clause *mergeClause) apply(tx *Tx, input []queryRow, params map[string]any, budget *queryBudget) (output []queryRow, err error) {
+	defer budget.sourceRows(func() []queryRow { return output })()
 	defer func() {
 		if err != nil {
 			budget.releaseRows(len(output))
@@ -239,6 +240,20 @@ func mergeMatchRows(tx *Tx, row queryRow, patterns []matchPattern, params map[st
 }
 
 func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *queryBudget) error {
+	var temporary uint64
+	defer func() { budget.releaseTemporary(temporary) }()
+	retainProperties := func(properties map[string]any) (map[string]any, error) {
+		retained := make(map[string]any, len(properties))
+		for key, value := range properties {
+			normalized, bytes, err := normalizeRetainedMutationValue(value, budget)
+			if err != nil {
+				return nil, err
+			}
+			temporary = saturatingAdd(temporary, bytes)
+			retained[key] = normalized
+		}
+		return retained, nil
+	}
 	// Collect repeated node declarations before creating anything, so a cycle's
 	// shared endpoint receives all its labels and properties.
 	nodes := map[string]nodePattern{}
@@ -304,7 +319,11 @@ func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *
 			}
 			continue
 		}
-		node, err := tx.CreateNode(CreateNodeOptions{Labels: pattern.Labels, Properties: pattern.Properties})
+		properties, err := retainProperties(pattern.Properties)
+		if err != nil {
+			return err
+		}
+		node, err := tx.CreateNode(CreateNodeOptions{Labels: pattern.Labels, Properties: properties})
 		if err != nil {
 			return err
 		}
@@ -338,7 +357,11 @@ func createMergePattern(tx *Tx, row *queryRow, patterns []matchPattern, budget *
 			}
 			continue
 		}
-		edge, err := tx.CreateEdge(left.Node.ID, right.Node.ID, pattern.EdgeType, CreateEdgeOptions{Properties: pattern.Properties})
+		properties, err := retainProperties(pattern.Properties)
+		if err != nil {
+			return err
+		}
+		edge, err := tx.CreateEdge(left.Node.ID, right.Node.ID, pattern.EdgeType, CreateEdgeOptions{Properties: properties})
 		if err != nil {
 			return err
 		}
