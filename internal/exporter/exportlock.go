@@ -137,11 +137,32 @@ func exportLockPath(path string) (string, error) {
 	if runtime.GOOS == "windows" {
 		mode = 0o777
 	}
-	created := false
-	if err := os.Mkdir(directory, mode); err == nil {
-		created = true
-	} else if !errors.Is(err, os.ErrExist) {
-		return "", fmt.Errorf("create export lock directory: %w", err)
+	if _, err := os.Lstat(directory); errors.Is(err, os.ErrNotExist) {
+		staging, err := os.MkdirTemp(filepath.Dir(path), exportLockDirectory+".init-")
+		if err != nil {
+			return "", err
+		}
+		defer os.RemoveAll(staging)
+		// A published directory stays nonempty, so competing renames cannot replace it.
+		if err := os.WriteFile(filepath.Join(staging, ".ready"), nil, 0o600); err != nil {
+			return "", err
+		}
+		root, err := os.OpenRoot(staging)
+		if err != nil {
+			return "", err
+		}
+		chmodErr := root.Chmod(".", mode)
+		closeErr := root.Close()
+		if err := errors.Join(chmodErr, closeErr); err != nil {
+			return "", fmt.Errorf("set export lock directory permissions: %w", err)
+		}
+		if err := os.Rename(staging, directory); err != nil {
+			if _, statErr := os.Lstat(directory); statErr != nil {
+				return "", fmt.Errorf("publish export lock directory: %w", err)
+			}
+		}
+	} else if err != nil {
+		return "", err
 	}
 	info, err := os.Lstat(directory)
 	if err != nil {
@@ -158,16 +179,6 @@ func exportLockPath(path string) (string, error) {
 	opened, err := root.Stat(".")
 	if err != nil || !os.SameFile(info, opened) {
 		return "", errors.New("export lock directory identity changed")
-	}
-	if created {
-		// Independent users of a shared parent must not inherit the creator's umask.
-		if err := root.Chmod(".", mode); err != nil {
-			return "", fmt.Errorf("set export lock directory permissions: %w", err)
-		}
-		opened, err = root.Stat(".")
-		if err != nil {
-			return "", err
-		}
 	}
 	if runtime.GOOS != "windows" && (opened.Mode().Perm() != 0o777 || opened.Mode()&os.ModeSticky == 0) {
 		return "", errors.New("export lock directory requires sticky shared permissions")
@@ -260,7 +271,7 @@ func canonicalExportOutputPath(path string) (string, error) {
 
 func exportPathIsReserved(path string) bool {
 	for directory := path; ; directory = filepath.Dir(directory) {
-		if strings.EqualFold(filepath.Base(directory), exportLockDirectory) {
+		if name := strings.ToLower(filepath.Base(directory)); name == exportLockDirectory || strings.HasPrefix(name, exportLockDirectory+".init-") {
 			return true
 		}
 		if filepath.Dir(directory) == directory {

@@ -55,3 +55,10 @@ GitHub Codex review was unavailable because the account's code-review quota was
 exhausted. Thread-aware inspection found zero review threads; this is not a
 fresh clean Codex result. Independent Pro source re-review is required for the
 exporter repair; final remote status is recorded on PR #251 and in release notes.
+
+The first exporter repair exposed a concurrent initialization race between
+Mkdir and Chmod in the existing subprocess test. Initialization now prepares
+permissions and a nonempty marker in a reserved private temporary directory,
+then publishes it by rename. A competing initializer cannot replace an already
+published nonempty directory. Twenty repetitions of the subprocess/race and
+release regressions passed; the Linux two-UID checks also passed.

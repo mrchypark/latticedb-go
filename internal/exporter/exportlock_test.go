@@ -73,15 +73,17 @@ func TestCSVConcurrentSubprocessPublicationAndOwnerDeath(t *testing.T) {
 	}
 	output := filepath.Join(t.TempDir(), "graph.csv")
 	commands := make([]*exec.Cmd, 3)
+	logs := make([]bytes.Buffer, len(commands))
 	for index := range commands {
 		commands[index] = exportHelperCommand(t, "export", output, "")
+		commands[index].Stdout, commands[index].Stderr = &logs[index], &logs[index]
 		if err := commands[index].Start(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, command := range commands {
+	for index, command := range commands {
 		if err := command.Wait(); err != nil {
-			t.Fatalf("export helper: %v", err)
+			t.Fatalf("export helper: %v\n%s", err, &logs[index])
 		}
 	}
 	assertCSVManifestPathsExist(t, output)
