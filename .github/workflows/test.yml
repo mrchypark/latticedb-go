@@ -42,3 +42,8 @@ jobs:
         if: runner.os == 'Linux'
       - run: go test -race ./internal/exporter -run 'Test(CSVConcurrentSubprocessPublicationAndOwnerDeath|ExportPathLockRegistryReclaimsEntries)$' -count=20
         if: runner.os == 'Linux'
+      - name: Verify independent exports by different OS users
+        if: runner.os == 'Linux'
+        run: |
+          go test -c -o "$RUNNER_TEMP/exporter-uid.test" ./internal/exporter
+          sudo "$RUNNER_TEMP/exporter-uid.test" -test.run '^TestReleaseExportSharedParentAcrossUIDs$' -test.v

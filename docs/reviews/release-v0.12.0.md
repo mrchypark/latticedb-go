@@ -28,3 +28,30 @@ compiles and all three Python tool suites passed locally. Remote CI remains a
 release gate.
 The remote review loop must inspect unresolved and outdated threads, not only
 flat comments. Record the final PR, exact revision and CI links in release notes.
+
+## Independent Pro review of 1713918
+
+- R251-1: the parent-wide 0700 lock directory denied a second UID's distinct
+  output in a writable shared parent. Reproduced with the public exporter under
+  two non-root Linux UIDs. Use sticky shared directory permissions, set through
+  the opened directory only on creation, preserve owner-private lock files,
+  and reject incompatible existing permissions. Restrictive-umask regression
+  checks actual permissions and successful sequential exports.
+- R251-2: a pre-existing lock-directory symlink allowed a public export to
+  replace an active lock inode. Reproduced through the public exporter. Reject
+  reserved lexical destinations before symlink resolution, reject symlinked
+  directories and lock files, validate opened-directory identity, and open lock
+  files relative to that directory. Regression checks preserve inode identity
+  and same-output exclusion.
+
+Both findings failed against the reviewed candidate and pass in the repaired
+Linux tests. Existing case/Unicode alias and subprocess locking tests remain.
+The shared-directory owner and processes able to replace the namespace must be
+trusted to cooperate; the directory is not an adversarial cross-user boundary.
+Different UIDs can export distinct names; owner-private locks do not permit
+same-name ownership handoff. The README records these limits.
+
+GitHub Codex review was unavailable because the account's code-review quota was
+exhausted. Thread-aware inspection found zero review threads; this is not a
+fresh clean Codex result. Independent Pro source re-review is required for the
+exporter repair; final remote status is recorded on PR #251 and in release notes.
