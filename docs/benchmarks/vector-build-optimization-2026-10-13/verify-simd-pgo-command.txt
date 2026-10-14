@@ -1,0 +1,2 @@
+GOEXPERIMENT=simd go test -pgo=/tmp/latticedb-vector-opt-20261013/lru-simd-fma.cpu ./internal/search ./internal/engine . -run "TestSquaredVectorDistance|TestPageVector|TestPublicVector|TestDiskVector"
+exit status: 0

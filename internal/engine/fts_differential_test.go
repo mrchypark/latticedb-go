@@ -166,3 +166,55 @@ func TestFuzzySearchOverlappingMemoryBudget(t *testing.T) {
 		}
 	}
 }
+
+func TestFuzzyFrequencyUsesMaxPerQueryTerm(t *testing.T) {
+	terms := []string{"book", "book"}
+	tokens := []string{"book", "books"}
+	opts := FTSSearchOptions{MaxDistance: 1, MinTermLength: 1}
+	budget, err := newDirectSearchBudget(context.Background(), ^uint64(0), ^uint64(0), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frequencies, bytes, err := ftsTermFrequencies(tokens, terms, opts, budget)
+	if err != nil || frequencyScore(frequencies) != 2 {
+		t.Fatalf("frequency score=%v frequencies=%v err=%v", frequencyScore(frequencies), frequencies, err)
+	}
+	budget.releaseBytes(bytes)
+
+	opts.Scoring = FTSScoringBM25
+	frequencies, bytes, err = ftsTermFrequencies(tokens, []string{"book"}, opts, budget)
+	if err != nil || frequencyScore(frequencies) != 2 {
+		t.Fatalf("BM25 frequency=%v frequencies=%v err=%v", frequencyScore(frequencies), frequencies, err)
+	}
+	budget.releaseBytes(bytes)
+}
+
+func TestMemoryFuzzyFrequencyUsesMaxPerQueryTerm(t *testing.T) {
+	graph := store.NewGraphState()
+	graph.FTS.Set(1, &store.FTSRecord{Text: "book books", Tokens: []string{"book", "books"}})
+	graph.FTSTokens.Add("book", 1)
+	graph.FTSTokens.Add("books", 1)
+	db := &DB{graph: graph, memory: true, queryCache: map[string]*queryPlan{}}
+	got, err := db.FTSSearch("book book", FTSSearchOptions{MaxDistance: 1, MinTermLength: 1})
+	if err != nil || len(got) != 1 || got[0].NodeID != 1 || got[0].Score != 2 {
+		t.Fatalf("results=%v err=%v", got, err)
+	}
+}
+
+func TestFTSTermFrequenciesMeterWorkAndCancellation(t *testing.T) {
+	opts := FTSSearchOptions{MaxDistance: 1, MinTermLength: 1}
+	budget := &directSearchBudget{ctx: context.Background(), maxWork: 9, maxBytes: 1024}
+	if _, _, err := ftsTermFrequencies([]string{"a", "b"}, []string{"a", "b"}, opts, budget); !errors.Is(err, ErrResourceLimit) || budget.work > 9 {
+		t.Fatalf("work=%d err=%v", budget.work, err)
+	}
+
+	ctx := &ftsCancelChecks{Context: context.Background()}
+	budget = &directSearchBudget{ctx: ctx, maxWork: ^uint64(0), maxBytes: 1 << 20}
+	terms := make([]string, 8192)
+	for i := range terms {
+		terms[i] = "a"
+	}
+	if _, _, err := ftsTermFrequencies([]string{"a"}, terms, opts, budget); !errors.Is(err, context.Canceled) || budget.work > 8192 {
+		t.Fatalf("work=%d err=%v", budget.work, err)
+	}
+}

@@ -119,9 +119,19 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 			if err != nil {
 				return err
 			}
-			score := frequencyScore(frequencies)
+			scoreWork := uint64(len(frequencies))
+			if opts.Scoring == FTSScoringBM25 {
+				scoreWork = saturatingAdd(scoreWork, uint64(len(frequencies)))
+			}
+			if err := budget.add(scoreWork); err != nil {
+				budget.releaseBytes(frequencyBytes)
+				return err
+			}
+			var score float64
 			if opts.Scoring == FTSScoringBM25 {
 				score = bm25Score(frequencies, documentFrequency, uint64(len(tokens)), documentCount, averageLength)
+			} else {
+				score = frequencyScore(frequencies)
 			}
 			budget.releaseBytes(frequencyBytes)
 			if score > 0 {
@@ -161,6 +171,10 @@ func ftsBM25CorpusStats(ctx context.Context, graph *store.GraphState, terms []st
 			return err
 		}
 		for index, count := range matches {
+			if err := budget.add(1); err != nil {
+				budget.releaseBytes(matchBytes)
+				return err
+			}
 			if count != 0 {
 				frequencies[index]++
 			}
@@ -238,12 +252,47 @@ func ftsTokenBytes(tokens []string) uint64 {
 
 func ftsTermFrequencies(tokens, terms []string, opts FTSSearchOptions, budget *directSearchBudget) ([]uint64, uint64, error) {
 	bytes := saturatingMul(uint64(len(terms)), 8)
+	maxFuzzyFrequency := opts.Scoring == FTSScoringFrequency && opts.MaxDistance != 0
+	if maxFuzzyFrequency {
+		bytes = saturatingAdd(bytes, saturatingMul(uint64(len(tokens)), 48))
+	}
 	if err := budget.reserveBytes(bytes); err != nil {
 		return nil, 0, err
 	}
 	frequencies := make([]uint64, len(terms))
+	if maxFuzzyFrequency {
+		counts := make(map[string]uint64, len(tokens))
+		for _, token := range tokens {
+			if err := budget.add(1); err != nil {
+				budget.releaseBytes(bytes)
+				return nil, 0, err
+			}
+			counts[token]++
+		}
+		for termIndex, term := range terms {
+			for token, count := range counts {
+				if err := budget.add(1); err != nil {
+					budget.releaseBytes(bytes)
+					return nil, 0, err
+				}
+				match, err := fuzzyTokenMatchBudget(term, token, opts.MaxDistance, opts.MinTermLength, budget)
+				if err != nil {
+					budget.releaseBytes(bytes)
+					return nil, 0, err
+				}
+				if match && count > frequencies[termIndex] {
+					frequencies[termIndex] = count
+				}
+			}
+		}
+		return frequencies, bytes, nil
+	}
 	for termIndex, term := range terms {
 		for _, token := range tokens {
+			if err := budget.add(1); err != nil {
+				budget.releaseBytes(bytes)
+				return nil, 0, err
+			}
 			match, err := fuzzyTokenMatchBudget(term, token, opts.MaxDistance, opts.MinTermLength, budget)
 			if err != nil {
 				budget.releaseBytes(bytes)

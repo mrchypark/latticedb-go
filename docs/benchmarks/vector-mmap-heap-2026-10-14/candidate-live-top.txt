@@ -1,0 +1,16 @@
+File: cursor-diag.test
+Type: inuse_space
+Time: 2026-10-14 08:10:27 KST
+Showing nodes accounting for 95.08MB, 100% of 95.08MB total
+Showing top 10 nodes out of 21
+      flat  flat%   sum%        cum   cum%
+   47.74MB 50.21% 50.21%    47.74MB 50.21%  go.etcd.io/bbolt.Open.func2
+   46.83MB 49.26% 99.46%    46.83MB 49.26%  github.com/mrchypark/latticedb-go/internal/benchvector.Generate
+    0.51MB  0.54%   100%     0.51MB  0.54%  sync.(*poolChain).pushHead
+         0     0%   100%    48.25MB 50.74%  github.com/mrchypark/latticedb-go.(*DB).Update
+         0     0%   100%    95.08MB   100%  github.com/mrchypark/latticedb-go.BenchmarkVectorSearchDisk128D.func1
+         0     0%   100%    48.25MB 50.74%  github.com/mrchypark/latticedb-go.diskVectorDB
+         0     0%   100%    48.25MB 50.74%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).Update (inline)
+         0     0%   100%    48.25MB 50.74%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).updateContext
+         0     0%   100%    48.25MB 50.74%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitInternalContext
+         0     0%   100%    48.25MB 50.74%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitPages

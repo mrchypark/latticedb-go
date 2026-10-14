@@ -13,7 +13,7 @@ import (
 	"github.com/mrchypark/latticedb-go/internal/store"
 )
 
-func pageFTSFixture(t *testing.T, count int) (*pagestore.DB, *store.GraphState) {
+func pageFTSFixture(t *testing.T, count int, firstText ...string) (*pagestore.DB, *store.GraphState) {
 	t.Helper()
 	ctx := context.Background()
 	pages, err := pagestore.Open(filepath.Join(t.TempDir(), "pages"), pagestore.Options{})
@@ -33,6 +33,9 @@ func pageFTSFixture(t *testing.T, count int) (*pagestore.DB, *store.GraphState) 
 		text := "common trailing"
 		if i == 1 {
 			text = "rare running"
+			if len(firstText) != 0 {
+				text = firstText[0]
+			}
 		}
 		if i == 2 {
 			text = "rare runs"
@@ -113,10 +116,12 @@ func TestPageFTSIndexesUseDeclaredScopeAndBuildBudgets(t *testing.T) {
 	if err := applyPageFTSIndexDelta(context.Background(), page, graph, &after, delta, ^uint64(0), ^uint64(0)); err != nil {
 		t.Fatal(err)
 	}
+	if err := graph.PageBase.Tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
 	if err := write.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	_ = graph.PageBase.Tx.Rollback()
 	read, err := pages.Begin(false)
 	if err != nil {
 		t.Fatal(err)
@@ -193,6 +198,65 @@ func TestPageFTSSearchRankingAndSelectiveWorkMatchScanOracle(t *testing.T) {
 	_ = budget.add(4)
 	if _, _, err := db.pageIndexedFTSSearch(context.Background(), graph, "common", low, budget); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("low candidate memory budget error=%v", err)
+	}
+}
+
+func TestPageFuzzyFrequencyUsesMaxPerQueryTerm(t *testing.T) {
+	_, graph := pageFTSFixture(t, 1, "book books")
+	budget, err := newDirectSearchBudget(context.Background(), ^uint64(0), ^uint64(0), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := budget.add(uint64(len("book book"))); err != nil {
+		t.Fatal(err)
+	}
+	got, used, err := new(DB).pageIndexedFTSSearch(context.Background(), graph, "book book", FTSSearchOptions{Limit: 5, MaxDistance: 1, MinTermLength: 1}, budget)
+	if err != nil || !used || len(got) != 1 || got[0].NodeID != 1 || got[0].Score != 2 {
+		t.Fatalf("fuzzy frequency results=%v used=%v err=%v", got, used, err)
+	}
+}
+
+func TestPageFTSResultAggregationMetersBudgetAndCancellation(t *testing.T) {
+	_, graph := pageFTSFixture(t, 256)
+	page := graph.PageBase
+	stats, err := page.FTSIndexStats(store.PageFTSManualStandard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms := make([]string, 64)
+	for i := range terms {
+		terms[i] = "common"
+	}
+	for _, scoring := range []FTSScoring{FTSScoringFrequency, FTSScoringBM25} {
+		opts := FTSSearchOptions{Limit: 1, Scoring: scoring}
+		budget := &directSearchBudget{ctx: context.Background(), maxWork: ^uint64(0), maxBytes: 1 << 20}
+		if _, err := collectPageFTSResults(context.Background(), page, store.PageFTSManualStandard, terms, []string{"common"}, opts, stats, budget); err != nil {
+			t.Fatal(err)
+		}
+		if budget.work == 0 {
+			t.Fatal("aggregation did not charge work")
+		}
+		limited := &directSearchBudget{ctx: context.Background(), maxWork: budget.work - 1, maxBytes: 1 << 20}
+		if _, err := collectPageFTSResults(context.Background(), page, store.PageFTSManualStandard, terms, []string{"common"}, opts, stats, limited); !errors.Is(err, ErrResourceLimit) {
+			t.Fatalf("scoring=%v aggregation work limit error=%v", scoring, err)
+		}
+	}
+
+	cancelled := &directSearchBudget{ctx: &ftsCancelChecks{Context: context.Background()}, maxWork: ^uint64(0), maxBytes: 1 << 20}
+	if _, err := collectPageFTSResults(context.Background(), page, store.PageFTSManualStandard, terms, []string{"common"}, FTSSearchOptions{Limit: 1}, stats, cancelled); !errors.Is(err, context.Canceled) || cancelled.work > 8192 {
+		t.Fatalf("aggregation cancellation work=%d err=%v", cancelled.work, err)
+	}
+}
+
+func TestPageFTSPostingTermsMeterCancellation(t *testing.T) {
+	_, graph := pageFTSFixture(t, 1)
+	terms := make([]string, 8192)
+	for i := range terms {
+		terms[i] = "common"
+	}
+	budget := &directSearchBudget{ctx: &ftsCancelChecks{Context: context.Background()}, maxWork: ^uint64(0), maxBytes: 1 << 20}
+	if _, _, err := pageFTSPostingTerms(context.Background(), graph.PageBase, store.PageFTSManualStandard, terms, FTSSearchOptions{}, budget); !errors.Is(err, context.Canceled) || budget.work <= uint64(len(terms)) {
+		t.Fatalf("posting term cancellation work=%d err=%v", budget.work, err)
 	}
 }
 

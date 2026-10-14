@@ -617,6 +617,13 @@ func (posting *propertyPostingChunks) has(id uint64) bool {
 }
 
 func (posting *propertyPostingChunks) add(id uint64) {
+	if len(posting.chunks) == 0 {
+		posting.cloneDirectory()
+		posting.chunks = append(posting.chunks, &propertyPostingChunk{ids: []uint64{id}})
+		posting.cloned = nil
+		posting.length++
+		return
+	}
 	index := posting.index(id)
 	if index == len(posting.chunks) {
 		index--

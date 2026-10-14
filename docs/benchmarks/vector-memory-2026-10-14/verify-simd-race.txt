@@ -1,0 +1,5 @@
+ok  	github.com/mrchypark/latticedb-go/internal/search	(cached)
+ok  	github.com/mrchypark/latticedb-go/internal/engine	132.943s
+ok  	github.com/mrchypark/latticedb-go/internal/store	75.311s
+ok  	github.com/mrchypark/latticedb-go/internal/pagestore	2.878s
+ok  	github.com/mrchypark/latticedb-go	74.074s

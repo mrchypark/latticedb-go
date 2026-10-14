@@ -1,0 +1,26 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkVectorSearchDisk128D/10K-2         	       1	   1600125 ns/op	         1.000 disk-api-contract	  83378176 file-bytes	     14309 index-build-ms	   1484454 mean-ns	   1907541 p99-ns	        99.00 recall@10	       723.8 reopen-ms	 1381064 B/op	   14530 allocs/op
+BenchmarkVectorSearchDisk128D/10K-2         	       1	   2722500 ns/op	         1.000 disk-api-contract	  83378176 file-bytes	     13060 index-build-ms	   1501755 mean-ns	   2099500 p99-ns	        99.00 recall@10	       718.3 reopen-ms	 1381096 B/op	   14530 allocs/op
+BenchmarkVectorSearchDisk128D/10K-2         	       1	   1534791 ns/op	         1.000 disk-api-contract	  83378176 file-bytes	     13196 index-build-ms	   1470829 mean-ns	   1786084 p99-ns	        99.00 recall@10	       719.9 reopen-ms	 1381064 B/op	   14530 allocs/op
+PASS
+       44.37 real        43.01 user         0.68 sys
+           150241280  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               23655  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                9788  signals received
+                2538  voluntary context switches
+               87915  involuntary context switches
+        808232714750  instructions retired
+        161372947289  cycles elapsed
+            90210976  peak memory footprint

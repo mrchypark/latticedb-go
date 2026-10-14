@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,6 +17,8 @@ type exportPathLock struct {
 	file      *os.File
 	info      os.FileInfo
 }
+
+const exportLockDirectory = ".latticedb-export-locks"
 
 // ponytail: scan only active locks by file identity; add an inode index if
 // concurrent exports are ever numerous enough for this bounded registry to matter.
@@ -36,7 +39,10 @@ func acquireExportLockContext(ctx context.Context, path string) (func(), error) 
 	if err != nil {
 		return nil, err
 	}
-	lockPath := path + ".lock"
+	lockPath, err := exportLockPath(path)
+	if err != nil {
+		return nil, err
+	}
 	exportPathLocks.Lock()
 	entry, err := findExportPathLock(lockPath)
 	if err != nil {
@@ -108,6 +114,14 @@ func acquireExportLockContext(ctx context.Context, path string) (func(), error) 
 	}, nil
 }
 
+func exportLockPath(path string) (string, error) {
+	directory := filepath.Join(filepath.Dir(path), exportLockDirectory)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", fmt.Errorf("create export lock directory: %w", err)
+	}
+	return filepath.Join(directory, filepath.Base(path)+".lock"), nil
+}
+
 // findExportPathLock runs while exportPathLocks is held. It checks the lock
 // file before opening anything, because closing a redundant descriptor can
 // release this process's POSIX record lock.
@@ -153,6 +167,9 @@ func canonicalExportOutputPath(path string) (string, error) {
 					return "", errors.New("export outputs with multiple hard links are unsupported")
 				}
 			}
+			if exportPathIsReserved(canonical) {
+				return "", errors.New("export destination is inside the reserved lock directory")
+			}
 			return canonical, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
@@ -179,5 +196,16 @@ func canonicalExportOutputPath(path string) (string, error) {
 		}
 		missing = append(missing, filepath.Base(current))
 		current = parent
+	}
+}
+
+func exportPathIsReserved(path string) bool {
+	for directory := path; ; directory = filepath.Dir(directory) {
+		if strings.EqualFold(filepath.Base(directory), exportLockDirectory) {
+			return true
+		}
+		if filepath.Dir(directory) == directory {
+			return false
+		}
 	}
 }

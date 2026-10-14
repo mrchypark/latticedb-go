@@ -1,0 +1,128 @@
+disk-build-progress n=100000 inserted=1000 batch_ms=750.2 elapsed_ms=801.2
+disk-build-progress n=100000 inserted=2000 batch_ms=1026.8 elapsed_ms=1828.1
+disk-build-progress n=100000 inserted=3000 batch_ms=1316.1 elapsed_ms=3144.2
+disk-build-progress n=100000 inserted=4000 batch_ms=1311.6 elapsed_ms=4455.9
+disk-build-progress n=100000 inserted=5000 batch_ms=1423.6 elapsed_ms=5879.5
+disk-build-progress n=100000 inserted=6000 batch_ms=1492.0 elapsed_ms=7371.5
+disk-build-progress n=100000 inserted=7000 batch_ms=1589.2 elapsed_ms=8960.7
+disk-build-progress n=100000 inserted=8000 batch_ms=1777.0 elapsed_ms=10738.0
+disk-build-progress n=100000 inserted=9000 batch_ms=1688.5 elapsed_ms=12426.5
+disk-build-progress n=100000 inserted=10000 batch_ms=1720.1 elapsed_ms=14146.6
+disk-build-progress n=100000 inserted=11000 batch_ms=1726.5 elapsed_ms=15873.2
+disk-build-progress n=100000 inserted=12000 batch_ms=1783.4 elapsed_ms=17656.6
+disk-build-progress n=100000 inserted=13000 batch_ms=1744.5 elapsed_ms=19401.2
+disk-build-progress n=100000 inserted=14000 batch_ms=1882.2 elapsed_ms=21283.4
+disk-build-progress n=100000 inserted=15000 batch_ms=1837.4 elapsed_ms=23120.8
+disk-build-progress n=100000 inserted=16000 batch_ms=1738.1 elapsed_ms=24858.9
+disk-build-progress n=100000 inserted=17000 batch_ms=1940.0 elapsed_ms=26798.9
+disk-build-progress n=100000 inserted=18000 batch_ms=1909.7 elapsed_ms=28708.6
+disk-build-progress n=100000 inserted=19000 batch_ms=1777.5 elapsed_ms=30486.1
+disk-build-progress n=100000 inserted=20000 batch_ms=1698.9 elapsed_ms=32185.1
+disk-build-progress n=100000 inserted=21000 batch_ms=1779.2 elapsed_ms=33964.3
+disk-build-progress n=100000 inserted=22000 batch_ms=1688.3 elapsed_ms=35652.5
+disk-build-progress n=100000 inserted=23000 batch_ms=1827.4 elapsed_ms=37480.0
+disk-build-progress n=100000 inserted=24000 batch_ms=1798.9 elapsed_ms=39278.8
+disk-build-progress n=100000 inserted=25000 batch_ms=1712.8 elapsed_ms=40991.7
+disk-build-progress n=100000 inserted=26000 batch_ms=1796.1 elapsed_ms=42787.8
+disk-build-progress n=100000 inserted=27000 batch_ms=1736.9 elapsed_ms=44524.6
+disk-build-progress n=100000 inserted=28000 batch_ms=1685.2 elapsed_ms=46209.8
+disk-build-progress n=100000 inserted=29000 batch_ms=2323.6 elapsed_ms=48533.4
+disk-build-progress n=100000 inserted=30000 batch_ms=1999.1 elapsed_ms=50532.5
+disk-build-progress n=100000 inserted=31000 batch_ms=2020.5 elapsed_ms=52553.4
+disk-build-progress n=100000 inserted=32000 batch_ms=1847.1 elapsed_ms=54400.5
+disk-build-progress n=100000 inserted=33000 batch_ms=1832.4 elapsed_ms=56233.1
+disk-build-progress n=100000 inserted=34000 batch_ms=1838.7 elapsed_ms=58071.7
+disk-build-progress n=100000 inserted=35000 batch_ms=1783.6 elapsed_ms=59855.3
+disk-build-progress n=100000 inserted=36000 batch_ms=1841.2 elapsed_ms=61696.5
+disk-build-progress n=100000 inserted=37000 batch_ms=1747.3 elapsed_ms=63443.9
+disk-build-progress n=100000 inserted=38000 batch_ms=1757.1 elapsed_ms=65201.0
+disk-build-progress n=100000 inserted=39000 batch_ms=1797.0 elapsed_ms=66998.0
+disk-build-progress n=100000 inserted=40000 batch_ms=1736.6 elapsed_ms=68734.6
+disk-build-progress n=100000 inserted=41000 batch_ms=1863.4 elapsed_ms=70598.0
+disk-build-progress n=100000 inserted=42000 batch_ms=1740.3 elapsed_ms=72338.3
+disk-build-progress n=100000 inserted=43000 batch_ms=1752.8 elapsed_ms=74091.1
+disk-build-progress n=100000 inserted=44000 batch_ms=1819.6 elapsed_ms=75910.7
+disk-build-progress n=100000 inserted=45000 batch_ms=1692.5 elapsed_ms=77603.3
+disk-build-progress n=100000 inserted=46000 batch_ms=1770.1 elapsed_ms=79373.4
+disk-build-progress n=100000 inserted=47000 batch_ms=1770.4 elapsed_ms=81143.9
+disk-build-progress n=100000 inserted=48000 batch_ms=1812.2 elapsed_ms=82956.0
+disk-build-progress n=100000 inserted=49000 batch_ms=1832.7 elapsed_ms=84788.8
+SNAPSHOT built-50000 alloc=96377536 inuse=115195904 sys=268042240 idle=152846336 released=36814848 objects=195257 gc=148
+disk-build-progress n=100000 inserted=50000 batch_ms=3043.7 elapsed_ms=87832.5
+disk-build-progress n=100000 inserted=51000 batch_ms=1712.9 elapsed_ms=89545.4
+disk-build-progress n=100000 inserted=52000 batch_ms=1707.2 elapsed_ms=91252.6
+disk-build-progress n=100000 inserted=53000 batch_ms=1789.6 elapsed_ms=93042.2
+disk-build-progress n=100000 inserted=54000 batch_ms=1844.8 elapsed_ms=94887.0
+disk-build-progress n=100000 inserted=55000 batch_ms=1799.4 elapsed_ms=96686.5
+disk-build-progress n=100000 inserted=56000 batch_ms=1809.1 elapsed_ms=98495.6
+disk-build-progress n=100000 inserted=57000 batch_ms=1872.1 elapsed_ms=100367.7
+disk-build-progress n=100000 inserted=58000 batch_ms=1748.8 elapsed_ms=102116.5
+disk-build-progress n=100000 inserted=59000 batch_ms=1888.8 elapsed_ms=104005.3
+disk-build-progress n=100000 inserted=60000 batch_ms=1903.3 elapsed_ms=105908.7
+disk-build-progress n=100000 inserted=61000 batch_ms=1863.5 elapsed_ms=107772.2
+disk-build-progress n=100000 inserted=62000 batch_ms=1855.7 elapsed_ms=109627.9
+disk-build-progress n=100000 inserted=63000 batch_ms=2581.3 elapsed_ms=112209.3
+disk-build-progress n=100000 inserted=64000 batch_ms=2406.0 elapsed_ms=114615.3
+disk-build-progress n=100000 inserted=65000 batch_ms=2579.4 elapsed_ms=117194.7
+disk-build-progress n=100000 inserted=66000 batch_ms=2524.6 elapsed_ms=119719.4
+disk-build-progress n=100000 inserted=67000 batch_ms=2434.6 elapsed_ms=122154.0
+disk-build-progress n=100000 inserted=68000 batch_ms=2536.8 elapsed_ms=124690.8
+disk-build-progress n=100000 inserted=69000 batch_ms=2534.4 elapsed_ms=127225.2
+disk-build-progress n=100000 inserted=70000 batch_ms=2557.8 elapsed_ms=129783.0
+disk-build-progress n=100000 inserted=71000 batch_ms=2971.9 elapsed_ms=132755.0
+disk-build-progress n=100000 inserted=72000 batch_ms=2775.0 elapsed_ms=135530.0
+disk-build-progress n=100000 inserted=73000 batch_ms=2547.1 elapsed_ms=138077.1
+disk-build-progress n=100000 inserted=74000 batch_ms=2675.0 elapsed_ms=140752.1
+disk-build-progress n=100000 inserted=75000 batch_ms=2654.4 elapsed_ms=143406.6
+disk-build-progress n=100000 inserted=76000 batch_ms=2766.7 elapsed_ms=146173.3
+disk-build-progress n=100000 inserted=77000 batch_ms=2742.3 elapsed_ms=148915.6
+disk-build-progress n=100000 inserted=78000 batch_ms=2995.5 elapsed_ms=151911.1
+disk-build-progress n=100000 inserted=79000 batch_ms=2807.9 elapsed_ms=154719.0
+disk-build-progress n=100000 inserted=80000 batch_ms=2845.4 elapsed_ms=157564.4
+disk-build-progress n=100000 inserted=81000 batch_ms=2894.3 elapsed_ms=160458.8
+disk-build-progress n=100000 inserted=82000 batch_ms=3027.2 elapsed_ms=163485.9
+disk-build-progress n=100000 inserted=83000 batch_ms=2896.4 elapsed_ms=166382.3
+disk-build-progress n=100000 inserted=84000 batch_ms=3676.2 elapsed_ms=170058.5
+disk-build-progress n=100000 inserted=85000 batch_ms=3051.2 elapsed_ms=173109.7
+disk-build-progress n=100000 inserted=86000 batch_ms=3036.0 elapsed_ms=176145.7
+disk-build-progress n=100000 inserted=87000 batch_ms=3123.5 elapsed_ms=179269.2
+disk-build-progress n=100000 inserted=88000 batch_ms=3054.1 elapsed_ms=182323.3
+disk-build-progress n=100000 inserted=89000 batch_ms=3222.7 elapsed_ms=185546.0
+disk-build-progress n=100000 inserted=90000 batch_ms=3256.7 elapsed_ms=188802.8
+disk-build-progress n=100000 inserted=91000 batch_ms=3219.2 elapsed_ms=192022.0
+disk-build-progress n=100000 inserted=92000 batch_ms=3384.9 elapsed_ms=195406.9
+disk-build-progress n=100000 inserted=93000 batch_ms=3288.6 elapsed_ms=198695.5
+disk-build-progress n=100000 inserted=94000 batch_ms=3450.2 elapsed_ms=202145.7
+disk-build-progress n=100000 inserted=95000 batch_ms=3304.3 elapsed_ms=205450.0
+disk-build-progress n=100000 inserted=96000 batch_ms=3999.8 elapsed_ms=209449.9
+disk-build-progress n=100000 inserted=97000 batch_ms=3405.8 elapsed_ms=212855.7
+disk-build-progress n=100000 inserted=98000 batch_ms=3520.8 elapsed_ms=216376.5
+disk-build-progress n=100000 inserted=99000 batch_ms=3482.1 elapsed_ms=219858.6
+SNAPSHOT built-100000 alloc=264159784 inuse=336928768 sys=368705536 idle=31776768 released=26099712 objects=1184713 gc=519
+disk-build-progress n=100000 inserted=100000 batch_ms=4154.6 elapsed_ms=224013.3
+SNAPSHOT closed alloc=264189480 inuse=336961536 sys=368705536 idle=31744000 released=26099712 objects=1184775 gc=519
+SNAPSHOT reopened alloc=90620944 inuse=96452608 sys=368705536 idle=272252928 released=247382016 objects=399489 gc=663
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkVectorSearchDisk128D/100K-2         	       1	   2439125 ns/op	         1.000 disk-api-contract	 419856384 file-bytes	    224584 index-build-ms	   2150766 mean-ns	   2699125 p99-ns	       100.0 recall@10	      8396 reopen-ms	 1804504 B/op	   16529 allocs/op
+PASS
+      238.08 real       232.16 user         4.89 sys
+           687095808  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              158102  page reclaims
+                1834  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+               14426  signals received
+               43605  voluntary context switches
+              386723  involuntary context switches
+       3443773869781  instructions retired
+        872163276606  cycles elapsed
+           383288352  peak memory footprint

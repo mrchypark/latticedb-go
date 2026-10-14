@@ -1,0 +1,4 @@
+=== RUN   TestMaterializeLegacyVectorFixture
+    vector_disk_benchmark_test.go:367: re-encoded and compared all 100000 HNSW nodes
+--- PASS: TestMaterializeLegacyVectorFixture (2.31s)
+PASS

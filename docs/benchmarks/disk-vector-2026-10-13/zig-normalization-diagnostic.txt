@@ -1,0 +1,4 @@
+nodes=10000 persisted=true
+id=1 vector_equal=true property_equal=true dims=128
+id=10000 vector_equal=false property_equal=true dims=128
+first_difference dimension=0 got=0.001549297 expected=0.0015492968

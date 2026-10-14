@@ -1,0 +1,45 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkReadRequests/write_commit-2   	      10	   5734342 ns/op	   91998 B/op	     446 allocs/op
+BenchmarkReadRequests/write_commit-2   	      10	   5937054 ns/op	   96078 B/op	     445 allocs/op
+BenchmarkReadRequests/write_commit-2   	      10	   5961704 ns/op	  103417 B/op	     446 allocs/op
+BenchmarkSingleRecordCommitScaling/nodes_100000/direct-2  	      10	   5691746 ns/op	  142000 B/op	     385 allocs/op
+BenchmarkSingleRecordCommitScaling/nodes_100000/direct-2  	      10	   5590683 ns/op	  145363 B/op	     385 allocs/op
+BenchmarkSingleRecordCommitScaling/nodes_100000/direct-2  	      10	   6146896 ns/op	  153084 B/op	     385 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go	2.065s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go/internal/engine
+cpu: Apple M3
+BenchmarkQueryMultiHopSlots-2   	      10	     57012 ns/op	   83368 B/op	     616 allocs/op
+BenchmarkQueryMultiHopSlots-2   	      10	     75629 ns/op	   83368 B/op	     616 allocs/op
+BenchmarkQueryMultiHopSlots-2   	      10	     57425 ns/op	   83368 B/op	     616 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/engine	0.793s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go/internal/store
+cpu: Apple M3
+BenchmarkLoadLatestWALV2/delta_history/256-2         	      10	    851783 ns/op	  453453 B/op	    4621 allocs/op
+BenchmarkLoadLatestWALV2/delta_history/256-2         	      10	    859117 ns/op	  453356 B/op	    4620 allocs/op
+BenchmarkLoadLatestWALV2/delta_history/256-2         	      10	    858646 ns/op	  453352 B/op	    4620 allocs/op
+BenchmarkAdjacencyAppendScaling/chunked_10000-2      	      10	       595.8 ns/op	    4400 B/op	       5 allocs/op
+BenchmarkAdjacencyAppendScaling/chunked_10000-2      	      10	       508.3 ns/op	    4400 B/op	       5 allocs/op
+BenchmarkAdjacencyAppendScaling/chunked_10000-2      	      10	       920.9 ns/op	    4400 B/op	       5 allocs/op
+BenchmarkAdjacencyReadScaling/chunked_10000-2        	      10	      3800 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAdjacencyReadScaling/chunked_10000-2        	      10	      3746 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAdjacencyReadScaling/chunked_10000-2        	      10	      3571 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go/internal/store	0.401s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkReadRequests/query-2         	   10000	      4618 ns/op	         1.000 source-admission-contract	    3569 B/op	      63 allocs/op
+BenchmarkReadRequests/query-2         	   10000	      3684 ns/op	         1.000 source-admission-contract	    3569 B/op	      63 allocs/op
+BenchmarkReadRequests/query-2         	   10000	      4130 ns/op	         1.000 source-admission-contract	    3569 B/op	      63 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go	0.782s

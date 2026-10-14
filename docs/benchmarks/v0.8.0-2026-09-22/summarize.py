@@ -3,7 +3,7 @@ root = pathlib.Path(__file__).parent
 files = ['query.txt','fts.txt','vector-exact.txt','vector-ann.txt','fuzzy-vocabulary.txt']
 # This generator describes one archived measurement, not the current checkout.
 # Reject changed metadata or logs before touching either generated output.
-manifest = json.loads((root/'inputs.sha256.json').read_text())
+manifest = json.loads((root/'inputs.sha256.json').read_text(encoding='utf-8'))
 inputs = files + ['environment.txt', 'grammar-tests.jsonl']
 if set(manifest) != set(inputs):
     raise SystemExit('Archived benchmark input manifest is incomplete')
@@ -12,7 +12,7 @@ for name in inputs:
         raise SystemExit(f'Archived benchmark input changed: {name}; refusing to overwrite historical report')
 rows = []
 for file in files:
-    source = (root/file).read_text()
+    source = (root/file).read_text(encoding='utf-8')
     assert '\nPASS\n' in source and '\nFAIL' not in source, file
     grouped = collections.defaultdict(list)
     for line in source.splitlines():
@@ -32,7 +32,7 @@ for file in files:
             row[metric+'_max'] = max(values)
         rows.append(row)
 keys=['file','benchmark','runs']+sorted(set().union(*(r.keys() for r in rows))-{'file','benchmark','runs'})
-with (root/'summary.csv').open('w') as f:
+with (root/'summary.csv').open('w', encoding='utf-8', newline='') as f:
     w=csv.DictWriter(f,keys);w.writeheader();w.writerows(rows)
 by_name={r['benchmark']:r for r in rows}
 def table(names, metric='ns/op'):
@@ -42,7 +42,7 @@ def table(names, metric='ns/op'):
         lines.append(f"| `{name.removeprefix('Benchmark')}` | {r[metric]/1e6:.4f} ms | {r[metric+'_min']/1e6:.4f}–{r[metric+'_max']/1e6:.4f} ms | {r['B/op']/1024:.2f} KiB | {r['allocs/op']:.0f} |")
     return '\n'.join(lines)
 counts=collections.Counter()
-for line in (root/'grammar-tests.jsonl').read_text().splitlines():
+for line in (root/'grammar-tests.jsonl').read_text(encoding='utf-8').splitlines():
     event=json.loads(line)
     assert event.get('Action')!='fail',event
     t=event.get('Test','')
@@ -153,5 +153,5 @@ summary=f"""## 핵심 결과
 
 """
 report=report.replace('## 측정 방법',summary+'## 측정 방법',1)
-(root/'REPORT.md').write_text(report)
+(root/'REPORT.md').write_text(report, encoding='utf-8')
 print('wrote',len(rows),'benchmark summaries; grammar',dict(counts))

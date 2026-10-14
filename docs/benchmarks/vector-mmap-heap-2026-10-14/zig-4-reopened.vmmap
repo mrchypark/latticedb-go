@@ -1,0 +1,58 @@
+Process:         zig-snapshot [42611]
+Path:            /private/tmp/*/zig-snapshot
+Load Address:    0x104b8c000
+Identifier:      zig-snapshot
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  Python [42249]
+Target Type:     live task
+
+Date/Time:       2026-10-14 08:24:38.310 +0900
+Launch Time:     2026-10-14 08:18:59.842 +0900
+OS Version:      macOS 26.3 (25D125)
+Report Version:  7
+Analysis Tool:   /usr/bin/vmmap
+
+Physical footprint:         181.3M
+Physical footprint (peak):  183.9M
+Idle exit:                  untracked
+----
+
+ReadOnly portion of Libraries: Total=594.1M resident=26.8M(5%) swapped_out_or_unallocated=567.2M(95%)
+Writable regions: Total=278.9M written=180.9M(65%) resident=87.5M(31%) swapped_out=93.4M(33%) unallocated=98.0M(35%)
+
+                                VIRTUAL RESIDENT    DIRTY  SWAPPED VOLATILE   NONVOL    EMPTY   REGION 
+REGION TYPE                        SIZE     SIZE     SIZE     SIZE     SIZE     SIZE     SIZE    COUNT (non-coalesced) 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+Kernel Alloc Once                   32K       0K       0K      16K       0K       0K       0K        1 
+MALLOC guard page                 3936K       0K       0K       0K       0K       0K       0K        4 
+MALLOC metadata                   64.8M      16K      16K     224K       0K       0K       0K        6 
+MALLOC_SMALL                      12.0M      32K      32K      32K       0K       0K       0K        3         see MALLOC ZONE table below
+MALLOC_TINY                       4096K       0K       0K      48K       0K       0K       0K        1         see MALLOC ZONE table below
+STACK GUARD                         16K       0K       0K       0K       0K       0K       0K        1 
+Stack                             16.0M     400K     400K       0K       0K       0K       0K        1 
+VM_ALLOCATE                      181.5M    86.8M    86.8M    93.1M       0K       0K       0K     2031 
+__AUTH                              35K      34K       0K     1104       0K       0K       0K       13 
+__AUTH_CONST                       202K     167K       0K       0K       0K       0K       0K       44 
+__DATA                             475K     165K      64K      37K       0K       0K       0K       35 
+__DATA_CONST                       113K     109K       0K       4K       0K       0K       0K       43 
+__DATA_DIRTY                       152K      98K      76K      54K       0K       0K       0K       36 
+__LINKEDIT                       587.4M    20.7M       0K       0K       0K       0K       0K        2 
+__OBJC_RO                         78.4M    49.1M       0K       0K       0K       0K       0K        1 
+__OBJC_RW                         2571K    2144K       0K      27K       0K       0K       0K        1 
+__TEXT                            6840K    6236K       0K       0K       0K       0K       0K       46 
+__TPRO_CONST                       128K      48K      16K      16K       0K       0K       0K        2 
+mapped file                         16K       0K       0K      12K       0K       0K       0K        2 
+page table in kernel               320K     320K     320K       0K       0K       0K       0K        1 
+shared memory                       32K      32K      32K       0K       0K       0K       0K        1 
+unused .note.gnu.prope              320      320       0K       0K       0K       0K       0K        1 
+unused but dirty shlib __DATA       77K      20K      20K      57K       0K       0K       0K       31 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+TOTAL                            958.7M   166.2M    87.7M    93.6M       0K       0K       0K     2307 
+
+                                 VIRTUAL   RESIDENT      DIRTY    SWAPPED ALLOCATION      BYTES DIRTY+SWAP          REGION
+MALLOC ZONE                         SIZE       SIZE       SIZE       SIZE      COUNT  ALLOCATED  FRAG SIZE  % FRAG   COUNT
+===========                      =======  =========  =========  =========  =========  =========  =========  ======  ======
+DefaultMallocZone_0x105064000      16.5M        32K        32K       144K        311       291K         0K      0%       6
+

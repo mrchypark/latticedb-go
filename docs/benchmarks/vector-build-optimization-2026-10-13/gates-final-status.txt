@@ -1,0 +1,3 @@
+go run ./scripts/benchcmp.go -current gates-final-candidate.txt -previous gates-before-stable.txt -check
+exit status: 0
+No gate threshold was changed. Final allocation samples ran concurrently with correctness tests; latency from these gate runs is not used as performance evidence.

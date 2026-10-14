@@ -1,0 +1,10 @@
+ok  	github.com/mrchypark/latticedb-go	65.389s
+ok  	github.com/mrchypark/latticedb-go/embedding	(cached)
+ok  	github.com/mrchypark/latticedb-go/internal/benchvector	(cached)
+ok  	github.com/mrchypark/latticedb-go/internal/engine	150.751s
+ok  	github.com/mrchypark/latticedb-go/internal/exporter	9.978s
+ok  	github.com/mrchypark/latticedb-go/internal/pagestore	5.949s
+ok  	github.com/mrchypark/latticedb-go/internal/search	(cached)
+ok  	github.com/mrchypark/latticedb-go/internal/store	72.171s
+ok  	github.com/mrchypark/latticedb-go/scripts	(cached)
+ok  	github.com/mrchypark/latticedb-go/scripts/fts-corpus-go	4.893s

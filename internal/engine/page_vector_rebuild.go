@@ -70,8 +70,12 @@ func (db *DB) rebuildPageVectorTargetContext(ctx context.Context, namespace *Vec
 		selectVector = func(n *store.NodeRecord) ([]float32, bool) { return selectedVector(view, n) }
 	}
 	budget := &directSearchBudget{ctx: ctx, maxWork: db.vectorIndexBuildMaxWork, maxBytes: db.vectorIndexBuildMaxLogicalBytes, annVisitedLimit: ^uint64(0)}
-	maxPersistent := db.vectorIndexBuildMaxLogicalBytes
-	if err = rebuildPageVectorIndex(ctx, page, name, selectVector, dimensions, configuredVectorIndexM(&build), maxPersistent, budget); err != nil {
+	buildBudget, err := pageVectorBuildBudgetForCurrent(ctx, page, pageVectorBuildTargets(&build), db.vectorIndexBuildMaxLogicalBytes, budget)
+	if err != nil {
+		_ = write.Rollback()
+		return err
+	}
+	if err = rebuildPageVectorIndexWithBudget(ctx, page, name, selectVector, dimensions, configuredVectorIndexM(&build), buildBudget, budget); err != nil {
 		_ = write.Rollback()
 		return err
 	}

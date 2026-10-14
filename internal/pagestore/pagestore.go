@@ -109,6 +109,8 @@ func (db *DB) Close() error {
 // Tx serializes access to its bbolt transaction. Scans release the mutex
 // between owned records so callbacks can perform nested reads or writes.
 type Tx struct {
+	pairCursor *bolt.Cursor
+	pairBucket string
 	mu         sync.Mutex
 	db         *DB
 	tx         *bolt.Tx
@@ -157,6 +159,16 @@ func (tx *Tx) Get(bucket string, key []byte) ([]byte, error) {
 
 // Put creates bucket if needed and copies key and value into the transaction.
 func (tx *Tx) Put(bucket string, key, value []byte) error {
+	return tx.put(bucket, key, value, false)
+}
+
+// PutOwned copies key and takes ownership of value until the transaction ends.
+// The caller must not modify or reuse value after this call.
+func (tx *Tx) PutOwned(bucket string, key, value []byte) error {
+	return tx.put(bucket, key, value, true)
+}
+
+func (tx *Tx) put(bucket string, key, value []byte, owned bool) error {
 	if tx == nil {
 		return ErrClosed
 	}
@@ -178,7 +190,10 @@ func (tx *Tx) Put(bucket string, key, value []byte) error {
 		}
 	}
 	// bbolt copies the key itself, but retains the value until commit.
-	if err := b.Put(key, bytes.Clone(value)); err != nil {
+	if !owned {
+		value = bytes.Clone(value)
+	}
+	if err := b.Put(key, value); err != nil {
 		return fmt.Errorf("pagestore: put in bucket %q: %w", bucket, err)
 	}
 	if int64(len(key))+int64(len(value)) > int64(^uint64(0)>>1)-tx.writeBytes {
@@ -362,6 +377,8 @@ func (tx *Tx) finishLocked() {
 		return
 	}
 	tx.closed = true
+	tx.pairCursor = nil
+	tx.pairBucket = ""
 	tx.tx = nil
 	if tx.writable {
 		tx.db.writers--

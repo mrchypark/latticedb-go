@@ -176,17 +176,26 @@ func (source *pageStreamSource) record(ctx context.Context, name string, sequenc
 	if err := ctx.Err(); err != nil {
 		return StreamRecord{}, err
 	}
-	data, err := source.graph.Tx.Get(pageStreamRecords, pageStreamRecordKey(name, sequence))
+	var record StreamRecord
+	found := false
+	// Maintenance reads must not retain obsolete stream payloads in the cache.
+	// The decoder checks the record limit before allocating owned values.
+	err := source.graph.Tx.ReadBounded(pageStreamRecords, pageStreamRecordKey(name, sequence), ^uint64(0), func(data []byte) error {
+		found = true
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var err error
+		record, err = decodePageStreamRecord(data, name, sequence, source.graph.recordLimit())
+		return err
+	})
 	if err != nil {
 		return StreamRecord{}, err
 	}
-	if data == nil {
+	if !found {
 		return StreamRecord{}, fmt.Errorf("missing page stream record %q sequence %d", name, sequence)
 	}
-	if err := ctx.Err(); err != nil {
-		return StreamRecord{}, err
-	}
-	return decodePageStreamRecord(data, name, sequence, source.graph.recordLimit())
+	return record, nil
 }
 
 func (store StreamStore) pageRecord(ctx context.Context, name string, sequence uint64) (StreamRecord, error) {

@@ -1,0 +1,6 @@
+SNAPSHOT built
+SNAPSHOT built
+SNAPSHOT closed
+SNAPSHOT reopened
+DISK_VECTOR_V1 n=100000 build_ms=336989 reopen_ms=1403 mean_ns=1964022 p99_ns=5660750 recall=100.00 file_bytes=416559104
+exit=0

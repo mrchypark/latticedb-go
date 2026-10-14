@@ -108,6 +108,7 @@ const (
 	walHeaderPrefixSize    = 12
 	walDatabaseIDAt        = 32
 	maxWALFrameBytes       = 1 << 30
+	maxWALPayloadBytes     = maxWALFrameBytes - walHeaderSize
 	maxStateFileBytes      = 1 << 30
 	maxIDsFileBytes        = 64 << 10
 	stateHeaderSize        = 64
@@ -1505,7 +1506,7 @@ func RewriteWALSnapshotFiles(files DatabaseFiles, graph *GraphState, nextNodeID 
 	if err != nil {
 		return err
 	}
-	if info.Size() > maxWALFrameBytes {
+	if info.Size() > maxWALPayloadBytes {
 		return errors.New("WAL frame exceeds size limit")
 	}
 	header, err := encodeWALHeaderFields(graph.DatabaseID, commitID, uint64(info.Size()), checksum.Sum32())
@@ -3941,7 +3942,7 @@ func encodeWALHeaderFieldsInto(header *[walHeaderSize]byte, databaseID string, c
 	if err := validateDatabaseID(databaseID); err != nil {
 		return err
 	}
-	if payloadLength > maxWALFrameBytes {
+	if payloadLength > maxWALPayloadBytes {
 		return errors.New("WAL frame exceeds size limit")
 	}
 	copy(header[:8], walMagic[:])
@@ -4005,7 +4006,7 @@ func isBinaryWALHeader(header []byte) bool {
 }
 
 func validateWALPayloadSize(size int) error {
-	if size > maxWALFrameBytes {
+	if size > maxWALPayloadBytes {
 		return errors.New("WAL frame exceeds size limit")
 	}
 	return nil

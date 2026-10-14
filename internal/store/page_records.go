@@ -19,7 +19,12 @@ func encodePageRecord(kind byte, encode func(*binaryEncoder)) ([]byte, error) {
 }
 
 func encodePageRecordBounded(kind byte, maxBytes uint64, encode func(*binaryEncoder)) ([]byte, error) {
+	return encodePageRecordCapacity(kind, maxBytes, 0, encode)
+}
+
+func encodePageRecordCapacity(kind byte, maxBytes uint64, capacity int, encode func(*binaryEncoder)) ([]byte, error) {
 	var output bytes.Buffer
+	output.Grow(min(capacity, int(min(maxBytes, uint64(^uint(0)>>1)))))
 	output.Write([]byte{pageRecordVersion, kind, 0, 0, 0, 0})
 	encoder := binaryEncoder{out: &output, allocationLimit: multiplySaturated(maxBytes, 2)}
 	encode(&encoder)
@@ -35,6 +40,14 @@ func encodePageRecordBounded(kind byte, maxBytes uint64, encode func(*binaryEnco
 }
 
 func decodePageRecord(data []byte, kind byte, maxBytes uint64) (*binaryDecoder, error) {
+	payload, err := decodePageRecordPayload(data, kind, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	return newBinaryDecoderBytes(payload, maxBytes), nil
+}
+
+func decodePageRecordPayload(data []byte, kind byte, maxBytes uint64) ([]byte, error) {
 	if uint64(len(data)) > maxBytes {
 		return nil, fmt.Errorf("%w: page record exceeds limit", ErrLoadResourceLimit)
 	}
@@ -44,7 +57,7 @@ func decodePageRecord(data []byte, kind byte, maxBytes uint64) (*binaryDecoder, 
 	if binary.BigEndian.Uint32(data[2:6]) != crc32.ChecksumIEEE(data[6:]) {
 		return nil, errors.New("page record checksum mismatch")
 	}
-	return newBinaryDecoder(bytes.NewReader(data[6:]), uint64(len(data)-6), maxBytes), nil
+	return data[6:], nil
 }
 
 func encodePageNode(node *NodeRecord) ([]byte, error) {

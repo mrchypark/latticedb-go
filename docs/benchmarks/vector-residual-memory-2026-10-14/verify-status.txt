@@ -1,0 +1,3 @@
+focused-race 0
+vet-root 0
+diff-check 0

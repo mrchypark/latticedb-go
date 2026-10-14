@@ -1,0 +1,1 @@
+ok  	github.com/mrchypark/latticedb-go/conformance/go	4.425s

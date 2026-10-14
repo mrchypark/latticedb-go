@@ -15,6 +15,8 @@ import (
 // use is bounded by EfSearch and the query budget, independent of index size.
 func pageVectorSearch(ctx context.Context, index store.PageVectorIndex, query []float32, k, ef, m int, budget *directSearchBudget) ([]VectorSearchResult, error) {
 	index.MaxRecordBytes = pageVectorNodeReadBudget(len(query), m)
+	access := newPageVectorAccess(index, budget, false)
+	defer access.close()
 	meta, err := index.Meta()
 	if err != nil {
 		return nil, err
@@ -36,12 +38,12 @@ func pageVectorSearch(ctx context.Context, index store.PageVectorIndex, query []
 	}
 	entry := meta.EntryID
 	for level := meta.MaxLevel; level > 0; level-- {
-		entry, err = pageVectorGreedy(ctx, index, query, entry, level, budget)
+		entry, err = pageVectorGreedy(ctx, access, query, entry, level, budget)
 		if err != nil {
 			return nil, err
 		}
 	}
-	candidates, err := pageVectorLayer(ctx, index, query, entry, 0, ef, 0, budget)
+	candidates, err := pageVectorLayer(ctx, access, query, entry, 0, ef, 0, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +84,7 @@ func pageVectorNodeReadBudget(dimensions, m int) uint64 {
 	return saturatingMul(raw, 3)
 }
 
-func pageVectorGreedy(ctx context.Context, index store.PageVectorIndex, query []float32, entry uint64, level int, budget *directSearchBudget) (uint64, error) {
+func pageVectorGreedy(ctx context.Context, index *pageVectorAccess, query []float32, entry uint64, level int, budget *directSearchBudget) (uint64, error) {
 	if level < 0 {
 		return entry, fmt.Errorf("corrupt page HNSW level %d", level)
 	}
@@ -137,7 +139,7 @@ func pageVectorGreedy(ctx context.Context, index store.PageVectorIndex, query []
 	}
 }
 
-func pageVectorLayer(ctx context.Context, index store.PageVectorIndex, query []float32, entry uint64, level, ef int, exclude uint64, budget *directSearchBudget) ([]vectorCandidate, error) {
+func pageVectorLayer(ctx context.Context, index *pageVectorAccess, query []float32, entry uint64, level, ef int, exclude uint64, budget *directSearchBudget) ([]vectorCandidate, error) {
 	visitedBytes := uint64(0)
 	if budget != nil {
 		scratchBytes := saturatingMul(uint64(max(ef, 1)), 128)
@@ -172,12 +174,29 @@ func pageVectorLayer(ctx context.Context, index store.PageVectorIndex, query []f
 		return nil, err
 	}
 	frontier := vectorCandidateHeap{}
-	frontier.push(vectorCandidate{id: entry, distance: distance})
 	best := vectorCandidateHeap{max: true}
+	visited := map[uint64]struct{}{}
+	if scratch := index.scratch; scratch != nil {
+		frontier.items, best.items = scratch.frontier[:0], scratch.best[:0]
+		if scratch.visited != nil {
+			visited = scratch.visited
+		}
+		defer func() {
+			scratch.frontier, scratch.best = frontier.items[:0], best.items[:0]
+			scratch.visited = visited
+			scratch.visitedCapacity = max(scratch.visitedCapacity, len(visited))
+			clear(visited)
+			// Keep at most 448KiB of scratch within the 512KiB cache reservation.
+			if !vectorSearchScratchFits(scratch, 4096, 4096, 4096) {
+				*scratch = vectorSearchScratch{}
+			}
+		}()
+	}
+	frontier.push(vectorCandidate{id: entry, distance: distance})
 	if entry != exclude && !first.Deleted {
 		best.push(frontier.items[0])
 	}
-	visited := map[uint64]struct{}{entry: {}}
+	visited[entry] = struct{}{}
 	for frontier.Len() > 0 {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -233,13 +252,19 @@ func pageVectorLayer(ctx context.Context, index store.PageVectorIndex, query []f
 	return best.items, nil
 }
 
-func selectPageVectorNeighbors(ctx context.Context, index store.PageVectorIndex, candidates []vectorCandidate, limit int, overrideID uint64, overrideVector []float32, budget *directSearchBudget) ([]vectorCandidate, error) {
-	selected := make([]vectorCandidate, 0, limit)
-	selectedVectors := make([][]float32, 0, limit)
-	rejected := make([]vectorCandidate, 0, min(len(candidates), vectorIndexConstructionEF))
+func selectPageVectorNeighbors(ctx context.Context, index *pageVectorAccess, candidates []vectorCandidate, limit int, vectors map[uint64][]float32, budget *directSearchBudget) ([]vectorCandidate, error) {
+	if limit < 1 || limit > 128 {
+		return nil, fmt.Errorf("invalid page HNSW neighbor limit %d", limit)
+	}
+	// Selection compacts candidates in place; scratch does not escape the call.
+	selected := candidates[:0]
+	var vectorScratch [128][]float32
+	selectedVectors := vectorScratch[:0:limit]
+	var rejectedScratch [vectorIndexConstructionEF]vectorCandidate
+	rejected := rejectedScratch[:0]
 	for _, candidate := range candidates {
-		vector := overrideVector
-		if overrideVector == nil || candidate.id != overrideID {
+		vector, ok := vectors[candidate.id]
+		if !ok {
 			node, err := index.Get(candidate.id)
 			if err != nil {
 				return nil, err
@@ -271,24 +296,15 @@ func selectPageVectorNeighbors(ctx context.Context, index store.PageVectorIndex,
 		}
 	}
 	for i := 0; len(selected) < limit && i < len(rejected); i++ {
-		vector := overrideVector
-		if overrideVector == nil || rejected[i].id != overrideID {
-			node, err := index.Get(rejected[i].id)
-			if err != nil {
-				return nil, err
-			}
-			if node == nil {
-				return nil, fmt.Errorf("page HNSW neighbor %d is missing", rejected[i].id)
-			}
-			vector = node.Vector
-		}
 		selected = append(selected, rejected[i])
-		selectedVectors = append(selectedVectors, vector)
 	}
 	return selected, nil
 }
 
-func connectPageVectorNeighbor(ctx context.Context, index store.PageVectorIndex, id, neighbor uint64, neighborVector []float32, level, maxNeighbors int, budget *directSearchBudget) error {
+func connectPageVectorNeighbor(ctx context.Context, index *pageVectorAccess, id, neighbor uint64, neighborVector []float32, level, maxNeighbors int, budget *directSearchBudget) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	node, err := index.Get(id)
 	if err != nil {
 		return err
@@ -296,11 +312,29 @@ func connectPageVectorNeighbor(ctx context.Context, index store.PageVectorIndex,
 	if node == nil || level >= len(node.Neighbors) || slices.Contains(node.Neighbors[level], neighbor) {
 		return err
 	}
+	copyNode := *node
+	copyNode.Neighbors = slices.Clone(node.Neighbors)
+	copyNode.Neighbors[level] = slices.Clone(node.Neighbors[level])
+	node = &copyNode
 	if len(node.Neighbors[level]) < maxNeighbors {
 		node.Neighbors[level] = append(node.Neighbors[level], neighbor)
 		return index.Put(id, node)
 	}
-	var candidates []vectorCandidate
+	if len(neighborVector) != len(node.Vector) {
+		return fmt.Errorf("page HNSW neighbor vector length mismatch: %d != %d", len(neighborVector), len(node.Vector))
+	}
+	// Reuse these immutable vectors only for this neighbor selection.
+	count := uint64(len(node.Neighbors[level]) + 1)
+	if budget != nil {
+		reserved := saturatingMul(count, saturatingAdd(uint64(len(node.Vector))*4, 128))
+		if err := budget.reserveBytes(reserved); err != nil {
+			return err
+		}
+		defer budget.releaseBytes(reserved)
+	}
+	vectors := map[uint64][]float32{neighbor: neighborVector}
+	var candidateScratch [129]vectorCandidate
+	candidates := candidateScratch[:0]
 	for _, candidateID := range node.Neighbors[level] {
 		candidate, err := index.Get(candidateID)
 		if err != nil {
@@ -321,7 +355,7 @@ func connectPageVectorNeighbor(ctx context.Context, index store.PageVectorIndex,
 	}
 	candidates = append(candidates, vectorCandidate{id: neighbor, distance: distance})
 	slices.SortFunc(candidates, compareVectorCandidate)
-	selected, err := selectPageVectorNeighbors(ctx, index, candidates, maxNeighbors, neighbor, neighborVector, budget)
+	selected, err := selectPageVectorNeighbors(ctx, index, candidates, maxNeighbors, vectors, budget)
 	if err != nil {
 		return err
 	}
@@ -334,7 +368,56 @@ func connectPageVectorNeighbor(ctx context.Context, index store.PageVectorIndex,
 
 // rebuildPageVectorIndex replaces one namespace atomically in the caller's
 // page transaction. The work and temporary graph are bounded by supplied limits.
-type pageVectorBuildBudget struct{ persistentBytes, stagedBytes, maxPersistentBytes, maxStagedBytes uint64 }
+type pageVectorBuildBudget struct {
+	persistentBytes, stagedBytes, maxPersistentBytes, maxStagedBytes uint64
+	persistentByNamespace                                            map[string]uint64
+}
+
+func pageVectorBuildTargets(graph *store.GraphState) []string {
+	targets := []string{"default"}
+	for _, namespace := range sortedVectorNamespaces(graph.VectorNamespaces) {
+		ns := namespace
+		targets = append(targets, pageVectorNamespaceKey(&ns))
+	}
+	return targets
+}
+
+// pageVectorBuildBudgetForCurrent admits retained HNSW records before a page
+// transaction stages replacement or new records.
+func pageVectorBuildBudgetForCurrent(ctx context.Context, page *store.PageGraph, targets []string, maxBytes uint64, work *directSearchBudget) (*pageVectorBuildBudget, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	budget := &pageVectorBuildBudget{maxPersistentBytes: maxBytes, maxStagedBytes: maxBytes}
+	for _, target := range targets {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if work != nil {
+			if err := work.add(1); err != nil {
+				return nil, err
+			}
+		}
+		index := store.PageVectorIndex{Tx: page.Tx, Namespace: target}
+		has, err := index.HasMeta()
+		if err != nil {
+			return nil, err
+		}
+		if !has {
+			continue
+		}
+		meta, err := index.Meta()
+		if err != nil {
+			return nil, err
+		}
+		bytes := estimateVectorIndexBytesForM(meta.Count, meta.Dimensions, meta.M)
+		if err := budget.chargePersistent(bytes); err != nil {
+			return nil, err
+		}
+		budget.rememberPersistent(target, bytes)
+	}
+	return budget, nil
+}
 
 func (b *pageVectorBuildBudget) chargePersistent(n uint64) error {
 	if b.persistentBytes > b.maxPersistentBytes || n > b.maxPersistentBytes-b.persistentBytes {
@@ -343,6 +426,23 @@ func (b *pageVectorBuildBudget) chargePersistent(n uint64) error {
 	b.persistentBytes += n
 	return nil
 }
+
+func (b *pageVectorBuildBudget) rememberPersistent(namespace string, n uint64) {
+	if b.persistentByNamespace == nil {
+		b.persistentByNamespace = make(map[string]uint64)
+	}
+	b.persistentByNamespace[namespace] = n
+}
+
+func (b *pageVectorBuildBudget) replacePersistent(namespace string) {
+	n, ok := b.persistentByNamespace[namespace]
+	if !ok {
+		return
+	}
+	b.persistentBytes -= n
+	delete(b.persistentByNamespace, namespace)
+}
+
 func (b *pageVectorBuildBudget) chargeStaged(n uint64) error {
 	if b.stagedBytes > b.maxStagedBytes || n > b.maxStagedBytes-b.stagedBytes {
 		return fmt.Errorf("%w: page HNSW transaction staging exceeds %d bytes", ErrResourceLimit, b.maxStagedBytes)
@@ -375,6 +475,9 @@ func rebuildPageVectorIndexWithBudget(ctx context.Context, graph *store.PageGrap
 	}); err != nil {
 		return err
 	}
+	buildBudget.replacePersistent(namespace)
+	access := newPageVectorAccess(index, budget, true)
+	defer access.close()
 	meta := store.PageVectorMeta{}
 	meta.M, meta.Dimensions, meta.Valid = uint16(m), dimensions, true
 	var buildErr error
@@ -405,7 +508,7 @@ func rebuildPageVectorIndexWithBudget(ctx context.Context, graph *store.PageGrap
 				return e
 			}
 		}
-		buildErr = insertPageVector(ctx, index, &meta, node.ID, vector, m, budget)
+		buildErr = insertPageVector(ctx, access, &meta, node.ID, vector, m, budget)
 		return buildErr
 	})
 	if err != nil {
@@ -416,7 +519,11 @@ func rebuildPageVectorIndexWithBudget(ctx context.Context, graph *store.PageGrap
 	}
 	meta.Mutations = 0
 	meta.Valid = true
-	return index.PutMeta(meta)
+	if err := index.PutMeta(meta); err != nil {
+		return err
+	}
+	buildBudget.rememberPersistent(namespace, estimateVectorIndexBytesForM(meta.Count, dimensions, uint16(m)))
+	return nil
 }
 
 // applyPageVectorChanges is called inside the same writable page transaction
@@ -426,36 +533,14 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 		ctx = context.Background()
 	}
 	m := configuredVectorIndexM(after)
-	type target struct {
-		name       string
-		dimensions uint16
-	}
-	targets := []target{{name: "default", dimensions: after.VectorDimensions}}
-	for _, ns := range sortedVectorNamespaces(after.VectorNamespaces) {
-		targets = append(targets, target{name: pageVectorNamespaceKey(&ns), dimensions: ns.Dimensions})
-	}
-	buildBudget := &pageVectorBuildBudget{maxPersistentBytes: ^uint64(0), maxStagedBytes: ^uint64(0)}
+	targets := pageVectorBuildTargets(after)
+	maxBytes := ^uint64(0)
 	if budget != nil {
-		buildBudget.maxPersistentBytes = budget.maxBytes
-		buildBudget.maxStagedBytes = budget.maxBytes
+		maxBytes = budget.maxBytes
 	}
-	// Include every active namespace's current persistent footprint before
-	// reserving additions and staged neighbor rewrites for this transaction.
-	for _, target := range targets {
-		if budget != nil {
-			if err := budget.add(1); err != nil {
-				return err
-			}
-		}
-		index := store.PageVectorIndex{Tx: page.Tx, Namespace: target.name}
-		meta, err := index.Meta()
-		if err != nil {
-			return err
-		}
-		entryBytes := estimateVectorIndexBytesForM(1, target.dimensions, uint16(m))
-		if err = buildBudget.chargePersistent(saturatingMul(meta.Count, entryBytes)); err != nil {
-			return err
-		}
+	buildBudget, err := pageVectorBuildBudgetForCurrent(ctx, page, targets, maxBytes, budget)
+	if err != nil {
+		return err
 	}
 	chargeChange := func(name string, dimensions uint16, id uint64, adding bool) error {
 		if budget != nil {
@@ -521,6 +606,21 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 	if err := invalidateInactivePageVectorIndexesBudget(ctx, page, sortedVectorNamespaces(after.VectorNamespaces), budget, buildBudget); err != nil {
 		return err
 	}
+	var access *pageVectorAccess
+	defer func() {
+		if access != nil {
+			access.close()
+		}
+	}()
+	applyChange := func(namespace string, id uint64, vector []float32, present bool) error {
+		if access == nil || access.Namespace != namespace {
+			if access != nil {
+				access.close()
+			}
+			access = newPageVectorAccess(store.PageVectorIndex{Tx: page.Tx, Namespace: namespace, BeforeWrite: buildBudget.chargeStaged}, budget, true)
+		}
+		return applyPageVectorChange(ctx, access, id, vector, present, m, budget)
+	}
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -539,7 +639,7 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 				oldVector, oldOK := selectedVector(before, oldNode)
 				newVector, newOK := selectedVector(after, newNode)
 				if oldOK != newOK || !slices.Equal(oldVector, newVector) {
-					if err := applyPageVectorChange(ctx, page, "default", id, newVector, newOK, m, budget, buildBudget); err != nil {
+					if err := applyChange("default", id, newVector, newOK); err != nil {
 						return err
 					}
 				}
@@ -558,7 +658,7 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 					if oldOK == newOK && slices.Equal(oldVector, newVector) {
 						continue
 					}
-					if err := applyPageVectorChange(ctx, page, pageVectorNamespaceKey(&ns), id, newVector, newOK, m, budget, buildBudget); err != nil {
+					if err := applyChange(pageVectorNamespaceKey(&ns), id, newVector, newOK); err != nil {
 						return err
 					}
 				}
@@ -571,8 +671,7 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 	return nil
 }
 
-func applyPageVectorChange(ctx context.Context, page *store.PageGraph, namespace string, id uint64, vector []float32, present bool, m int, budget *directSearchBudget, buildBudget *pageVectorBuildBudget) error {
-	index := store.PageVectorIndex{Tx: page.Tx, Namespace: namespace, BeforeWrite: buildBudget.chargeStaged}
+func applyPageVectorChange(ctx context.Context, index *pageVectorAccess, id uint64, vector []float32, present bool, m int, budget *directSearchBudget) error {
 	meta, err := index.Meta()
 	if err != nil {
 		return err
@@ -582,7 +681,11 @@ func applyPageVectorChange(ctx context.Context, page *store.PageGraph, namespace
 		dimensions = uint16(len(vector))
 	}
 	if dimensions != 0 {
-		index.MaxRecordBytes = pageVectorNodeReadBudget(int(dimensions), m)
+		limit := pageVectorNodeReadBudget(int(dimensions), m)
+		if index.MaxRecordBytes != limit {
+			index.reset()
+			index.MaxRecordBytes = limit
+		}
 	}
 	if ok, err := index.HasMeta(); err != nil {
 		return err
@@ -592,7 +695,7 @@ func applyPageVectorChange(ctx context.Context, page *store.PageGraph, namespace
 			return err
 		}
 	}
-	if err := mutatePageVectorIndex(ctx, index, &meta, id, vector, present, m, budget); err != nil {
+	if err := mutatePageVectorIndexAccess(ctx, index, &meta, id, vector, present, m, budget); err != nil {
 		return err
 	}
 	return nil
@@ -621,7 +724,10 @@ func preparePageVectorIndexes(ctx context.Context, page *store.PageGraph, graph 
 			selectVector func(*store.NodeRecord) ([]float32, bool)
 		}{name: pageVectorNamespaceKey(&ns), dimensions: ns.Dimensions, selectVector: func(n *store.NodeRecord) ([]float32, bool) { return selectedVector(view, n) }})
 	}
-	buildBudget := &pageVectorBuildBudget{maxPersistentBytes: maxBytes, maxStagedBytes: maxBytes}
+	buildBudget, err := pageVectorBuildBudgetForCurrent(ctx, page, pageVectorBuildTargets(graph), maxBytes, budget)
+	if err != nil {
+		return err
+	}
 	for _, target := range targets {
 		index := store.PageVectorIndex{Tx: page.Tx, Namespace: target.name}
 		index.MaxRecordBytes = pageVectorNodeReadBudget(int(target.dimensions), configuredVectorIndexM(graph))
@@ -755,7 +861,7 @@ func pageStoreInvalidationBudget(work *directSearchBudget, staged *pageVectorBui
 	return &b
 }
 
-func insertPageVector(ctx context.Context, index store.PageVectorIndex, meta *store.PageVectorMeta, id uint64, vector []float32, m int, budget *directSearchBudget) error {
+func insertPageVector(ctx context.Context, index *pageVectorAccess, meta *store.PageVectorMeta, id uint64, vector []float32, m int, budget *directSearchBudget) error {
 	level := vectorLevel(id)
 	node := &store.PageVectorNode{Level: level, Neighbors: make([][]uint64, level+1), Vector: slices.Clone(vector)}
 	if meta.Count == 0 {
@@ -786,7 +892,7 @@ func insertPageVector(ctx context.Context, index store.PageVectorIndex, meta *st
 			maxNeighbors = 2 * m
 		}
 		if len(candidates) > maxNeighbors {
-			candidates, err = selectPageVectorNeighbors(ctx, index, candidates, maxNeighbors, 0, nil, budget)
+			candidates, err = selectPageVectorNeighbors(ctx, index, candidates, maxNeighbors, nil, budget)
 			if err != nil {
 				return err
 			}
@@ -816,9 +922,23 @@ func insertPageVector(ctx context.Context, index store.PageVectorIndex, meta *st
 }
 
 func mutatePageVectorIndex(ctx context.Context, index store.PageVectorIndex, meta *store.PageVectorMeta, id uint64, vector []float32, present bool, m int, budget *directSearchBudget) error {
+	access := newPageVectorAccess(index, budget, true)
+	defer access.close()
+	return mutatePageVectorIndexAccess(ctx, access, meta, id, vector, present, m, budget)
+}
+
+func mutatePageVectorIndexAccess(ctx context.Context, index *pageVectorAccess, meta *store.PageVectorMeta, id uint64, vector []float32, present bool, m int, budget *directSearchBudget) error {
 	old, err := index.Get(id)
 	if err != nil {
 		return err
+	}
+	if old != nil {
+		copyNode := *old
+		copyNode.Neighbors = slices.Clone(old.Neighbors)
+		for level := range copyNode.Neighbors {
+			copyNode.Neighbors[level] = slices.Clone(old.Neighbors[level])
+		}
+		old = &copyNode
 	}
 	if !present {
 		if old != nil && !old.Deleted {
@@ -852,6 +972,7 @@ func mutatePageVectorIndex(ctx context.Context, index store.PageVectorIndex, met
 		return index.PutMeta(*meta)
 	}
 	if meta.Count != 0 && meta.DeletedCount == meta.Count {
+		index.reset()
 		if err := index.DeleteAll(ctx, func() error {
 			if budget != nil {
 				return budget.add(1)
@@ -870,9 +991,16 @@ func mutatePageVectorIndex(ctx context.Context, index store.PageVectorIndex, met
 	return index.PutMeta(*meta)
 }
 
-func reconnectPageVectorNode(ctx context.Context, index store.PageVectorIndex, meta *store.PageVectorMeta, id uint64, node *store.PageVectorNode, m int, budget *directSearchBudget) error {
+func reconnectPageVectorNode(ctx context.Context, index *pageVectorAccess, meta *store.PageVectorMeta, id uint64, node *store.PageVectorNode, m int, budget *directSearchBudget) error {
 	entry := meta.EntryID
-	for level := meta.MaxLevel; level >= 0 && level <= node.Level; level-- {
+	for level := meta.MaxLevel; level > node.Level; level-- {
+		var err error
+		entry, err = pageVectorGreedy(ctx, index, node.Vector, entry, level, budget)
+		if err != nil {
+			return err
+		}
+	}
+	for level := min(node.Level, meta.MaxLevel); level >= 0; level-- {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -885,7 +1013,7 @@ func reconnectPageVectorNode(ctx context.Context, index store.PageVectorIndex, m
 			maxNeighbors = 2 * m
 		}
 		if len(candidates) > maxNeighbors {
-			candidates, err = selectPageVectorNeighbors(ctx, index, candidates, maxNeighbors, 0, nil, budget)
+			candidates, err = selectPageVectorNeighbors(ctx, index, candidates, maxNeighbors, nil, budget)
 			if err != nil {
 				return err
 			}

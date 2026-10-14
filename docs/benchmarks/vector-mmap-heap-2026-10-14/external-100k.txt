@@ -1,0 +1,11 @@
+SNAPSHOT built-50000 alloc=96278528 inuse=114409472 sys=276430848 idle=162021376 released=49283072 objects=195051 gc=138
+SNAPSHOT built-100000 alloc=251328184 inuse=332259328 sys=377094144 idle=44834816 released=35651584 objects=1022978 gc=473
+SNAPSHOT closed alloc=251328488 inuse=332259328 sys=377094144 idle=44834816 released=35651584 objects=1022986 gc=473
+SNAPSHOT reopened alloc=80745096 inuse=86294528 sys=377094144 idle=290799616 released=255844352 objects=284673 gc=601
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkVectorSearchDisk128D/100K-2         	       1	   2415875 ns/op	         1.000 disk-api-contract	 419856384 file-bytes	    213589 index-build-ms	   1878764 mean-ns	   2460875 p99-ns	       100.0 recall@10	      7813 reopen-ms	 1525432 B/op	   10373 allocs/op
+PASS
+exit=0 user=221.09853 sys=3.3807869999999998 maxrss_bytes=705560576

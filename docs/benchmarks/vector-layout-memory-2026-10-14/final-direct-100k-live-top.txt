@@ -1,0 +1,33 @@
+File: final-direct.test
+Type: inuse_space
+Time: 2026-10-14 06:21:45 KST
+Showing nodes accounting for 91.99MB, 100% of 91.99MB total
+      flat  flat%   sum%        cum   cum%
+   48.84MB 53.09% 53.09%    48.84MB 53.09%  github.com/mrchypark/latticedb-go/internal/benchvector.Generate
+   42.15MB 45.82% 98.91%    42.15MB 45.82%  go.etcd.io/bbolt.Open.func2
+    0.50MB  0.54% 99.46%     0.50MB  0.54%  runtime.mallocgc
+    0.50MB  0.54%   100%     0.50MB  0.54%  github.com/mrchypark/latticedb-go/internal/pagestore.(*recordCache).put
+         0     0%   100%    42.65MB 46.37%  github.com/mrchypark/latticedb-go.(*DB).Update
+         0     0%   100%    91.49MB 99.46%  github.com/mrchypark/latticedb-go.BenchmarkVectorSearchDisk128D.func1
+         0     0%   100%    42.65MB 46.37%  github.com/mrchypark/latticedb-go.diskVectorDB
+         0     0%   100%    42.65MB 46.37%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).Update (inline)
+         0     0%   100%    42.65MB 46.37%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).updateContext
+         0     0%   100%    42.65MB 46.37%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitInternalContext
+         0     0%   100%    42.65MB 46.37%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitPages
+         0     0%   100%    42.15MB 45.82%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).Commit
+         0     0%   100%     0.50MB  0.54%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).Get
+         0     0%   100%     0.50MB  0.54%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).Catalog
+         0     0%   100%     0.50MB  0.54%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).LoadGraph
+         0     0%   100%    42.15MB 45.82%  go.etcd.io/bbolt.(*Bucket).spill
+         0     0%   100%    42.15MB 45.82%  go.etcd.io/bbolt.(*DB).allocate
+         0     0%   100%    42.15MB 45.82%  go.etcd.io/bbolt.(*Tx).Commit
+         0     0%   100%    42.15MB 45.82%  go.etcd.io/bbolt.(*Tx).allocate
+         0     0%   100%    42.15MB 45.82%  go.etcd.io/bbolt.(*node).spill
+         0     0%   100%     0.50MB  0.54%  runtime.malg
+         0     0%   100%     0.50MB  0.54%  runtime.newobject
+         0     0%   100%     0.50MB  0.54%  runtime.newproc.func1
+         0     0%   100%     0.50MB  0.54%  runtime.newproc1
+         0     0%   100%     0.50MB  0.54%  runtime.systemstack
+         0     0%   100%    42.15MB 45.82%  sync.(*Pool).Get
+         0     0%   100%    91.49MB 99.46%  testing.(*B).run1.func1
+         0     0%   100%    91.49MB 99.46%  testing.(*B).runN

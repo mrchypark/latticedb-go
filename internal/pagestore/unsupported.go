@@ -14,11 +14,15 @@ func (*DB) Sync() error                                       { return ErrUnsupp
 func (*Tx) Get(string, []byte) ([]byte, error)                { return nil, ErrUnsupportedPlatform }
 func (*Tx) Has(string, []byte) (bool, error)                  { return false, ErrUnsupportedPlatform }
 func (*Tx) GetBounded(string, []byte, uint64) ([]byte, error) { return nil, ErrUnsupportedPlatform }
+func (*Tx) ReadBounded(string, []byte, uint64, func([]byte) error) error {
+	return ErrUnsupportedPlatform
+}
 func (*Tx) GetBoundedWithCharge(string, []byte, uint64, func(uint64) error) ([]byte, error) {
 	return nil, ErrUnsupportedPlatform
 }
-func (*Tx) Put(string, []byte, []byte) error { return ErrUnsupportedPlatform }
-func (*Tx) Delete(string, []byte) error      { return ErrUnsupportedPlatform }
+func (*Tx) Put(string, []byte, []byte) error      { return ErrUnsupportedPlatform }
+func (*Tx) PutOwned(string, []byte, []byte) error { return ErrUnsupportedPlatform }
+func (*Tx) Delete(string, []byte) error           { return ErrUnsupportedPlatform }
 func (*Tx) Scan(context.Context, string, []byte, []byte, func([]byte, []byte) error) error {
 	return ErrUnsupportedPlatform
 }
@@ -36,5 +40,9 @@ func (*Tx) ScanBounded(context.Context, string, []byte, []byte, uint64, func([]b
 }
 
 func (*Tx) ScanKeysWithCharge(context.Context, string, []byte, []byte, uint64, func(uint64) error, func([]byte) error) error {
+	return ErrUnsupportedPlatform
+}
+
+func (*Tx) ReadPairBounded(string, []byte, []byte, uint64, func([]byte, []byte) error) error {
 	return ErrUnsupportedPlatform
 }

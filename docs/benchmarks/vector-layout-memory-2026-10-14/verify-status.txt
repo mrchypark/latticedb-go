@@ -1,0 +1,15 @@
+focused 0
+normal 0
+race 0
+vet 0
+simd 0
+conformance 0
+compile-linux 0
+compile-windows 0
+compile-plan9 0
+compile-js 0
+compile-wasip1 0
+allocation-gates 0
+source-manifest 0
+report-links 0
+query-reproduce-syntax 0
