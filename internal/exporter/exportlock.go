@@ -271,7 +271,8 @@ func canonicalExportOutputPath(path string) (string, error) {
 
 func exportPathIsReserved(path string) bool {
 	for directory := path; ; directory = filepath.Dir(directory) {
-		if name := strings.ToLower(filepath.Base(directory)); name == exportLockDirectory || strings.HasPrefix(name, exportLockDirectory+".init-") {
+		name, _, _ := strings.Cut(strings.ToLower(filepath.Base(directory)), ".init-")
+		if strings.EqualFold(name, exportLockDirectory) {
 			return true
 		}
 		if filepath.Dir(directory) == directory {

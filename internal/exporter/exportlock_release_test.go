@@ -118,3 +118,11 @@ func TestReleaseExportRejectsSymlinkLockFile(t *testing.T) {
 		t.Fatalf("rejected export published output: %v", err)
 	}
 }
+
+func TestReleaseExportReservedNamespaceCaseFolding(t *testing.T) {
+	for _, name := range []string{".latticedb-export-locks", ".LATTICEDB-EXPORT-LOCKS", ".latticedb-export-lockſ", ".LATTICEDB-EXPORT-LOCKS.INIT-123", ".latticedb-export-lockſ.init-123"} {
+		if !exportPathIsReserved(filepath.Join(t.TempDir(), name, "output")) {
+			t.Errorf("reserved alias accepted: %s", name)
+		}
+	}
+}
