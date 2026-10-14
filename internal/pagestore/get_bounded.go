@@ -4,6 +4,7 @@ package pagestore
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 )
 
@@ -25,6 +26,35 @@ func (tx *Tx) Has(bucket string, key []byte) (bool, error) {
 // It checks the bbolt slice length before cloning or admitting it to the cache.
 func (tx *Tx) GetBounded(bucket string, key []byte, maxBytes uint64) ([]byte, error) {
 	return tx.GetBoundedWithCharge(bucket, key, maxBytes, nil)
+}
+
+// ReadBounded calls read with a borrowed value only when its stored size is
+// within maxBytes. It holds the transaction lock while read runs, so read must
+// not retain the value or call methods on tx.
+func (tx *Tx) ReadBounded(bucket string, key []byte, maxBytes uint64, read func([]byte) error) error {
+	if tx == nil {
+		return ErrClosed
+	}
+	if read == nil {
+		return errors.New("pagestore: nil bounded read callback")
+	}
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if err := tx.check(); err != nil {
+		return err
+	}
+	b := tx.tx.Bucket([]byte(bucket))
+	if b == nil {
+		return nil
+	}
+	value := b.Get(key)
+	if value == nil {
+		return nil
+	}
+	if uint64(len(value)) > maxBytes {
+		return fmt.Errorf("%w: bucket %q has %d bytes, limit is %d", ErrValueTooLarge, bucket, len(value), maxBytes)
+	}
+	return read(value)
 }
 
 // GetBoundedWithCharge admits the value size before caching or cloning it.
@@ -63,4 +93,44 @@ func (tx *Tx) GetBoundedWithCharge(bucket string, key []byte, maxBytes uint64, c
 		tx.db.cache.put(ck, value)
 	}
 	return bytes.Clone(value), nil
+}
+
+// ReadPairBounded reads two borrowed records under one lock. Their combined
+// size is checked before read runs; read must not retain bytes or reenter tx.
+func (tx *Tx) ReadPairBounded(bucket string, first, second []byte, maxBytes uint64, read func([]byte, []byte) error) error {
+	if tx == nil {
+		return ErrClosed
+	}
+	if read == nil {
+		return errors.New("pagestore: nil bounded pair callback")
+	}
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if err := tx.check(); err != nil {
+		return err
+	}
+	if tx.pairCursor == nil || tx.pairBucket != bucket {
+		b := tx.tx.Bucket([]byte(bucket))
+		if b == nil {
+			return nil
+		}
+		tx.pairCursor, tx.pairBucket = b.Cursor(), bucket
+	}
+	// Seek restarts at the root after mutations; retain only one search stack.
+	cursor := tx.pairCursor
+	key, left := cursor.Seek(first)
+	if !bytes.Equal(key, first) {
+		left = nil
+	}
+	key, right := cursor.Seek(second)
+	if !bytes.Equal(key, second) {
+		right = nil
+	}
+	if left == nil && right == nil {
+		return nil
+	}
+	if uint64(len(left)) > maxBytes || uint64(len(right)) > maxBytes-uint64(len(left)) {
+		return fmt.Errorf("%w: bucket %q pair exceeds %d bytes", ErrValueTooLarge, bucket, maxBytes)
+	}
+	return read(left, right)
 }

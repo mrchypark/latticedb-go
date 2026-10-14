@@ -345,6 +345,60 @@ func TestPageVectorReinsertAfterAllDeletedResetsEntry(t *testing.T) {
 	}
 }
 
+func TestPageVectorUpdateReconnectsLowerLevelNodeAfterReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page-vector-reconnect")
+	db, err := pagestore.Open(path, pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := store.PageVectorIndex{Tx: write, Namespace: "default"}
+	meta := store.PageVectorMeta{EntryID: 2, LastID: 3, MaxLevel: 1, Count: 3, M: 2, Dimensions: 2, Valid: true}
+	if err = idx.Put(1, &store.PageVectorNode{Level: 0, Neighbors: [][]uint64{{}}, Vector: []float32{100, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = idx.Put(2, &store.PageVectorNode{Level: 1, Neighbors: [][]uint64{{1, 3}, {}}, Vector: []float32{10, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = idx.Put(3, &store.PageVectorNode{Level: 0, Neighbors: [][]uint64{{2}}, Vector: []float32{0, 0}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = idx.PutMeta(meta); err != nil {
+		t.Fatal(err)
+	}
+	if err = mutatePageVectorIndex(context.Background(), idx, &meta, 1, []float32{1, 0}, true, 2, &directSearchBudget{ctx: context.Background(), maxWork: 10_000, maxBytes: 1 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	if err = write.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = pagestore.Open(path, pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := (store.PageVectorIndex{Tx: read, Namespace: "default"}).Get(1)
+	if err != nil || !slices.Contains(updated.Neighbors[0], uint64(3)) {
+		_ = read.Rollback()
+		t.Fatalf("reconnected node=%+v err=%v, want level-0 link to 3", updated, err)
+	}
+	if err = read.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPageVectorNamespaceKeySeparatesDelimiterContainingFields(t *testing.T) {
 	a := VectorNamespace{Scope: "a\x00b", Property: "c", Dimensions: 2, Metric: VectorMetricL2}
 	b := VectorNamespace{Scope: "a", Property: "b\x00c", Dimensions: 2, Metric: VectorMetricL2}
@@ -694,6 +748,107 @@ func TestPageVectorMutationBudgetAggregatesNamespaces(t *testing.T) {
 		t.Fatalf("reopen after rejected aggregate mutation: %v", err)
 	}
 	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPageVectorCurrentAndNewAdmissionKeepsNamespaceSiblings(t *testing.T) {
+	namespace := VectorNamespace{Property: "embedding", Scope: "active", Dimensions: 2}
+	path := filepath.Join(t.TempDir(), "page-vector-current-and-new")
+	opts := OpenOptions{Create: true, PageStorage: true, EnableVector: true, VectorDimensions: 2, VectorIndexMode: VectorIndexHNSWSynchronous, VectorM: 4, VectorNamespaces: []VectorNamespace{namespace}, VectorIndexBuildMaxLogicalBytes: 8 << 20}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Update(func(tx *Tx) error {
+		for i := 0; i < 512; i++ {
+			if _, e := tx.CreateNode(CreateNodeOptions{Labels: []string{"active"}, Properties: map[string]any{"embedding": []float32{float32(i), 0}}}); e != nil {
+				return e
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	entryBytes := estimateVectorIndexBytesForM(1, 2, 4)
+	db.vectorIndexBuildMaxLogicalBytes = entryBytes*1025 - 1
+	if err = db.RebuildVectorIndexContext(context.Background()); err != nil {
+		t.Fatalf("rebuild retained-namespace admission=%v", err)
+	}
+	err = db.Update(func(tx *Tx) error {
+		_, e := tx.CreateNode(CreateNodeOptions{Labels: []string{"active"}, Properties: map[string]any{"embedding": []float32{9, 0}}})
+		return e
+	})
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("update admission=%v, want resource limit", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opts.Create = false
+	opts.VectorIndexBuildMaxLogicalBytes = entryBytes * 1025
+	db, err = Open(path, opts)
+	if err != nil {
+		t.Fatalf("reopen after rejected rebuild/update: %v", err)
+	}
+	defer db.Close()
+	for _, search := range []VectorSearchOptions{{K: 1}, {Namespace: &namespace, K: 1}} {
+		results, e := db.VectorSearch([]float32{0, 0}, search)
+		if e != nil || len(results) != 1 {
+			t.Fatalf("reopened search=%+v err=%v", results, e)
+		}
+	}
+}
+
+func TestPageVectorPrepareRebuildReleasesOnlyReplacedNamespaceBudget(t *testing.T) {
+	db, page, graph := pageVectorFixture(t, 512)
+	namespace := VectorNamespace{Property: "embedding", Dimensions: 2}
+	graph.VectorNamespaces = emptyVectorNamespaceStates([]VectorNamespace{namespace})
+	selector := func(n *store.NodeRecord) ([]float32, bool) { return n.Properties.FirstVector() }
+	shared := &pageVectorBuildBudget{maxPersistentBytes: 8 << 20, maxStagedBytes: 8 << 20}
+	build := &directSearchBudget{ctx: context.Background(), maxWork: 2_000_000, maxBytes: 8 << 20}
+	if err := rebuildPageVectorIndexWithBudget(context.Background(), page, "default", selector, 2, 4, shared, build); err != nil {
+		t.Fatal(err)
+	}
+	view := vectorNamespaceFacade(graph, namespace)
+	view.VectorDimensions = namespace.Dimensions
+	name := pageVectorNamespaceKey(&namespace)
+	if err := rebuildPageVectorIndexWithBudget(context.Background(), page, name, func(n *store.NodeRecord) ([]float32, bool) { return selectedVector(view, n) }, 2, 4, shared, build); err != nil {
+		t.Fatal(err)
+	}
+	index := store.PageVectorIndex{Tx: page.Tx, Namespace: "default"}
+	meta, err := index.Meta()
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Valid = false
+	if err := index.PutMeta(meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := page.Tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	write, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := store.CloneGraphState(graph)
+	current.PageBase = &store.PageGraph{Tx: write}
+	entryBytes := estimateVectorIndexBytesForM(1, 2, 4)
+	if err := preparePageVectorIndexes(context.Background(), current.PageBase, current, 2_000_000, entryBytes*1025-1); err != nil {
+		_ = write.Rollback()
+		t.Fatalf("open preparation rebuild=%v", err)
+	}
+	meta, err = (store.PageVectorIndex{Tx: write, Namespace: "default"}).Meta()
+	if err != nil || !meta.Valid || meta.Count != 512 {
+		_ = write.Rollback()
+		t.Fatalf("rebuilt metadata=%+v err=%v", meta, err)
+	}
+	if err := write.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -1,0 +1,3 @@
+ok  	github.com/mrchypark/latticedb-go/internal/search	0.437s
+ok  	github.com/mrchypark/latticedb-go/internal/engine	1.860s
+ok  	github.com/mrchypark/latticedb-go	1.249s

@@ -1,0 +1,141 @@
+File: optimized.test
+Type: alloc_space
+Time: 2026-10-13 22:46:33 KST
+Showing nodes accounting for 5236.61MB, 98.20% of 5332.47MB total
+Dropped 104 nodes (cum <= 26.66MB)
+      flat  flat%   sum%        cum   cum%
+ 1395.45MB 26.17% 26.17%  1524.46MB 28.59%  github.com/mrchypark/latticedb-go/internal/store.decodePageVectorNode
+     714MB 13.39% 39.56%  1810.47MB 33.95%  github.com/mrchypark/latticedb-go/internal/engine.pageVectorLayer
+  693.89MB 13.01% 52.57%   693.89MB 13.01%  bytes.growSlice
+  482.35MB  9.05% 61.62%   482.35MB  9.05%  bytes.Clone (inline)
+  364.20MB  6.83% 68.45%   364.20MB  6.83%  github.com/mrchypark/latticedb-go/internal/engine.pushVectorCandidateHeap
+  302.52MB  5.67% 74.12%   302.52MB  5.67%  go.etcd.io/bbolt.(*Cursor).search
+  214.61MB  4.02% 78.14%  1839.88MB 34.50%  github.com/mrchypark/latticedb-go/internal/engine.connectPageVectorNeighbor
+  118.51MB  2.22% 80.37%   118.51MB  2.22%  github.com/mrchypark/latticedb-go/internal/store.newBinaryDecoderBytes (inline)
+   99.50MB  1.87% 82.23%    99.50MB  1.87%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.key
+   98.02MB  1.84% 84.07%    98.02MB  1.84%  go.etcd.io/bbolt.Open.func2
+   96.55MB  1.81% 85.88%    96.55MB  1.81%  github.com/mrchypark/latticedb-go/internal/store.normalizeValue
+   87.52MB  1.64% 87.52%    87.52MB  1.64%  slices.Clone[go.shape.[]uint64,go.shape.uint64] (inline)
+   70.53MB  1.32% 88.85%    70.53MB  1.32%  github.com/mrchypark/latticedb-go/internal/store.decodeValue
+   69.53MB  1.30% 90.15%    69.53MB  1.30%  github.com/mrchypark/latticedb-go/internal/store.(*binaryDecoder).value
+      62MB  1.16% 91.31%   719.39MB 13.49%  github.com/mrchypark/latticedb-go/internal/store.encodePageRecordCapacity
+   57.01MB  1.07% 92.38%   128.54MB  2.41%  github.com/mrchypark/latticedb-go/internal/store.(*binaryDecoder).properties
+   42.57MB   0.8% 93.18%    59.58MB  1.12%  github.com/mrchypark/latticedb-go/internal/store.(*StreamStore).Publish
+   33.50MB  0.63% 93.81%    33.50MB  0.63%  slices.Clone[go.shape.[][]uint64,go.shape.[]uint64] (inline)
+   31.52MB  0.59% 94.40%    31.52MB  0.59%  go.etcd.io/bbolt.(*node).dereference
+   31.50MB  0.59% 94.99%    31.50MB  0.59%  go.etcd.io/bbolt.cloneBytes (inline)
+      28MB  0.53% 95.51%       29MB  0.54%  go.etcd.io/bbolt.(*Bucket).openBucket
+   27.50MB  0.52% 96.03%   146.01MB  2.74%  github.com/mrchypark/latticedb-go/internal/store.decodePageRecord
+      25MB  0.47% 96.50%    34.01MB  0.64%  github.com/mrchypark/latticedb-go/internal/store.encodeNormalizedPropertyMap
+   21.01MB  0.39% 96.89%    46.01MB  0.86%  github.com/mrchypark/latticedb-go/internal/store.encodeValue
+   10.70MB   0.2% 97.09%   221.80MB  4.16%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).pageCommit
+       9MB  0.17% 97.26%    34.01MB  0.64%  github.com/mrchypark/latticedb-go/internal/store.encodePropertyStorage-range1 (inline)
+    8.50MB  0.16% 97.42%  3590.90MB 67.34%  github.com/mrchypark/latticedb-go/internal/engine.insertPageVector
+    6.58MB  0.12% 97.55%  1157.88MB 21.71%  github.com/mrchypark/latticedb-go/internal/engine.(*pageVectorAccess).Get
+    5.50MB   0.1% 97.65%   302.11MB  5.67%  github.com/mrchypark/latticedb-go/internal/store.decodePageNodeAdmitted
+    5.50MB   0.1% 97.75%   149.07MB  2.80%  github.com/mrchypark/latticedb-go/internal/store.decodePropertyStorage
+       5MB 0.094% 97.85%  3921.13MB 73.53%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).visitReadRecord
+    4.50MB 0.084% 97.93%    30.69MB  0.58%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).appendPropertyChanges
+    3.50MB 0.066% 98.00%   697.39MB 13.08%  bytes.(*Buffer).grow
+    2.50MB 0.047% 98.04%    86.79MB  1.63%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).appendNodeChanges
+    2.50MB 0.047% 98.09%    36.51MB  0.68%  github.com/mrchypark/latticedb-go/internal/store.encodePropertyStorage
+       2MB 0.038% 98.13%    77.99MB  1.46%  github.com/mrchypark/latticedb-go/internal/store.(*binaryEncoder).properties
+    1.50MB 0.028% 98.16%    27.81MB  0.52%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).appendLabelChanges
+    1.50MB 0.028% 98.18%    77.36MB  1.45%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).ApplyStreamOperations
+       1MB 0.019% 98.20%   220.58MB  4.14%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).VisitNodes.func1
+         0     0% 98.20%   615.87MB 11.55%  bytes.(*Buffer).Grow (inline)
+         0     0% 98.20%    79.49MB  1.49%  bytes.(*Buffer).Write
+         0     0% 98.20%  4062.06MB 76.18%  github.com/mrchypark/latticedb-go.(*DB).Update
+         0     0% 98.20%    91.03MB  1.71%  github.com/mrchypark/latticedb-go.(*DB).VectorIndexStats
+         0     0% 98.20%   491.81MB  9.22%  github.com/mrchypark/latticedb-go.(*DB).VectorSearch
+         0     0% 98.20%  5328.22MB 99.92%  github.com/mrchypark/latticedb-go.BenchmarkVectorSearchDisk128D.func1
+         0     0% 98.20%   679.69MB 12.75%  github.com/mrchypark/latticedb-go.Open (inline)
+         0     0% 98.20%   679.69MB 12.75%  github.com/mrchypark/latticedb-go.OpenContext
+         0     0% 98.20%  4768.76MB 89.43%  github.com/mrchypark/latticedb-go.diskVectorDB
+         0     0% 98.20%   355.73MB  6.67%  github.com/mrchypark/latticedb-go.diskVectorRecall
+         0     0% 98.20%  4062.06MB 76.18%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).Update (inline)
+         0     0% 98.20%    91.03MB  1.71%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).VectorIndexStats
+         0     0% 98.20%   491.81MB  9.22%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).VectorSearch (inline)
+         0     0% 98.20%   491.81MB  9.22%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).VectorSearchContext
+         0     0% 98.20%   491.31MB  9.21%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).VectorSearchContext.func1
+         0     0% 98.20%   491.81MB  9.22%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).View
+         0     0% 98.20%  4062.06MB 76.18%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).updateContext
+         0     0% 98.20%    73.79MB  1.38%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).appendChange
+         0     0% 98.20%    86.79MB  1.63%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).appendChangefeed
+         0     0% 98.20%  4047.05MB 75.89%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitInternalContext
+         0     0% 98.20%  4047.05MB 75.89%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitPages
+         0     0% 98.20%  1158.76MB 21.73%  github.com/mrchypark/latticedb-go/internal/engine.(*pageVectorAccess).Put (inline)
+         0     0% 98.20%   364.20MB  6.83%  github.com/mrchypark/latticedb-go/internal/engine.(*vectorCandidateHeap).push (inline)
+         0     0% 98.20%   679.69MB 12.75%  github.com/mrchypark/latticedb-go/internal/engine.OpenContext
+         0     0% 98.20%  3599.40MB 67.50%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChange
+         0     0% 98.20%  3602.90MB 67.57%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChanges
+         0     0% 98.20%  3599.40MB 67.50%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChanges.func4
+         0     0% 98.20%  3599.40MB 67.50%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChanges.func5
+         0     0% 98.20%  3599.40MB 67.50%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChanges.func5.1
+         0     0% 98.20%  3596.90MB 67.45%  github.com/mrchypark/latticedb-go/internal/engine.mutatePageVectorIndexAccess
+         0     0% 98.20%   679.69MB 12.75%  github.com/mrchypark/latticedb-go/internal/engine.openPageDB
+         0     0% 98.20%    50.51MB  0.95%  github.com/mrchypark/latticedb-go/internal/engine.pageVectorGreedy
+         0     0% 98.20%   149.58MB  2.81%  github.com/mrchypark/latticedb-go/internal/engine.pageVectorSearch
+         0     0% 98.20%   651.68MB 12.22%  github.com/mrchypark/latticedb-go/internal/engine.preparePageVectorIndexes
+         0     0% 98.20%   650.18MB 12.19%  github.com/mrchypark/latticedb-go/internal/engine.preparePageVectorIndexes.func3
+         0     0% 98.20%   491.31MB  9.21%  github.com/mrchypark/latticedb-go/internal/engine.searchVectorGraph
+         0     0% 98.20%    28.01MB  0.53%  github.com/mrchypark/latticedb-go/internal/engine.validatePageGraphVectorsContext (inline)
+         0     0% 98.20%    91.03MB  1.71%  github.com/mrchypark/latticedb-go/internal/engine.vectorIndexStats
+         0     0% 98.20%   132.05MB  2.48%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).Commit
+         0     0% 98.20%    97.15MB  1.82%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).GetBoundedWithCharge
+         0     0% 98.20%   503.14MB  9.44%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).Put
+         0     0% 98.20%  1728.97MB 32.42%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).ReadBounded
+         0     0% 98.20%   119.55MB  2.24%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).Scan (inline)
+         0     0% 98.20%   119.55MB  2.24%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).ScanBounded
+         0     0% 98.20%   651.68MB 12.22%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).ScanKeys (inline)
+         0     0% 98.20%   992.91MB 18.62%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).ScanKeysWithCharge
+         0     0% 98.20%    36.52MB  0.68%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).scanEntry
+         0     0% 98.20%    55.03MB  1.03%  github.com/mrchypark/latticedb-go/internal/pagestore.(*recordCache).get
+         0     0% 98.20%  3602.40MB 67.56%  github.com/mrchypark/latticedb-go/internal/store.(*GraphState).VisitNode
+         0     0% 98.20%   432.27MB  8.11%  github.com/mrchypark/latticedb-go/internal/store.(*GraphState).VisitNodes
+         0     0% 98.20%   432.27MB  8.11%  github.com/mrchypark/latticedb-go/internal/store.(*GraphState).VisitNodes.func1
+         0     0% 98.20%   221.80MB  4.16%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).PageCommit
+         0     0% 98.20%    52.43MB  0.98%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).PutNode
+         0     0% 98.20%  3602.40MB 67.56%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).VisitNode
+         0     0% 98.20%  3599.40MB 67.50%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).VisitNode.func1
+         0     0% 98.20%   460.28MB  8.63%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).VisitNodes
+         0     0% 98.20%    82.53MB  1.55%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).VisitNodes.func2
+         0     0% 98.20%   341.23MB  6.40%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).scanReadRecords
+         0     0% 98.20%   318.73MB  5.98%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).scanReadRecords.func2
+         0     0% 98.20%   131.54MB  2.47%  github.com/mrchypark/latticedb-go/internal/store.(*binaryDecoder).node
+         0     0% 98.20%       42MB  0.79%  github.com/mrchypark/latticedb-go/internal/store.(*binaryEncoder).delta
+         0     0% 98.20%    37.64MB  0.71%  github.com/mrchypark/latticedb-go/internal/store.(*binaryEncoder).node
+         0     0% 98.20%    77.99MB  1.46%  github.com/mrchypark/latticedb-go/internal/store.(*binaryEncoder).value
+         0     0% 98.20%    75.99MB  1.43%  github.com/mrchypark/latticedb-go/internal/store.(*binaryEncoder).write
+         0     0% 98.20%  1151.30MB 21.59%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.Get
+         0     0% 98.20%  1801.47MB 33.78%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.GetBounded
+         0     0% 98.20%  1524.46MB 28.59%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.GetBounded.func1
+         0     0% 98.20%  1158.76MB 21.73%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.Put
+         0     0% 98.20%   651.68MB 12.22%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.VisitIDs
+         0     0% 98.20%   650.18MB 12.19%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.VisitIDs.func1
+         0     0% 98.20%    34.01MB  0.64%  github.com/mrchypark/latticedb-go/internal/store.Properties.All.func1 (inline)
+         0     0% 98.20%    39.31MB  0.74%  github.com/mrchypark/latticedb-go/internal/store.buildPersistedDelta
+         0     0% 98.20%    82.53MB  1.55%  github.com/mrchypark/latticedb-go/internal/store.decodePageNode (inline)
+         0     0% 98.20%       42MB  0.79%  github.com/mrchypark/latticedb-go/internal/store.encodeBinaryWALPayload
+         0     0% 98.20%    37.02MB  0.69%  github.com/mrchypark/latticedb-go/internal/store.encodePageNodeBounded
+         0     0% 98.20%    52.02MB  0.98%  github.com/mrchypark/latticedb-go/internal/store.encodePageRecordBounded (inline)
+         0     0% 98.20%    45.02MB  0.84%  github.com/mrchypark/latticedb-go/internal/store.encodePageStreamRecordBounded
+         0     0% 98.20%   432.27MB  8.11%  github.com/mrchypark/latticedb-go/internal/store.visitOverlay[go.shape.*uint8]
+         0     0% 98.20%       42MB  0.79%  github.com/mrchypark/latticedb-go/internal/store.writeBinaryWALPayload
+         0     0% 98.20%    40.50MB  0.76%  go.etcd.io/bbolt.(*Bucket).Bucket
+         0     0% 98.20%   210.51MB  3.95%  go.etcd.io/bbolt.(*Bucket).Get
+         0     0% 98.20%   112.84MB  2.12%  go.etcd.io/bbolt.(*Bucket).Put
+         0     0% 98.20%    31.52MB  0.59%  go.etcd.io/bbolt.(*Bucket).dereference
+         0     0% 98.20%   131.05MB  2.46%  go.etcd.io/bbolt.(*Bucket).spill
+         0     0% 98.20%   144.51MB  2.71%  go.etcd.io/bbolt.(*Cursor).searchNode
+         0     0% 98.20%   102.51MB  1.92%  go.etcd.io/bbolt.(*Cursor).searchPage
+         0     0% 98.20%   302.52MB  5.67%  go.etcd.io/bbolt.(*Cursor).seek
+         0     0% 98.20%   129.54MB  2.43%  go.etcd.io/bbolt.(*DB).allocate
+         0     0% 98.20%    31.52MB  0.59%  go.etcd.io/bbolt.(*DB).mmap
+         0     0% 98.20%    40.50MB  0.76%  go.etcd.io/bbolt.(*Tx).Bucket (inline)
+         0     0% 98.20%   132.05MB  2.48%  go.etcd.io/bbolt.(*Tx).Commit
+         0     0% 98.20%   129.54MB  2.43%  go.etcd.io/bbolt.(*Tx).allocate
+         0     0% 98.20%   131.05MB  2.46%  go.etcd.io/bbolt.(*node).spill
+         0     0% 98.20%    98.02MB  1.84%  sync.(*Pool).Get
+         0     0% 98.20%  5328.22MB 99.92%  testing.(*B).run1.func1
+         0     0% 98.20%  5328.22MB 99.92%  testing.(*B).runN

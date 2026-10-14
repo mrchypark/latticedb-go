@@ -1,0 +1,15 @@
+/tmp/latticedb-structures-20261014/final-direct.test: go1.27.1
+	path	github.com/mrchypark/latticedb-go.test
+	mod	github.com/mrchypark/latticedb-go	(devel)	
+	dep	go.etcd.io/bbolt	v1.5.0	h1:S7GAl7Fxv12yohbwFfIbQCGDWbQbtDGPET4P/bD4lxU=
+	dep	golang.org/x/sys	v0.48.0	h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	CGO_ENABLED=1
+	build	CGO_CFLAGS=
+	build	CGO_CPPFLAGS=
+	build	CGO_CXXFLAGS=
+	build	CGO_LDFLAGS=
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0

@@ -1,0 +1,38 @@
+File: latticedb-disk-candidate.test
+Type: cpu
+Time: 2026-10-13 21:44:46 KST
+Duration: 32.02s, Total samples = 28.51s (89.05%)
+Showing nodes accounting for 17.68s, 62.01% of 28.51s total
+Dropped 229 nodes (cum <= 0.14s)
+Showing top 30 nodes out of 119
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%     22.14s 77.66%  github.com/mrchypark/latticedb-go.BenchmarkVectorSearchDisk128D.func1
+         0     0%     0%     22.14s 77.66%  testing.(*B).run1.func1
+         0     0%     0%     22.14s 77.66%  testing.(*B).runN
+         0     0%     0%     21.90s 76.82%  github.com/mrchypark/latticedb-go.diskVectorDB
+         0     0%     0%     21.69s 76.08%  github.com/mrchypark/latticedb-go.(*DB).Update
+         0     0%     0%     21.69s 76.08%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).Update (inline)
+         0     0%     0%     21.69s 76.08%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).updateContext
+         0     0%     0%     21.69s 76.08%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitInternalContext
+         0     0%     0%     21.69s 76.08%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitPages
+         0     0%     0%     21.67s 76.01%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChanges
+         0     0%     0%     21.67s 76.01%  github.com/mrchypark/latticedb-go/internal/store.(*GraphState).VisitNode
+         0     0%     0%     21.67s 76.01%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).VisitNode
+         0     0%     0%     21.67s 76.01%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).visitReadRecord
+         0     0%     0%     21.65s 75.94%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChange
+         0     0%     0%     21.65s 75.94%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChanges.func3
+         0     0%     0%     21.65s 75.94%  github.com/mrchypark/latticedb-go/internal/engine.applyPageVectorChanges.func3.1
+         0     0%     0%     21.65s 75.94%  github.com/mrchypark/latticedb-go/internal/engine.insertPageVector
+         0     0%     0%     21.65s 75.94%  github.com/mrchypark/latticedb-go/internal/engine.mutatePageVectorIndex
+         0     0%     0%     21.65s 75.94%  github.com/mrchypark/latticedb-go/internal/store.(*PageGraph).VisitNode.func1
+     1.13s  3.96%  3.96%     21.61s 75.80%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.GetBounded
+     0.01s 0.035%  4.00%     21.42s 75.13%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.Get
+     0.46s  1.61%  5.61%     18.39s 64.50%  github.com/mrchypark/latticedb-go/internal/store.(*binaryDecoder).u
+     3.45s 12.10% 17.71%     17.93s 62.89%  encoding/binary.ReadUvarint
+         0     0% 17.71%     15.11s 53.00%  github.com/mrchypark/latticedb-go/internal/engine.connectPageVectorNeighbor
+     1.26s  4.42% 22.13%     14.47s 50.75%  github.com/mrchypark/latticedb-go/internal/store.(*binaryDecoder).ReadByte
+     3.19s 11.19% 33.32%     13.21s 46.33%  github.com/mrchypark/latticedb-go/internal/store.(*binaryDecoder).read
+     0.02s  0.07% 33.39%     10.95s 38.41%  github.com/mrchypark/latticedb-go/internal/engine.selectPageVectorNeighbors
+     0.10s  0.35% 33.74%      9.95s 34.90%  io.ReadFull (inline)
+     5.04s 17.68% 51.42%      9.85s 34.55%  io.ReadAtLeast
+     3.02s 10.59% 62.01%      4.79s 16.80%  bytes.(*Reader).Read

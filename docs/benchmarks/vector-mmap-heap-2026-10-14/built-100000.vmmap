@@ -1,0 +1,60 @@
+Process:         baseline.test [36596]
+Path:            /private/tmp/*/baseline.test
+Load Address:    0x1025d8000
+Identifier:      baseline.test
+Version:         ???
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  time [36595]
+Target Type:     corpse
+
+Date/Time:       2026-10-14 08:03:42.767 +0900
+Launch Time:     2026-10-14 07:59:58.407 +0900
+OS Version:      macOS 26.3 (25D125)
+Report Version:  7
+Analysis Tool:   /usr/bin/vmmap
+
+Physical footprint:         344.4M
+Physical footprint (peak):  365.5M
+Idle exit:                  untracked
+----
+
+ReadOnly portion of Libraries: Total=878.6M resident=165.4M(19%) swapped_out_or_unallocated=713.2M(81%)
+Writable regions: Total=518.8M written=849K(0%) resident=354.3M(68%) swapped_out=592K(0%) unallocated=164.0M(32%)
+
+                                VIRTUAL RESIDENT    DIRTY  SWAPPED VOLATILE   NONVOL    EMPTY   REGION 
+REGION TYPE                        SIZE     SIZE     SIZE     SIZE     SIZE     SIZE     SIZE    COUNT (non-coalesced) 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+Kernel Alloc Once                   32K      16K      16K       0K       0K       0K       0K        1 
+MALLOC guard page                   32K       0K       0K       0K       0K       0K       0K        2 
+MALLOC metadata                   64.8M     224K     224K       0K       0K       0K       0K        6 
+MALLOC_SMALL                      8192K      32K      32K      96K       0K       0K       0K        2         see MALLOC ZONE table below
+MALLOC_TINY                       4096K      32K      32K      32K       0K       0K       0K        1         see MALLOC ZONE table below
+STACK GUARD                       56.1M       0K       0K       0K       0K       0K       0K        5 
+Stack                             10.1M      80K      80K      48K       0K       0K       0K        5 
+VM_ALLOCATE                        1.5G   353.0M   340.7M     416K       0K       0K       0K      192 
+__AUTH                            1303K     775K       0K     1104       0K       0K       0K      144 
+__AUTH_CONST                      17.0M    10.0M       0K       0K       0K       0K       0K      332 
+__CTF                               824      824       0K       0K       0K       0K       0K        1 
+__DATA                            36.5M    2294K     364K     176K       0K       0K       0K      290 
+__DATA_CONST                      16.2M    10.9M     892K     144K       0K       0K       0K      332 
+__DATA_DIRTY                      1288K     744K     120K     210K       0K       0K       0K      277 
+__FONT_DATA                        2352     2352       0K       0K       0K       0K       0K        1 
+__LINKEDIT                       588.6M    20.4M       0K       0K       0K       0K       0K        2 
+__OBJC_RO                         78.4M    48.9M       0K       0K       0K       0K       0K        1 
+__OBJC_RW                         2571K    2171K      43K       0K       0K       0K       0K        1 
+__TEXT                           290.0M   145.0M       0K       0K       0K       0K       0K      341 
+__TPRO_CONST                       128K      32K      32K      16K       0K       0K       0K        2 
+mapped file                      512.0M   275.1M       4K       0K       0K       0K       0K        2 
+page table in kernel               753K     753K     753K       0K       0K       0K       0K        1 
+shared memory                       32K      32K      32K       0K       0K       0K       0K        1 
+unused .note.gnu.prope              320      320       0K       0K       0K       0K       0K        1 
+unused but dirty shlib __DATA      105K      29K      29K      77K       0K       0K       0K       69 
+===========                     ======= ========    =====  ======= ========   ======    =====  ======= 
+TOTAL                              3.1G   870.3M   343.3M    1216K       0K       0K       0K     2012 
+
+                                 VIRTUAL   RESIDENT      DIRTY    SWAPPED ALLOCATION      BYTES DIRTY+SWAP          REGION
+MALLOC ZONE                         SIZE       SIZE       SIZE       SIZE      COUNT  ALLOCATED  FRAG SIZE  % FRAG   COUNT
+===========                      =======  =========  =========  =========  =========  =========  =========  ======  ======
+DefaultMallocZone_0x1056dc000      12.5M       112K       112K       128K        864        81K       159K     67%       5
+

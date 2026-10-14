@@ -17,10 +17,10 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       GOMAXPROCS: 2
-      ZIG_BENCH_CONFIG: "v1;repo=jeffhajewski/latticedb;host=ubuntu-x86_64;target=native;optimize=ReleaseFast;step=vector-benchmark;args=--scale 100000 --scale-only"
+      ZIG_BENCH_CONFIG: "disk-v1;public-db;batch=1000;cache-mib=64;M=16;ef=64;input=binary-f32;reopen=true;optimize=ReleaseFast"
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -104,64 +104,7 @@ jobs:
             fi
           fi
 
-      - name: Download compatible Zig reference
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          while IFS= read -r run_id; do
-            [[ -n "$run_id" ]] || continue
-            download_dir=$(mktemp -d)
-            if ! gh run download "$run_id" --name performance-results --dir "$download_dir"; then
-              continue
-            fi
-            if [[ -f "$download_dir/zig.txt" && -f "$download_dir/zig-revision.txt" && -f "$download_dir/zig-version.txt" && -f "$download_dir/zig-ref.txt" && -f "$download_dir/zig-sha256.txt" && -f "$download_dir/lattice-version.txt" && -f "$download_dir/zig-archive-sha256.txt" && -f "$download_dir/zig-tag.txt" && -f "$download_dir/zig-bench-config.txt" ]] \
-              && [[ "$(<"$download_dir/zig-bench-config.txt")" == "$ZIG_BENCH_CONFIG" ]] \
-              && [[ "$(<"$download_dir/lattice-version.txt")" == "$LATTICE_VERSION" ]] \
-              && [[ "$(<"$download_dir/zig-tag.txt")" == "$ZIG_TAG" ]] \
-              && [[ "$(<"$download_dir/zig-version.txt")" == "$ZIG_VERSION" ]] \
-              && [[ "$(<"$download_dir/zig-archive-sha256.txt")" == "$ZIG_SHA256" ]] \
-              && [[ "$(<"$download_dir/zig-ref.txt")" == "$ZIG_REF" ]] \
-              && [[ "$(<"$download_dir/zig-revision.txt")" == "$ZIG_REF" ]] \
-              && (cd "$download_dir" && sha256sum --check --status zig-sha256.txt) \
-              && go run ./scripts/benchcmp.go -validate-zig "$download_dir/zig.txt" >/dev/null 2>&1; then
-              cp "$download_dir"/zig{.txt,-revision.txt,-version.txt,-ref.txt,-sha256.txt,-bench-config.txt} previous/
-              printf '%s\n' "$LATTICE_VERSION" > previous/lattice-version.txt
-              printf '%s\n' "$ZIG_SHA256" > previous/zig-archive-sha256.txt
-              printf '%s\n' "$ZIG_TAG" > previous/zig-tag.txt
-              break
-            fi
-          done < <(gh run list --workflow benchmark.yml --branch main --status success --limit 20 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
-
-      - name: Reuse or prepare Zig reference
-        run: |
-          mkdir -p results
-          if [[ -f previous/zig.txt && -f previous/zig-revision.txt && -f previous/zig-version.txt && -f previous/lattice-version.txt && -f previous/zig-archive-sha256.txt && -f previous/zig-tag.txt && -f previous/zig-ref.txt && -f previous/zig-sha256.txt && -f previous/zig-bench-config.txt ]] \
-            && [[ "$(<previous/zig-bench-config.txt)" == "$ZIG_BENCH_CONFIG" ]] \
-            && [[ "$(<previous/lattice-version.txt)" == "$LATTICE_VERSION" ]] \
-            && [[ "$(<previous/zig-version.txt)" == "$ZIG_VERSION" ]] \
-            && [[ "$(<previous/zig-archive-sha256.txt)" == "$ZIG_SHA256" ]] \
-            && [[ "$(<previous/zig-tag.txt)" == "$ZIG_TAG" ]] \
-            && [[ "$(<previous/zig-ref.txt)" == "$ZIG_REF" ]] \
-            && [[ "$(<previous/zig-revision.txt)" =~ ^[0-9a-f]{40}$ ]] \
-            && [[ "$(<previous/zig-revision.txt)" == "$ZIG_REF" ]] \
-            && (cd previous && sha256sum --check --status zig-sha256.txt) \
-            && go run ./scripts/benchcmp.go -validate-zig previous/zig.txt; then
-            cp previous/zig.txt results/zig.txt
-            cp previous/zig-revision.txt results/zig-revision.txt
-            cp previous/zig-version.txt results/zig-version.txt
-            cp previous/lattice-version.txt results/lattice-version.txt
-            cp previous/zig-archive-sha256.txt results/zig-archive-sha256.txt
-            cp previous/zig-tag.txt results/zig-tag.txt
-            cp previous/zig-ref.txt results/zig-ref.txt
-            cp previous/zig-sha256.txt results/zig-sha256.txt
-            cp previous/zig-bench-config.txt results/zig-bench-config.txt
-            echo 'ZIG_REUSED=true' >> "$GITHUB_ENV"
-          else
-            echo 'ZIG_REUSED=false' >> "$GITHUB_ENV"
-          fi
-
       - name: Install Zig
-        if: env.ZIG_REUSED != 'true'
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/zig.tar.xz"
@@ -172,7 +115,6 @@ jobs:
           tar -xJf "$archive" -C "$RUNNER_TEMP"
           printf '%s\n' "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
       - uses: actions/checkout@v7.0.1
-        if: env.ZIG_REUSED != 'true'
         with:
           repository: jeffhajewski/latticedb
           ref: ${{ steps.resolve_zig.outputs.zig_ref }}
@@ -214,14 +156,26 @@ jobs:
             printf '%s\n' "$BASE_SHA" > previous/revision.txt
           fi
 
-      - name: Run Zig reference benchmark (100K)
-        if: env.ZIG_REUSED != 'true'
+      - name: Run public Go disk benchmark (100K)
         run: |
+          mkdir -p results/fixtures
           set -o pipefail
-          (
-            cd "$GITHUB_WORKSPACE/zig-reference"
-            zig build vector-benchmark -Doptimize=ReleaseFast -- --scale 100000 --scale-only
-          ) 2>&1 | tee results/zig.txt
+          LATTICEDB_VECTOR_FIXTURE_DIR="$GITHUB_WORKSPACE/results/fixtures" \
+            go test -timeout 120m -run '^$' -bench '^BenchmarkVectorSearchDisk128D$/^100K$' -benchtime=1x -count=1 . | tee -a results/current.txt
+          sha256sum results/fixtures/vectors-100000.bin > results/vector-fixture-sha256.txt
+
+      - name: Run public Zig disk benchmark (100K)
+        run: |
+          set -euo pipefail
+          zig build-exe -O ReleaseFast -lc \
+            --dep lattice --dep compat -Mroot=scripts/vector-disk-zig.zig \
+            --dep compat --dep lattice -Mlattice=zig-reference/src/main.zig \
+            -Mcompat=zig-reference/src/compat.zig \
+            -femit-bin="$RUNNER_TEMP/vector-disk-zig"
+          env -u LATTICE_BUFFER_POOL_MB "$RUNNER_TEMP/vector-disk-zig" \
+            results/fixtures/vectors-100000.bin "$RUNNER_TEMP/vector-disk-zig.db" 2>&1 | tee results/zig.txt
+          go run ./scripts/benchcmp.go -validate-zig results/zig.txt
+          sha256sum scripts/vector-disk-zig.zig > results/zig-adapter-sha256.txt
           zig_revision=$(git -C "$GITHUB_WORKSPACE/zig-reference" rev-parse HEAD)
           [[ "$zig_revision" == "$ZIG_REF" ]]
           printf '%s\n' "$zig_revision" > results/zig-revision.txt
@@ -235,13 +189,7 @@ jobs:
 
       - name: Create comparison report
         run: |
-          zig_status='freshly measured in this run'
-          zig_fresh=false
-          if [[ "$ZIG_REUSED" == true ]]; then
-            zig_status='reused from a compatible successful benchmark artifact; not measured in this run'
-          else
-            zig_fresh=true
-          fi
+          zig_status='freshly measured public disk API in this run'
           go run ./scripts/benchcmp.go \
             -current results/current.txt \
             -previous previous/current.txt \
@@ -251,7 +199,7 @@ jobs:
             -previous-label "$(cat previous/revision.txt)" \
             -zig results/zig.txt \
             -zig-label "jeffhajewski/latticedb@$(cat results/zig-revision.txt) (Zig $(cat results/zig-version.txt), ReleaseFast; $zig_status)" \
-            -zig-fresh="$zig_fresh" \
+            -zig-fresh=true \
             -output results/report.md
           printf 'Zig reference: %s (Zig %s, ref %s).\n\n' "$zig_status" "$(cat results/zig-version.txt)" "$(cat results/zig-ref.txt)" >> "$GITHUB_STEP_SUMMARY"
           cat results/report.md >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,9 @@
 package latticedb
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"hash/crc32"
 	"path/filepath"
 	"testing"
 
@@ -106,12 +109,18 @@ func TestPageVectorRejectsOversizedDecodedDegree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	idx := store.PageVectorIndex{Tx: w, Namespace: "degree"}
-	neighbors := make([]uint64, 129)
-	for i := range neighbors {
-		neighbors[i] = uint64(i + 1)
+	// Inject the malformed record directly: normal writers reject this degree.
+	data := []byte{1, 5, 0, 0, 0, 0, 0, 0, 2}
+	data = binary.AppendUvarint(data, 130)
+	for id := uint64(1); id <= 129; id++ {
+		data = binary.AppendUvarint(data, id)
 	}
-	if err = idx.Put(1, &store.PageVectorNode{Level: 0, Neighbors: [][]uint64{neighbors}, Vector: []float32{0, 0}}); err != nil {
+	data = append(data, 3, 0, 0)
+	binary.BigEndian.PutUint32(data[2:6], crc32.ChecksumIEEE(data[6:]))
+	prefix := sha256.Sum256([]byte("degree"))
+	key := append([]byte{1}, prefix[:]...)
+	key = binary.BigEndian.AppendUint64(key, 1)
+	if err = w.Put("vector-hnsw", key, data); err != nil {
 		t.Fatal(err)
 	}
 	if err = w.Commit(); err != nil {

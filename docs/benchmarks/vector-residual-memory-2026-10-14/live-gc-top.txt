@@ -1,0 +1,24 @@
+File: diagnostic.test
+Type: inuse_space
+Time: 2026-10-14 01:01:31 KST
+Showing nodes accounting for 201.21MB, 99.50% of 202.22MB total
+Dropped 7 nodes (cum <= 1.01MB)
+      flat  flat%   sum%        cum   cum%
+  153.37MB 75.85% 75.85%   153.37MB 75.85%  go.etcd.io/bbolt.Open.func2
+   47.84MB 23.66% 99.50%    47.84MB 23.66%  github.com/mrchypark/latticedb-go/internal/benchvector.Generate
+         0     0% 99.50%   153.88MB 76.10%  github.com/mrchypark/latticedb-go.(*DB).Update
+         0     0% 99.50%   201.72MB 99.75%  github.com/mrchypark/latticedb-go.BenchmarkVectorSearchDisk128D.func1
+         0     0% 99.50%   153.88MB 76.10%  github.com/mrchypark/latticedb-go.diskVectorDB
+         0     0% 99.50%   153.88MB 76.10%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).Update (inline)
+         0     0% 99.50%   153.88MB 76.10%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).updateContext
+         0     0% 99.50%   153.88MB 76.10%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitInternalContext
+         0     0% 99.50%   153.88MB 76.10%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitPages
+         0     0% 99.50%   153.88MB 76.10%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).Commit
+         0     0% 99.50%   153.88MB 76.10%  go.etcd.io/bbolt.(*Bucket).spill
+         0     0% 99.50%   153.37MB 75.85%  go.etcd.io/bbolt.(*DB).allocate
+         0     0% 99.50%   153.88MB 76.10%  go.etcd.io/bbolt.(*Tx).Commit
+         0     0% 99.50%   153.37MB 75.85%  go.etcd.io/bbolt.(*Tx).allocate
+         0     0% 99.50%   153.88MB 76.10%  go.etcd.io/bbolt.(*node).spill
+         0     0% 99.50%   153.37MB 75.85%  sync.(*Pool).Get
+         0     0% 99.50%   201.72MB 99.75%  testing.(*B).run1.func1
+         0     0% 99.50%   201.72MB 99.75%  testing.(*B).runN

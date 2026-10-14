@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -170,6 +171,58 @@ func TestReportComparesPureGoWithZig100K(t *testing.T) {
 	writeReport(&report, current, result{}, "head", "base", zig, "upstream@abc", false)
 	if !strings.Contains(report.String(), "The Zig result was not measured in this CI run") {
 		t.Fatalf("reused Zig report omitted provenance:\n%s", report.String())
+	}
+}
+
+type brokenReportWriter struct{}
+
+func (brokenReportWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestReportPropagatesWriteFailure(t *testing.T) {
+	if err := writeReport(brokenReportWriter{}, result{}, result{}, "head", "base", nil, "", false); err != io.ErrClosedPipe {
+		t.Fatalf("write failure = %v", err)
+	}
+}
+
+func TestDiskComparisonRequiresDiskEvidence(t *testing.T) {
+	line := "DISK_VECTOR_V1 n=100000 build_ms=1000 reopen_ms=2 mean_ns=500000 p99_ns=700000 recall=98 file_bytes=4096"
+	zig, err := parseZig(strings.NewReader(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := parse(strings.NewReader("BenchmarkVectorSearchDisk128D/100K-8 1 900000 ns/op 1 disk-api-contract 1234 index-build-ms 3 reopen-ms 8192 file-bytes 800000 mean-ns 1100000 p99-ns 99 recall@10\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report bytes.Buffer
+	if err := writeReport(&report, current, result{}, "head", "base", zig, "Zig", true); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Go vs Zig public disk APIs (100K)", "Durable build + close (ms)", "public persistent DB APIs", "| Recall@10 | 99.0% | 98.0%"} {
+		if !strings.Contains(report.String(), want) {
+			t.Fatalf("missing %q", want)
+		}
+	}
+	delete(current["BenchmarkVectorSearchDisk128D/100K"], "disk-api-contract")
+	if err := writeReport(&report, current, result{}, "head", "base", zig, "Zig", true); err == nil {
+		t.Fatal("accepted missing disk contract")
+	}
+	validGo := "BenchmarkVectorSearchDisk128D/100K-8 1 900000 ns/op 1 disk-api-contract 1234 index-build-ms 3 reopen-ms 8192 file-bytes 800000 mean-ns 1100000 p99-ns 99 recall@10\n"
+	for _, bad := range []string{
+		strings.Replace(validGo, "1 disk-api-contract", "2 disk-api-contract", 1),
+		strings.Replace(validGo, "1 disk-api-contract", "", 1),
+		strings.Replace(validGo, "3 reopen-ms", "", 1),
+		strings.Replace(validGo, "3 reopen-ms", "bad reopen-ms", 1),
+		strings.Replace(validGo, "1 disk-api-contract", "1 disk-api-contract 1 disk-api-contract", 1),
+	} {
+		if _, err := parse(strings.NewReader(validGo + bad)); err == nil {
+			t.Fatalf("accepted mixed disk samples: %s", bad)
+		}
+	}
+	for _, bad := range []string{strings.Replace(line, "recall=98", "recall=101", 1), line + " n=100000", strings.Replace(line, "file_bytes=4096", "file_bytes=0", 1), strings.Replace(line, "mean_ns=500000", "mean_ns=NaN", 1)} {
+		if _, err := parseZig(strings.NewReader(bad)); err == nil {
+			t.Fatalf("accepted %s", bad)
+		}
 	}
 }
 

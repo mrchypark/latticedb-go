@@ -1,0 +1,22 @@
+File: cursor-diag.test
+Type: alloc_space
+Time: 2026-10-14 08:10:27 KST
+Showing nodes accounting for 40.18GB, 91.40% of 43.96GB total
+Dropped 120 nodes (cum <= 0.22GB)
+Showing top 15 nodes out of 109
+      flat  flat%   sum%        cum   cum%
+   11.77GB 26.77% 26.77%    11.77GB 26.77%  github.com/mrchypark/latticedb-go/internal/store.decodePageVectorBase
+   11.02GB 25.06% 51.83%    11.02GB 25.06%  github.com/mrchypark/latticedb-go/internal/store.decodePageVectorHeader
+    2.73GB  6.22% 58.05%     7.19GB 16.35%  github.com/mrchypark/latticedb-go/internal/engine.(*pageVectorAccess).Put
+    2.36GB  5.36% 63.42%     2.36GB  5.36%  github.com/mrchypark/latticedb-go/internal/store.newBinaryDecoderBytes (inline)
+    2.26GB  5.15% 68.56%     2.26GB  5.15%  go.etcd.io/bbolt.Open.func2
+    1.91GB  4.35% 72.91%     1.91GB  4.35%  go.etcd.io/bbolt.(*Cursor).search
+    1.63GB  3.72% 76.63%     1.63GB  3.72%  bytes.growSlice
+    1.45GB  3.29% 79.93%     1.45GB  3.29%  github.com/mrchypark/latticedb-go/internal/engine.(*pageVectorAccess).admit
+    1.40GB  3.17% 83.10%     1.40GB  3.17%  github.com/mrchypark/latticedb-go/internal/store.PageVectorIndex.key
+    0.92GB  2.08% 85.19%     0.92GB  2.08%  slices.Clone[go.shape.[]uint64,go.shape.uint64]
+    0.70GB  1.60% 86.78%     3.06GB  6.96%  github.com/mrchypark/latticedb-go/internal/store.decodePageRecord
+    0.61GB  1.38% 88.16%     1.89GB  4.29%  github.com/mrchypark/latticedb-go/internal/store.encodePageRecordCapacity
+    0.56GB  1.27% 89.43%     0.56GB  1.27%  github.com/mrchypark/latticedb-go/internal/store.decodePageVectorValues
+    0.45GB  1.02% 90.45%     0.61GB  1.38%  github.com/mrchypark/latticedb-go/internal/store.(*binaryDecoder).properties
+    0.42GB  0.95% 91.40%     0.57GB  1.30%  github.com/mrchypark/latticedb-go/internal/store.(*StreamStore).Publish

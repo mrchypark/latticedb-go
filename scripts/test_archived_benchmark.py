@@ -3,6 +3,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import os
 import tempfile
 import unittest
 
@@ -14,7 +15,7 @@ class ArchivedBenchmarkTest(unittest.TestCase):
             root = Path(directory) / 'archive'
             shutil.copytree(source, root)
             def generate():
-                return subprocess.run([sys.executable, str(root / 'summarize.py')], capture_output=True)
+                return subprocess.run([sys.executable, str(root / 'summarize.py')], capture_output=True, env={**os.environ, 'LC_ALL': 'C', 'PYTHONUTF8': '0', 'PYTHONCOERCECLOCALE': '0'})
             result = generate()
             self.assertEqual(result.returncode, 0, result.stderr)
             outputs = {name: (root / name).read_bytes() for name in ['REPORT.md', 'summary.csv']}

@@ -35,3 +35,9 @@ func TestPageVectorConfigurationHistoryBindsAllocatorFrame(t *testing.T) {
 		t.Fatal("configuration history omitted allocator high-water marks from the commit frame")
 	}
 }
+
+func TestPageCommitPreflightRejectsArchiveOversizedPayload(t *testing.T) {
+	if _, err := encodeWALHeaderFields("00000000000000000000000000000001", 1, uint64(maxWALPayloadBytes+1), 0); err == nil {
+		t.Fatal("page commit preflight accepted an archive-oversized payload")
+	}
+}

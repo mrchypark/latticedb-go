@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,6 +18,8 @@ type exportPathLock struct {
 	file      *os.File
 	info      os.FileInfo
 }
+
+const exportLockDirectory = ".latticedb-export-locks"
 
 // ponytail: scan only active locks by file identity; add an inode index if
 // concurrent exports are ever numerous enough for this bounded registry to matter.
@@ -36,15 +40,31 @@ func acquireExportLockContext(ctx context.Context, path string) (func(), error) 
 	if err != nil {
 		return nil, err
 	}
-	lockPath := path + ".lock"
+	lockPath, err := exportLockPath(path)
+	if err != nil {
+		return nil, err
+	}
+	directory, err := os.OpenRoot(filepath.Dir(lockPath))
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	opened, err := directory.Stat(".")
+	if err != nil {
+		return nil, err
+	}
+	current, err := os.Lstat(filepath.Dir(lockPath))
+	if err != nil || !current.IsDir() || !os.SameFile(opened, current) {
+		return nil, errors.New("export lock directory identity changed")
+	}
 	exportPathLocks.Lock()
-	entry, err := findExportPathLock(lockPath)
+	entry, err := findExportPathLock(directory, filepath.Base(lockPath))
 	if err != nil {
 		exportPathLocks.Unlock()
 		return nil, err
 	}
 	if entry == nil {
-		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+		file, err := directory.OpenFile(filepath.Base(lockPath), os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
 			exportPathLocks.Unlock()
 			return nil, err
@@ -108,16 +128,77 @@ func acquireExportLockContext(ctx context.Context, path string) (func(), error) 
 	}, nil
 }
 
+func exportLockPath(path string) (string, error) {
+	directory := filepath.Join(filepath.Dir(path), exportLockDirectory)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", fmt.Errorf("create export parent directory: %w", err)
+	}
+	mode := os.FileMode(0o777) | os.ModeSticky
+	if runtime.GOOS == "windows" {
+		mode = 0o777
+	}
+	if _, err := os.Lstat(directory); errors.Is(err, os.ErrNotExist) {
+		staging, err := os.MkdirTemp(filepath.Dir(path), exportLockDirectory+".init-")
+		if err != nil {
+			return "", err
+		}
+		defer os.RemoveAll(staging)
+		// A published directory stays nonempty, so competing renames cannot replace it.
+		if err := os.WriteFile(filepath.Join(staging, ".ready"), nil, 0o600); err != nil {
+			return "", err
+		}
+		root, err := os.OpenRoot(staging)
+		if err != nil {
+			return "", err
+		}
+		chmodErr := root.Chmod(".", mode)
+		closeErr := root.Close()
+		if err := errors.Join(chmodErr, closeErr); err != nil {
+			return "", fmt.Errorf("set export lock directory permissions: %w", err)
+		}
+		if err := os.Rename(staging, directory); err != nil {
+			if _, statErr := os.Lstat(directory); statErr != nil {
+				return "", fmt.Errorf("publish export lock directory: %w", err)
+			}
+		}
+	} else if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", errors.New("export lock directory must be a real directory")
+	}
+	root, err := os.OpenRoot(directory)
+	if err != nil {
+		return "", err
+	}
+	defer root.Close()
+	opened, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, opened) {
+		return "", errors.New("export lock directory identity changed")
+	}
+	if runtime.GOOS != "windows" && (opened.Mode().Perm() != 0o777 || opened.Mode()&os.ModeSticky == 0) {
+		return "", errors.New("export lock directory requires sticky shared permissions")
+	}
+	return filepath.Join(directory, filepath.Base(path)+".lock"), nil
+}
+
 // findExportPathLock runs while exportPathLocks is held. It checks the lock
 // file before opening anything, because closing a redundant descriptor can
 // release this process's POSIX record lock.
-func findExportPathLock(lockPath string) (*exportPathLock, error) {
-	info, err := os.Stat(lockPath)
+func findExportPathLock(directory *os.Root, name string) (*exportPathLock, error) {
+	info, err := directory.Lstat(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("export lock must be a regular file")
 	}
 	for _, entry := range exportPathLocks.entries {
 		if os.SameFile(info, entry.info) {
@@ -131,6 +212,9 @@ func canonicalExportOutputPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("resolve export output path: %w", err)
+	}
+	if exportPathIsReserved(abs) {
+		return "", errors.New("export destination is inside the reserved lock directory")
 	}
 	current := abs
 	var missing []string
@@ -152,6 +236,9 @@ func canonicalExportOutputPath(path string) (string, error) {
 				if multiple {
 					return "", errors.New("export outputs with multiple hard links are unsupported")
 				}
+			}
+			if exportPathIsReserved(canonical) {
+				return "", errors.New("export destination is inside the reserved lock directory")
 			}
 			return canonical, nil
 		}
@@ -179,5 +266,17 @@ func canonicalExportOutputPath(path string) (string, error) {
 		}
 		missing = append(missing, filepath.Base(current))
 		current = parent
+	}
+}
+
+func exportPathIsReserved(path string) bool {
+	for directory := path; ; directory = filepath.Dir(directory) {
+		name, _, _ := strings.Cut(strings.ToLower(filepath.Base(directory)), ".init-")
+		if strings.EqualFold(name, exportLockDirectory) {
+			return true
+		}
+		if filepath.Dir(directory) == directory {
+			return false
+		}
 	}
 }

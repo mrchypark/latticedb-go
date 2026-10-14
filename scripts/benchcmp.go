@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,11 +17,15 @@ import (
 type result map[string]map[string][]float64
 
 type zigResult struct {
-	insertMS float64
-	meanNS   float64
-	p99NS    float64
-	recall   float64
-	memoryMB float64
+	disk      bool
+	scale     int
+	reopenMS  float64
+	fileBytes float64
+	insertMS  float64
+	meanNS    float64
+	p99NS     float64
+	recall    float64
+	memoryMB  float64
 }
 
 type performanceGate struct {
@@ -80,6 +85,27 @@ func parse(r io.Reader) (result, error) {
 		name := cpuSuffix.ReplaceAllString(fields[0], "")
 		name = strings.Replace(name, "BenchmarkVectorSearchZigHarness", "BenchmarkVectorSearchClustered128D", 1)
 		name = strings.Replace(name, "BenchmarkVectorIndexBuildZigHarness", "BenchmarkVectorIndexBuildClustered128D", 1)
+		if strings.HasPrefix(name, "BenchmarkVectorSearchDisk128D/") {
+			for _, unit := range []string{"disk-api-contract", "index-build-ms", "reopen-ms", "file-bytes", "mean-ns", "p99-ns", "recall@10"} {
+				count := 0
+				for i, field := range fields {
+					if field != unit {
+						continue
+					}
+					count++
+					if i < 3 || i%2 == 0 {
+						return nil, fmt.Errorf("benchmark %s: malformed %s", name, unit)
+					}
+					v, err := strconv.ParseFloat(fields[i-1], 64)
+					if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || (unit == "disk-api-contract" && v != 1) || (unit == "recall@10" && v > 100) || (unit == "file-bytes" && v == 0) {
+						return nil, fmt.Errorf("benchmark %s: invalid %s", name, unit)
+					}
+				}
+				if count != 1 {
+					return nil, fmt.Errorf("benchmark %s: require exactly one %s per sample", name, unit)
+				}
+			}
+		}
 		markerCount := 0
 		for i, field := range fields {
 			if field == "source-admission-contract" {
@@ -125,6 +151,9 @@ func parse(r io.Reader) (result, error) {
 func parseZig(r io.Reader) (*zigResult, error) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "DISK_VECTOR_V1 ") {
+			return parseDiskVector(scanner.Text())
+		}
 		parts := strings.Split(scanner.Text(), "│")
 		if len(parts) != 8 || strings.TrimSpace(parts[1]) != "100000" {
 			continue
@@ -149,6 +178,38 @@ func parseZig(r io.Reader) (*zigResult, error) {
 		return nil, err
 	}
 	return nil, fmt.Errorf("Zig 100K result not found")
+}
+
+func parseDiskVector(line string) (*zigResult, error) {
+	fields := strings.Fields(line)
+	values := map[string]float64{}
+	for _, field := range fields[1:] {
+		key, raw, ok := strings.Cut(field, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid disk vector field %q", field)
+		}
+		if _, duplicate := values[key]; duplicate {
+			return nil, fmt.Errorf("duplicate disk vector field %s", key)
+		}
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			return nil, fmt.Errorf("invalid disk vector field %s", key)
+		}
+		values[key] = v
+	}
+	for _, key := range []string{"n", "build_ms", "reopen_ms", "mean_ns", "p99_ns", "recall", "file_bytes"} {
+		if _, ok := values[key]; !ok {
+			return nil, fmt.Errorf("missing disk vector field %s", key)
+		}
+	}
+	n := values["n"]
+	if n != 1000 && n != 10000 && n != 100000 {
+		return nil, fmt.Errorf("unsupported disk vector scale %g", n)
+	}
+	if values["recall"] > 100 || values["file_bytes"] == 0 {
+		return nil, errors.New("invalid disk vector recall/file size")
+	}
+	return &zigResult{disk: true, scale: int(n), insertMS: values["build_ms"], reopenMS: values["reopen_ms"], meanNS: values["mean_ns"], p99NS: values["p99_ns"], recall: values["recall"], fileBytes: values["file_bytes"]}, nil
 }
 
 func median(values []float64) float64 {
@@ -340,10 +401,17 @@ func otherMetrics(current, previous map[string][]float64) string {
 
 func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel string, zigFresh bool) {
 	goMetrics := current["BenchmarkVectorSearchClustered128D/100K"]
+	if zig.disk {
+		goMetrics = current[fmt.Sprintf("BenchmarkVectorSearchDisk128D/%dK", zig.scale/1000)]
+	}
 	if goMetrics == nil {
 		return
 	}
-	fmt.Fprintln(w, "\n## pure-Go vs Zig reference (100K)")
+	if zig.disk {
+		fmt.Fprintf(w, "\n## Go vs Zig public disk APIs (%dK)\n", zig.scale/1000)
+	} else {
+		fmt.Fprintln(w, "\n## pure-Go vs Zig reference (100K)")
+	}
 	fmt.Fprintf(w, "\nZig reference: `%s`\n", zigLabel)
 	fmt.Fprintln(w, "\n| Metric | pure-Go | Zig | pure-Go vs Zig |")
 	fmt.Fprintln(w, "|---|---:|---:|---:|")
@@ -356,6 +424,18 @@ func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel st
 		{"Mean search (ns)", "mean-ns", zig.meanNS},
 		{"P99 search (ns)", "p99-ns", zig.p99NS},
 	}
+	if zig.disk {
+		rows[0].label = "Durable build + close (ms)"
+		rows = append(rows, struct {
+			label string
+			unit  string
+			zig   float64
+		}{"Reopen (ms)", "reopen-ms", zig.reopenMS}, struct {
+			label string
+			unit  string
+			zig   float64
+		}{"Primary database file bytes (sidecars excluded)", "file-bytes", zig.fileBytes})
+	}
 	for _, row := range rows {
 		goValue, ok := value(goMetrics, row.unit)
 		if !ok {
@@ -366,6 +446,14 @@ func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel st
 	if goRecall, ok := value(goMetrics, "recall@10"); ok {
 		fmt.Fprintf(w, "| Recall@10 | %.1f%% | %.1f%% | %+.1f pp |\n", goRecall, zig.recall, goRecall-zig.recall)
 	}
+	if zig.disk {
+		fmt.Fprintln(w, "\nBoth paths use public persistent DB APIs, 1000-vector commit batches, close/reopen, identical binary input, and warm single-client ANN search. Build includes commit and close. Go record cache and Zig buffer pool are both configured to 64 MiB but do not have identical semantics; OS cache and process RSS are not capped. This is not an OS-cold test. Compare recall alongside latency; do not infer language-wide superiority.")
+		fmt.Fprintln(w, "Go uses L2 and Zig uses cosine on unit-normalized input; both recalls use exact L2 ground truth. Native distance arithmetic, index layout, and durability implementations still differ. Primary-file bytes exclude sidecars.")
+		if !zigFresh {
+			fmt.Fprintln(w, "The Zig result was not measured in this CI run.")
+		}
+		return
+	}
 	if zigFresh {
 		fmt.Fprintf(w, "\nPositive latency/build Δ means pure-Go is slower. Zig reports %.1f MB of index memory; it is not compared with Go B/op because they measure different things. Both are measured in the same CI run with the same 128-D clustered workload and HNSW parameters, but the Zig benchmark includes its storage layer.\n", zig.memoryMB)
 	} else {
@@ -373,7 +461,19 @@ func writeZigComparison(w io.Writer, current result, zig *zigResult, zigLabel st
 	}
 }
 
-func writeReport(w io.Writer, current, previous result, currentLabel, previousLabel string, zig *zigResult, zigLabel string, zigFresh bool, diskBaseline ...diskBaselineInput) {
+func writeReport(w io.Writer, current, previous result, currentLabel, previousLabel string, zig *zigResult, zigLabel string, zigFresh bool, diskBaseline ...diskBaselineInput) error {
+	if zig != nil && zig.disk {
+		name := fmt.Sprintf("BenchmarkVectorSearchDisk128D/%dK", zig.scale/1000)
+		metrics := current[name]
+		for _, unit := range []string{"disk-api-contract", "index-build-ms", "reopen-ms", "file-bytes", "mean-ns", "p99-ns", "recall@10"} {
+			v, ok := value(metrics, unit)
+			if !ok || (unit == "disk-api-contract" && v != 1) || (unit == "recall@10" && v > 100) || (unit == "file-bytes" && v == 0) {
+				return fmt.Errorf("invalid or missing %s %s", name, unit)
+			}
+		}
+	}
+	buffered := bufio.NewWriter(w)
+	w = buffered
 	names := make([]string, 0, len(current))
 	for name := range current {
 		names = append(names, name)
@@ -408,6 +508,7 @@ func writeReport(w io.Writer, current, previous result, currentLabel, previousLa
 			otherMetrics(cur, prev),
 		)
 	}
+	return buffered.Flush()
 }
 
 func read(path string) (result, error) {
@@ -562,6 +663,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	defer output.Close()
-	writeReport(output, current, previous, *currentLabel, *previousLabel, zig, *zigLabel, *zigFresh, diskBaseline...)
+	err = writeReport(output, current, previous, *currentLabel, *previousLabel, zig, *zigLabel, *zigFresh, diskBaseline...)
+	err = errors.Join(err, output.Close())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }

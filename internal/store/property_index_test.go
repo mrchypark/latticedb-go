@@ -179,6 +179,73 @@ func TestPropertyIndexLookupLimitReturnsOrderedPrefixAcrossMutations(t *testing.
 	}
 }
 
+func TestPropertyIndexChunksReaddAfterEmpty(t *testing.T) {
+	t.Run("direct", func(t *testing.T) {
+		ids := make([]uint64, 65)
+		for index := range ids {
+			ids[index] = uint64(index + 1)
+		}
+		chunks := newPropertyPostingChunks(ids)
+		for id := uint64(1); id <= 65; id++ {
+			chunks.remove(id)
+		}
+		chunks.add(66)
+		if !chunks.has(66) || chunks.length != 1 {
+			t.Fatalf("readded direct chunks = %#v", chunks)
+		}
+	})
+
+	t.Run("page overlay", func(t *testing.T) {
+		indexes := NewPropertyIndexes()
+		definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+		indexes.Create(definition)
+		indexes.page = &pagePropertyBackend{}
+		for id := uint64(1); id <= 65; id++ {
+			if err := indexes.Add(definition, "sparse", id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for id := uint64(1); id <= 65; id++ {
+			if err := indexes.Remove(definition, "sparse", id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := indexes.Add(definition, "sparse", 66); err != nil {
+			t.Fatalf("readd after empty page overlay chunks: %v", err)
+		}
+		key, err := makePropertyValueKey("sparse")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if posting := indexes.deltaPosting(indexes.added, definition, key); !posting.has(66) || posting.len() != 1 {
+			t.Fatalf("readded page overlay posting = %#v", posting)
+		}
+	})
+
+	t.Run("resident", func(t *testing.T) {
+		indexes := NewPropertyIndexes()
+		definition := PropertyIndexDefinition{Scope: "Item", Property: "kind"}
+		indexes.Create(definition)
+		for id := uint64(1); id <= 65; id++ {
+			if err := indexes.Add(definition, "sparse", id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for id := uint64(1); id <= 65; id++ {
+			if err := indexes.Remove(definition, "sparse", id); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := indexes.Add(definition, "sparse", 66); err != nil {
+			t.Fatalf("readd after empty chunks: %v", err)
+		}
+		ids, found, err := indexes.Lookup(definition, "sparse")
+		if err != nil || !found || !slices.Equal(ids, []uint64{66}) {
+			t.Fatalf("readded sparse posting = %v, found=%v, err=%v", ids, found, err)
+		}
+	})
+}
+
 func TestPropertyIndexesDefinitionsFor(t *testing.T) {
 	indexes := NewPropertyIndexes()
 	for _, definition := range []PropertyIndexDefinition{

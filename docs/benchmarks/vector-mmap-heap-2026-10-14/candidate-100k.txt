@@ -1,0 +1,229 @@
+disk-build-progress n=100000 inserted=1000 batch_ms=789.2 elapsed_ms=822.3
+disk-memory n=100000 inserted=1000 heap_alloc=70663496 heap_inuse=76128256 heap_sys=129662976 heap_objects=161684 total_alloc=168543224 gc=10 pause_ns=486748
+disk-build-progress n=100000 inserted=2000 batch_ms=1043.3 elapsed_ms=1865.7
+disk-memory n=100000 inserted=2000 heap_alloc=88989040 heap_inuse=98697216 heap_sys=133857280 heap_objects=267865 total_alloc=287411064 gc=12 pause_ns=564790
+disk-build-progress n=100000 inserted=3000 batch_ms=1222.1 elapsed_ms=3087.9
+disk-memory n=100000 inserted=3000 heap_alloc=74335872 heap_inuse=84205568 heap_sys=133857280 heap_objects=199006 total_alloc=406233088 gc=15 pause_ns=697164
+disk-build-progress n=100000 inserted=4000 batch_ms=1437.9 elapsed_ms=4525.9
+disk-memory n=100000 inserted=4000 heap_alloc=81149240 heap_inuse=90832896 heap_sys=142245888 heap_objects=247721 total_alloc=530397800 gc=17 pause_ns=804706
+disk-build-progress n=100000 inserted=5000 batch_ms=1448.2 elapsed_ms=5974.2
+disk-memory n=100000 inserted=5000 heap_alloc=97787336 heap_inuse=132194304 heap_sys=150634496 heap_objects=321340 total_alloc=663474704 gc=19 pause_ns=880498
+disk-build-progress n=100000 inserted=6000 batch_ms=1480.9 elapsed_ms=7455.1
+disk-memory n=100000 inserted=6000 heap_alloc=112594728 heap_inuse=138207232 heap_sys=154828800 heap_objects=484411 total_alloc=797917192 gc=21 pause_ns=958498
+disk-build-progress n=100000 inserted=7000 batch_ms=1532.0 elapsed_ms=8987.1
+disk-memory n=100000 inserted=7000 heap_alloc=128022880 heap_inuse=143998976 heap_sys=154828800 heap_objects=646005 total_alloc=933764976 gc=23 pause_ns=1040499
+disk-build-progress n=100000 inserted=8000 batch_ms=1610.1 elapsed_ms=10597.2
+disk-memory n=100000 inserted=8000 heap_alloc=81363544 heap_inuse=93036544 heap_sys=154828800 heap_objects=234399 total_alloc=1072651752 gc=26 pause_ns=1147209
+disk-build-progress n=100000 inserted=9000 batch_ms=1598.9 elapsed_ms=12196.2
+disk-memory n=100000 inserted=9000 heap_alloc=92806240 heap_inuse=106602496 heap_sys=167411712 heap_objects=272642 total_alloc=1213141536 gc=28 pause_ns=1227167
+disk-build-progress n=100000 inserted=10000 batch_ms=1790.6 elapsed_ms=13986.8
+disk-memory n=100000 inserted=10000 heap_alloc=121345648 heap_inuse=157884416 heap_sys=167411712 heap_objects=531952 total_alloc=1356806528 gc=30 pause_ns=1308918
+disk-build-progress n=100000 inserted=11000 batch_ms=1707.7 elapsed_ms=15694.6
+disk-memory n=100000 inserted=11000 heap_alloc=73165424 heap_inuse=86515712 heap_sys=171606016 heap_objects=161778 total_alloc=1501711896 gc=33 pause_ns=1456376
+disk-build-progress n=100000 inserted=12000 batch_ms=1799.4 elapsed_ms=17494.1
+disk-memory n=100000 inserted=12000 heap_alloc=74094800 heap_inuse=87465984 heap_sys=171606016 heap_objects=163629 total_alloc=1750232272 gc=38 pause_ns=1653126
+disk-build-progress n=100000 inserted=13000 batch_ms=1710.4 elapsed_ms=19204.5
+disk-memory n=100000 inserted=13000 heap_alloc=86081928 heap_inuse=98336768 heap_sys=171606016 heap_objects=263290 total_alloc=1900418112 gc=40 pause_ns=1734126
+disk-build-progress n=100000 inserted=14000 batch_ms=1829.3 elapsed_ms=21033.8
+disk-memory n=100000 inserted=14000 heap_alloc=125074352 heap_inuse=171892736 heap_sys=184188928 heap_objects=529312 total_alloc=2051446144 gc=42 pause_ns=1816543
+disk-build-progress n=100000 inserted=15000 batch_ms=1781.5 elapsed_ms=22815.3
+disk-memory n=100000 inserted=15000 heap_alloc=76032016 heap_inuse=90488832 heap_sys=188383232 heap_objects=168885 total_alloc=2206882776 gc=45 pause_ns=1941374
+disk-build-progress n=100000 inserted=16000 batch_ms=1725.4 elapsed_ms=24540.7
+disk-memory n=100000 inserted=16000 heap_alloc=126300736 heap_inuse=172498944 heap_sys=188383232 heap_objects=512445 total_alloc=2359808472 gc=47 pause_ns=2024707
+disk-build-progress n=100000 inserted=17000 batch_ms=1863.4 elapsed_ms=26404.2
+disk-memory n=100000 inserted=17000 heap_alloc=130092808 heap_inuse=170196992 heap_sys=188383232 heap_objects=539585 total_alloc=2520833872 gc=50 pause_ns=2144790
+disk-build-progress n=100000 inserted=18000 batch_ms=1851.7 elapsed_ms=28256.0
+disk-memory n=100000 inserted=18000 heap_alloc=111610424 heap_inuse=129097728 heap_sys=192577536 heap_objects=542277 total_alloc=2780362704 gc=54 pause_ns=2298580
+disk-build-progress n=100000 inserted=19000 batch_ms=1845.9 elapsed_ms=30101.9
+disk-memory n=100000 inserted=19000 heap_alloc=152961320 heap_inuse=173268992 heap_sys=192577536 heap_objects=784427 total_alloc=2940705392 gc=56 pause_ns=2382911
+disk-build-progress n=100000 inserted=20000 batch_ms=2888.8 elapsed_ms=32990.8
+disk-memory n=100000 inserted=20000 heap_alloc=91917736 heap_inuse=112156672 heap_sys=192577536 heap_objects=270057 total_alloc=3103288960 gc=59 pause_ns=2519661
+disk-build-progress n=100000 inserted=21000 batch_ms=2043.4 elapsed_ms=35034.2
+disk-memory n=100000 inserted=21000 heap_alloc=148432016 heap_inuse=183885824 heap_sys=192577536 heap_objects=707901 total_alloc=3268389456 gc=61 pause_ns=2617578
+disk-build-progress n=100000 inserted=22000 batch_ms=2144.9 elapsed_ms=37179.2
+disk-memory n=100000 inserted=22000 heap_alloc=100112584 heap_inuse=120897536 heap_sys=196771840 heap_objects=291208 total_alloc=3432183232 gc=64 pause_ns=2753911
+disk-build-progress n=100000 inserted=23000 batch_ms=1799.5 elapsed_ms=38978.8
+disk-memory n=100000 inserted=23000 heap_alloc=151362568 heap_inuse=187621376 heap_sys=196771840 heap_objects=711865 total_alloc=3600074344 gc=66 pause_ns=2838285
+disk-build-progress n=100000 inserted=24000 batch_ms=1783.5 elapsed_ms=40762.4
+disk-memory n=100000 inserted=24000 heap_alloc=92075272 heap_inuse=113442816 heap_sys=205160448 heap_objects=267762 total_alloc=3870557216 gc=71 pause_ns=3057867
+disk-build-progress n=100000 inserted=25000 batch_ms=1685.1 elapsed_ms=42447.5
+disk-memory n=100000 inserted=25000 heap_alloc=153424960 heap_inuse=193331200 heap_sys=205160448 heap_objects=712371 total_alloc=4042149976 gc=73 pause_ns=3145534
+disk-build-progress n=100000 inserted=26000 batch_ms=2317.4 elapsed_ms=44765.0
+disk-memory n=100000 inserted=26000 heap_alloc=167517056 heap_inuse=187883520 heap_sys=213549056 heap_objects=859217 total_alloc=4217649824 gc=75 pause_ns=3245074
+disk-build-progress n=100000 inserted=27000 batch_ms=1701.7 elapsed_ms=46466.8
+disk-memory n=100000 inserted=27000 heap_alloc=83749248 heap_inuse=108298240 heap_sys=213549056 heap_objects=182636 total_alloc=4392768912 gc=78 pause_ns=3362658
+disk-build-progress n=100000 inserted=28000 batch_ms=1771.3 elapsed_ms=48238.1
+disk-memory n=100000 inserted=28000 heap_alloc=159366144 heap_inuse=194543616 heap_sys=213549056 heap_objects=742621 total_alloc=4567413040 gc=80 pause_ns=3450742
+disk-build-progress n=100000 inserted=29000 batch_ms=1741.3 elapsed_ms=49979.5
+disk-memory n=100000 inserted=29000 heap_alloc=158621744 heap_inuse=196550656 heap_sys=213549056 heap_objects=708993 total_alloc=4749644144 gc=83 pause_ns=3576951
+disk-build-progress n=100000 inserted=30000 batch_ms=1810.6 elapsed_ms=51790.1
+disk-memory n=100000 inserted=30000 heap_alloc=88655000 heap_inuse=112795648 heap_sys=226131968 heap_objects=190172 total_alloc=5030375136 gc=87 pause_ns=3745911
+disk-build-progress n=100000 inserted=31000 batch_ms=1700.4 elapsed_ms=53490.6
+disk-memory n=100000 inserted=31000 heap_alloc=111240952 heap_inuse=134021120 heap_sys=226131968 heap_objects=341357 total_alloc=5216738072 gc=89 pause_ns=3830704
+disk-build-progress n=100000 inserted=32000 batch_ms=1780.2 elapsed_ms=55270.9
+disk-memory n=100000 inserted=32000 heap_alloc=180017488 heap_inuse=195706880 heap_sys=226131968 heap_objects=929382 total_alloc=5400215944 gc=91 pause_ns=3917997
+disk-build-progress n=100000 inserted=33000 batch_ms=1722.1 elapsed_ms=56993.1
+disk-memory n=100000 inserted=33000 heap_alloc=108097672 heap_inuse=133210112 heap_sys=226131968 heap_objects=303572 total_alloc=5590970624 gc=94 pause_ns=4039623
+disk-build-progress n=100000 inserted=34000 batch_ms=1684.4 elapsed_ms=58677.5
+disk-memory n=100000 inserted=34000 heap_alloc=88275560 heap_inuse=112140288 heap_sys=226131968 heap_objects=188205 total_alloc=5780750144 gc=97 pause_ns=4172330
+disk-build-progress n=100000 inserted=35000 batch_ms=1734.2 elapsed_ms=60411.7
+disk-memory n=100000 inserted=35000 heap_alloc=159466600 heap_inuse=219488256 heap_sys=226131968 heap_objects=647572 total_alloc=5972611296 gc=99 pause_ns=4257247
+disk-build-progress n=100000 inserted=36000 batch_ms=1825.0 elapsed_ms=62236.8
+disk-memory n=100000 inserted=36000 heap_alloc=196146848 heap_inuse=256221184 heap_sys=263880704 heap_objects=1064783 total_alloc=6267264536 gc=103 pause_ns=4417373
+disk-build-progress n=100000 inserted=37000 batch_ms=1667.6 elapsed_ms=63904.4
+disk-memory n=100000 inserted=37000 heap_alloc=110518048 heap_inuse=133455872 heap_sys=268075008 heap_objects=307295 total_alloc=6460243168 gc=106 pause_ns=4539623
+disk-build-progress n=100000 inserted=38000 batch_ms=1682.0 elapsed_ms=65586.5
+disk-memory n=100000 inserted=38000 heap_alloc=98149024 heap_inuse=120193024 heap_sys=268075008 heap_objects=254112 total_alloc=6655640208 gc=109 pause_ns=4666830
+disk-build-progress n=100000 inserted=39000 batch_ms=1706.0 elapsed_ms=67292.5
+disk-memory n=100000 inserted=39000 heap_alloc=188224128 heap_inuse=209772544 heap_sys=268075008 heap_objects=938878 total_alloc=6852713000 gc=111 pause_ns=4750414
+disk-build-progress n=100000 inserted=40000 batch_ms=1718.0 elapsed_ms=69010.6
+disk-memory n=100000 inserted=40000 heap_alloc=91258080 heap_inuse=114638848 heap_sys=268075008 heap_objects=191698 total_alloc=7055597512 gc=114 pause_ns=4868748
+disk-build-progress n=100000 inserted=41000 batch_ms=1643.3 elapsed_ms=70653.9
+disk-memory n=100000 inserted=41000 heap_alloc=174421128 heap_inuse=227368960 heap_sys=268075008 heap_objects=749098 total_alloc=7258188824 gc=116 pause_ns=4956789
+disk-build-progress n=100000 inserted=42000 batch_ms=1836.4 elapsed_ms=72490.4
+disk-memory n=100000 inserted=42000 heap_alloc=92208600 heap_inuse=115924992 heap_sys=268075008 heap_objects=192138 total_alloc=7559574848 gc=121 pause_ns=5156663
+disk-build-progress n=100000 inserted=43000 batch_ms=1677.6 elapsed_ms=74168.1
+disk-memory n=100000 inserted=43000 heap_alloc=180553880 heap_inuse=228917248 heap_sys=268075008 heap_objects=797780 total_alloc=7766198848 gc=123 pause_ns=5237997
+disk-build-progress n=100000 inserted=44000 batch_ms=1628.7 elapsed_ms=75796.8
+disk-memory n=100000 inserted=44000 heap_alloc=169788264 heap_inuse=233504768 heap_sys=268075008 heap_objects=663539 total_alloc=7971963672 gc=126 pause_ns=5363955
+disk-build-progress n=100000 inserted=45000 batch_ms=1690.7 elapsed_ms=77487.6
+disk-memory n=100000 inserted=45000 heap_alloc=166211592 heap_inuse=247382016 heap_sys=268075008 heap_objects=609056 total_alloc=8178901200 gc=128 pause_ns=5445246
+disk-build-progress n=100000 inserted=46000 batch_ms=1724.1 elapsed_ms=79211.7
+disk-memory n=100000 inserted=46000 heap_alloc=115504296 heap_inuse=136986624 heap_sys=284852224 heap_objects=311608 total_alloc=8392369504 gc=130 pause_ns=5562037
+disk-build-progress n=100000 inserted=47000 batch_ms=1756.0 elapsed_ms=80967.8
+disk-memory n=100000 inserted=47000 heap_alloc=94756304 heap_inuse=115916800 heap_sys=284852224 heap_objects=196066 total_alloc=8605865728 gc=133 pause_ns=5698872
+disk-build-progress n=100000 inserted=48000 batch_ms=1747.9 elapsed_ms=82715.7
+disk-memory n=100000 inserted=48000 heap_alloc=95226040 heap_inuse=113803264 heap_sys=284852224 heap_objects=193862 total_alloc=8917962312 gc=138 pause_ns=5888748
+disk-build-progress n=100000 inserted=49000 batch_ms=1631.9 elapsed_ms=84347.7
+disk-memory n=100000 inserted=49000 heap_alloc=240576696 heap_inuse=253149184 heap_sys=284852224 heap_objects=1429626 total_alloc=9105949944 gc=139 pause_ns=5929748
+SNAPSHOT built-50000 alloc=213459376 inuse=227844096 sys=289046528 idle=61202432 released=19218432 objects=1096254 gc=141
+disk-build-progress n=100000 inserted=50000 batch_ms=2328.3 elapsed_ms=86676.1
+disk-memory n=100000 inserted=50000 heap_alloc=213489336 heap_inuse=227868672 heap_sys=289046528 heap_objects=1096315 total_alloc=9321042376 gc=141 pause_ns=6015707
+disk-build-progress n=100000 inserted=51000 batch_ms=1755.4 elapsed_ms=88431.6
+disk-memory n=100000 inserted=51000 heap_alloc=96982104 heap_inuse=117407744 heap_sys=289046528 heap_objects=196392 total_alloc=9538089872 gc=144 pause_ns=6224749
+disk-build-progress n=100000 inserted=52000 batch_ms=1650.2 elapsed_ms=90081.8
+disk-memory n=100000 inserted=52000 heap_alloc=118760048 heap_inuse=138436608 heap_sys=289046528 heap_objects=315223 total_alloc=9757061248 gc=146 pause_ns=6311208
+disk-build-progress n=100000 inserted=53000 batch_ms=1743.4 elapsed_ms=91825.3
+disk-memory n=100000 inserted=53000 heap_alloc=184999384 heap_inuse=252043264 heap_sys=289046528 heap_objects=731173 total_alloc=9980811576 gc=149 pause_ns=6444457
+disk-build-progress n=100000 inserted=54000 batch_ms=1747.1 elapsed_ms=93572.4
+disk-memory n=100000 inserted=54000 heap_alloc=98214536 heap_inuse=116875264 heap_sys=289046528 heap_objects=197011 total_alloc=10303349960 gc=153 pause_ns=6601457
+disk-build-progress n=100000 inserted=55000 batch_ms=1679.4 elapsed_ms=95251.9
+disk-memory n=100000 inserted=55000 heap_alloc=98643160 heap_inuse=120758272 heap_sys=289046528 heap_objects=197008 total_alloc=10501170800 gc=155 pause_ns=6684999
+disk-build-progress n=100000 inserted=56000 batch_ms=1763.4 elapsed_ms=97015.4
+disk-memory n=100000 inserted=56000 heap_alloc=104243680 heap_inuse=126926848 heap_sys=289046528 heap_objects=229559 total_alloc=10731974904 gc=157 pause_ns=6791999
+disk-build-progress n=100000 inserted=57000 batch_ms=1711.1 elapsed_ms=98726.5
+disk-memory n=100000 inserted=57000 heap_alloc=229035032 heap_inuse=243253248 heap_sys=289046528 heap_objects=1198634 total_alloc=10960683728 gc=159 pause_ns=6875123
+disk-build-progress n=100000 inserted=58000 batch_ms=1652.7 elapsed_ms=100379.2
+disk-memory n=100000 inserted=58000 heap_alloc=121225336 heap_inuse=139706368 heap_sys=289046528 heap_objects=317678 total_alloc=11189468928 gc=162 pause_ns=6999749
+disk-build-progress n=100000 inserted=59000 batch_ms=1755.4 elapsed_ms=102134.7
+disk-memory n=100000 inserted=59000 heap_alloc=113442928 heap_inuse=131973120 heap_sys=289046528 heap_objects=296715 total_alloc=11422899240 gc=165 pause_ns=7128082
+disk-build-progress n=100000 inserted=60000 batch_ms=1900.8 elapsed_ms=104035.6
+disk-memory n=100000 inserted=60000 heap_alloc=101423040 heap_inuse=122085376 heap_sys=289046528 heap_objects=200233 total_alloc=11759618008 gc=170 pause_ns=7315372
+disk-build-progress n=100000 inserted=61000 batch_ms=1731.0 elapsed_ms=105766.6
+disk-memory n=100000 inserted=61000 heap_alloc=121785848 heap_inuse=142819328 heap_sys=289046528 heap_objects=317428 total_alloc=11998807432 gc=172 pause_ns=7393914
+disk-build-progress n=100000 inserted=62000 batch_ms=1710.3 elapsed_ms=107477.0
+disk-memory n=100000 inserted=62000 heap_alloc=108843008 heap_inuse=128114688 heap_sys=289046528 heap_objects=252149 total_alloc=12237282736 gc=175 pause_ns=7517041
+disk-build-progress n=100000 inserted=63000 batch_ms=1981.4 elapsed_ms=109458.4
+disk-memory n=100000 inserted=63000 heap_alloc=111465184 heap_inuse=130228224 heap_sys=297435136 heap_objects=273247 total_alloc=12632855936 gc=179 pause_ns=7733957
+disk-build-progress n=100000 inserted=64000 batch_ms=2324.6 elapsed_ms=111783.1
+disk-memory n=100000 inserted=64000 heap_alloc=225333712 heap_inuse=312385536 heap_sys=322600960 heap_objects=960902 total_alloc=13210358960 gc=184 pause_ns=8013250
+disk-build-progress n=100000 inserted=65000 batch_ms=2336.7 elapsed_ms=114119.9
+disk-memory n=100000 inserted=65000 heap_alloc=203544896 heap_inuse=317669376 heap_sys=326795264 heap_objects=777780 total_alloc=13804254552 gc=189 pause_ns=8236585
+disk-build-progress n=100000 inserted=66000 batch_ms=2451.4 elapsed_ms=116571.3
+disk-memory n=100000 inserted=66000 heap_alloc=142872488 heap_inuse=155983872 heap_sys=360349696 heap_objects=622380 total_alloc=14518778264 gc=195 pause_ns=8480793
+disk-build-progress n=100000 inserted=67000 batch_ms=2392.9 elapsed_ms=118964.3
+disk-memory n=100000 inserted=67000 heap_alloc=105135952 heap_inuse=122109952 heap_sys=360349696 heap_objects=203968 total_alloc=15149593528 gc=202 pause_ns=8773085
+disk-build-progress n=100000 inserted=68000 batch_ms=2465.7 elapsed_ms=121430.0
+disk-memory n=100000 inserted=68000 heap_alloc=124955752 heap_inuse=141189120 heap_sys=360349696 heap_objects=320223 total_alloc=15796983824 gc=208 pause_ns=9049293
+disk-build-progress n=100000 inserted=69000 batch_ms=2443.2 elapsed_ms=123873.3
+disk-memory n=100000 inserted=69000 heap_alloc=214332616 heap_inuse=321732608 heap_sys=360349696 heap_objects=847005 total_alloc=16463968160 gc=214 pause_ns=9331876
+disk-build-progress n=100000 inserted=70000 batch_ms=3189.2 elapsed_ms=127062.6
+disk-memory n=100000 inserted=70000 heap_alloc=265558664 heap_inuse=321011712 heap_sys=360349696 heap_objects=1263851 total_alloc=17148384400 gc=219 pause_ns=9561041
+disk-build-progress n=100000 inserted=71000 batch_ms=3592.2 elapsed_ms=130655.0
+disk-memory n=100000 inserted=71000 heap_alloc=211608872 heap_inuse=323502080 heap_sys=360349696 heap_objects=822145 total_alloc=17851877976 gc=226 pause_ns=9882001
+disk-build-progress n=100000 inserted=72000 batch_ms=2833.4 elapsed_ms=133488.4
+disk-memory n=100000 inserted=72000 heap_alloc=134825808 heap_inuse=150765568 heap_sys=364544000 heap_objects=505994 total_alloc=18674122360 gc=233 pause_ns=10182336
+disk-build-progress n=100000 inserted=73000 batch_ms=2857.6 elapsed_ms=136346.2
+disk-memory n=100000 inserted=73000 heap_alloc=107627408 heap_inuse=126263296 heap_sys=364544000 heap_objects=205907 total_alloc=19416038648 gc=240 pause_ns=10476666
+disk-build-progress n=100000 inserted=74000 batch_ms=2665.0 elapsed_ms=139011.2
+disk-memory n=100000 inserted=74000 heap_alloc=108272280 heap_inuse=126861312 heap_sys=364544000 heap_objects=204450 total_alloc=20178153512 gc=247 pause_ns=10769708
+disk-build-progress n=100000 inserted=75000 batch_ms=3403.0 elapsed_ms=142414.3
+disk-memory n=100000 inserted=75000 heap_alloc=112816528 heap_inuse=131956736 heap_sys=364544000 heap_objects=235322 total_alloc=20961789776 gc=253 pause_ns=11151956
+disk-build-progress n=100000 inserted=76000 batch_ms=2811.0 elapsed_ms=145225.4
+disk-memory n=100000 inserted=76000 heap_alloc=114049208 heap_inuse=133111808 heap_sys=364544000 heap_objects=240027 total_alloc=21761975096 gc=260 pause_ns=11456124
+disk-build-progress n=100000 inserted=77000 batch_ms=3086.9 elapsed_ms=148312.3
+disk-memory n=100000 inserted=77000 heap_alloc=131060600 heap_inuse=148217856 heap_sys=364544000 heap_objects=325871 total_alloc=22583799816 gc=267 pause_ns=11803917
+disk-build-progress n=100000 inserted=78000 batch_ms=2980.0 elapsed_ms=151292.4
+disk-memory n=100000 inserted=78000 heap_alloc=110038760 heap_inuse=129564672 heap_sys=364544000 heap_objects=206663 total_alloc=23524801568 gc=276 pause_ns=12268500
+disk-build-progress n=100000 inserted=79000 batch_ms=2757.7 elapsed_ms=154050.1
+disk-memory n=100000 inserted=79000 heap_alloc=110878616 heap_inuse=130310144 heap_sys=364544000 heap_objects=207055 total_alloc=24382302456 gc=284 pause_ns=12625251
+disk-build-progress n=100000 inserted=80000 batch_ms=2696.7 elapsed_ms=156746.9
+disk-memory n=100000 inserted=80000 heap_alloc=111408784 heap_inuse=131473408 heap_sys=364544000 heap_objects=210278 total_alloc=25260817360 gc=292 pause_ns=12981083
+disk-build-progress n=100000 inserted=81000 batch_ms=2793.0 elapsed_ms=159540.0
+disk-memory n=100000 inserted=81000 heap_alloc=111323752 heap_inuse=131137536 heap_sys=364544000 heap_objects=205761 total_alloc=26158687752 gc=301 pause_ns=13368875
+disk-build-progress n=100000 inserted=82000 batch_ms=2689.6 elapsed_ms=162229.6
+disk-memory n=100000 inserted=82000 heap_alloc=221425576 heap_inuse=329998336 heap_sys=364544000 heap_objects=858197 total_alloc=27074991128 gc=308 pause_ns=13677418
+disk-build-progress n=100000 inserted=83000 batch_ms=2747.6 elapsed_ms=164977.3
+disk-memory n=100000 inserted=83000 heap_alloc=270536400 heap_inuse=329056256 heap_sys=364544000 heap_objects=1246752 total_alloc=28013675040 gc=315 pause_ns=13961502
+disk-build-progress n=100000 inserted=84000 batch_ms=3277.8 elapsed_ms=168255.1
+disk-memory n=100000 inserted=84000 heap_alloc=259343416 heap_inuse=356843520 heap_sys=364544000 heap_objects=1296828 total_alloc=29072888960 gc=325 pause_ns=14492250
+disk-build-progress n=100000 inserted=85000 batch_ms=3524.8 elapsed_ms=171780.0
+disk-memory n=100000 inserted=85000 heap_alloc=249925776 heap_inuse=329334784 heap_sys=372932608 heap_objects=1067363 total_alloc=30047166104 gc=333 pause_ns=14958251
+disk-build-progress n=100000 inserted=86000 batch_ms=3284.2 elapsed_ms=175064.3
+disk-memory n=100000 inserted=86000 heap_alloc=251455824 heap_inuse=331374592 heap_sys=372932608 heap_objects=1083090 total_alloc=31041543400 gc=341 pause_ns=15276506
+disk-build-progress n=100000 inserted=87000 batch_ms=3367.8 elapsed_ms=178432.2
+disk-memory n=100000 inserted=87000 heap_alloc=114675744 heap_inuse=136577024 heap_sys=372932608 heap_objects=209388 total_alloc=32058755696 gc=350 pause_ns=15685259
+disk-build-progress n=100000 inserted=88000 batch_ms=3353.5 elapsed_ms=181785.7
+disk-memory n=100000 inserted=88000 heap_alloc=209207912 heap_inuse=330366976 heap_sys=372932608 heap_objects=742747 total_alloc=33091599152 gc=359 pause_ns=16151049
+disk-build-progress n=100000 inserted=89000 batch_ms=3106.1 elapsed_ms=184891.9
+disk-memory n=100000 inserted=89000 heap_alloc=225177384 heap_inuse=332292096 heap_sys=372932608 heap_objects=858068 total_alloc=34140427080 gc=367 pause_ns=16515339
+disk-build-progress n=100000 inserted=90000 batch_ms=4011.9 elapsed_ms=188903.8
+disk-memory n=100000 inserted=90000 heap_alloc=115488856 heap_inuse=137797632 heap_sys=372932608 heap_objects=209913 total_alloc=35308285712 gc=377 pause_ns=16965216
+disk-build-progress n=100000 inserted=91000 batch_ms=3098.5 elapsed_ms=192002.4
+disk-memory n=100000 inserted=91000 heap_alloc=116047944 heap_inuse=137822208 heap_sys=372932608 heap_objects=209632 total_alloc=36400922552 gc=386 pause_ns=17384548
+disk-build-progress n=100000 inserted=92000 batch_ms=3196.0 elapsed_ms=195198.4
+disk-memory n=100000 inserted=92000 heap_alloc=117205440 heap_inuse=139550720 heap_sys=372932608 heap_objects=210303 total_alloc=37504853864 gc=396 pause_ns=17826962
+disk-build-progress n=100000 inserted=93000 batch_ms=3211.5 elapsed_ms=198409.9
+disk-memory n=100000 inserted=93000 heap_alloc=243880368 heap_inuse=332079104 heap_sys=372932608 heap_objects=990518 total_alloc=38628181264 gc=405 pause_ns=18282128
+disk-build-progress n=100000 inserted=94000 batch_ms=4552.6 elapsed_ms=202962.5
+disk-memory n=100000 inserted=94000 heap_alloc=249065312 heap_inuse=333889536 heap_sys=372932608 heap_objects=1028525 total_alloc=39769988656 gc=414 pause_ns=18692959
+disk-build-progress n=100000 inserted=95000 batch_ms=3569.6 elapsed_ms=206532.2
+disk-memory n=100000 inserted=95000 heap_alloc=274592504 heap_inuse=331423744 heap_sys=372932608 heap_objects=1226615 total_alloc=40933474232 gc=423 pause_ns=19098417
+disk-build-progress n=100000 inserted=96000 batch_ms=3695.0 elapsed_ms=210227.2
+disk-memory n=100000 inserted=96000 heap_alloc=278896616 heap_inuse=356933632 heap_sys=372867072 heap_objects=1407656 total_alloc=42204738328 gc=434 pause_ns=19570501
+disk-build-progress n=100000 inserted=97000 batch_ms=3428.2 elapsed_ms=213655.5
+disk-memory n=100000 inserted=97000 heap_alloc=251128344 heap_inuse=331071488 heap_sys=372932608 heap_objects=1034717 total_alloc=43402070464 gc=444 pause_ns=20036625
+disk-build-progress n=100000 inserted=98000 batch_ms=3597.6 elapsed_ms=217253.2
+disk-memory n=100000 inserted=98000 heap_alloc=128853888 heap_inuse=151150592 heap_sys=372899840 heap_objects=282835 total_alloc=44605491464 gc=454 pause_ns=20524750
+disk-build-progress n=100000 inserted=99000 batch_ms=3669.2 elapsed_ms=220922.5
+disk-memory n=100000 inserted=99000 heap_alloc=224928608 heap_inuse=331382784 heap_sys=372899840 heap_objects=823566 total_alloc=45834039608 gc=464 pause_ns=21049376
+SNAPSHOT built-100000 alloc=121272896 inuse=144916480 sys=372899840 idle=227983360 released=109592576 objects=214510 gc=474
+disk-build-progress n=100000 inserted=100000 batch_ms=4369.3 elapsed_ms=225291.9
+disk-memory n=100000 inserted=100000 heap_alloc=121302280 heap_inuse=144932864 heap_sys=372899840 heap_objects=214568 total_alloc=47077627048 gc=474 pause_ns=21478332
+disk-memory-after-gc heap_alloc=97886432 heap_inuse=105431040 heap_sys=372932608 heap_idle=267501568 heap_released=109592576
+SNAPSHOT closed alloc=99463528 inuse=107118592 sys=372932608 idle=265814016 released=109592576 objects=110920 gc=475
+SNAPSHOT reopened alloc=98683504 inuse=104849408 sys=372932608 idle=268083200 released=259375104 objects=408397 gc=603
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkVectorSearchDisk128D/100K-2         	       1	   3665958 ns/op	         1.000 disk-api-contract	 419856384 file-bytes	    225950 index-build-ms	   1826936 mean-ns	   2378250 p99-ns	       100.0 recall@10	      8496 reopen-ms	 1525432 B/op	   10373 allocs/op
+PASS
+      239.59 real       229.60 user         5.15 sys
+           678985728  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              168793  page reclaims
+                  65  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+               13847  signals received
+               44192  voluntary context switches
+              468651  involuntary context switches
+       3396713962178  instructions retired
+        859650315253  cycles elapsed
+           384205856  peak memory footprint

@@ -1,0 +1,27 @@
+File: diagnostic.test
+Type: inuse_space
+Time: 2026-10-14 06:05:26 KST
+Showing nodes accounting for 210.88MB, 99.52% of 211.88MB total
+Dropped 7 nodes (cum <= 1.06MB)
+      flat  flat%   sum%        cum   cum%
+  159.47MB 75.26% 75.26%   159.47MB 75.26%  go.etcd.io/bbolt.Open.func2
+   49.34MB 23.28% 98.54%    49.34MB 23.28%  github.com/mrchypark/latticedb-go/internal/benchvector.Generate
+    1.07MB  0.51% 99.05%     1.07MB  0.51%  sync.(*poolChain).pushHead
+       1MB  0.47% 99.52%     2.07MB  0.98%  go.etcd.io/bbolt.(*Tx).write
+         0     0% 99.52%   162.05MB 76.48%  github.com/mrchypark/latticedb-go.(*DB).Update
+         0     0% 99.52%   211.38MB 99.76%  github.com/mrchypark/latticedb-go.BenchmarkVectorSearchDisk128D.func1
+         0     0% 99.52%   162.05MB 76.48%  github.com/mrchypark/latticedb-go.diskVectorDB
+         0     0% 99.52%   162.05MB 76.48%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).Update (inline)
+         0     0% 99.52%   162.05MB 76.48%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).updateContext
+         0     0% 99.52%   162.05MB 76.48%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitInternalContext
+         0     0% 99.52%   162.05MB 76.48%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitPages
+         0     0% 99.52%   162.05MB 76.48%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).Commit
+         0     0% 99.52%   159.97MB 75.50%  go.etcd.io/bbolt.(*Bucket).spill
+         0     0% 99.52%   159.97MB 75.50%  go.etcd.io/bbolt.(*DB).allocate
+         0     0% 99.52%   162.05MB 76.48%  go.etcd.io/bbolt.(*Tx).Commit
+         0     0% 99.52%   159.97MB 75.50%  go.etcd.io/bbolt.(*Tx).allocate
+         0     0% 99.52%   159.97MB 75.50%  go.etcd.io/bbolt.(*node).spill
+         0     0% 99.52%   159.47MB 75.26%  sync.(*Pool).Get
+         0     0% 99.52%     1.07MB  0.51%  sync.(*Pool).Put
+         0     0% 99.52%   211.38MB 99.76%  testing.(*B).run1.func1
+         0     0% 99.52%   211.38MB 99.76%  testing.(*B).runN

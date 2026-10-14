@@ -1,0 +1,19 @@
+DISK_VECTOR_V1 n=10000 build_ms=5694 reopen_ms=90 mean_ns=114035 p99_ns=170209 recall=99.00 file_bytes=41316352
+        5.83 real         5.58 user         0.15 sys
+            97157120  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                7392  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 543  voluntary context switches
+                6452  involuntary context switches
+         64778942818  instructions retired
+         21358034590  cycles elapsed
+            96420224  peak memory footprint

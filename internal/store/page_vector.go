@@ -7,11 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 
 	"github.com/mrchypark/latticedb-go/internal/pagestore"
 )
 
 const pageVectorBucket = "vector-hnsw"
+
+// Older readers reject the tagged base instead of using obsolete links.
+const pageVectorLinkedBase byte = 8
+const pageVectorLinks byte = 6
 
 // PageVectorIndex is a transaction-scoped HNSW view. Each lookup decodes one
 // node record; no index-wide resident map is built.
@@ -53,8 +58,12 @@ func (index PageVectorIndex) metaKey() []byte {
 }
 
 func (index PageVectorIndex) key(id uint64) []byte {
-	key := append([]byte{1}, index.prefix()...)
-	return append(key, pageID(id)...)
+	key := make([]byte, 1+sha256.Size+8)
+	key[0] = 1
+	hash := sha256.Sum256([]byte(index.Namespace))
+	copy(key[1:], hash[:])
+	binary.BigEndian.PutUint64(key[1+sha256.Size:], id)
+	return key
 }
 
 func (index PageVectorIndex) Meta() (PageVectorMeta, error) {
@@ -138,14 +147,54 @@ func (index PageVectorIndex) GetBounded(id uint64, maxBytes uint64) (*PageVector
 		return nil, errors.New("page vector record exceeds read budget")
 	}
 	rawLimit := maxBytes / 3
-	data, err := index.Tx.GetBounded(pageVectorBucket, index.key(id), rawLimit)
-	if err != nil || data == nil {
-		return nil, err
-	}
-	d, err := decodePageRecord(data, 5, rawLimit)
+	var result *PageVectorNode
+	key := index.key(id)
+	var linksKey [1 + sha256.Size + 8]byte
+	copy(linksKey[:], key)
+	linksKey[0] = 2
+	err := index.Tx.ReadPairBounded(pageVectorBucket, key, linksKey[:], rawLimit, func(data, links []byte) error {
+		if data == nil {
+			return errors.New("missing page vector base")
+		}
+		if len(data) < 2 || data[1] != pageVectorLinkedBase {
+			if links != nil {
+				return errors.New("unexpected page vector links")
+			}
+			var err error
+			result, err = decodePageVectorNode(data, id, rawLimit)
+			return err
+		}
+		if links == nil {
+			return errors.New("missing page vector links")
+		}
+		vector, err := decodePageVectorBase(data, id, rawLimit)
+		if err != nil {
+			return err
+		}
+		d, err := decodePageRecord(links, pageVectorLinks, rawLimit-uint64(len(data)))
+		if err != nil {
+			return err
+		}
+		if d.u() != 18 || d.u() != id || d.err != nil {
+			return errors.New("invalid page vector links identity")
+		}
+		result, err = decodePageVectorHeader(d, rawLimit)
+		if err != nil {
+			return err
+		}
+		if err := d.finish(); err != nil {
+			return err
+		}
+		result.Vector = vector
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
+	return result, nil
+}
+
+func decodePageVectorHeader(d *binaryDecoder, rawLimit uint64) (*PageVectorNode, error) {
 	level := d.u()
 	deleted := d.u()
 	if d.err != nil {
@@ -189,6 +238,26 @@ func (index PageVectorIndex) GetBounded(id uint64, maxBytes uint64) (*PageVector
 		}
 		n.Neighbors[i] = neighbors
 	}
+	return n, nil
+}
+
+func decodePageVectorNode(data []byte, id, rawLimit uint64) (*PageVectorNode, error) {
+	d, err := decodePageRecord(data, 5, rawLimit)
+	if err != nil {
+		return nil, err
+	}
+	n, err := decodePageVectorHeader(d, rawLimit)
+	if err != nil {
+		return nil, err
+	}
+	n.Vector, err = decodePageVectorValues(d, rawLimit)
+	if err != nil {
+		return nil, fmt.Errorf("decode page vector node %d: %w", id, err)
+	}
+	return n, nil
+}
+
+func decodePageVectorValues(d *binaryDecoder, rawLimit uint64) ([]float32, error) {
 	dimensionsEncoded := d.u()
 	if d.err != nil {
 		return nil, d.err
@@ -200,8 +269,8 @@ func (index PageVectorIndex) GetBounded(id uint64, maxBytes uint64) (*PageVector
 	if uint64(dimensions)*4 > rawLimit {
 		return nil, pagestore.ErrValueTooLarge
 	}
-	n.Vector = make([]float32, dimensions)
-	for i := range n.Vector {
+	vector := make([]float32, dimensions)
+	for i := range vector {
 		value := d.u()
 		if d.err != nil {
 			return nil, d.err
@@ -209,15 +278,15 @@ func (index PageVectorIndex) GetBounded(id uint64, maxBytes uint64) (*PageVector
 		if value > math.MaxUint32 {
 			return nil, errors.New("invalid page vector float encoding")
 		}
-		n.Vector[i] = math.Float32frombits(uint32(value))
-		if math.IsNaN(float64(n.Vector[i])) || math.IsInf(float64(n.Vector[i]), 0) {
+		vector[i] = math.Float32frombits(uint32(value))
+		if math.IsNaN(float64(vector[i])) || math.IsInf(float64(vector[i]), 0) {
 			return nil, errors.New("non-finite page vector value")
 		}
 	}
 	if err := d.finish(); err != nil {
-		return nil, fmt.Errorf("decode page vector node %d: %w", id, err)
+		return nil, err
 	}
-	return n, nil
+	return vector, nil
 }
 
 func (index PageVectorIndex) Put(id uint64, node *PageVectorNode) error {
@@ -227,24 +296,30 @@ func (index PageVectorIndex) Put(id uint64, node *PageVectorNode) error {
 	if len(node.Vector) > math.MaxUint16 || len(node.Neighbors) > 17 {
 		return errors.New("page vector node exceeds encoding limits")
 	}
+	encodedBytes := 6 + uvarintBytes(uint64(node.Level)) + 1 + uvarintBytes(uint64(len(node.Neighbors)+1)) + uvarintBytes(uint64(len(node.Vector)+1))
 	for _, value := range node.Vector {
 		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
 			return errors.New("non-finite page vector value")
 		}
+		encodedBytes += uvarintBytes(uint64(math.Float32bits(value)))
+	}
+	maxBytes := uint64(128 + 5*len(node.Vector) + 10*len(node.Neighbors))
+	for _, neighbors := range node.Neighbors {
+		if len(neighbors) > 128 {
+			return errors.New("page vector degree exceeds limit")
+		}
+		maxBytes += uint64(10 + 10*len(neighbors))
+		encodedBytes += uvarintBytes(uint64(len(neighbors) + 1))
+		for _, id := range neighbors {
+			encodedBytes += uvarintBytes(id)
+		}
 	}
 	if index.BeforeWrite != nil {
-		maxBytes := uint64(64 + 5*len(node.Vector) + 10*len(node.Neighbors))
-		for _, neighbors := range node.Neighbors {
-			if len(neighbors) > 128 {
-				return errors.New("page vector degree exceeds limit")
-			}
-			maxBytes += uint64(10 + 10*len(neighbors))
-		}
 		if err := index.BeforeWrite(maxBytes); err != nil {
 			return err
 		}
 	}
-	data, err := encodePageRecord(5, func(e *binaryEncoder) {
+	data, err := encodePageRecordCapacity(5, (&PageGraph{}).recordLimit(), encodedBytes, func(e *binaryEncoder) {
 		e.u(uint64(node.Level))
 		if node.Deleted {
 			e.u(1)
@@ -263,16 +338,24 @@ func (index PageVectorIndex) Put(id uint64, node *PageVectorNode) error {
 	if err != nil {
 		return err
 	}
-	return index.Tx.Put(pageVectorBucket, index.key(id), data)
+	if err := index.Tx.PutOwned(pageVectorBucket, index.key(id), data); err != nil {
+		return err
+	}
+	return index.Tx.Delete(pageVectorBucket, index.linksKey(id))
 }
+
+func uvarintBytes(value uint64) int { return (bits.Len64(value|1) + 6) / 7 }
 
 func (index PageVectorIndex) Delete(id uint64) error {
 	if index.BeforeWrite != nil {
-		if err := index.BeforeWrite(64); err != nil {
+		if err := index.BeforeWrite(128); err != nil {
 			return err
 		}
 	}
-	return index.Tx.Delete(pageVectorBucket, index.key(id))
+	if err := index.Tx.Delete(pageVectorBucket, index.key(id)); err != nil {
+		return err
+	}
+	return index.Tx.Delete(pageVectorBucket, index.linksKey(id))
 }
 
 func (index PageVectorIndex) Visit(ctx context.Context, visit func(uint64, *PageVectorNode) error) error {
@@ -382,4 +465,40 @@ func InvalidatePageVectorIndexesExceptBudget(ctx context.Context, tx *pagestore.
 		}
 		return tx.Put(pageVectorBucket, key, encoded)
 	})
+}
+
+func decodePageVectorBase(data []byte, id, rawLimit uint64) ([]float32, error) {
+	data, err := decodePageRecordPayload(data, pageVectorLinkedBase, rawLimit)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 || data[0] != 17 {
+		return nil, errors.New("invalid page vector base tag")
+	}
+	storedID, n := binary.Uvarint(data[1:])
+	if n <= 0 || storedID != id {
+		return nil, errors.New("invalid page vector base identity")
+	}
+	data = data[1+n:]
+	encoded, n := binary.Uvarint(data)
+	if n <= 0 || encoded <= 1 || encoded-1 > math.MaxUint16 {
+		return nil, errors.New("invalid page vector dimensions")
+	}
+	data = data[n:]
+	dimensions := int(encoded - 1)
+	if uint64(dimensions)*4 > rawLimit {
+		return nil, pagestore.ErrValueTooLarge
+	}
+	if len(data) != dimensions*4 {
+		return nil, errors.New("invalid page vector payload size")
+	}
+	vector := make([]float32, dimensions)
+	for i := range vector {
+		bits := binary.LittleEndian.Uint32(data[i*4:])
+		if bits&0x7f800000 == 0x7f800000 {
+			return nil, errors.New("non-finite page vector value")
+		}
+		vector[i] = math.Float32frombits(bits)
+	}
+	return vector, nil
 }

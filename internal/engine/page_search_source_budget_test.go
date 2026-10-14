@@ -141,6 +141,14 @@ func TestStaleFTSSearchAdmitsCanonicalSource(t *testing.T) {
 	}
 }
 
+func TestStaleFuzzyFrequencyUsesMaxPerQueryTerm(t *testing.T) {
+	db := staleManualFTSSourceFixture(t, 1, "book books")
+	got, err := db.FTSSearchContext(context.Background(), "book book", FTSSearchOptions{Limit: 1, MaxDistance: 1, MinTermLength: 1})
+	if err != nil || len(got) != 1 || got[0].Score != 2 {
+		t.Fatalf("results=%v err=%v", got, err)
+	}
+}
+
 func TestStaleFTSScanReleasesBytesButSharesBM25Work(t *testing.T) {
 	db := staleManualFTSSourceFixture(t, 128, "running needle")
 	opts := FTSSearchOptions{Limit: 1, MaxWork: 1 << 20, MaxBytes: 1024, Scoring: FTSScoringBM25}

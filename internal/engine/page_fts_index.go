@@ -614,9 +614,16 @@ func (db *DB) pageIndexedFTSSearch(ctx context.Context, graph *store.GraphState,
 
 func pageFTSPostingTerms(ctx context.Context, page *store.PageGraph, index string, terms []string, opts FTSSearchOptions, budget *directSearchBudget) ([]string, uint64, error) {
 	if opts.MaxDistance == 0 {
+		if err := budget.add(uint64(len(terms))); err != nil {
+			return nil, 0, err
+		}
 		out := slices.Clone(terms)
 		held := saturatingMul(uint64(len(out)), 24)
 		if err := budget.reserveBytes(held); err != nil {
+			return nil, 0, err
+		}
+		if err := chargeFTSStringSort(budget, len(out)); err != nil {
+			budget.releaseBytes(held)
 			return nil, 0, err
 		}
 		slices.Sort(out)
@@ -659,10 +666,26 @@ func pageFTSPostingTerms(ctx context.Context, page *store.PageGraph, index strin
 	}
 	out := make([]string, 0, len(vocab))
 	for term := range vocab {
+		if err := budget.add(1); err != nil {
+			budget.releaseBytes(saturatingAdd(held, listBytes))
+			return nil, 0, err
+		}
 		out = append(out, term)
+	}
+	if err := chargeFTSStringSort(budget, len(out)); err != nil {
+		budget.releaseBytes(saturatingAdd(held, listBytes))
+		return nil, 0, err
 	}
 	slices.Sort(out)
 	return out, saturatingAdd(held, listBytes), nil
+}
+
+func chargeFTSStringSort(budget *directSearchBudget, length int) error {
+	work := uint64(length)
+	for width := length; width > 1; width = (width + 1) / 2 {
+		work = saturatingAdd(work, uint64(length))
+	}
+	return budget.add(work)
 }
 
 func collectPageFTSResults(ctx context.Context, page *store.PageGraph, index string, terms, postingTerms []string, opts FTSSearchOptions, stats store.PageFTSStats, budget *directSearchBudget) ([]FTSSearchResult, error) {
@@ -679,6 +702,10 @@ func collectPageFTSResults(ctx context.Context, page *store.PageGraph, index str
 	bytes = mapBase
 	docs := make(map[uint64]*docScore)
 	for _, token := range postingTerms {
+		if err := budget.add(1); err != nil {
+			budget.releaseBytes(bytes)
+			return nil, err
+		}
 		queryTermBytes := saturatingMul(uint64(len(terms)), 8)
 		if err := budget.reserveBytes(queryTermBytes); err != nil {
 			budget.releaseBytes(bytes)
@@ -686,6 +713,11 @@ func collectPageFTSResults(ctx context.Context, page *store.PageGraph, index str
 		}
 		queryTerms := make([]int, 0, len(terms))
 		for i, term := range terms {
+			if err := budget.add(1); err != nil {
+				budget.releaseBytes(queryTermBytes)
+				budget.releaseBytes(bytes)
+				return nil, err
+			}
 			match, err := fuzzyTokenMatchBudget(term, token, opts.MaxDistance, opts.MinTermLength, budget)
 			if err != nil {
 				budget.releaseBytes(queryTermBytes)
@@ -715,7 +747,14 @@ func collectPageFTSResults(ctx context.Context, page *store.PageGraph, index str
 				docs[posting.DocumentID] = doc
 			}
 			for _, queryTerm := range queryTerms {
-				doc.frequencies[queryTerm] = saturatingAdd(doc.frequencies[queryTerm], posting.Frequency)
+				if err := budget.add(1); err != nil {
+					return err
+				}
+				if opts.Scoring == FTSScoringFrequency && opts.MaxDistance != 0 {
+					doc.frequencies[queryTerm] = max(doc.frequencies[queryTerm], posting.Frequency)
+				} else {
+					doc.frequencies[queryTerm] = saturatingAdd(doc.frequencies[queryTerm], posting.Frequency)
+				}
 			}
 			return nil
 		}); err != nil {
@@ -743,7 +782,13 @@ func collectPageFTSResults(ctx context.Context, page *store.PageGraph, index str
 	defer budget.releaseBytes(dfBytes)
 	df := make([]uint64, len(terms))
 	for _, doc := range docs {
+		if err := budget.add(1); err != nil {
+			return nil, err
+		}
 		for i, count := range doc.frequencies {
+			if err := budget.add(1); err != nil {
+				return nil, err
+			}
 			if count != 0 {
 				df[i]++
 			}
@@ -756,9 +801,18 @@ func collectPageFTSResults(ctx context.Context, page *store.PageGraph, index str
 		if err := budget.add(1); err != nil {
 			return nil, err
 		}
-		score := frequencyScore(doc.frequencies)
+		scoreWork := uint64(len(doc.frequencies))
+		if opts.Scoring == FTSScoringBM25 {
+			scoreWork = saturatingAdd(scoreWork, uint64(len(doc.frequencies)))
+		}
+		if err := budget.add(scoreWork); err != nil {
+			return nil, err
+		}
+		var score float64
 		if opts.Scoring == FTSScoringBM25 {
 			score = bm25Score(doc.frequencies, df, doc.length, stats.Documents, stats.AverageLength())
+		} else {
+			score = frequencyScore(doc.frequencies)
 		}
 		if score > 0 {
 			var err error

@@ -1313,11 +1313,14 @@ func TestPersistentFileSizeLimitsAreCheckedBeforeRead(t *testing.T) {
 }
 
 func TestWALWriterUsesReaderFrameLimit(t *testing.T) {
-	if err := validateWALPayloadSize(maxWALFrameBytes); err != nil {
-		t.Fatalf("reader limit rejected: %v", err)
+	if err := validateWALPayloadSize(maxWALPayloadBytes); err != nil {
+		t.Fatalf("archive-compatible payload limit rejected: %v", err)
 	}
-	if err := validateWALPayloadSize(maxWALFrameBytes + 1); err == nil {
-		t.Fatal("writer accepted a frame above the reader limit")
+	if err := validateWALPayloadSize(maxWALPayloadBytes + 1); err == nil {
+		t.Fatal("writer accepted a payload that exceeds the archive frame limit")
+	}
+	if uint64(walHeaderSize)+uint64(maxWALPayloadBytes) != maxWALFrameBytes {
+		t.Fatalf("archive frame bytes = %d, want %d", uint64(walHeaderSize)+uint64(maxWALPayloadBytes), uint64(maxWALFrameBytes))
 	}
 }
 

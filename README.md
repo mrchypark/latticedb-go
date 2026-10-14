@@ -169,6 +169,7 @@ durability modes are rejected for memory databases.
 - The legacy native-engine options `OpenOptions.EnableWAL`, `DisableWAL`, and `EnableAdjacencyCache` must remain false (their default); true requests return `ErrUnsupportedOption`. Public page-backed commits use atomic bbolt transactions.
 - `OpenOptions.CacheSizeMB` enables a bounded read-record cache in MiB; zero disables it. The limit covers logical cached records and does not include the OS page cache, caller-owned results, or total process RSS. `PageSize` accepts powers of two from 1024 through 65536 for new files and legacy migration. Zero uses the native default or stored size; a nonzero value must match an existing file.
 - Disk-backed `Open` uses the page backend. A new directory database stores bbolt pages in `state.json`. A legacy v5 state/WAL database is imported into a staged `state.json.pages` sidecar while preserving its source files; a read-only open without that sidecar imports to a private temporary directory. The v5 state/WAL formats remain migration and interchange formats, not the normal page-backed runtime. See [storage format and legacy limits](docs/binary-storage.md).
+- Version 0.12 writes compact HNSW vector/link records that v0.11.x cannot read. Existing records remain readable by the new version, but vector writes or rebuilds can convert them. Back up the database before upgrading; to downgrade, restore a backup made before the upgrade. This does not provide Zig file compatibility.
 - Page-backed storage persists graph records, label/type/adjacency postings, equality property postings, stream records, and consumer offsets in bbolt. Exact search scans pages as needed; HNSW nodes and full-text postings are also stored in page buckets. Application metadata is persisted but is still loaded into the in-memory graph catalog.
 - Page storage currently runs on Linux, macOS, and Windows. AIX and Solaris cross-compilation is checked; runtime validation on those systems is not yet available. JS/WASI and Plan 9 compile through an explicit unsupported stub; opening a disk-backed database there returns an unsupported-platform error.
 
@@ -230,7 +231,23 @@ The detailed behavioral contract is documented in [docs/engine_conformance.md](d
 
 CSV export returns and atomically publishes a JSON manifest whose `nodes` and `edges` paths point into `<output>_generations`. Published generations remain immutable and are not reclaimed automatically. For explicit pruning, every reader must hold an `OpenCSVGenerationContext` lease until it finishes reading; `PruneCSVGenerationsContext` protects current and leased generations. Legacy readers are not protected during pruning. Pruning requires native Unix locking and directory sync; unsupported platforms return an error.
 
+File exports reserve a sibling `.latticedb-export-locks` directory for persistent lock files. Export destinations cannot be that directory, its descendants, or the `.latticedb-export-locks.init-` initialization namespace, including case variants. On Unix this is a sticky shared directory so different OS users can export to distinct names. Lock files remain owner-private; another user cannot take over the same name. Its owner and other processes that can replace the directory must be trusted to cooperate; this is not a security boundary against them. Symlinked lock directories/files and incompatible directory permissions are rejected. Do not remove it while exporters or CSV generation readers are active. Stop older processes that use `<output>.lock` before upgrading exporters or CSV generation readers; the old and new lock paths do not coordinate.
+
 ## Development
+
+Disk-vector measurements and reproducible profiling commands are in the
+[Go/Zig optimization report](docs/benchmarks/vector-build-optimization-2026-10-13/REPORT.md),
+the [CPU/memory follow-up](docs/benchmarks/vector-memory-2026-10-14/REPORT.md),
+the [remaining-memory investigation](docs/benchmarks/vector-residual-memory-2026-10-14/REPORT.md),
+the [storage-layout optimization](docs/benchmarks/vector-layout-memory-2026-10-14/REPORT.md),
+and the [mmap/heap analysis](docs/benchmarks/vector-mmap-heap-2026-10-14/REPORT.md).
+The storage-layout change reads existing vector records and converts them lazily.
+Converted HNSW records require this newer Go implementation; do not reuse the
+converted database with an older binary.
+Go 1.27 ARM64 builds can opt into the experimental SIMD distance kernel with
+`GOEXPERIMENT=simd`; other builds use the scalar kernel. PGO requires an explicit,
+representative application profile. Neither option changes the disk format or
+commit policy, and the library does not change process-wide GC settings.
 
 ```sh
 go test ./...

@@ -1,0 +1,7 @@
+# github.com/mrchypark/latticedb-go/internal/store [github.com/mrchypark/latticedb-go/internal/store.test]
+internal/store/page_vector_links_test.go:6:2: "encoding/binary" imported and not used
+ok  	github.com/mrchypark/latticedb-go/internal/pagestore	0.638s
+FAIL	github.com/mrchypark/latticedb-go/internal/store [build failed]
+ok  	github.com/mrchypark/latticedb-go/internal/engine	2.266s
+ok  	github.com/mrchypark/latticedb-go	0.754s
+FAIL

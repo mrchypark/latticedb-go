@@ -73,15 +73,17 @@ func TestCSVConcurrentSubprocessPublicationAndOwnerDeath(t *testing.T) {
 	}
 	output := filepath.Join(t.TempDir(), "graph.csv")
 	commands := make([]*exec.Cmd, 3)
+	logs := make([]bytes.Buffer, len(commands))
 	for index := range commands {
 		commands[index] = exportHelperCommand(t, "export", output, "")
+		commands[index].Stdout, commands[index].Stderr = &logs[index], &logs[index]
 		if err := commands[index].Start(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, command := range commands {
+	for index, command := range commands {
 		if err := command.Wait(); err != nil {
-			t.Fatalf("export helper: %v", err)
+			t.Fatalf("export helper: %v\n%s", err, &logs[index])
 		}
 	}
 	assertCSVManifestPathsExist(t, output)
@@ -210,6 +212,56 @@ func TestAllFileExportsHonorPathLock(t *testing.T) {
 	defer cancel()
 	if _, err := ExportGraphContext(ctx, store.NewGraphState(), ExportFormatJSON, output); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("JSON writer bypassed common output lock: %v", err)
+	}
+}
+
+func TestExportLockSurvivesPublishingLockNamedOutput(t *testing.T) {
+	directory := t.TempDir()
+	output := filepath.Join(directory, "graph")
+	unlock, err := acquireExportLock(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, err := ExportGraph(store.NewGraphState(), ExportFormatJSON, output+".lock"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := acquireExportLockContext(ctx, output); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock was replaced by lock-named output: %v", err)
+	}
+}
+
+func TestExportRejectsActiveLockPath(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "graph")
+	unlock, err := acquireExportLock(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	lockPath, err := exportLockPath(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caseAlias := filepath.Join(filepath.Dir(filepath.Dir(lockPath)), strings.ToUpper(exportLockDirectory), filepath.Base(lockPath))
+	for _, destination := range []string{lockPath, filepath.Dir(lockPath), caseAlias} {
+		if _, err := ExportGraph(store.NewGraphState(), ExportFormatJSON, destination); err == nil || !strings.Contains(err.Error(), "reserved lock directory") {
+			t.Fatalf("export accepted reserved destination %s: %v", destination, err)
+		}
+	}
+	after, err := os.Stat(lockPath)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("lock identity changed: before=%v after=%v err=%v", before, after, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := acquireExportLockContext(ctx, output); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock was released after rejected lock-path export: %v", err)
 	}
 }
 

@@ -229,6 +229,7 @@ func (e *binaryEncoder) value(value persistedValue, depth int) {
 
 type binaryDecoder struct {
 	in              io.Reader
+	data            *[]byte
 	remaining       uint64
 	allocationLeft  uint64
 	admitAllocation func(uint64) error
@@ -239,6 +240,9 @@ type binaryDecoder struct {
 func newBinaryDecoder(in io.Reader, length, maxBytes uint64) *binaryDecoder {
 	return &binaryDecoder{in: in, remaining: length, allocationLeft: multiplySaturated(maxBytes, 2)}
 }
+func newBinaryDecoderBytes(data []byte, maxBytes uint64) *binaryDecoder {
+	return &binaryDecoder{data: &data, remaining: uint64(len(data)), allocationLeft: multiplySaturated(maxBytes, 2)}
+}
 func (d *binaryDecoder) read(data []byte) {
 	if d.err != nil {
 		return
@@ -247,13 +251,40 @@ func (d *binaryDecoder) read(data []byte) {
 		d.err = io.ErrUnexpectedEOF
 		return
 	}
+	if d.data != nil {
+		copy(data, *d.data)
+		*d.data = (*d.data)[len(data):]
+		d.remaining -= uint64(len(data))
+		return
+	}
 	_, d.err = io.ReadFull(d.in, data)
 	d.remaining -= uint64(len(data))
 }
-func (d *binaryDecoder) ReadByte() (byte, error) { d.read(d.scratch[:1]); return d.scratch[0], d.err }
+func (d *binaryDecoder) ReadByte() (byte, error) {
+	if d.data != nil && d.err == nil {
+		if d.remaining == 0 {
+			d.err = io.ErrUnexpectedEOF
+		} else {
+			d.scratch[0] = (*d.data)[0]
+			*d.data = (*d.data)[1:]
+			d.remaining--
+		}
+	} else {
+		d.read(d.scratch[:1])
+	}
+	return d.scratch[0], d.err
+}
 func (d *binaryDecoder) u() uint64 {
 	if d.err != nil {
 		return 0
+	}
+	if d.data != nil {
+		value, n := binary.Uvarint(*d.data)
+		if n > 0 {
+			*d.data = (*d.data)[n:]
+			d.remaining -= uint64(n)
+			return value
+		}
 	}
 	value, err := binary.ReadUvarint(d)
 	if err != nil {
@@ -265,6 +296,14 @@ func (d *binaryDecoder) u() uint64 {
 func (d *binaryDecoder) i() int64 {
 	if d.err != nil {
 		return 0
+	}
+	if d.data != nil {
+		value, n := binary.Varint(*d.data)
+		if n > 0 {
+			*d.data = (*d.data)[n:]
+			d.remaining -= uint64(n)
+			return value
+		}
 	}
 	value, err := binary.ReadVarint(d)
 	if err != nil {
