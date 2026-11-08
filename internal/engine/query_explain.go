@@ -233,6 +233,12 @@ func explainOperators(plan *queryPlan, tx *Tx, patterns []matchPattern, params m
 		}
 	}
 
+	aggregate := plan.returnClause != nil && plan.returnClause.hasAggregates()
+	if aggregate {
+		if err := add(PlanOperator{Name: "Project", Access: "aggregate"}); err != nil {
+			return nil, err
+		}
+	}
 	topK := plan.usesTopK(skip, limit)
 	if len(plan.orderClauses) != 0 {
 		operator := PlanOperator{Name: "Sort", Access: explainOrderAccess(plan.orderClauses)}
@@ -244,12 +250,8 @@ func explainOperators(plan *queryPlan, tx *Tx, patterns []matchPattern, params m
 			return nil, err
 		}
 	}
-	if plan.returnClause != nil {
-		access := "scalar"
-		if plan.returnClause.hasAggregates() {
-			access = "aggregate"
-		}
-		if err := add(PlanOperator{Name: "Project", Access: access}); err != nil {
+	if plan.returnClause != nil && !aggregate {
+		if err := add(PlanOperator{Name: "Project", Access: "scalar"}); err != nil {
 			return nil, err
 		}
 		if plan.returnClause.Distinct {
@@ -306,7 +308,7 @@ func explainNodeOperator(plan *queryPlan, tx *Tx, node nodePattern, search *wher
 			return operator, nil
 		}
 	}
-	if access, ok := explainNodeIndexAccess(plan, tx, node); ok {
+	if access, ok := explainNodeIndexAccess(plan, tx, node, params); ok {
 		operator.Name = "NodeIndexSeek"
 		operator.Access = access
 		operator.Conditional = true
@@ -342,7 +344,7 @@ func explainEdgeOperator(plan *queryPlan, tx *Tx, edge edgePattern, params map[s
 		Direction: direction,
 		Estimate:  estimate,
 	}
-	if access, ok := explainEdgeIndexAccess(plan, tx, edge); ok {
+	if access, ok := explainEdgeIndexAccess(plan, tx, edge, params); ok {
 		operator.Name = "EdgeIndexSeek"
 		operator.Access = access
 		operator.Conditional = true
@@ -487,7 +489,7 @@ func explainSearchAccess(tx *Tx, node nodePattern, clause *whereClause, budget *
 	return "", nil
 }
 
-func explainNodeIndexAccess(plan *queryPlan, tx *Tx, node nodePattern) (string, bool) {
+func explainNodeIndexAccess(plan *queryPlan, tx *Tx, node nodePattern, params map[string]any) (string, bool) {
 	for _, label := range node.Labels {
 		for _, clause := range plan.whereClauses {
 			if clause.Var != node.Var || clause.Kind != whereEquals {
@@ -498,6 +500,9 @@ func explainNodeIndexAccess(plan *queryPlan, tx *Tx, node nodePattern) (string, 
 			default:
 				continue
 			}
+			if value, err := clause.Expr.eval(queryRow{}, params, nil); err == nil && hasNestedNumericValue(value) {
+				continue
+			}
 			if tx.graph.NodeProperties.Has(propertyIndexDefinition(label, clause.Property)) {
 				return "node_property:" + label + "." + clause.Property, true
 			}
@@ -506,7 +511,7 @@ func explainNodeIndexAccess(plan *queryPlan, tx *Tx, node nodePattern) (string, 
 	return "", false
 }
 
-func explainEdgeIndexAccess(plan *queryPlan, tx *Tx, edge edgePattern) (string, bool) {
+func explainEdgeIndexAccess(plan *queryPlan, tx *Tx, edge edgePattern, params map[string]any) (string, bool) {
 	if edge.EdgeVar == "" || edge.EdgeType == "" {
 		return "", false
 	}
@@ -517,6 +522,9 @@ func explainEdgeIndexAccess(plan *queryPlan, tx *Tx, edge edgePattern) (string, 
 		switch clause.Expr.(type) {
 		case literalExpr, paramExpr:
 		default:
+			continue
+		}
+		if value, err := clause.Expr.eval(queryRow{}, params, nil); err == nil && hasNestedNumericValue(value) {
 			continue
 		}
 		if tx.graph.EdgeProperties.Has(propertyIndexDefinition(edge.EdgeType, clause.Property)) {

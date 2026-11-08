@@ -2909,6 +2909,9 @@ func (plan *queryPlan) patternCardinalityWithBudget(tx *Tx, pattern matchPattern
 		if err != nil {
 			return err
 		}
+		if hasNestedNumericValue(value) {
+			return nil
+		}
 		count, found, err := indexes.CardinalityContext(queryScanContext(budget), definition, value, queryScanCharge(budget))
 		if err != nil {
 			return err

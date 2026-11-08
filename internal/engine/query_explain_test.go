@@ -293,3 +293,40 @@ func TestQueryExplainCandidateSources(t *testing.T) {
 		}
 	}
 }
+
+func TestQueryExplainAggregateOrderAndCompositeIndexFallback(t *testing.T) {
+	db, err := Open(":memory:", OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"value": []any{int64(1)}}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNodePropertyIndex("Item", "value"); err != nil {
+		t.Fatal(err)
+	}
+	const query = "MATCH (n:Item) WHERE n.value = $value RETURN n"
+	params := map[string]any{"value": []any{float64(1)}}
+	result, err := db.Query(query, params)
+	if err != nil || len(result.Rows) != 1 {
+		t.Fatalf("query: %#v, %v", result, err)
+	}
+	plan, err := db.ExplainContext(t.Context(), query, params, QueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op := plan.Root.Children[0]; op.Name != "NodeScan" || op.Estimate == nil || *op.Estimate != 1 {
+		t.Fatalf("unexpected source: %#v", op)
+	}
+	aggregate, err := db.ExplainContext(t.Context(), "MATCH (n:Item) RETURN n.value AS value, count(*) AS total ORDER BY total DESC", nil, QueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := explainNames(aggregate); !reflect.DeepEqual(got, []string{"NodeScan", "Project", "Sort"}) {
+		t.Fatalf("aggregate operator order = %v", got)
+	}
+}
