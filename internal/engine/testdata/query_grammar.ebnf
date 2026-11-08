@@ -1,4 +1,5 @@
-query          = query-part {WITH with-clause query-part} [";"]
+query          = query-chain [ {UNION query-chain} | {UNION ALL query-chain} ] [";"]
+query-chain    = query-part {WITH with-clause query-part}
 query-part     = match-query | create-query | merge-query | unwind-query | RETURN return-tail
 with-clause    = [DISTINCT] projection {"," projection} [WHERE predicates]
                 [ORDER BY order {"," order}] [SKIP pagination] [LIMIT pagination]

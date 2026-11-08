@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "2f252039290e1a87414b232e4d2fccf9f7d0abdfe61808e00a2947150b584793"
+const auditedCypherParserDigest = "a2b336d0797e0c63a936d34b1d8d6f8fbd27113cf6a6ff3a15a89b8708368ba3"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -177,6 +177,8 @@ func TestQueryGrammarASTShape(t *testing.T) {
 
 func TestQueryGrammarMatrix(t *testing.T) {
 	accepted := map[string]string{
+		"union branches":                       `RETURN 1 AS x UNION RETURN 2 AS x`,
+		"union all branches":                   `MATCH (n) RETURN n AS x LIMIT 1 UNION ALL RETURN null AS x`,
 		"optional match":                       `OPTIONAL MATCH (n) RETURN n`,
 		"correlated exists":                    `MATCH (n) WHERE NOT EXISTS { MATCH (n)-[:R]->(m) } RETURN n`,
 		"with create":                          "MATCH (n) WITH n.name AS name CREATE (m:Copy {name: name}) RETURN m",
@@ -390,7 +392,7 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"negative skip":                              `MATCH (n) RETURN n SKIP -1`,
 		"skip after limit":                           `MATCH (n) RETURN n LIMIT 1 SKIP 1`,
 		"unknown order binding":                      `MATCH (n) RETURN n ORDER BY missing`,
-		"union":                                      `MATCH (n) RETURN n UNION MATCH (m) RETURN m`,
+		"union mismatched ordered columns":           `MATCH (n) RETURN n UNION MATCH (m) RETURN m`,
 		"with as final clause":                       `MATCH (n) WITH n`,
 		"with drops bindings":                        `MATCH (n) WITH n.name AS name RETURN n.name AS value`,
 		"unwind without as":                          `UNWIND $items RETURN item`,
