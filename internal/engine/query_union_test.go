@@ -138,6 +138,8 @@ func TestQueryUnionPreservesUppercaseUnionIdentifiers(t *testing.T) {
 		{`WITH 1 AS UNION RETURN [1, UNION ] AS value`, func(result QueryResult) bool {
 			return reflect.DeepEqual(result.Rows[0]["value"], []any{int64(1), int64(1)})
 		}},
+		{`WITH 1 AS UNION RETURN [1, UNION ] AS value UNION RETURN [1, 1] AS value`, func(result QueryResult) bool { return len(result.Rows) == 1 }},
+		{`RETURN 1 AS UNION UNION ALL RETURN 2 AS UNION`, func(result QueryResult) bool { return len(result.Rows) == 2 }},
 	}
 	for _, test := range cases {
 		result, err := db.Query(test.query, nil)

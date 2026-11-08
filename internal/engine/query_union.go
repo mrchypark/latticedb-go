@@ -50,11 +50,18 @@ func splitQueryUnion(query string) ([]string, bool, bool, error) {
 		if scanQueryString(query, index, &quote) {
 			continue
 		}
-		if (index == 0 || query[index-1] == ' ') && strings.HasPrefix(query[index:], "UNION") {
+		if braceDepth == 0 && bracketDepth == 0 && parenDepth == 0 &&
+			(index == 0 || query[index-1] == ' ') && strings.HasPrefix(query[index:], "UNION") {
 			end := index + len("UNION")
 			if end == len(query) || query[end] == ' ' {
-				if braceDepth != 0 || bracketDepth != 0 || parenDepth != 0 {
-					return nil, false, false, errors.New("nested UNION is unsupported")
+				prefix := strings.TrimSpace(query[:index])
+				prior := prefix
+				if last := strings.LastIndexByte(prefix, ' '); last >= 0 {
+					prior = prefix[last+1:]
+				}
+				switch prior {
+				case "AS", "RETURN", "WITH", "DISTINCT":
+					continue
 				}
 				separator := queryUnionSeparator{index: index, end: end}
 				cursor := end
@@ -66,6 +73,16 @@ func splitQueryUnion(query string) ([]string, bool, bool, error) {
 					separator.end = cursor + len("ALL")
 				} else if hasQueryWord(query, cursor, "DISTINCT") {
 					return nil, false, false, errors.New("UNION DISTINCT is unsupported")
+				}
+				// UNION may also be a binding or alias. Only a complete
+				// branch starter after the token makes it a separator.
+				next := strings.TrimSpace(query[separator.end:])
+				switch {
+				case strings.HasPrefix(next, "MATCH "), strings.HasPrefix(next, "OPTIONAL MATCH "),
+					strings.HasPrefix(next, "RETURN "), strings.HasPrefix(next, "WITH "),
+					strings.HasPrefix(next, "UNWIND "), strings.HasPrefix(next, "CREATE "), strings.HasPrefix(next, "MERGE "):
+				default:
+					continue
 				}
 				separators = append(separators, separator)
 				index = separator.end - 1
