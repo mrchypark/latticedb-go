@@ -2,7 +2,8 @@ query          = query-part {WITH with-clause query-part} [";"]
 query-part     = match-query | create-query | merge-query | unwind-query | RETURN return-tail
 with-clause    = [DISTINCT] projection {"," projection} [WHERE predicates]
                 [ORDER BY order {"," order}] [SKIP pagination] [LIMIT pagination]
-match-query    = MATCH patterns [WHERE predicates] {MATCH patterns [WHERE predicates]} [match-terminal]
+match-query    = match-clause {match-clause} [match-terminal]
+match-clause   = [OPTIONAL] MATCH patterns [WHERE predicates]
 match-terminal = RETURN return-tail
                 | SET assignments [RETURN return-tail]
                 | CREATE create-pattern {"," create-pattern} [RETURN return-tail]
@@ -36,7 +37,8 @@ properties     = "{" [property ":" expression {"," property ":" expression}] "}"
 
 predicates     = and-expression {OR and-expression}
 and-expression = not-expression {AND not-expression}
-not-expression = [NOT] ("(" predicates ")" | predicate)
+not-expression = [NOT] ("(" predicates ")" | predicate | exists-predicate)
+exists-predicate = EXISTS "{" MATCH patterns [WHERE predicates] "}"
 predicate      = expression ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
                 | property-access IN expression
                 | property-access (STARTS WITH | ENDS WITH | CONTAINS) expression

@@ -59,18 +59,22 @@ type matchWhereScope struct {
 	patterns  []matchPattern
 	clauses   []*whereClause
 	predicate wherePredicate
+	optional  bool
 }
 
 // queryBudget tracks cumulative work and logical live bytes. Live bytes include
 // returned results, materialized query rows, and scoped scratch; it is not an
 // estimate of process RSS.
 type queryBudget struct {
-	ctx      context.Context
-	maxRows  uint32
-	maxWork  uint32
-	maxBytes uint32
-	work     uint32
-	bytes    uint32
+	ctx          context.Context
+	activeTx     *Tx
+	existsStages *existsEvalState
+	matchRowSink func(queryRow) error
+	maxRows      uint32
+	maxWork      uint32
+	maxBytes     uint32
+	work         uint32
+	bytes        uint32
 	// Source storage has a separate ledger: expression scratch checkpoints
 	// must never release a disk record retained by a row or path.
 	sourceContext     context.Context
@@ -887,6 +891,16 @@ func parseQuery(query string) (*queryPlan, error) {
 	if err != nil {
 		return nil, err
 	}
+	if plan.mutates() {
+		for part := plan; part != nil; part = part.next {
+			if predicateHasExists(part.wherePredicate) || predicateHasExists(part.withWhere) {
+				return nil, errors.New("EXISTS cannot be combined with mutation")
+			}
+		}
+	}
+	if err := validateOptionalMatchPlan(plan); err != nil {
+		return nil, err
+	}
 	for current := plan; current != nil; current = current.next {
 		if err := current.validateBindings(); err != nil {
 			return nil, err
@@ -925,6 +939,8 @@ func parseQueryText(query string) (*queryPlan, error) {
 		plan = &queryPlan{}
 	case strings.HasPrefix(head, "MATCH "):
 		plan, err = parseMatchQuery(head)
+	case strings.HasPrefix(head, "OPTIONAL MATCH "):
+		plan, err = parseOptionalMatchQuery(head)
 	case strings.HasPrefix(head, "CREATE "):
 		plan, err = parseCreateQuery(head)
 	case strings.HasPrefix(head, "MERGE "):
@@ -955,7 +971,7 @@ func attachWithPart(plan *queryPlan, text string) error {
 	if text == "" {
 		return errors.New("WITH must be followed by another clause")
 	}
-	itemsText, keyword, tail := splitOnNextClause(text, " MATCH ", " UNWIND ", " CREATE ", " MERGE ", " RETURN ")
+	itemsText, keyword, tail := splitOnNextClause(text, " OPTIONAL MATCH ", " MATCH ", " UNWIND ", " CREATE ", " MERGE ", " RETURN ")
 	keywordIndex := -1
 	if keyword != "" {
 		keywordIndex = findTopLevelToken(text, keyword)
@@ -1416,6 +1432,22 @@ func (plan *queryPlan) validateBindings() error {
 				return err
 			}
 		}
+		if predicateHasExists(scope.predicate) {
+			roles := make(map[string]bindingRole, len(available))
+			for name := range available {
+				role := bindings[name]
+				if role == 0 {
+					role = plan.inheritedRoles[name]
+				}
+				if role == 0 {
+					role = bindingValue
+				}
+				roles[name] = role
+			}
+			if err := validateExistsPredicateScope(scope.predicate, roles); err != nil {
+				return err
+			}
+		}
 		for _, clause := range wherePredicateClauses(scope.predicate) {
 			if err := validateScopedName(clause.Var); err != nil {
 				return err
@@ -1637,6 +1669,11 @@ func (plan *queryPlan) validateBindings() error {
 			}
 			roles[name] = role
 		}
+		if predicateHasExists(plan.withWhere) {
+			if err := validateExistsPredicateScope(plan.withWhere, roles); err != nil {
+				return err
+			}
+		}
 		projected := make(map[string]struct{}, len(clause.Projections))
 		for _, name := range withOutputNames(clause) {
 			projected[name] = struct{}{}
@@ -1717,8 +1754,21 @@ func parseMatchQuery(query string) (*queryPlan, error) {
 }
 
 func parseMatchQueryWithPathIndex(query string, pathIndex *int) (*queryPlan, error) {
-	rest := strings.TrimSpace(strings.TrimPrefix(query, "MATCH "))
-	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " MATCH ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
+	return parseMatchQueryPartWithPathIndex(query, false, pathIndex)
+}
+
+func parseOptionalMatchQuery(query string) (*queryPlan, error) {
+	pathIndex := 0
+	return parseMatchQueryPartWithPathIndex(query, true, &pathIndex)
+}
+
+func parseMatchQueryPartWithPathIndex(query string, optional bool, pathIndex *int) (*queryPlan, error) {
+	prefix := "MATCH "
+	if optional {
+		prefix = "OPTIONAL MATCH "
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(query, prefix))
+	matchText, nextKeyword, tail := splitOnNextClause(rest, " WHERE ", " OPTIONAL MATCH ", " MATCH ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
 	patterns, err := parseMatchPatternsWithPathIndex(matchText, pathIndex)
 	if err != nil {
 		return nil, err
@@ -1729,7 +1779,7 @@ func parseMatchQueryWithPathIndex(query string, pathIndex *int) (*queryPlan, err
 
 	switch nextKeyword {
 	case " WHERE ":
-		whereText, whereNext, afterWhere := splitOnNextClause(tail, " MATCH ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
+		whereText, whereNext, afterWhere := splitOnNextClause(tail, " OPTIONAL MATCH ", " MATCH ", " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ")
 		predicate, err := parseWherePredicate(whereText)
 		if err != nil {
 			return nil, err
@@ -1746,7 +1796,7 @@ func parseMatchQueryWithPathIndex(query string, pathIndex *int) (*queryPlan, err
 		}
 		nextKeyword = whereNext
 		tail = afterWhere
-	case " MATCH ":
+	case " OPTIONAL MATCH ", " MATCH ":
 		// Handled with the other terminal clauses below.
 	case " RETURN ", " SET ", " CREATE ", " MERGE ", " REMOVE ", " DETACH DELETE ", " DELETE ", "":
 	default:
@@ -1756,11 +1806,17 @@ func parseMatchQueryWithPathIndex(query string, pathIndex *int) (*queryPlan, err
 		patterns:  slices.Clone(patterns),
 		clauses:   slices.Clone(plan.whereClauses),
 		predicate: plan.wherePredicate,
+		optional:  optional,
 	})
 
 	switch nextKeyword {
-	case " MATCH ":
-		next, err := parseMatchQueryWithPathIndex("MATCH "+tail, pathIndex)
+	case " OPTIONAL MATCH ", " MATCH ":
+		nextOptional := nextKeyword == " OPTIONAL MATCH "
+		nextPrefix := "MATCH "
+		if nextOptional {
+			nextPrefix = "OPTIONAL MATCH "
+		}
+		next, err := parseMatchQueryPartWithPathIndex(nextPrefix+tail, nextOptional, pathIndex)
 		if err != nil {
 			return nil, err
 		}
@@ -1852,7 +1908,7 @@ func parseUnwindQueryPart(query string, allowNoTerminal bool) (*queryPlan, error
 		return nil, err
 	}
 
-	varText, nextKeyword, afterVar := splitOnNextClause(tail, " MATCH ", " CREATE ", " MERGE ", " RETURN ")
+	varText, nextKeyword, afterVar := splitOnNextClause(tail, " OPTIONAL MATCH ", " MATCH ", " CREATE ", " MERGE ", " RETURN ")
 	varName, err := parseQueryIdentifier(varText)
 	if err != nil {
 		return nil, fmt.Errorf("invalid UNWIND binding %q", query)
@@ -1861,6 +1917,8 @@ func parseUnwindQueryPart(query string, allowNoTerminal bool) (*queryPlan, error
 	switch nextKeyword {
 	case " MATCH ":
 		plan, err = parseMatchQuery("MATCH " + afterVar)
+	case " OPTIONAL MATCH ":
+		plan, err = parseOptionalMatchQuery("OPTIONAL MATCH " + afterVar)
 	case " CREATE ":
 		plan, err = parseCreateQuery("CREATE " + afterVar)
 	case " MERGE ":
@@ -1954,9 +2012,15 @@ func parsePlanReturn(plan *queryPlan, text string) error {
 
 func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudget) (QueryResult, error) {
 	previous := tx.queryBudget
+	budget.activeTx = tx
 	budget.residentSources = tx.graph.PageBase == nil
 	tx.queryBudget = budget
-	defer func() { tx.queryBudget = previous; budget.closeSources() }()
+	defer func() {
+		tx.queryBudget = previous
+		budget.activeTx = nil
+		budget.existsStages = nil
+		budget.closeSources()
+	}()
 	return plan.executeWithInput(tx, params, budget, nil)
 }
 
@@ -2024,7 +2088,7 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 	match := stream
 	matchRoot := budget.iteratorSources(match)
 	defer matchRoot.close(budget)
-	if len(plan.matchWhereScopes) > 1 {
+	if len(plan.matchWhereScopes) > 1 || plan.hasOptionalMatch() {
 		for _, scope := range plan.matchWhereScopes {
 			// Index lookup may prune candidates from the predicates attached to
 			// this MATCH only. Later scope predicates must not suppress errors
@@ -2032,14 +2096,20 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 			scopePlan := *plan
 			scopePlan.whereClauses = scope.clauses
 			scopePlan.wherePredicate = scope.predicate
-			for _, pattern := range scope.patterns {
-				match = newPatternQueryIterator(&scopePlan, tx, match, pattern, params, limit, skip, budget, nil)
+			if scope.optional {
+				optional := newOptionalMatchPattern(&scopePlan, scope, params, limit, skip)
+				match = newPatternQueryIterator(&scopePlan, tx, match, optional, params, limit, skip, budget, nil)
 				matchRoot.setIterator(match)
-			}
-			match, err = applyWhereQueryStream(match, tx, params, budget, scope.clauses, scope.predicate)
-			matchRoot.setIterator(match)
-			if err != nil {
-				return QueryResult{}, err
+			} else {
+				for _, pattern := range scope.patterns {
+					match = newPatternQueryIterator(&scopePlan, tx, match, pattern, params, limit, skip, budget, nil)
+					matchRoot.setIterator(match)
+				}
+				match, err = applyWhereQueryStream(match, tx, params, budget, scope.clauses, scope.predicate)
+				matchRoot.setIterator(match)
+				if err != nil {
+					return QueryResult{}, err
+				}
 			}
 		}
 	} else {
@@ -2244,7 +2314,7 @@ func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any, budge
 	if len(budgets) != 0 {
 		budget = budgets[0]
 	}
-	if plan.unwindClause != nil || plan.mutates() || len(plan.matchWhereScopes) > 1 || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) == 0 {
+	if plan.unwindClause != nil || plan.mutates() || len(plan.matchWhereScopes) > 1 || plan.hasOptionalMatch() || len(plan.orderClauses) == 0 || plan.skipExpr != nil || plan.limitExpr != nil || len(plan.matchPatterns) == 0 {
 		return plan.matchPatterns, nil
 	}
 	search, err := plan.hasSearchPatternClause(budget)
@@ -3927,6 +3997,9 @@ func parseWherePredicate(text string) (wherePredicate, error) {
 		}
 		return notPredicate{Item: item}, nil
 	}
+	if strings.HasPrefix(text, "EXISTS {") || strings.HasPrefix(text, "EXISTS{") {
+		return parseExistsPredicate(text)
+	}
 	return parseWhereClause(text)
 }
 
@@ -3954,7 +4027,7 @@ func flattenWhereConjunction(predicate wherePredicate) ([]*whereClause, bool) {
 
 func wherePredicateClauses(predicate wherePredicate) []*whereClause {
 	switch predicate := predicate.(type) {
-	case nil:
+	case nil, *existsPredicate:
 		return nil
 	case *whereClause:
 		return []*whereClause{predicate}
@@ -4765,9 +4838,15 @@ func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) (
 		return nextRows, nil
 	}
 	anchor := pattern.Labels[0]
-	anchorCount, err := tx.graph.LabelCountContext(queryScanContext(budget), anchor, queryScanCharge(budget))
-	if err != nil {
-		return nil, err
+	var anchorCount uint64
+	var err error
+	// A paged EXISTS can stop on its first candidate. Counting the entire
+	// posting first would defeat that early exit for a single label.
+	if budget.matchRowSink == nil || tx.graph.PageBase == nil || len(pattern.Labels) > 1 {
+		anchorCount, err = tx.graph.LabelCountContext(queryScanContext(budget), anchor, queryScanCharge(budget))
+		if err != nil {
+			return nil, err
+		}
 	}
 	for _, label := range pattern.Labels[1:] {
 		count, err := tx.graph.LabelCountContext(queryScanContext(budget), label, queryScanCharge(budget))
@@ -4865,6 +4944,12 @@ func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecor
 				if err := budget.check(0, len(nextRows)+1); err != nil {
 					return nil, err
 				}
+				if budget.matchRowSink != nil {
+					if err := budget.matchRowSink(row); err != nil {
+						return nil, err
+					}
+					continue
+				}
 				nextRows = append(nextRows, row)
 				continue
 			}
@@ -4875,6 +4960,12 @@ func (pattern nodePattern) appendNodeRows(rows []queryRow, node *store.NodeRecor
 		nextRow := row.clone()
 		if pattern.Var != "" {
 			nextRow.set(pattern.Var, boundValue{Node: node})
+		}
+		if budget.matchRowSink != nil {
+			if err := budget.matchRowSink(nextRow); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		if budget.source != nil {
 			budget.escapeSource(nextRow)
@@ -5191,6 +5282,9 @@ func (pattern edgePattern) appendEdgeRow(row queryRow, edge *store.EdgeRecord, l
 	}
 	if pattern.EdgeVar != "" {
 		nextRow.set(pattern.EdgeVar, boundValue{Edge: edge})
+	}
+	if budget.matchRowSink != nil {
+		return rows, budget.matchRowSink(nextRow)
 	}
 	if budget.source != nil {
 		budget.escapeSource(nextRow)
