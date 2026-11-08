@@ -146,7 +146,7 @@ func TestHashArchiveFileCancellationAndErrors(t *testing.T) {
 	}
 }
 
-func BenchmarkWriteArchiveHeadPreviousFullRehashBytes(b *testing.B) {
+func BenchmarkArchivePreviousHeadHashBytes(b *testing.B) {
 	for _, size := range []int{1 << 10, 1 << 20} {
 		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
 			previous := writeArchiveHeadTestEntry(b, b.TempDir(), 1, size)

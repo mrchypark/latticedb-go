@@ -25,7 +25,7 @@ or physical disk reads.
 Run the focused benchmark with:
 
 ```sh
-go test ./internal/engine -run '^$' -bench '^BenchmarkWriteArchiveHeadPreviousFullRehashBytes$' -benchmem
+go test ./internal/engine -run '^$' -bench '^BenchmarkArchivePreviousHeadHashBytes$' -benchmem
 ```
 
 The benchmark opens the real fixture files and runs the same reader helper that
@@ -41,8 +41,8 @@ The benchmark produced this result on 2026-11-08 with Go on darwin/arm64 and an
 Apple M3. It is one local timing sample, not a disk-read measurement.
 
 ```text
-BenchmarkWriteArchiveHeadPreviousFullRehashBytes/1024B-8       31473   36463 ns/op      1024 previous_rehash_bytes   33384 B/op   7 allocs/op
-BenchmarkWriteArchiveHeadPreviousFullRehashBytes/1048576B-8     1699  710912 ns/op   1048576 previous_rehash_bytes   33384 B/op   7 allocs/op
+BenchmarkArchivePreviousHeadHashBytes/1024B-8       31473   36463 ns/op      1024 previous_rehash_bytes   33384 B/op   7 allocs/op
+BenchmarkArchivePreviousHeadHashBytes/1048576B-8     1699  710912 ns/op   1048576 previous_rehash_bytes   33384 B/op   7 allocs/op
 ```
 
 The corruption test uses synthetic bytes. It proves that the current digest
