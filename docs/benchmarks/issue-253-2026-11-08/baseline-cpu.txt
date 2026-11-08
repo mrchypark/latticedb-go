@@ -1,0 +1,22 @@
+File: engine.test
+Type: cpu
+Time: 2026-11-08 20:56:31 KST
+Duration: 1.53s, Total samples = 500ms (32.69%)
+Showing nodes accounting for 120ms, 24.00% of 500ms total
+Showing top 15 nodes out of 134
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      260ms 52.00%  runtime.systemstack
+         0     0%     0%      150ms 30.00%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).Update (inline)
+         0     0%     0%      150ms 30.00%  github.com/mrchypark/latticedb-go/internal/engine.(*DB).updateContext
+         0     0%     0%      150ms 30.00%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitInternalContext
+         0     0%     0%      150ms 30.00%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).commitPages
+         0     0%     0%      150ms 30.00%  github.com/mrchypark/latticedb-go/internal/engine.BenchmarkPageCommitWithGrowingMetadata.func1
+         0     0%     0%      150ms 30.00%  testing.(*B).runN
+         0     0%     0%      130ms 26.00%  runtime.(*mheap).alloc.func1
+         0     0%     0%      130ms 26.00%  runtime.(*mheap).allocSpan
+         0     0%     0%      130ms 26.00%  testing.(*B).launch
+     120ms 24.00% 24.00%      120ms 24.00%  runtime.madvise
+         0     0% 24.00%      120ms 24.00%  runtime.sysUsed (inline)
+         0     0% 24.00%      120ms 24.00%  runtime.sysUsedOS (inline)
+         0     0% 24.00%       90ms 18.00%  runtime.semasleep
+         0     0% 24.00%       80ms 16.00%  github.com/mrchypark/latticedb-go/internal/pagestore.(*Tx).Scan (inline)
