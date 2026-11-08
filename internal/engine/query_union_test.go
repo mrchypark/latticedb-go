@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -140,6 +141,14 @@ func TestQueryUnionPreservesUppercaseUnionIdentifiers(t *testing.T) {
 		}},
 		{`WITH 1 AS UNION RETURN [1, UNION ] AS value UNION RETURN [1, 1] AS value`, func(result QueryResult) bool { return len(result.Rows) == 1 }},
 		{`RETURN 1 AS UNION UNION ALL RETURN 2 AS UNION`, func(result QueryResult) bool { return len(result.Rows) == 2 }},
+	}
+	for _, alias := range []string{"AS", "RETURN", "WITH", "DISTINCT"} {
+		cases = append(cases, struct {
+			query string
+			check func(QueryResult) bool
+		}{fmt.Sprintf("RETURN 1 AS %s UNION ALL RETURN 2 AS %s", alias, alias), func(result QueryResult) bool {
+			return len(result.Rows) == 2 && result.Rows[0][alias] == int64(1) && result.Rows[1][alias] == int64(2)
+		}})
 	}
 	for _, test := range cases {
 		result, err := db.Query(test.query, nil)

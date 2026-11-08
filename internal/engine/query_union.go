@@ -44,6 +44,7 @@ type queryUnionSeparator struct {
 func splitQueryUnion(query string) ([]string, bool, bool, error) {
 	query = normalizeQueryText(query)
 	var separators []queryUnionSeparator
+	branchStart := 0
 	var quote byte
 	braceDepth, bracketDepth, parenDepth := 0, 0, 0
 	for index := 0; index < len(query); index++ {
@@ -54,15 +55,6 @@ func splitQueryUnion(query string) ([]string, bool, bool, error) {
 			(index == 0 || query[index-1] == ' ') && strings.HasPrefix(query[index:], "UNION") {
 			end := index + len("UNION")
 			if end == len(query) || query[end] == ' ' {
-				prefix := strings.TrimSpace(query[:index])
-				prior := prefix
-				if last := strings.LastIndexByte(prefix, ' '); last >= 0 {
-					prior = prefix[last+1:]
-				}
-				switch prior {
-				case "AS", "RETURN", "WITH", "DISTINCT":
-					continue
-				}
 				separator := queryUnionSeparator{index: index, end: end}
 				cursor := end
 				if cursor < len(query) && query[cursor] == ' ' {
@@ -84,6 +76,23 @@ func splitQueryUnion(query string) ([]string, bool, bool, error) {
 				default:
 					continue
 				}
+				prefix := strings.TrimSpace(query[branchStart:index])
+				prior := prefix
+				if last := strings.LastIndexByte(prefix, ' '); last >= 0 {
+					prior = prefix[last+1:]
+				}
+				switch prior {
+				case "AS", "RETURN", "WITH", "DISTINCT":
+					// A keyword can also complete a projection, e.g. RETURN 1 AS DISTINCT.
+					plan, err := parseQueryText(prefix)
+					if err != nil {
+						continue
+					}
+					if _, err := queryUnionColumns(plan); err != nil {
+						continue
+					}
+				}
+				branchStart = separator.end
 				separators = append(separators, separator)
 				index = separator.end - 1
 				continue
