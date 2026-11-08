@@ -233,7 +233,8 @@ query          = query-part {WITH with-clause query-part} [";"]
 query-part     = match-query | create-query | merge-query | unwind-query | RETURN return-tail
 with-clause    = [DISTINCT] projection {"," projection} [WHERE predicates]
                 [ORDER BY order {"," order}] [SKIP pagination] [LIMIT pagination]
-match-query    = MATCH patterns [WHERE predicates] {MATCH patterns [WHERE predicates]} [match-terminal]
+match-query    = match-clause {match-clause} [match-terminal]
+match-clause   = [OPTIONAL] MATCH patterns [WHERE predicates]
 match-terminal = RETURN return-tail
                 | SET assignments [RETURN return-tail]
                 | CREATE create-pattern {"," create-pattern} [RETURN return-tail]
@@ -267,7 +268,8 @@ properties     = "{" [property ":" expression {"," property ":" expression}] "}"
 
 predicates     = and-expression {OR and-expression}
 and-expression = not-expression {AND not-expression}
-not-expression = [NOT] ("(" predicates ")" | predicate)
+not-expression = [NOT] ("(" predicates ")" | predicate | exists-predicate)
+exists-predicate = EXISTS "{" MATCH patterns [WHERE predicates] "}"
 predicate      = expression ("=" | "<>" | "<" | "<=" | ">" | ">=") expression
                 | property-access IN expression
                 | property-access (STARTS WITH | ENDS WITH | CONTAINS) expression
@@ -331,7 +333,7 @@ parameter      = "$" identifier
 ```
 <!-- END supported-cypher-grammar -->
 
-Consecutive `MATCH` clauses may each add patterns and their own `WHERE` filter without a `WITH`. Fixed and variable-length `MATCH` paths may be incoming, outgoing, or undirected. Variable-length relationships accept `*`, `*n`, `*min..max`, `*..max`, and `*min..`; zero hops are valid. Only an unquoted `*` starts the hop range, so asterisks inside backtick-quoted relationship bindings and types remain part of those identifiers. A relationship may not repeat within one expansion, but nodes may repeat. Open upper bounds use the finite number of edges; work, row, byte, and context limits still apply. A bound variable-length relationship is a list of edges, including an empty list for zero hops. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `OPTIONAL MATCH` and `UNION` remain unsupported. List literals accept nested expressions and bindings, including in `UNWIND`, `IN`, projections, and properties. Bytes and vectors remain available through parameters.
+Consecutive `MATCH` clauses may each add patterns and their own `WHERE` filter without a `WITH`. Fixed and variable-length `MATCH` paths may be incoming, outgoing, or undirected. Variable-length relationships accept `*`, `*n`, `*min..max`, `*..max`, and `*min..`; zero hops are valid. Only an unquoted `*` starts the hop range, so asterisks inside backtick-quoted relationship bindings and types remain part of those identifiers. A relationship may not repeat within one expansion, but nodes may repeat. Open upper bounds use the finite number of edges; work, row, byte, and context limits still apply. A bound variable-length relationship is a list of edges, including an empty list for zero hops. Vector and full-text search predicates may be joined by `AND`, but not placed under `OR` or `NOT` because those operators carry ranking semantics. `UNION` remains unsupported. The read-only subset of `OPTIONAL MATCH` and correlated `EXISTS` is described in [the #256 contract](query-optional-exists.md). These clauses reject variable-length patterns and ranked search within the new operators. `EXISTS` rejects nested `EXISTS`, inner `WITH`, and inner `RETURN`. A statement containing either new operator cannot mutate data. List literals accept nested expressions and bindings, including in `UNWIND`, `IN`, projections, and properties. Bytes and vectors remain available through parameters.
 
 Function calls are limited to the built-in helpers `id`, `labels`, `type`, `properties`, `size`, `head`, `last`, `tail`, `range`, `split`, `replace`, `substring`, `trim`, `toLower`, `toUpper`, `toInteger`, `toFloat`, `toString`, `abs`, and `coalesce`. Unknown names and wrong argument counts are rejected while the query is parsed. Calls may appear wherever a value expression is accepted, including both sides of a `WHERE` comparison, `RETURN` projections, `SET` assignments, and `CREATE` property maps. Comparison operands may include nested function calls and arithmetic, and `ORDER BY` on a computed projection is not supported.
 

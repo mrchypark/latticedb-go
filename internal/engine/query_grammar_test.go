@@ -15,7 +15,7 @@ import (
 	"testing"
 )
 
-const auditedCypherParserDigest = "f05c96a366e2a48990945c153232a37907566f44c8df2447f336a7c86559d141"
+const auditedCypherParserDigest = "2f252039290e1a87414b232e4d2fccf9f7d0abdfe61808e00a2947150b584793"
 
 func TestSupportedCypherGrammarContract(t *testing.T) {
 	grammar, err := os.ReadFile(filepath.Join("testdata", "query_grammar.ebnf"))
@@ -177,6 +177,8 @@ func TestQueryGrammarASTShape(t *testing.T) {
 
 func TestQueryGrammarMatrix(t *testing.T) {
 	accepted := map[string]string{
+		"optional match":                       `OPTIONAL MATCH (n) RETURN n`,
+		"correlated exists":                    `MATCH (n) WHERE NOT EXISTS { MATCH (n)-[:R]->(m) } RETURN n`,
 		"with create":                          "MATCH (n) WITH n.name AS name CREATE (m:Copy {name: name}) RETURN m",
 		"multiple create paths":                `CREATE (a:Person {name: 'Ada'})-[:KNOWS]->(b:Person {name: 'Bob'}), (team:Team {name: 'Ops'}) RETURN a.name, b.name, team.name`,
 		"create node list":                     `CREATE (a:Person), (b:Person) RETURN id(a), id(b)`,
@@ -328,11 +330,11 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"with order by alias":                  `MATCH (n) WITH n.age AS age ORDER BY age DESC LIMIT 1 RETURN age AS age`,
 		"list literal":                         `MATCH (n) WHERE n.kind IN ["a", "b"] RETURN n`,
 		"count with projection list":           `MATCH (n) RETURN count(n), n.name`,
-		"boolean projections":                 `RETURN true AS yes, false AS no`,
-		"null projection":                     `RETURN null AS missing`,
-		"literal with":                        `WITH true AS yes, false AS no, null AS missing RETURN yes, no, missing`,
-		"literal count":                       `RETURN count(null) AS missing`,
-		"quoted literal binding":              "WITH 7 AS `null` RETURN `null` AS value, count(`null`) AS present",
+		"boolean projections":                  `RETURN true AS yes, false AS no`,
+		"null projection":                      `RETURN null AS missing`,
+		"literal with":                         `WITH true AS yes, false AS no, null AS missing RETURN yes, no, missing`,
+		"literal count":                        `RETURN count(null) AS missing`,
+		"quoted literal binding":               "WITH 7 AS `null` RETURN `null` AS value, count(`null`) AS present",
 	}
 	for name, query := range accepted {
 		t.Run("accept/"+name, func(t *testing.T) {
@@ -347,7 +349,6 @@ func TestQueryGrammarMatrix(t *testing.T) {
 		"decoded duplicate with":                     "MATCH (a), (b) WITH a AS b, `b` RETURN b",
 		"empty query":                                ``,
 		"lowercase keyword":                          `match (n) RETURN n`,
-		"optional match":                             `OPTIONAL MATCH (n) RETURN n`,
 		"missing match pattern":                      `MATCH`,
 		"empty where":                                `MATCH (n) WHERE`,
 		"dangling boolean predicate":                 `MATCH (n) WHERE n.active = true AND RETURN n`,

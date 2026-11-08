@@ -40,14 +40,13 @@ Implement these in independently reviewable stages.
 OPTIONAL's attached WHERE filters candidate matches before null extension. A
 WHERE after WITH filters the resulting rows, so it can remove an unmatched row.
 Chained OPTIONAL preserves a NULL outer binding; a later pattern cannot rebind
-that NULL into a real node. On zero input rows OPTIONAL emits no rows. With a
-bound NULL, an EXISTS pattern has no match and returns false. Empty input to an
+that NULL into a real node. On zero input rows OPTIONAL emits no rows. When an EXISTS pattern references a NULL entity binding, it has no match.
+Unreferenced NULL bindings have no effect. Empty input to an
 outer query does not invent an EXISTS row.
 
-An inner WITH follows the existing alias/drop rules; dropped names cannot be
-used later. Reject references to unknown names and attempts to redefine an outer
-binding with a different entity. Nested EXISTS must use distinct lexical scopes;
-if the initial parser cannot enforce this, reject nested EXISTS explicitly.
+In the initial subset, reject inner WITH, inner RETURN, and nested EXISTS.
+Names already in outer scope are correlated, not shadowed. Reject unknown or
+dropped references. See [the #256 contract](query-optional-exists.md) for details.
 
 For UNION, first-stage ORDER BY/SKIP/LIMIT belongs to an individual branch.
 Ordering applies only where explicitly requested. A global union-tail ordering
