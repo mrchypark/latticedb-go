@@ -541,7 +541,7 @@ func (tx *Tx) commitPages(ctx context.Context) error {
 		db.recoveryRequired = true
 		return errors.Join(ErrCommitOutcomeUnknown, err)
 	}
-	graph, _, err := (&store.PageGraph{Tx: read}).LoadGraph(context.Background())
+	graph, _, err := (&store.PageGraph{Tx: read}).LoadGraphWithAppMetadata(context.Background(), tx.graph.AppMetadata)
 	if err != nil {
 		_ = read.Rollback()
 		db.recoveryRequired = true
