@@ -223,3 +223,57 @@ func TestPageStreamInitialImport(t *testing.T) {
 		t.Fatalf("imported offset = %d, %v", offset, ok)
 	}
 }
+
+func TestPageStreamReadCapacityBoundedByUnreadAndBytes(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "capacity.db"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	write, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memory := NewStreamStore()
+	ops := make([]StreamOperation, 1024)
+	for i := range ops {
+		ops[i] = StreamOperation{Type: "publish", Stream: "events", Sequence: uint64(i + 1), Kind: "event", Payload: "payload"}
+		memory.Publish("events", "event", "payload")
+	}
+	if err := (&PageGraph{Tx: write}).ApplyStreamOperations(context.Background(), ops); err != nil {
+		t.Fatal(err)
+	}
+	if err := write.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	read, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Rollback()
+	disk, err := (&PageGraph{Tx: read}).LoadStreams(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name         string
+		after, bytes uint64
+		capacity     int
+	}{
+		{"tail", 1023, 0, 1}, {"tiny", 0, 1, 1}, {"tail-tiny", 1023, 1, 1}, {"exhausted", 1024, 0, 0}, {"overflow", ^uint64(0), 1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := disk.ReadBoundedContext(context.Background(), "events", tc.after, 1_000_000, tc.bytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := memory.ReadBounded("events", tc.after, 1_000_000, tc.bytes)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("disk=%+v memory=%+v", got, want)
+			}
+			if cap(got.Records) > tc.capacity {
+				t.Fatalf("capacity=%d want <=%d", cap(got.Records), tc.capacity)
+			}
+		})
+	}
+}
