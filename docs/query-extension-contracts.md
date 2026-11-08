@@ -105,7 +105,6 @@ application metadata keys that callers can overwrite.
 Validate every write path, including bulk/import, under a bounded validation
 budget; there is no silent trusted-bulk bypass in stage one. Backup serializes
 constraints, and restore validates both definitions and data before activation.
-Legacy backups without constraints restore with an empty constraint catalog.
 Dropping a constraint is transactional and preserves older snapshot views.
 Violation details contain constraint name, entity ID, property and reason without
 unbounded value dumps. Preserve the public error wrapping convention.
