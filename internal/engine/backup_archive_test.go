@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -99,34 +101,70 @@ func TestWriteArchiveHeadRejectsCorruptPreviousFileAndPreservesHead(t *testing.T
 	}
 }
 
+func TestHashArchiveReaderCountsAndDigestsFiles(t *testing.T) {
+	for _, size := range []int{0, 2*backupIOChunk + 17} {
+		t.Run(fmt.Sprintf("%dB", size), func(t *testing.T) {
+			content := bytes.Repeat([]byte{byte(size)}, size)
+			path := filepath.Join(t.TempDir(), "archive")
+			if err := os.WriteFile(path, content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest, copied, hashErr := hashArchiveReader(context.Background(), file)
+			if err := errors.Join(hashErr, file.Close()); err != nil {
+				t.Fatal(err)
+			}
+			if copied != int64(size) || digest != sha256.Sum256(content) {
+				t.Fatalf("hash = %x, copied = %d, want digest with %d bytes", digest, copied, size)
+			}
+		})
+	}
+}
+
+func TestHashArchiveFileCancellationAndErrors(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "archive")
+	if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := hashArchiveFile(ctx, path); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled hash error = %v", err)
+	}
+	if _, err := hashArchiveFile(context.Background(), filepath.Join(directory, "missing")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing hash error = %v", err)
+	}
+	wantErr := errors.New("injected read failure")
+	reader := io.MultiReader(bytes.NewReader([]byte("partial")), iotest.ErrReader(wantErr))
+	digest, copied, err := hashArchiveReader(context.Background(), reader)
+	if !errors.Is(err, wantErr) || copied != 7 || digest != [sha256.Size]byte{} {
+		t.Fatalf("failed hash = %x, copied = %d, err = %v", digest, copied, err)
+	}
+}
+
 func BenchmarkWriteArchiveHeadPreviousFullRehashBytes(b *testing.B) {
 	for _, size := range []int{1 << 10, 1 << 20} {
 		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
-			directory := b.TempDir()
-			previous := writeArchiveHeadTestEntry(b, directory, 1, size)
-			if err := writeArchiveHead(directory, previous); err != nil {
-				b.Fatal(err)
-			}
-			headPath := filepath.Join(directory, backupHeadFile)
-			head, err := os.ReadFile(headPath)
-			if err != nil {
-				b.Fatal(err)
-			}
-			next := writeArchiveHeadTestEntry(b, directory, 2, 1)
+			previous := writeArchiveHeadTestEntry(b, b.TempDir(), 1, size)
+			var copied int64
 			b.ResetTimer()
-			b.ReportMetric(float64(size), "previous_rehash_bytes")
 			for i := 0; i < b.N; i++ {
-				if i > 0 {
-					b.StopTimer()
-					if err := os.WriteFile(headPath, head, 0o600); err != nil {
-						b.Fatal(err)
-					}
-					b.StartTimer()
-				}
-				if err := writeArchiveHead(directory, next); err != nil {
+				file, err := os.Open(previous.path)
+				if err != nil {
 					b.Fatal(err)
 				}
+				_, hashed, hashErr := hashArchiveReader(context.Background(), file)
+				if err := errors.Join(hashErr, file.Close()); err != nil {
+					b.Fatal(err)
+				}
+				copied += hashed
 			}
+			b.StopTimer()
+			b.ReportMetric(float64(copied)/float64(b.N), "previous_rehash_bytes")
 		})
 	}
 }

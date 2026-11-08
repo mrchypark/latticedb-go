@@ -28,11 +28,12 @@ Run the focused benchmark with:
 go test ./internal/engine -run '^$' -bench '^BenchmarkWriteArchiveHeadPreviousFullRehashBytes$' -benchmem
 ```
 
-The benchmark derives `previous_rehash_bytes` from the fixture file size. It is
-1024 for the 1 KiB case and 1048576 for the 1 MiB case. The metric documents
-the input that the current unconditional `io.Copy` passes to SHA-256. It is not
-an observed read-byte counter. It will not detect a future change that skips the
-rehash.
+The benchmark opens the real fixture files and runs the same reader helper that
+production uses. It reports the average `io.Copy` byte count as
+`previous_rehash_bytes`, which is 1024 for the 1 KiB case and 1048576 for the
+1 MiB case. This is an observed count of bytes passed to SHA-256, not a physical
+disk-read counter. The timing isolates file open, hashing, and close; it excludes
+head JSON publication, rename, and directory synchronization.
 
 ## Recorded benchmark result
 
@@ -40,8 +41,8 @@ The benchmark produced this result on 2026-11-08 with Go on darwin/arm64 and an
 Apple M3. It is one local timing sample, not a disk-read measurement.
 
 ```text
-BenchmarkWriteArchiveHeadPreviousFullRehashBytes/1024B-8        177   6882136 ns/op      1024 previous_rehash_bytes   38770 B/op  47 allocs/op
-BenchmarkWriteArchiveHeadPreviousFullRehashBytes/1048576B-8     170   8215178 ns/op   1048576 previous_rehash_bytes   38849 B/op  47 allocs/op
+BenchmarkWriteArchiveHeadPreviousFullRehashBytes/1024B-8       31473   36463 ns/op      1024 previous_rehash_bytes   33384 B/op   7 allocs/op
+BenchmarkWriteArchiveHeadPreviousFullRehashBytes/1048576B-8     1699  710912 ns/op   1048576 previous_rehash_bytes   33384 B/op   7 allocs/op
 ```
 
 The corruption test uses synthetic bytes. It proves that the current digest

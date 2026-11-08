@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -59,6 +60,21 @@ func TestPageCommitReusesCommittedMetadataAndPreservesReloadedState(t *testing.T
 	if db.graph.AppMetadata != committedMetadata {
 		t.Fatal("successful page commit reloaded application metadata")
 	}
+	feedBefore, err := db.ReadStream(changeStreamName, 0, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error { return tx.SetProperty(1, "key", int64(7)) }); err != nil {
+		t.Fatal(err)
+	}
+	if db.graph.AppMetadata != committedMetadata {
+		t.Fatal("unchanged metadata view was reloaded")
+	}
+	feedAfter, err := db.ReadStream(changeStreamName, 0, 100, 0)
+	if err != nil || !reflect.DeepEqual(feedBefore, feedAfter) {
+		t.Fatalf("no-op property commit changed feed: %v", err)
+	}
+
 	for _, check := range []struct {
 		tx   *Tx
 		key  []byte
@@ -220,6 +236,9 @@ func TestPageCommitRecoveryReloadsIndexAndStreamSources(t *testing.T) {
 		if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"key": int64(7)}}); err != nil {
 			return err
 		}
+		if err := tx.PutAppMetadata([]byte("durable"), []byte("before")); err != nil {
+			return err
+		}
 		return tx.PublishStream("events", "seed", map[string]any{"n": int64(1)})
 	}); err != nil {
 		t.Fatal(err)
@@ -241,13 +260,33 @@ func TestPageCommitRecoveryReloadsIndexAndStreamSources(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	beforeMetadata := db.graph.AppMetadata
+	beforeFeed, err := db.ReadStream(changeStreamName, 0, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	writeErr := db.Update(func(tx *Tx) error {
+		if err := tx.PutAppMetadata([]byte("durable"), []byte("rejected")); err != nil {
+			return err
+		}
 		_, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Large"}, Properties: map[string]any{"payload": strings.Repeat("x", 2<<20)}})
 		return err
 	})
 	if !errors.Is(writeErr, ErrResourceLimit) || !errors.Is(writeErr, pagestore.ErrSnapshotGrowth) {
 		_ = snapshot.Close()
 		t.Fatalf("commit with pinned older generation = %v, want snapshot growth resource error", writeErr)
+	}
+
+	if db.graph.AppMetadata == beforeMetadata {
+		t.Fatal("failed page commit did not authoritatively reload metadata")
+	}
+	value, ok := db.graph.AppMetadata.Get("durable")
+	if !ok || string(value) != "before" {
+		t.Fatalf("rejected metadata leaked: %q", value)
+	}
+	afterFeed, err := db.ReadStream(changeStreamName, 0, 100, 0)
+	if err != nil || !reflect.DeepEqual(beforeFeed, afterFeed) {
+		t.Fatalf("rejected commit changed feed: %v", err)
 	}
 
 	assertCurrent := func(wantEvents int, wantIndexed []int64) {
@@ -421,5 +460,54 @@ func TestPageMigrationHonorsRecoveryBudget(t *testing.T) {
 	count, err := db.graph.NodeCount()
 	if err != nil || count != 1 {
 		t.Fatalf("retry migration count %d: %v", count, err)
+	}
+}
+
+func TestPageMetadataCommitChangefeedMatchesMemory(t *testing.T) {
+	var expected []StreamRecord
+	for _, paged := range []bool{false, true} {
+		db, err := Open(filepath.Join(t.TempDir(), "db"), OpenOptions{Create: true, PageStorage: paged})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for step := 0; step < 3; step++ {
+			err = db.Update(func(tx *Tx) error {
+				if step == 0 {
+					if err := tx.PutAppMetadata([]byte("key"), []byte("first")); err != nil {
+						return err
+					}
+					_, err := tx.CreateNode(CreateNodeOptions{Properties: map[string]any{"value": int64(1)}})
+					return err
+				}
+				if step == 1 {
+					if err := tx.PutAppMetadata([]byte("key"), []byte("next")); err != nil {
+						return err
+					}
+					return tx.SetProperty(1, "value", int64(2))
+				}
+				if err := tx.DeleteAppMetadata([]byte("key")); err != nil {
+					return err
+				}
+				return tx.SetProperty(1, "value", int64(3))
+			})
+			if err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+		}
+		got, err := db.ReadStream(changeStreamName, 0, 100, 0)
+		if err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		if !paged {
+			expected = got
+		} else if len(got) == 0 || !reflect.DeepEqual(got, expected) {
+			db.Close()
+			t.Fatalf("page changefeed differs: got=%+v want=%+v", got, expected)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
