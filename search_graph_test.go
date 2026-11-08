@@ -15,7 +15,7 @@ func TestSearchGraphFTSRankingExpansionAndBudget(t *testing.T) {
 			if backend == "page" {
 				path = filepath.Join(t.TempDir(), "db")
 			}
-			db, err := Open(path, OpenOptions{Create: true})
+			db, err := Open(path, OpenOptions{Create: true, PageSize: 1024})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -83,6 +83,25 @@ func TestSearchGraphFTSRankingExpansionAndBudget(t *testing.T) {
 			fromTx, err := read.SearchGraphContext(ctx, options)
 			if err != nil || !reflect.DeepEqual(fromTx, result) {
 				t.Fatalf("DB and Tx differ: %+v, %v", fromTx, err)
+			}
+			if err := db.Update(func(tx *Tx) error {
+				if err := tx.FTSIndex(ids[0], "needle needle needle"); err != nil {
+					return err
+				}
+				_, err := tx.CreateEdge(ids[0], ids[3], "LINK", CreateEdgeOptions{})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			options.MaxRows = 0
+			pinned, err := read.SearchGraphContext(ctx, options)
+			if err != nil || !reflect.DeepEqual(pinned, result) {
+				t.Fatalf("old reader mixed generations: %+v, %v", pinned, err)
+			}
+			head, err := db.SearchGraphContext(ctx, options)
+			if err != nil || head.CommitID != result.CommitID+1 || len(head.Rows) != 2 ||
+				head.Rows[0].NodeID != ids[0] || head.Rows[0].TargetID != ids[3] || head.Rows[0].Value != 3 {
+				t.Fatalf("current head did not see new posting and edge: %+v, %v", head, err)
 			}
 			canceled, cancel := context.WithCancel(ctx)
 			cancel()
@@ -160,9 +179,17 @@ func TestSearchGraphReportsExactVectorFallback(t *testing.T) {
 		Vector:     &SearchGraphVector{Embedding: []float32{1, 1}, Approximate: true, EfSearch: 20},
 		CandidateK: 20, ResultK: 20,
 	}
+	before, err := db.VectorIndexStats()
+	if err != nil {
+		t.Fatal(err)
+	}
 	approx, err := db.SearchGraphContext(t.Context(), options)
 	if err != nil || !approx.Exact || len(approx.Rows) != 20 {
 		t.Fatalf("ANN exact fallback: %+v, %v", approx, err)
+	}
+	after, err := db.VectorIndexStats()
+	if err != nil || after.ExactFallbacks != before.ExactFallbacks+1 {
+		t.Fatalf("expected exact fallback counter to advance: before=%d after=%d err=%v", before.ExactFallbacks, after.ExactFallbacks, err)
 	}
 	options.Vector.Approximate = false
 	exact, err := db.SearchGraphContext(t.Context(), options)

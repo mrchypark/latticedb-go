@@ -201,6 +201,9 @@ func (tx *Tx) SearchGraphContext(ctx context.Context, opts SearchGraphOptions) (
 		if err != nil {
 			return SearchGraphResult{}, pageStorageOpenError(err)
 		}
+		if fallback {
+			tx.db.vectorExactFallbacks.Add(1)
+		}
 		result.Metric, result.Direction = SearchGraphL2, SearchGraphLowerFirst
 		result.Exact = !opts.Vector.Approximate || tx.db.disableVectorIndex || fallback ||
 			(graph.PageBase == nil && graph.VectorIndex.Nodes.Len() == 0)
@@ -227,7 +230,20 @@ func appendSearchGraphPaths(ctx context.Context, graph *store.GraphState, id uin
 	take := limit - start
 	log := uint64(bits.Len(uint(take)))
 	var pathsHeap searchGraphPathHeap
-	err := graph.VisitOutgoing(ctx, id, func(edgeID uint64) error {
+	visitOutgoing := graph.VisitOutgoing
+	if page := graph.PageBase; page != nil {
+		if graph.Edges.Len() != 0 || graph.DeletedEdges.Len() != 0 {
+			return fmt.Errorf("%w: search composition requires committed page adjacency", ErrUnsupportedOption)
+		}
+		// The cursor holds the previous and current fixed-width adjacency keys.
+		const adjacencyScratch = 64
+		if err := budget.reserveBytes(adjacencyScratch); err != nil {
+			return err
+		}
+		defer budget.releaseBytes(adjacencyScratch)
+		visitOutgoing = page.VisitOutgoing
+	}
+	err := visitOutgoing(ctx, id, func(edgeID uint64) error {
 		if err := chargeRows(1); err != nil {
 			return err
 		}

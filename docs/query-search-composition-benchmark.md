@@ -80,18 +80,18 @@ isolated or frequency-pinned result.
 | `CandidateK` / `ResultK` | 10 / 30 |
 | Queries matching reference rows and score bits | 300 / 300 |
 | Mean ranked document Recall@10 | 0.790944 |
-| Disk graph build | 14.2886 s |
-| Reopen | 4.897791 ms |
-| Mean composed call | 7.213158 ms |
-| P95 composed call | 13.2595 ms |
-| Mean allocated bytes per call | 7,575,191 B |
+| Disk graph build | 23.5718 s |
+| Reopen | 6.916792 ms |
+| Mean composed call | 9.567741 ms |
+| P95 composed call | 18.800666 ms |
+| Mean allocated bytes per call | 7,570,900 B |
 | Sample query / accepted rows | query 1 / 30 |
-| Sample minimum accepted work | 57,839 |
+| Sample minimum accepted work | 60,089 |
 | Sample minimum accepted logical bytes | 338,095 |
 
 The measured JSON contains all 300 query records and all 900 latency and
 allocation samples. In the recorded run, its SHA-256 was
-`aa92a31ff9f665360951fb5d9797fb91e62436b86d674a734a233d2fc6fe7b86`.
+`b9d9c346cbf7395ae9eb0787b1434c7b8852a6c72d537c2f0821d77d1135a96d`.
 
 ## Reproduce
 
@@ -136,7 +136,7 @@ go test . -run '^$' -bench '^BenchmarkSearchGraphVectorRecall$' -benchtime=1x -c
 ```
 
 One Apple M3 run matched every reference candidate and expanded row (recall
-1.000 in both cases, no exact fallback). The 100-query batch took 38.68 ms
-without expansion and 42.48 ms with expansion. Allocations were 24,408,520 B
-and 27,933,720 B for the batch. This small control checks ranking and
+1.000 in both cases, no exact fallback). The 100-query batch allocated
+24,408,816 B without expansion and 27,110,456 B with expansion. This small
+control checks ranking and
 multiplicity; it does not predict ANN recall on other vector collections.
