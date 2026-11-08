@@ -124,9 +124,18 @@ func TestLocalSourceSnapshotSpike(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer other.Close()
+	if err := other.Update(func(tx *Tx) error {
+		_, err := tx.CreateNode(CreateNodeOptions{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
 	otherPlan, err := other.ExplainContext(ctx, "RETURN 1 AS marker", nil, QueryOptions{})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if otherPlan.CommitID != originalPlan.CommitID || otherPlan.DatabaseID == originalPlan.DatabaseID {
+		t.Fatalf("expected equal commit numbers in distinct databases: original=%+v other=%+v", originalPlan, otherPlan)
 	}
 	if got := compareProbeSources(otherPlan, oldSearch, true, nil); got != probeOtherDatabase {
 		t.Fatalf("foreign database accepted: %s", got)
@@ -134,8 +143,12 @@ func TestLocalSourceSnapshotSpike(t *testing.T) {
 	if got := compareProbeSources(originalPlan, oldSearch, false, nil); got != probeUnverified {
 		t.Fatalf("unverified watermark accepted: %s", got)
 	}
-	asOf := originalPlan.CommitID + 10
-	if got := compareProbeSources(originalPlan, oldSearch, ready, &asOf); got != probeNoArbitraryAsOf {
+	newPlan, err := db.ExplainContext(ctx, graphQuery, nil, QueryOptions{})
+	if err != nil || newPlan.CommitID != newSearch.CommitID || newPlan.CommitID <= originalPlan.CommitID {
+		t.Fatalf("expected a newer head for historical comparison: %+v, %v", newPlan, err)
+	}
+	asOf := originalPlan.CommitID
+	if got := compareProbeSources(newPlan, oldSearch, ready, &asOf); got != probeNoArbitraryAsOf {
 		t.Fatalf("arbitrary historical request accepted: %s", got)
 	}
 

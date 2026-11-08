@@ -12,8 +12,9 @@ values while a new request sees both new values. Use the #260 composed request
 to prove one budget covers both phases. Use exact identity checks in the probe
 to reject a different database, a different commit, an unverifiable watermark,
 and an arbitrary historical request; distinguish these probe rejections from
-production APIs. Pinning current head is supported; arbitrary historical
-querying is not. Backup restore is a separate facility.
+production APIs. The experiment pins the current head using the existing
+read transaction API. It adds no historical query capability. Backup restore
+is a separate facility.
 
 Graph can use label/property postings and adjacency; FTS candidate generation
 can use the ready same-snapshot postings. Qualifying target label and final
@@ -45,7 +46,8 @@ while a read snapshot is pinned. It inspects persisted FTS readiness, pins a
 read transaction, updates both
 the indexed text and edge in a writer, and checks both generations. The probe
 rejects different database IDs, different commits, absent watermark proof, and
-an arbitrary historical commit. Equal commit numbers alone are insufficient.
+a historical request for the actual earlier commit. The two databases have the
+same commit number in the mismatch test.
 A paired request with `MaxRows=2` fits without expansion and fails without
 partial rows with expansion. A canceled request returns no rows. `TestFTSPinnedCoreUsesPinnedGraphForCanonicalFallback`
 checks that unavailable FTS index access falls back on the same pinned graph.
