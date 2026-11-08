@@ -32,6 +32,10 @@
   scanned entities, decoded values and retained uniqueness keys; fail with a
   resource error without writing on exhaustion. Avoid scanning for transactions
   that do not change relevant graph data or definitions.
+- Open and deserialize validate recovered state using `RecoveryMaxWork` and
+  `RecoveryMaxDecodedBytes`. Staged restore uses the bounded recovery defaults.
+  Recovery charges page decoding in addition to the rule checks; its budget is
+  separate from the ordinary write validation budget.
 - Verify both backends, failed old-data admission, overlapping labels, typed
   equality, null and wrong-type failures, batch duplicates, same-transaction swap,
   definition/data atomicity, reopen and backup/restore, and corrupt raw import

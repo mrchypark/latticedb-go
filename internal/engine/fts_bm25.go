@@ -71,7 +71,7 @@ func (db *DB) ftsSearchGraph(ctx context.Context, graph *store.GraphState, query
 	if err := budget.add(uint64(len(query))); err != nil {
 		return nil, err
 	}
-	indexedResults, indexed, err := db.pageIndexedFTSSearch(ctx, graph, query, opts, budget)
+	indexedResults, indexed, err := db.pageIndexedFTSSearch(store.WithPageReadBudget(ctx, budget), graph, query, opts, budget)
 	if err != nil {
 		return nil, err
 	}

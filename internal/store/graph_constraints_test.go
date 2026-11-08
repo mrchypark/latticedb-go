@@ -338,6 +338,51 @@ func TestValidateGraphConstraintsPageLease(t *testing.T) {
 	}
 }
 
+func TestGraphConstraintPageWorkUsesCallerBudget(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "constraints-work.pages"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	write, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&PageGraph{Tx: write}).PutNode(&NodeRecord{
+		ID: 1, Labels: []string{"Item"},
+		Properties: PropertiesFromMap(map[string]any{"active": true, "payload": strings.Repeat("x", 20<<20)}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := write.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	read, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Rollback()
+	graph := NewGraphState()
+	graph.PageBase = &PageGraph{Tx: read}
+	putConstraint(t, graph, GraphConstraint{Name: "active", Label: "Item", Property: "active", Kind: ConstraintKindRequired})
+
+	writeBudget := &constraintTestBudget{maxWork: 16 << 20, maxBytes: 256 << 20}
+	if err := ValidateGraphConstraints(t.Context(), graph, writeBudget); !errors.Is(err, errConstraintTestBudget) {
+		t.Fatalf("write budget error = %v", err)
+	}
+	recovery := &recoveryBudget{limits: RecoveryLimits{MaxWork: defaultConstraintRecoveryWork, MaxDecodedBytes: defaultConstraintRecoveryBytes}}
+	if err := ValidateGraphConstraints(t.Context(), graph, recovery); err != nil {
+		t.Fatal(err)
+	}
+	if recovery.work <= 20<<20 {
+		t.Fatalf("page decode work = %d, want more than payload bytes", recovery.work)
+	}
+	limited := &recoveryBudget{limits: RecoveryLimits{MaxWork: 16 << 20, MaxDecodedBytes: defaultConstraintRecoveryBytes}}
+	if err := ValidateGraphConstraints(t.Context(), graph, limited); !errors.Is(err, ErrLoadResourceLimit) {
+		t.Fatalf("limited recovery error = %v", err)
+	}
+}
+
 func TestValidateGraphConstraintsPageOverlayLabelMerge(t *testing.T) {
 	db, err := pagestore.Open(filepath.Join(t.TempDir(), "constraint-overlay.pages"), pagestore.Options{})
 	if err != nil {

@@ -501,7 +501,22 @@ func (page *PageGraph) replaceFTSDocument(ctx context.Context, index string, id 
 
 func (page *PageGraph) VisitFTSPostings(ctx context.Context, index, term string, visit func(PageFTSPosting) error) error {
 	prefix := pageFTSTermPrefix(index, term)
-	return page.Tx.Scan(ctx, pageFTSPostings, prefix, pagePrefixEnd(prefix), func(key, value []byte) error {
+	keyBytes := uint64(len(prefix) + 8)
+	budget := pageReadBudgetFromContext(ctx)
+	if budget != nil {
+		// Scan retains its previous seek key while it copies the next posting.
+		scratch := 2*keyBytes + 64
+		if err := budget.ReservePageRead(0, scratch); err != nil {
+			return err
+		}
+		defer budget.ReleasePageRead(scratch)
+	}
+	return page.Tx.ScanBounded(ctx, pageFTSPostings, prefix, pagePrefixEnd(prefix), keyBytes+64, func(key, value []byte) error {
+		if budget != nil {
+			if err := budget.ReservePageRead(1, 0); err != nil {
+				return err
+			}
+		}
 		if len(key) != len(prefix)+8 {
 			return errors.New("invalid FTS posting key")
 		}

@@ -20,6 +20,8 @@ const (
 	graphConstraintHeaderBytes     = 15
 	defaultConstraintWork          = uint64(1 << 24)
 	defaultConstraintBytes         = uint64(256 << 20)
+	defaultConstraintRecoveryWork  = uint64(1_000_000_000)
+	defaultConstraintRecoveryBytes = uint64(4 << 30)
 )
 
 type ConstraintKind uint8
@@ -282,6 +284,35 @@ func ValidateGraphConstraints(ctx context.Context, graph *GraphState, budget Con
 		}
 	}
 	return ctx.Err()
+}
+
+// ValidateGraphConstraintsWithRecoveryLimits validates raw or staged state
+// using the caller's recovery limits. Zero limits use the bounded constraint
+// defaults rather than making restore unbounded.
+func ValidateGraphConstraintsWithRecoveryLimits(ctx context.Context, graph *GraphState, limits RecoveryLimits) error {
+	if limits.MaxDecodedBytes == 0 {
+		limits.MaxDecodedBytes = defaultConstraintRecoveryBytes
+	}
+	if limits.MaxWork == 0 {
+		limits.MaxWork = defaultConstraintRecoveryWork
+	}
+	return validateRecoveredGraphConstraints(ctx, graph, &recoveryBudget{limits: limits})
+}
+
+func defaultGraphConstraintRecoveryLimits() RecoveryLimits {
+	return RecoveryLimits{
+		MaxDecodedBytes: defaultConstraintRecoveryBytes,
+		MaxWork:         defaultConstraintRecoveryWork,
+	}
+}
+
+func validateRecoveredGraphConstraints(ctx context.Context, graph *GraphState, budget ConstraintBudget) error {
+	if GraphConstraintsPresent(graph) {
+		return ValidateGraphConstraints(ctx, graph, budget)
+	}
+	// A raw definition without its marker is corrupt and still needs the full
+	// catalog check, but it must not consume recovery work for an unconstrained DB.
+	return ValidateGraphConstraints(ctx, graph, nil)
 }
 
 func validateGraphConstraintData(ctx context.Context, graph *GraphState, def GraphConstraint, budget ConstraintBudget) error {
