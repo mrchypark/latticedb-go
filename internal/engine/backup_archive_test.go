@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,6 +48,86 @@ func TestWriteArchiveHeadPreservesUnrecognizedFile(t *testing.T) {
 	data, err := os.ReadFile(headPath)
 	if err != nil || string(data) != "keep" {
 		t.Fatalf("unrecognized head changed: %q, %v", data, err)
+	}
+}
+
+func writeArchiveHeadTestEntry(t testing.TB, directory string, commitID uint64, size int) backupEntry {
+	t.Helper()
+	content := make([]byte, size)
+	for i := range content {
+		content[i] = byte(i)
+	}
+	digest := sha256.Sum256(content)
+	metadata := BackupMetadata{CommitID: commitID, CapturedAt: time.Unix(int64(commitID), 0)}
+	path := filepath.Join(directory, backupFilename(metadata, digest))
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return backupEntry{metadata: metadata, digest: digest, path: path}
+}
+
+func TestWriteArchiveHeadRejectsCorruptPreviousFileAndPreservesHead(t *testing.T) {
+	directory := t.TempDir()
+	previous := writeArchiveHeadTestEntry(t, directory, 1, 4<<10)
+	if err := writeArchiveHead(directory, previous); err != nil {
+		t.Fatal(err)
+	}
+	headPath := filepath.Join(directory, backupHeadFile)
+	headBefore, err := os.ReadFile(headPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(previous.path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte{0xff}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeArchiveHead(directory, writeArchiveHeadTestEntry(t, directory, 2, 1)); err == nil {
+		t.Fatal("corrupt previous file replaced the archive head")
+	}
+	headAfter, err := os.ReadFile(headPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(headAfter, headBefore) {
+		t.Fatal("corrupt previous file changed the archive head")
+	}
+}
+
+func BenchmarkWriteArchiveHeadPreviousFullRehashBytes(b *testing.B) {
+	for _, size := range []int{1 << 10, 1 << 20} {
+		b.Run(fmt.Sprintf("%dB", size), func(b *testing.B) {
+			directory := b.TempDir()
+			previous := writeArchiveHeadTestEntry(b, directory, 1, size)
+			if err := writeArchiveHead(directory, previous); err != nil {
+				b.Fatal(err)
+			}
+			headPath := filepath.Join(directory, backupHeadFile)
+			head, err := os.ReadFile(headPath)
+			if err != nil {
+				b.Fatal(err)
+			}
+			next := writeArchiveHeadTestEntry(b, directory, 2, 1)
+			b.ResetTimer()
+			b.ReportMetric(float64(size), "previous_rehash_bytes")
+			for i := 0; i < b.N; i++ {
+				if i > 0 {
+					b.StopTimer()
+					if err := os.WriteFile(headPath, head, 0o600); err != nil {
+						b.Fatal(err)
+					}
+					b.StartTimer()
+				}
+				if err := writeArchiveHead(directory, next); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
