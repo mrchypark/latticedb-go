@@ -4838,9 +4838,15 @@ func (pattern nodePattern) apply(tx *Tx, rows []queryRow, budget *queryBudget) (
 		return nextRows, nil
 	}
 	anchor := pattern.Labels[0]
-	anchorCount, err := tx.graph.LabelCountContext(queryScanContext(budget), anchor, queryScanCharge(budget))
-	if err != nil {
-		return nil, err
+	var anchorCount uint64
+	var err error
+	// A paged EXISTS can stop on its first candidate. Counting the entire
+	// posting first would defeat that early exit for a single label.
+	if budget.matchRowSink == nil || tx.graph.PageBase == nil || len(pattern.Labels) > 1 {
+		anchorCount, err = tx.graph.LabelCountContext(queryScanContext(budget), anchor, queryScanCharge(budget))
+		if err != nil {
+			return nil, err
+		}
 	}
 	for _, label := range pattern.Labels[1:] {
 		count, err := tx.graph.LabelCountContext(queryScanContext(budget), label, queryScanCharge(budget))

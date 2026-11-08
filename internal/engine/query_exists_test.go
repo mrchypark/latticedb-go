@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -250,80 +251,91 @@ func TestExistsEvalUnrelatedNullDoesNotFail(t *testing.T) {
 }
 
 func TestExistsStageRowCounterIsCumulative(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "exists-counter.ltdb"), OpenOptions{Create: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var person uint64
-	if err := db.Update(func(tx *Tx) error {
-		created, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Person"}})
-		if err != nil {
-			return err
-		}
-		person = created.ID
-		_, err = tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}})
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	predicate, err := parseExistsPredicate(`EXISTS { MATCH (x:Item) }`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.View(func(tx *Tx) error {
-		budget := newQueryBudget(t.Context(), QueryOptions{MaxRows: 1})
-		defer releaseQueryBudget(budget)
-		budget.activeTx = tx
-		budget.residentSources = true
-		if got, err := evalExistsTestRow(budget, tx, "p", person, predicate); err != nil || !got {
-			t.Fatalf("first invocation = %v, %v", got, err)
-		}
-		if _, err := evalExistsTestRow(budget, tx, "p", person, predicate); !errors.Is(err, ErrResourceLimit) {
-			t.Fatalf("second invocation = %v, want cumulative row-limit error", err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	for _, page := range []bool{false, true} {
+		t.Run(fmt.Sprint("page=", page), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "exists-counter.ltdb"), OpenOptions{Create: true, PageStorage: page})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var person uint64
+			if err := db.Update(func(tx *Tx) error {
+				created, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Person"}})
+				if err != nil {
+					return err
+				}
+				person = created.ID
+				_, err = tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}})
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			predicate, err := parseExistsPredicate(`EXISTS { MATCH (p:Person), (x:Item) }`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.View(func(tx *Tx) error {
+				budget := newQueryBudget(t.Context(), QueryOptions{MaxRows: 1})
+				defer releaseQueryBudget(budget)
+				budget.activeTx = tx
+				budget.residentSources = !page
+				if got, err := evalExistsTestRow(budget, tx, "p", person, predicate); err != nil || !got {
+					t.Fatalf("first invocation = %v, %v", got, err)
+				}
+				if got := budget.existsStages.stageRows(predicate); len(got) != 2 || got[0] != 1 || got[1] != 1 {
+					t.Fatalf("independent stage counts = %v", got)
+				}
+				if _, err := evalExistsTestRow(budget, tx, "p", person, predicate); !errors.Is(err, ErrResourceLimit) {
+					t.Fatalf("second invocation = %v, want cumulative row-limit error", err)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
 func TestExistsStopsBeforeUnneededCandidates(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "exists-tail.ltdb"), OpenOptions{Create: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if err := db.Update(func(tx *Tx) error {
-		if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"tag": int64(1)}}); err != nil {
-			return err
-		}
-		for index := 0; index < 2_000; index++ {
-			if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"tag": int64(2)}}); err != nil {
-				return err
+	for _, page := range []bool{false, true} {
+		t.Run(fmt.Sprint("page=", page), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "exists-tail.ltdb"), OpenOptions{Create: true, PageStorage: page})
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	predicate, err := parseExistsPredicate(`EXISTS { MATCH (x:Item) WHERE x.tag = 1 }`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.View(func(tx *Tx) error {
-		budget := newQueryBudget(t.Context(), QueryOptions{MaxWork: 32})
-		defer releaseQueryBudget(budget)
-		budget.activeTx = tx
-		budget.residentSources = true
-		row := queryRow{slots: []boundValue{}, index: map[string]int{}}
-		truth, err := predicate.eval(row, nil, budget)
-		if err != nil || truth != predicateTrue {
-			t.Fatalf("first candidate should satisfy EXISTS within work budget: %v, %v", truth, err)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+			defer db.Close()
+			if err := db.Update(func(tx *Tx) error {
+				if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"tag": int64(1)}}); err != nil {
+					return err
+				}
+				for index := 0; index < 2_000; index++ {
+					if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"tag": int64(2)}}); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			predicate, err := parseExistsPredicate(`EXISTS { MATCH (x:Item) WHERE x.tag = 1 }`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.View(func(tx *Tx) error {
+				budget := newQueryBudget(t.Context(), QueryOptions{MaxWork: 256})
+				defer releaseQueryBudget(budget)
+				budget.activeTx = tx
+				budget.residentSources = !page
+				row := queryRow{slots: []boundValue{}, index: map[string]int{}}
+				truth, err := predicate.eval(row, nil, budget)
+				if err != nil || truth != predicateTrue {
+					t.Fatalf("first candidate should satisfy EXISTS within work budget: %v, %v", truth, err)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

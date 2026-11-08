@@ -105,6 +105,28 @@ func TestOptionalMatchContract(t *testing.T) {
 			if _, err := db.QueryContext(t.Context(), query, nil, QueryOptions{MaxRows: 2}); !errors.Is(err, ErrResourceLimit) {
 				t.Fatalf("row budget: %v", err)
 			}
+			for _, opts := range []QueryOptions{{MaxWork: 1}, {MaxBytes: 256}} {
+				check := func(result QueryResult, err error) {
+					t.Helper()
+					if !errors.Is(err, ErrResourceLimit) || len(result.Rows) != 0 {
+						t.Fatalf("budget %+v returned rows %v and error %v", opts, result.Rows, err)
+					}
+				}
+				check(db.QueryContext(t.Context(), query, nil, opts))
+				if err := db.View(func(tx *Tx) error { check(tx.QueryContext(t.Context(), query, nil, opts)); return nil }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			entities, err := db.Query(`MATCH (p:Person) OPTIONAL MATCH (p)-[:LINK]->(x:Item) RETURN x AS entity, id(x) AS id, x.tag AS tag ORDER BY p.name, id`, nil)
+			if err != nil || len(entities.Rows) != 4 {
+				t.Fatalf("entity projections: %v %v", entities, err)
+			}
+			for i, row := range entities.Rows {
+				if row["tag"] != nil || (row["entity"] == nil) != (i == 3) || (row["id"] == nil) != (i == 3) {
+					t.Fatalf("entity projection %d = %v", i, row)
+				}
+			}
+
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 			if _, err := db.QueryContext(ctx, query, nil, QueryOptions{}); !errors.Is(err, context.Canceled) {
