@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -8,7 +9,118 @@ import (
 	"testing"
 
 	"github.com/mrchypark/latticedb-go/internal/pagestore"
+	"github.com/mrchypark/latticedb-go/internal/store"
 )
+
+func TestPageCommitReusesCommittedMetadataAndPreservesReloadedState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	db, err := Open(path, OpenOptions{Create: true, PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		if _, err := tx.CreateNode(CreateNodeOptions{Labels: []string{"Item"}, Properties: map[string]any{"key": int64(7)}}); err != nil {
+			return err
+		}
+		if err := tx.PutAppMetadata([]byte("changed"), []byte("before")); err != nil {
+			return err
+		}
+		if err := tx.PutAppMetadata([]byte("deleted"), []byte("present")); err != nil {
+			return err
+		}
+		return tx.PublishStream("events", "seed", int64(1))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateNodePropertyIndex("Item", "key"); err != nil {
+		t.Fatal(err)
+	}
+
+	older, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer older.Rollback()
+	var committedMetadata *store.AppMetadata
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.PutAppMetadata([]byte("changed"), []byte("after")); err != nil {
+			return err
+		}
+		if err := tx.DeleteAppMetadata([]byte("deleted")); err != nil {
+			return err
+		}
+		committedMetadata = tx.graph.AppMetadata
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if db.graph.AppMetadata != committedMetadata {
+		t.Fatal("successful page commit reloaded application metadata")
+	}
+	for _, check := range []struct {
+		tx   *Tx
+		key  []byte
+		want []byte
+		ok   bool
+	}{{older, []byte("changed"), []byte("before"), true}, {older, []byte("deleted"), []byte("present"), true}} {
+		got, ok, err := check.tx.GetAppMetadata(check.key)
+		if err != nil || ok != check.ok || check.ok && !bytes.Equal(got, check.want) {
+			t.Fatalf("metadata %q = %q, %t, %v; want %q, %t", check.key, got, ok, err, check.want, check.ok)
+		}
+	}
+	if err := db.View(func(tx *Tx) error {
+		value, ok, err := tx.GetAppMetadata([]byte("changed"))
+		if err != nil || !ok || !bytes.Equal(value, []byte("after")) {
+			return fmt.Errorf("changed metadata = %q, %t, %v", value, ok, err)
+		}
+		if _, ok, err := tx.GetAppMetadata([]byte("deleted")); err != nil || ok {
+			return fmt.Errorf("deleted metadata present = %t, %v", ok, err)
+		}
+		ids, err := tx.FindNodesByLabelProperty("Item", "key", int64(7), 1)
+		if err != nil || len(ids) != 1 {
+			return fmt.Errorf("index lookup = %v, %v", ids, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if records, err := db.ReadStream("events", 0, 1, 0); err != nil || len(records) != 1 || records[0].Sequence != 1 {
+		t.Fatalf("stream records = %#v, %v", records, err)
+	}
+	if err := older.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	older = nil
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, OpenOptions{PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		value, ok, err := tx.GetAppMetadata([]byte("changed"))
+		if err != nil || !ok || !bytes.Equal(value, []byte("after")) {
+			return fmt.Errorf("reopened metadata = %q, %t, %v", value, ok, err)
+		}
+		if _, ok, err := tx.GetAppMetadata([]byte("deleted")); err != nil || ok {
+			return fmt.Errorf("reopened deleted metadata present = %t, %v", ok, err)
+		}
+		ids, err := tx.FindNodesByLabelProperty("Item", "key", int64(7), 1)
+		if err != nil || len(ids) != 1 {
+			return fmt.Errorf("reopened index lookup = %v, %v", ids, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if records, err := db.ReadStream("events", 0, 1, 0); err != nil || len(records) != 1 || records[0].Sequence != 1 {
+		t.Fatalf("reopened stream records = %#v, %v", records, err)
+	}
+}
 
 func TestPageAPIReadsAndMutatesDiskRecords(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "db"), OpenOptions{Create: true, PageStorage: true})

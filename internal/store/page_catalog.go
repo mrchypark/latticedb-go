@@ -104,6 +104,16 @@ func (graph *PageGraph) PutCatalog(c PageCatalog) error {
 	return graph.Tx.Put(pageCatalogBucket, []byte("state"), data)
 }
 func (graph *PageGraph) LoadGraph(ctx context.Context) (*GraphState, PageCatalog, error) {
+	return graph.loadGraph(ctx, nil)
+}
+
+// LoadGraphWithAppMetadata loads the durable page state while reusing metadata
+// from a successful PageCommit. Callers must retain the exact immutable view.
+func (graph *PageGraph) LoadGraphWithAppMetadata(ctx context.Context, metadata *AppMetadata) (*GraphState, PageCatalog, error) {
+	return graph.loadGraph(ctx, metadata)
+}
+
+func (graph *PageGraph) loadGraph(ctx context.Context, metadata *AppMetadata) (*GraphState, PageCatalog, error) {
 	c, err := graph.Catalog()
 	if err != nil {
 		return nil, c, err
@@ -118,16 +128,20 @@ func (graph *PageGraph) LoadGraph(ctx context.Context) (*GraphState, PageCatalog
 	state.VectorDimensions = c.VectorDimensions
 	// This is generation bookkeeping, not a resident-memory DB size ceiling.
 	state.SnapshotBytes = max(c.SnapshotBytes, 4096)
-	err = graph.Tx.Scan(ctx, pageMetadataBucket, nil, nil, func(key, value []byte) error {
-		metadataKey, metadataValue, err := graph.decodeMetadata(key, value)
+	if metadata != nil {
+		state.AppMetadata = metadata
+	} else {
+		err = graph.Tx.Scan(ctx, pageMetadataBucket, nil, nil, func(key, value []byte) error {
+			metadataKey, metadataValue, err := graph.decodeMetadata(key, value)
+			if err != nil {
+				return err
+			}
+			state.AppMetadata.Set(string(metadataKey), metadataValue)
+			return nil
+		})
 		if err != nil {
-			return err
+			return nil, c, err
 		}
-		state.AppMetadata.Set(string(metadataKey), metadataValue)
-		return nil
-	})
-	if err != nil {
-		return nil, c, err
 	}
 	state.NodeProperties, err = graph.LoadPropertyIndexes(ctx, true)
 	if err != nil {
