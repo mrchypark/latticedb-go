@@ -129,7 +129,11 @@ func openPageDB(ctx context.Context, path string, files store.DatabaseFiles, loc
 	if err != nil {
 		return nil, err
 	}
-	if err = graphConstraintError(store.ValidateGraphConstraints(ctx, graph, nil)); err != nil {
+	if err = graphConstraintError(store.ValidateGraphConstraintsWithRecoveryLimits(ctx, graph, store.RecoveryLimits{
+		MaxDecodedBytes: opts.RecoveryMaxDecodedBytes,
+		MaxFrames:       opts.RecoveryMaxFrames,
+		MaxWork:         opts.RecoveryMaxWork,
+	})); err != nil {
 		return nil, err
 	}
 	if opts.MaxDatabaseSnapshotBytes != 0 && graph.SnapshotBytes > opts.MaxDatabaseSnapshotBytes {
