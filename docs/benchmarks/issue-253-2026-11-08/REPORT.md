@@ -45,3 +45,37 @@ go tool pprof -top -cum -nodecount=15 /tmp/metadata.pprof
 [baseline CPU top](baseline-cpu.txt), [candidate CPU top](candidate-cpu.txt).
 These profile runs overlapped other test activity. They are diagnostic samples, not controlled latency measurements.
 The binary profiles remain local in `/tmp/latticedb-issues-{baseline,candidate}-verified.pprof`.
+
+## Reported-version reproduction and acceptance coverage
+
+The original reported release `v0.11.3` resolves to `21d788c9cc1c399f63bab99a958aff0d64ff4058`.
+It was extracted with `git archive v0.11.3` into a separate directory. Only the
+same benchmark harness was copied into `internal/engine/`. Command:
+
+```sh
+go test ./internal/engine -run '^$' -bench '^BenchmarkPageCommitWithGrowingMetadata$' -benchtime=1x -count=1 -benchmem
+```
+
+Observed allocations for 0 / 256 / 4096 metadata entries were respectively
+50,200 / 385,944 / 4,299,232 B/op and 291 / 3,821 / 47,574 allocs/op.
+This single-operation reproduction confirms the reported release's scaling
+problem. Its wall time is not a stable latency estimate. The longer paired
+baseline/candidate runs and CPU samples above remain the performance evidence.
+
+Additional acceptance coverage:
+
+- `TestPageCommitReusesCommittedMetadataAndPreservesReloadedState` verifies
+  changed/deleted metadata, unchanged-metadata pointer reuse, older readers,
+  no-op changefeed parity, index and stream results, and reopen parity.
+- `TestPageCommitRecoveryReloadsIndexAndStreamSources` forces a page commit
+  rejection with a pinned generation. It asserts a fresh authoritative metadata
+  view, the old durable metadata value, unchanged changefeed, and preserved
+  index/stream state before a successful retry.
+- `TestPageMetadataCommitChangefeedMatchesMemory` applies the same ordered graph
+  changes while updating and deleting metadata on memory and page backends,
+  then compares all changefeed records, including payloads and sequence order.
+
+Released optimization source is reachable at `a315593971e25cf14d3a0792a4b76896e91e6837`
+(`v0.12.1`), for Rhiza's independent integration checks. Providing that immutable
+candidate is this issue's integration deliverable. This repository does not claim
+that Rhiza's separate SQL/KV/Graph × BeforeAck/Async E2E ran here.

@@ -456,19 +456,27 @@ func publishArchiveEntry(ctx context.Context, directory string, metadata BackupM
 }
 
 func hashArchiveFile(ctx context.Context, path string) ([sha256.Size]byte, error) {
-	var digest [sha256.Size]byte
 	file, err := os.Open(path)
 	if err != nil {
-		return digest, err
+		return [sha256.Size]byte{}, err
 	}
-	hash := sha256.New()
-	_, copyErr := io.Copy(hash, &backupContextReader{ctx: ctx, reader: file})
+	digest, _, copyErr := hashArchiveReader(ctx, file)
 	closeErr := file.Close()
 	if err := errors.Join(copyErr, closeErr); err != nil {
-		return digest, err
+		return [sha256.Size]byte{}, err
 	}
-	copy(digest[:], hash.Sum(nil))
 	return digest, nil
+}
+
+func hashArchiveReader(ctx context.Context, reader io.Reader) ([sha256.Size]byte, int64, error) {
+	hash := sha256.New()
+	copied, err := io.Copy(hash, &backupContextReader{ctx: ctx, reader: reader})
+	if err != nil {
+		return [sha256.Size]byte{}, copied, err
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest, copied, nil
 }
 
 func publishStagedSegment(ctx context.Context, directory, stagedPath string, start uint64, metadata BackupMetadata, previous [sha256.Size]byte, sourceHistory ...backupSourceHistory) (backupEntry, error) {
