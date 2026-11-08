@@ -167,3 +167,6 @@ Each unit must keep the common test matrix and unsupported-combination rules abo
 
 These are implementation candidates with acceptance criteria, not claims of
 implementation, compatibility, performance superiority or a delivery schedule.
+
+Tracked follow-ups: #256 OPTIONAL/EXISTS, #257 UNION, #258 EXPLAIN,
+#259 constraints, #260 search composition, and #261 source design spike.

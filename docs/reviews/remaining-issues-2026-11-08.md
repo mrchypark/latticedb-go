@@ -54,3 +54,6 @@ query features. Existing #115 planner and #219 corpus evidence are reused; both
 are closed, so proposed work must identify its additional scope rather than reopen
 completed work without evidence. Future implementations must satisfy their own
 backend/API/budget/rollback tests before the supported-feature contract changes.
+
+The six independent #252 implementation/design follow-ups are #256–#261.
+They remain open and are not reported as implemented by closing the roadmap.
