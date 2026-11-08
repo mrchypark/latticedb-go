@@ -43,6 +43,7 @@ type QueryErrorStage uint8
 const (
 	QueryErrorStageParse QueryErrorStage = iota + 1
 	QueryErrorStageExecution
+	QueryErrorStagePlan
 )
 
 type QueryError struct {
@@ -402,6 +403,7 @@ type Tx struct {
 	queryBudget            *queryBudget
 	db                     *DB
 	readOnly               bool
+	commitID               uint64
 	base                   *store.GraphState
 	graph                  *store.GraphState
 	writeLocked            bool
@@ -1956,6 +1958,7 @@ func (db *DB) beginAfterWriteLock(readOnly bool) (*Tx, error) {
 	tx := &Tx{
 		db:          db,
 		readOnly:    readOnly,
+		commitID:    db.commitID,
 		base:        base,
 		graph:       graph,
 		writeLocked: !readOnly,

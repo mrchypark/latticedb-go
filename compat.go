@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-
-	"github.com/mrchypark/latticedb-go/internal/engine"
 )
 
 func (db *DB) BeginRead() (*Tx, error)  { return db.Begin(true) }
@@ -42,14 +40,7 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, params map[string]
 	if err := tx.requireInner(); err != nil {
 		return QueryResult{}, err
 	}
-	result, err := tx.inner.QueryContext(ctx, query, params, engine.QueryOptions{
-		MaxRows:           opts.MaxRows,
-		MaxWork:           opts.MaxWork,
-		MaxBytes:          opts.MaxBytes,
-		VectorNamespace:   opts.VectorNamespace,
-		ApproximateVector: opts.ApproximateVector,
-		VectorEfSearch:    opts.VectorEfSearch,
-	})
+	result, err := tx.inner.QueryContext(ctx, query, params, engineQueryOptions(opts))
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}

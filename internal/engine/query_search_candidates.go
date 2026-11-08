@@ -16,57 +16,68 @@ type querySearchCandidate struct {
 	bytes         uint64
 }
 
-// searchCandidate returns complete FTS candidates, or explicitly approximate
-// vector candidates, only for a single-node read plan. All candidate rows
-// continue through the normal pattern and WHERE evaluation.
-func (plan *queryPlan) searchCandidate(tx *Tx, patterns []matchPattern, params map[string]any, limit, skip int, budget *queryBudget) (*querySearchCandidate, error) {
+func (plan *queryPlan) searchCandidateShape(tx *Tx, patterns []matchPattern, limit, skip int, budget *queryBudget) (nodePattern, *whereClause) {
 	if tx == nil || !querySearchSnapshotClean(tx) || plan.unwindClause != nil || plan.mutates() || len(patterns) != 1 || plan.wherePredicate != nil {
-		return nil, nil
+		return nodePattern{}, nil
 	}
 	if tx.graph.PageBase != nil && !tx.graph.PageBase.SearchIndexesCurrent {
-		return nil, nil
+		return nodePattern{}, nil
 	}
 	node, ok := patterns[0].(nodePattern)
 	if !ok || node.Var == "" || len(node.Properties) != 0 || len(node.PropertyExprs) != 0 {
-		return nil, nil
+		return nodePattern{}, nil
 	}
 	var searchClause *whereClause
 	searchClauseIndex := -1
 	for index, clause := range plan.whereClauses {
 		if clause.Var != node.Var {
-			return nil, nil
+			return nodePattern{}, nil
 		}
 		if clause.Kind != whereVector && clause.Kind != whereFTS {
 			continue
 		}
 		if searchClause != nil {
-			return nil, nil
+			return nodePattern{}, nil
 		}
 		searchClause = clause
 		searchClauseIndex = index
 	}
 	if searchClause == nil || !queryInvariantExpr(searchClause.Expr) {
-		return nil, nil
+		return nodePattern{}, nil
 	}
 	if searchClause.Kind == whereFTS {
 		// Preserve left-to-right error visibility: an empty FTS candidate set
 		// must not hide an earlier scalar clause that would have failed.
 		if searchClauseIndex != 0 {
-			return nil, nil
+			return nodePattern{}, nil
 		}
-		return plan.ftsSearchCandidate(tx, node, searchClause, params, budget)
+		return node, searchClause
 	}
 	if !budget.approximateVector || budget.vectorNamespace == nil || plan.skipExpr != nil || skip != 0 || plan.limitExpr == nil || limit <= 0 || len(plan.orderClauses) != 0 || plan.returnClause == nil || plan.returnClause.Distinct || plan.returnClause.CountAlias != "" || plan.returnClause.hasAggregates() {
-		return nil, nil
+		return nodePattern{}, nil
 	}
 	if len(plan.whereClauses) != 1 {
-		return nil, nil
+		return nodePattern{}, nil
 	}
 	if len(node.Labels) != 0 && (budget.vectorNamespace.Scope == "" || len(node.Labels) != 1 || node.Labels[0] != budget.vectorNamespace.Scope) {
-		return nil, nil
+		return nodePattern{}, nil
 	}
 	if limit > math.MaxUint32 {
+		return nodePattern{}, nil
+	}
+	return node, searchClause
+}
+
+// searchCandidate returns complete FTS candidates, or explicitly approximate
+// vector candidates, only for a single-node read plan. All candidate rows
+// continue through the normal pattern and WHERE evaluation.
+func (plan *queryPlan) searchCandidate(tx *Tx, patterns []matchPattern, params map[string]any, limit, skip int, budget *queryBudget) (*querySearchCandidate, error) {
+	node, searchClause := plan.searchCandidateShape(tx, patterns, limit, skip, budget)
+	if searchClause == nil {
 		return nil, nil
+	}
+	if searchClause.Kind == whereFTS {
+		return plan.ftsSearchCandidate(tx, node, searchClause, params, budget)
 	}
 	expected, err := searchClause.Expr.eval(queryRow{}, params, nil)
 	if err != nil {

@@ -415,14 +415,7 @@ func (db *DB) QueryContext(ctx context.Context, query string, params map[string]
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}
-	result, err := inner.QueryContext(ctx, query, params, engine.QueryOptions{
-		MaxRows:           opts.MaxRows,
-		MaxWork:           opts.MaxWork,
-		MaxBytes:          opts.MaxBytes,
-		VectorNamespace:   opts.VectorNamespace,
-		ApproximateVector: opts.ApproximateVector,
-		VectorEfSearch:    opts.VectorEfSearch,
-	})
+	result, err := inner.QueryContext(ctx, query, params, engineQueryOptions(opts))
 	if err != nil {
 		return QueryResult{}, wrapError(err)
 	}

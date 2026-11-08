@@ -2053,6 +2053,10 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 	return plan.executeWithInput(tx, params, budget, nil)
 }
 
+func (plan *queryPlan) usesTopK(skip, limit int) bool {
+	return plan.returnClause != nil && plan.next == nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit
+}
+
 // executeWithInput runs one query part over the rows produced by a preceding
 // WITH part and either hands the projection to plan.next or renders the result.
 func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *queryBudget, input []queryRow) (QueryResult, error) {
@@ -2172,7 +2176,7 @@ func (plan *queryPlan) executeWithInput(tx *Tx, params map[string]any, budget *q
 		}
 		return plan.returnClause.renderIterator(&limitQueryIterator{input: stream, skip: skip, limit: iteratorLimit, budget: budget}, params, budget)
 	}
-	if plan.returnClause != nil && input == nil && plan.next == nil && !plan.mutates() && len(plan.orderClauses) != 0 && !plan.returnClause.Distinct && plan.returnClause.CountAlias == "" && !plan.returnClause.hasAggregates() && plan.limitExpr != nil && limit != 0 && skip <= int(^uint(0)>>1)-limit {
+	if input == nil && plan.usesTopK(skip, limit) {
 		rows, err := plan.collectTopKRows(stream, skip, limit, budget)
 		if err != nil {
 			return QueryResult{}, err
