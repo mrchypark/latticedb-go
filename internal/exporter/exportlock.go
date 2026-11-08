@@ -64,7 +64,11 @@ func acquireExportLockContext(ctx context.Context, path string) (func(), error) 
 		return nil, err
 	}
 	if entry == nil {
-		file, err := directory.OpenFile(filepath.Base(lockPath), os.O_CREATE|os.O_RDWR, 0o600)
+		// Darwin openat can return ENOENT when create-or-open races first creation.
+		file, err := directory.OpenFile(filepath.Base(lockPath), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			file, err = directory.OpenFile(filepath.Base(lockPath), os.O_RDWR, 0)
+		}
 		if err != nil {
 			exportPathLocks.Unlock()
 			return nil, err

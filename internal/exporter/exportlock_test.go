@@ -73,16 +73,39 @@ func TestCSVConcurrentSubprocessPublicationAndOwnerDeath(t *testing.T) {
 	}
 	output := filepath.Join(t.TempDir(), "graph.csv")
 	commands := make([]*exec.Cmd, 3)
+	var children []*exec.Cmd
+	reaped := make(map[*exec.Cmd]bool)
+	var waiter *exec.Cmd
+	var waiterDone chan error
+	defer func() {
+		for _, child := range children {
+			if child.Process != nil && !reaped[child] {
+				_ = child.Process.Kill()
+			}
+		}
+		for _, child := range children {
+			if child.Process != nil && !reaped[child] {
+				if child == waiter && waiterDone != nil {
+					<-waiterDone
+				} else {
+					_ = child.Wait()
+				}
+			}
+		}
+	}()
 	logs := make([]bytes.Buffer, len(commands))
 	for index := range commands {
 		commands[index] = exportHelperCommand(t, "export", output, "")
+		children = append(children, commands[index])
 		commands[index].Stdout, commands[index].Stderr = &logs[index], &logs[index]
 		if err := commands[index].Start(); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for index, command := range commands {
-		if err := command.Wait(); err != nil {
+		err := command.Wait()
+		reaped[command] = true
+		if err != nil {
 			t.Fatalf("export helper: %v\n%s", err, &logs[index])
 		}
 	}
@@ -90,6 +113,7 @@ func TestCSVConcurrentSubprocessPublicationAndOwnerDeath(t *testing.T) {
 
 	ready := filepath.Join(t.TempDir(), "ready")
 	holder := exportHelperCommand(t, "hold", output, ready)
+	children = append(children, holder)
 	if err := holder.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -121,14 +145,16 @@ func TestCSVConcurrentSubprocessPublicationAndOwnerDeath(t *testing.T) {
 	if string(manifestAfter) != string(manifestBefore) {
 		t.Fatal("cancelled waiter changed the published manifest")
 	}
-	waiter := exportHelperCommand(t, "export", output, "")
+	waiter = exportHelperCommand(t, "export", output, "")
+	children = append(children, waiter)
 	if err := waiter.Start(); err != nil {
 		t.Fatal(err)
 	}
-	waited := make(chan error, 1)
-	go func() { waited <- waiter.Wait() }()
+	waiterDone = make(chan error, 1)
+	go func() { waiterDone <- waiter.Wait() }()
 	select {
-	case err := <-waited:
+	case err := <-waiterDone:
+		reaped[waiter] = true
 		t.Fatalf("waiter did not block on the OS lock: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
@@ -136,8 +162,10 @@ func TestCSVConcurrentSubprocessPublicationAndOwnerDeath(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = holder.Wait()
+	reaped[holder] = true
 	select {
-	case err := <-waited:
+	case err := <-waiterDone:
+		reaped[waiter] = true
 		if err != nil {
 			t.Fatal(err)
 		}
