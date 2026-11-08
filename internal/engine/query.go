@@ -46,6 +46,7 @@ type queryPlan struct {
 	withSkipExpr     valueExpr
 	withLimitExpr    valueExpr
 	next             *queryPlan
+	union            *queryUnionPlan
 	inherited        []string
 	inheritedSlots   []string
 	inheritedRoles   map[string]bindingRole
@@ -887,26 +888,44 @@ type propertyExpr struct {
 }
 
 func parseQuery(query string) (*queryPlan, error) {
-	plan, err := parseQueryText(query)
+	query, err := trimQueryTerminator(query)
 	if err != nil {
 		return nil, err
 	}
+	plan, parseErr := parseQueryText(query)
+	if parseErr == nil {
+		if err := validateQueryPlan(plan); err != nil {
+			return nil, err
+		}
+		return plan, nil
+	}
+	branches, all, isUnion, err := splitQueryUnion(query)
+	if err != nil {
+		return nil, err
+	}
+	if isUnion {
+		return parseQueryUnion(branches, all)
+	}
+	return nil, parseErr
+}
+
+func validateQueryPlan(plan *queryPlan) error {
 	if plan.mutates() {
 		for part := plan; part != nil; part = part.next {
 			if predicateHasExists(part.wherePredicate) || predicateHasExists(part.withWhere) {
-				return nil, errors.New("EXISTS cannot be combined with mutation")
+				return errors.New("EXISTS cannot be combined with mutation")
 			}
 		}
 	}
 	if err := validateOptionalMatchPlan(plan); err != nil {
-		return nil, err
+		return err
 	}
 	for current := plan; current != nil; current = current.next {
 		if err := current.validateBindings(); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return plan, nil
+	return nil
 }
 
 // parseQueryText parses one query part. A top-level WITH splits the text into
@@ -1968,6 +1987,13 @@ func (plan *queryPlan) mutates() bool {
 		if current.mutatesLocally() {
 			return true
 		}
+		if current.union != nil {
+			for _, branch := range current.union.branches {
+				if branch.mutates() {
+					return true
+				}
+			}
+		}
 	}
 	return false
 }
@@ -2021,6 +2047,9 @@ func (plan *queryPlan) execute(tx *Tx, params map[string]any, budget *queryBudge
 		budget.existsStages = nil
 		budget.closeSources()
 	}()
+	if plan.union != nil {
+		return plan.union.execute(tx, params, budget)
+	}
 	return plan.executeWithInput(tx, params, budget, nil)
 }
 

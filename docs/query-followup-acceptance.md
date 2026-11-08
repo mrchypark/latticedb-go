@@ -6,17 +6,27 @@ Review each section against the code at the start of its issue.
 
 ## #257: UNION row accounting and grammar
 
-A top-level unquoted UNION delimiter separates complete read-only statements.
-Each branch has one explicit RETURN schema. Its ORDER BY, SKIP and LIMIT are
-branch-local. There is no global tail syntax. A branch uses one read snapshot
-and the same normalized parameters as all the others. Validate all branches and
-schemas before evaluating any branch. All operators draw from one request budget.
-Keep existing per-stage row caps in each branch; also cap the combined count of
-rows submitted to the union collector across all branches, including duplicates.
-Charge deduplication and ordered result buffering to MaxWork and MaxBytes.
-On overflow return an error and no result. ALL emits in branch order and retains
-multiplicity. DISTINCT retains the first equal row in that order. Test duplicate
-rows across branches at the row limit, even when the unique result would fit.
+A top-level unquoted `UNION` or `UNION ALL` separates complete read-only
+statements. Reject empty branches, nested unions, mixed operator chains, and
+`UNION DISTINCT`. Allow only one terminal semicolon. Each branch has an explicit
+RETURN with identical column count and names in order. Column types may differ.
+ORDER BY, SKIP and LIMIT apply to their own branch, including the last branch;
+there is no global tail syntax. Validate every branch before evaluation.
+
+Branches run on one read snapshot with a shared request budget. Existing row caps
+apply inside each branch. The union collector counts every post-pagination row,
+including duplicates, before deduplication. Fail before accepting a row beyond
+MaxRows. Charge all retained output, deduplication keys and working buffers to
+the shared byte budget and all equality work to MaxWork. Cancellation and
+resource errors return the usual execution-stage error with no partial result.
+
+ALL retains multiplicity and branch order. Bare UNION retains the first equal
+row in that order. Compare projected values in declared column order using the
+existing canonical key and equality rules, including nested values, NULL,
+numeric values and entity identity. Neither branch provenance nor sorting
+fields are part of equality. Test mismatched schemas before evaluation, quoted
+UNION text, branch-local tails, and a duplicate-heavy result whose inputs exceed
+MaxRows even though its unique output fits.
 
 ## #258: structured plan contract
 
