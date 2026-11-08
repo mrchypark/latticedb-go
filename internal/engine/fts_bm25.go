@@ -53,16 +53,25 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 	if err != nil {
 		return nil, err
 	}
+	var results []FTSSearchResult
+	err = db.View(func(tx *Tx) error {
+		var err error
+		results, err = db.ftsSearchGraph(ctx, tx.graph, query, opts, budget)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+// ftsSearchGraph searches one caller-pinned graph with the page index and the
+// canonical FTS records so both read the same snapshot.
+func (db *DB) ftsSearchGraph(ctx context.Context, graph *store.GraphState, query string, opts FTSSearchOptions, budget *directSearchBudget) ([]FTSSearchResult, error) {
 	if err := budget.add(uint64(len(query))); err != nil {
 		return nil, err
 	}
-	var indexedResults []FTSSearchResult
-	var indexed bool
-	err = db.View(func(tx *Tx) error {
-		var err error
-		indexedResults, indexed, err = db.pageIndexedFTSSearch(ctx, tx.graph, query, opts, budget)
-		return err
-	})
+	indexedResults, indexed, err := db.pageIndexedFTSSearch(ctx, graph, query, opts, budget)
 	if err != nil {
 		return nil, err
 	}
@@ -89,67 +98,67 @@ func (db *DB) ftsSearchBM25Context(ctx context.Context, query string, opts FTSSe
 	}
 	defer budget.releaseBytes(termStateBytes)
 
-	var results []FTSSearchResult
-	err = db.View(func(tx *Tx) error {
-		var documentCount, totalLength uint64
-		var documentFrequency []uint64
-		if opts.Scoring == FTSScoringBM25 {
-			var err error
-			documentCount, totalLength, documentFrequency, err = ftsBM25CorpusStats(ctx, tx.graph, terms, opts, budget)
-			if err != nil {
-				return err
-			}
-			if documentCount == 0 || totalLength == 0 {
-				return nil
-			}
+	var documentCount, totalLength uint64
+	var documentFrequency []uint64
+	if opts.Scoring == FTSScoringBM25 {
+		var err error
+		documentCount, totalLength, documentFrequency, err = ftsBM25CorpusStats(ctx, graph, terms, opts, budget)
+		if err != nil {
+			return nil, err
 		}
-		capacity := limit
-		results = make([]FTSSearchResult, 0, int(capacity))
-		averageLength := float64(0)
-		if documentCount != 0 {
-			averageLength = float64(totalLength) / float64(documentCount)
+		if documentCount == 0 || totalLength == 0 {
+			return nil, nil
 		}
-		err := tx.graph.VisitFTS(store.WithPageReadBudget(ctx, budget), func(nodeID uint64, record *store.FTSRecord) error {
-			tokens, tokenBytes, err := ftsRecordTokens(ctx, record, opts.Analyzer, budget)
-			if err != nil {
-				return err
-			}
-			frequencies, frequencyBytes, err := ftsTermFrequencies(tokens, terms, opts, budget)
-			budget.releaseBytes(tokenBytes)
-			if err != nil {
-				return err
-			}
-			scoreWork := uint64(len(frequencies))
-			if opts.Scoring == FTSScoringBM25 {
-				scoreWork = saturatingAdd(scoreWork, uint64(len(frequencies)))
-			}
-			if err := budget.add(scoreWork); err != nil {
-				budget.releaseBytes(frequencyBytes)
-				return err
-			}
-			var score float64
-			if opts.Scoring == FTSScoringBM25 {
-				score = bm25Score(frequencies, documentFrequency, uint64(len(tokens)), documentCount, averageLength)
-			} else {
-				score = frequencyScore(frequencies)
-			}
-			budget.releaseBytes(frequencyBytes)
-			if score > 0 {
-				var pushErr error
-				results, pushErr = pushFTSResultBudget(results, FTSSearchResult{NodeID: nodeID, Score: float32(score)}, int(capacity), budget)
-				if pushErr != nil {
-					return pushErr
-				}
-			}
-			return nil
-		})
+	}
+	limit := uint64(opts.Limit)
+	if limit == 0 {
+		limit = 10
+	}
+	capacity := limit
+	results := make([]FTSSearchResult, 0, int(capacity))
+	averageLength := float64(0)
+	if documentCount != 0 {
+		averageLength = float64(totalLength) / float64(documentCount)
+	}
+	err = graph.VisitFTS(store.WithPageReadBudget(ctx, budget), func(nodeID uint64, record *store.FTSRecord) error {
+		tokens, tokenBytes, err := ftsRecordTokens(ctx, record, opts.Analyzer, budget)
 		if err != nil {
 			return err
 		}
-		return sortFTSResultsBudget(results, budget)
+		frequencies, frequencyBytes, err := ftsTermFrequencies(tokens, terms, opts, budget)
+		budget.releaseBytes(tokenBytes)
+		if err != nil {
+			return err
+		}
+		scoreWork := uint64(len(frequencies))
+		if opts.Scoring == FTSScoringBM25 {
+			scoreWork = saturatingAdd(scoreWork, uint64(len(frequencies)))
+		}
+		if err := budget.add(scoreWork); err != nil {
+			budget.releaseBytes(frequencyBytes)
+			return err
+		}
+		var score float64
+		if opts.Scoring == FTSScoringBM25 {
+			score = bm25Score(frequencies, documentFrequency, uint64(len(tokens)), documentCount, averageLength)
+		} else {
+			score = frequencyScore(frequencies)
+		}
+		budget.releaseBytes(frequencyBytes)
+		if score > 0 {
+			var pushErr error
+			results, pushErr = pushFTSResultBudget(results, FTSSearchResult{NodeID: nodeID, Score: float32(score)}, int(capacity), budget)
+			if pushErr != nil {
+				return pushErr
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, pageStorageOpenError(err)
+	}
+	if err := sortFTSResultsBudget(results, budget); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
