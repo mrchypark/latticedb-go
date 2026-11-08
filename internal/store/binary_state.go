@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 const (
@@ -221,6 +223,82 @@ func decodeBinaryWALPayload(input io.Reader, length, maxBytes uint64) (walPayloa
 	return value, d.finish()
 }
 
+func decodeBinaryWALPayloadForHeader(header []byte, input io.Reader, length, maxBytes uint64) (walPayload, error) {
+	value, err := decodeBinaryWALPayload(input, length, maxBytes)
+	if err != nil {
+		return value, err
+	}
+	if err := validateWALPayloadVersion(header, value); err != nil {
+		return walPayload{}, err
+	}
+	return value, nil
+}
+
+func validateWALPayloadVersion(header []byte, value walPayload) error {
+	if len(header) < walHeaderPrefixSize {
+		return errors.New("invalid WAL header")
+	}
+	version := binary.BigEndian.Uint16(header[8:10])
+	if version == binaryWALVersion {
+		if walPayloadRequiresFeatureMarker(value) {
+			return errors.New("WAL graph constraint marker mismatch")
+		}
+		return nil
+	}
+	if version != walVersion && version != constrainedWALVersion {
+		return errors.New("invalid WAL version")
+	}
+	requires := walPayloadRequiresFeatureMarker(value)
+	if requires != (version == constrainedWALVersion) {
+		return errors.New("WAL graph constraint marker mismatch")
+	}
+	return nil
+}
+
+func walPayloadRequiresFeatureMarker(value walPayload) bool {
+	switch value.Kind {
+	case "snapshot":
+		return value.Snapshot != nil && persistedGraphConstraintsPresent(value.Snapshot.AppMetadata)
+	case "delta", "property_delta":
+		if value.Delta == nil {
+			return false
+		}
+		for _, change := range value.Delta.AppMetadata {
+			key := string(change.Key)
+			if key == GraphConstraintsFeatureKey || strings.HasPrefix(key, GraphConstraintPrefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func persistedGraphConstraintsPresent(entries []persistedAppMetadata) bool {
+	for _, entry := range entries {
+		if string(entry.Key) == GraphConstraintsFeatureKey {
+			return true
+		}
+	}
+	return false
+}
+
+func validatePersistedGraphConstraintsVersion(entries []persistedAppMetadata, constrained bool) error {
+	present := false
+	for _, entry := range entries {
+		if string(entry.Key) != GraphConstraintsFeatureKey {
+			continue
+		}
+		if !bytes.Equal(entry.Value, []byte("1")) {
+			return errors.New("invalid graph constraint feature marker")
+		}
+		present = true
+	}
+	if present != constrained {
+		return errors.New("checkpoint graph constraint marker mismatch")
+	}
+	return nil
+}
+
 func decodeBinaryStatePayload(input io.Reader, length, maxBytes uint64) (*persistedState, error) {
 	d := newBinaryDecoder(input, length, maxBytes)
 	state := d.state()
@@ -234,7 +312,7 @@ func decodeWALPayloadBytes(ctx context.Context, header, payload []byte, maxBytes
 	if !isBinaryWALHeader(header) {
 		return unmarshalContext(ctx, payload, out)
 	}
-	decoded, err := decodeBinaryWALPayload(&contextReader{ctx: ctx, reader: bytes.NewReader(payload)}, uint64(len(payload)), maxBytes)
+	decoded, err := decodeBinaryWALPayloadForHeader(header, &contextReader{ctx: ctx, reader: bytes.NewReader(payload)}, uint64(len(payload)), maxBytes)
 	if err == nil {
 		*out = decoded
 	}

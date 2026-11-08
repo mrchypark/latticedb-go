@@ -42,7 +42,11 @@ func (page *PageGraph) pageCommit(ctx context.Context, graph *GraphState, nextNo
 	if err != nil {
 		return catalog, nil, err
 	}
-	header, err := encodeWALHeader(graph.DatabaseID, commitID, payload)
+	headerVersion := uint16(walVersion)
+	if walPayloadRequiresFeatureMarker(walPayload{Kind: kind, Delta: &persisted}) {
+		headerVersion = constrainedWALVersion
+	}
+	header, err := encodeWALHeaderVersion(graph.DatabaseID, commitID, payload, headerVersion)
 	if err != nil {
 		return catalog, nil, err
 	}
@@ -98,6 +102,10 @@ func (page *PageGraph) pageCommit(ctx context.Context, graph *GraphState, nextNo
 		if err := page.PutMetadata(change.Key, change.Value, change.Delete); err != nil {
 			return catalog, nil, err
 		}
+	}
+	catalog.graphConstraints, err = page.graphConstraintsPresent()
+	if err != nil {
+		return catalog, nil, err
 	}
 
 	for _, definition := range delta.DropNodeIndexes {

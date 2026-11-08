@@ -31,12 +31,18 @@ func (tx *Tx) PutAppMetadata(key, value []byte) error {
 	if err := validateAppMetadataKey(key); err != nil {
 		return err
 	}
+	if isGraphConstraintKey(key) {
+		return fmt.Errorf("%w: reserved graph constraint metadata key", ErrInvalidArgument)
+	}
+	tx.putAppMetadata(string(key), value)
+	return nil
+}
+
+func (tx *Tx) putAppMetadata(key string, value []byte) {
 	tx.ensureAppMetadataWritable()
 	cloned := slices.Clone(value)
-	textKey := string(key)
-	tx.graph.AppMetadata.Set(textKey, cloned)
-	tx.changes.appMetadata[textKey] = appMetadataChange{value: cloned}
-	return nil
+	tx.graph.AppMetadata.Set(key, cloned)
+	tx.changes.appMetadata[key] = appMetadataChange{value: cloned}
 }
 
 func (tx *Tx) DeleteAppMetadata(key []byte) error {
@@ -46,11 +52,17 @@ func (tx *Tx) DeleteAppMetadata(key []byte) error {
 	if err := validateAppMetadataKey(key); err != nil {
 		return err
 	}
-	tx.ensureAppMetadataWritable()
-	textKey := string(key)
-	tx.graph.AppMetadata.Delete(textKey)
-	tx.changes.appMetadata[textKey] = appMetadataChange{delete: true}
+	if isGraphConstraintKey(key) {
+		return fmt.Errorf("%w: reserved graph constraint metadata key", ErrInvalidArgument)
+	}
+	tx.deleteAppMetadata(string(key))
 	return nil
+}
+
+func (tx *Tx) deleteAppMetadata(key string) {
+	tx.ensureAppMetadataWritable()
+	tx.graph.AppMetadata.Delete(key)
+	tx.changes.appMetadata[key] = appMetadataChange{delete: true}
 }
 
 func (tx *Tx) ensureAppMetadataWritable() {
