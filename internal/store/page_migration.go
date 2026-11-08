@@ -231,7 +231,7 @@ func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []strin
 	finalGraph, finalCatalog, err := (&PageGraph{Tx: read}).LoadGraph(ctx)
 	var finalSnapshotBytes uint64
 	if err == nil {
-		err = ValidateGraphConstraints(ctx, finalGraph, nil)
+		err = validateRecoveredGraphConstraints(ctx, finalGraph, importer.recovery.withConstraintRecoveryDefaults())
 	}
 	if err == nil {
 		finalSnapshotBytes, err = EstimateSnapshotBytes(finalGraph)

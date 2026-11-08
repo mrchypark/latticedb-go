@@ -49,6 +49,53 @@ type recoveryBudget struct {
 	stateCount uint8
 }
 
+func (budget *recoveryBudget) ChargeConstraintWork(work uint64) error {
+	return budget.replayWork(work)
+}
+
+func (budget *recoveryBudget) ReserveConstraintBytes(bytes uint64) error {
+	return budget.decodedBytes(bytes)
+}
+
+func (budget *recoveryBudget) ReleaseConstraintBytes(bytes uint64) {
+	budget.bytes -= min(bytes, budget.bytes)
+}
+
+func (budget *recoveryBudget) ReservePageRead(work, bytes uint64) error {
+	if err := budget.ChargeConstraintWork(work); err != nil {
+		return err
+	}
+	return budget.ReserveConstraintBytes(bytes)
+}
+
+func (budget *recoveryBudget) ReleasePageRead(bytes uint64) {
+	budget.ReleaseConstraintBytes(bytes)
+}
+
+func (budget *recoveryBudget) RemainingPageReadBytes() uint64 {
+	if budget.limits.MaxDecodedBytes == 0 {
+		return ^uint64(0)
+	}
+	if budget.bytes >= budget.limits.MaxDecodedBytes {
+		return 0
+	}
+	return budget.limits.MaxDecodedBytes - budget.bytes
+}
+
+func (budget *recoveryBudget) withConstraintRecoveryDefaults() *recoveryBudget {
+	if budget == nil {
+		return &recoveryBudget{limits: defaultGraphConstraintRecoveryLimits()}
+	}
+	cloned := *budget
+	if cloned.limits.MaxDecodedBytes == 0 {
+		cloned.limits.MaxDecodedBytes = defaultConstraintRecoveryBytes
+	}
+	if cloned.limits.MaxWork == 0 {
+		cloned.limits.MaxWork = defaultConstraintRecoveryWork
+	}
+	return &cloned
+}
+
 func (budget *recoveryBudget) add(kind string, used *uint64, limit, amount uint64) error {
 	if limit != 0 && (*used > limit || amount > limit-*used) {
 		return fmt.Errorf("%w: recovery %s exceeds %d", ErrLoadResourceLimit, kind, limit)
@@ -420,7 +467,7 @@ func DeserializeGraphStateWithRecoveryLimits(data []byte, maxCanonicalBytes, max
 	}
 	graph, nextNodeID, nextEdgeID, commitID, err := decodePersistedStateContext(context.Background(), snapshot, maxDerivedWork, maxDerivedBytes)
 	if err == nil {
-		err = ValidateGraphConstraints(context.Background(), graph, nil)
+		err = validateRecoveredGraphConstraints(context.Background(), graph, budget.withConstraintRecoveryDefaults())
 	}
 	return graph, nextNodeID, nextEdgeID, commitID, err
 }
@@ -494,7 +541,7 @@ func LoadGraphStateFilesContextWithRecoveryLimitsAndWALAppendReady(ctx context.C
 	}
 	graph, nextNodeID, nextEdgeID, commitID, err := decodePersistedStateContext(ctx, *chosen, maxDerivedWork, maxDerivedBytes)
 	if err == nil {
-		err = ValidateGraphConstraints(ctx, graph, nil)
+		err = validateRecoveredGraphConstraints(ctx, graph, budget.withConstraintRecoveryDefaults())
 	}
 	return graph, nextNodeID, nextEdgeID, commitID, walAppendReady, err
 }
