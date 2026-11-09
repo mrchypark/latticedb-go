@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -23,6 +24,7 @@ type CheckpointScanHeader struct {
 	CommitID         uint64
 	NextNodeID       uint64
 	NextEdgeID       uint64
+	GraphConstraints bool
 }
 
 type CheckpointScanCounts struct {
@@ -89,9 +91,11 @@ func ScanCheckpointV5(ctx context.Context, input io.Reader, limits CheckpointSca
 	if _, err := io.ReadFull(reader, rawHeader[:]); err != nil {
 		return header, counts, err
 	}
-	if string(rawHeader[:8]) != string(stateBinaryMagic[:]) || binary.BigEndian.Uint16(rawHeader[8:10]) != stateVersion || !validStateHeader(rawHeader[:]) {
-		return header, counts, errors.New("unsupported checkpoint format: expected binary v5")
+	version := binary.BigEndian.Uint16(rawHeader[8:10])
+	if string(rawHeader[:8]) != string(stateBinaryMagic[:]) || (version != stateVersion && version != constrainedStateVersion) || !validStateHeader(rawHeader[:]) {
+		return header, counts, errors.New("unsupported checkpoint format")
 	}
+	header.GraphConstraints = version == constrainedStateVersion
 	payloadBytes := binary.BigEndian.Uint64(rawHeader[20:28])
 	// The default retains the historical 1 GiB safety cap. Explicit callers
 	// may raise it for streamed imports, but io.LimitReader takes int64.
@@ -191,6 +195,7 @@ func ScanCheckpointV5(ctx context.Context, input io.Reader, limits CheckpointSca
 	if counts.Metadata, err = collection(); err != nil {
 		return header, counts, err
 	}
+	metadataHasConstraints := false
 	for range counts.Metadata {
 		start, err := beginRecord()
 		if err != nil {
@@ -202,6 +207,12 @@ func ScanCheckpointV5(ctx context.Context, input io.Reader, limits CheckpointSca
 		}
 		if len(entry.Key) == 0 || len(entry.Key) > maxAppMetadataKeyBytes {
 			return header, counts, errors.New("invalid stored application metadata key length")
+		}
+		if string(entry.Key) == GraphConstraintsFeatureKey {
+			if !bytes.Equal(entry.Value, []byte("1")) {
+				return header, counts, errors.New("invalid graph constraint feature marker")
+			}
+			metadataHasConstraints = true
 		}
 		if err := call(func() error {
 			if visitor.Metadata != nil {
@@ -327,6 +338,9 @@ func ScanCheckpointV5(ctx context.Context, input io.Reader, limits CheckpointSca
 			return header, counts, io.ErrNoProgress
 		}
 		return header, counts, err
+	}
+	if metadataHasConstraints != header.GraphConstraints {
+		return header, counts, errors.New("checkpoint graph constraint marker mismatch")
 	}
 	return header, counts, nil
 }

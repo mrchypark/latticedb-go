@@ -42,7 +42,7 @@ func WriteGraphStateContext(ctx context.Context, output io.Writer, graph *GraphS
 	if err != nil {
 		return err
 	}
-	header, err := encodeStateHeader(graph.DatabaseID, commitID, uint64(info.Size()), checksum.Sum32())
+	header, err := encodeStateHeaderForGraph(graph, commitID, uint64(info.Size()), checksum.Sum32())
 	if err != nil {
 		return err
 	}
@@ -75,7 +75,7 @@ func (writer *WALWriter) CopyCommittedWALRangeTo(output io.Writer, startTail, en
 		return errors.New("invalid committed WAL range")
 	}
 	var base [walHeaderSize]byte
-	if _, err := writer.file.ReadAt(base[:], 0); err != nil || !validCurrentWALHeader(base[:]) {
+	if _, err := writer.file.ReadAt(base[:], 0); err != nil || !validSupportedWALHeader(base[:]) {
 		return errors.New("invalid WAL base header")
 	}
 	if string(bytes.TrimRight(base[walDatabaseIDAt:legacyWALHeaderSize], "\x00")) != databaseID {
@@ -104,7 +104,7 @@ func (writer *WALWriter) CopyCommittedWALRangeTo(output io.Writer, startTail, en
 			return fmt.Errorf("read committed WAL frame header: %w", err)
 		}
 		length := binary.BigEndian.Uint64(header[20:28])
-		if !validCurrentWALHeader(header[:]) || length > maxWALFrameBytes || int64(length) > end-offset-walHeaderSize {
+		if !validSupportedWALHeader(header[:]) || length > maxWALFrameBytes || int64(length) > end-offset-walHeaderSize {
 			return errors.New("invalid committed WAL frame")
 		}
 		frameCommit := binary.BigEndian.Uint64(header[12:20])
@@ -169,7 +169,7 @@ func ValidateBackupWALSegmentFileContext(ctx context.Context, path, databaseID s
 			return err
 		}
 		length := binary.BigEndian.Uint64(header[20:28])
-		if !validCurrentWALHeader(header[:]) || length > maxWALFrameBytes || length > uint64(info.Size()-offset-walHeaderSize) {
+		if !validSupportedWALHeader(header[:]) || length > maxWALFrameBytes || length > uint64(info.Size()-offset-walHeaderSize) {
 			return errors.New("invalid backup WAL frame")
 		}
 		frameCommit := binary.BigEndian.Uint64(header[12:20])
@@ -179,6 +179,10 @@ func ValidateBackupWALSegmentFileContext(ctx context.Context, path, databaseID s
 		checksum, err := backupRangeChecksum(ctx, file, offset+walHeaderSize, int64(length))
 		if err != nil || checksum != binary.BigEndian.Uint32(header[28:32]) {
 			return errors.Join(errors.New("backup WAL frame checksum mismatch"), err)
+		}
+		payload := &contextReader{ctx: ctx, reader: io.NewSectionReader(file, offset+walHeaderSize, int64(length))}
+		if _, err := decodeBinaryWALPayloadForHeader(header[:], payload, length, maxWALFrameBytes); err != nil {
+			return fmt.Errorf("invalid backup WAL payload: %w", err)
 		}
 		offset += walHeaderSize + int64(length)
 		commit = frameCommit

@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +12,8 @@ import (
 
 const pageCatalogBucket = "catalog"
 const pageMetadataBucket = "metadata"
+const pageCatalogRecord byte = 3
+const pageCatalogGraphConstraintsRecord byte = 7
 
 type PageCatalog struct {
 	SnapshotBytes                    uint64
@@ -19,6 +23,7 @@ type PageCatalog struct {
 	Nodes, Edges                     uint64
 	History                          [32]byte
 	ArchiveBasePending               bool
+	graphConstraints                 bool
 }
 
 func (graph *PageGraph) Catalog() (PageCatalog, error) {
@@ -30,7 +35,14 @@ func (graph *PageGraph) Catalog() (PageCatalog, error) {
 	if data == nil {
 		return result, errors.New("page catalog is missing")
 	}
-	d, err := decodePageRecord(data, 3, 4096)
+	if len(data) < 2 {
+		return result, errors.New("invalid page catalog record")
+	}
+	kind := data[1]
+	if kind != pageCatalogRecord && kind != pageCatalogGraphConstraintsRecord {
+		return result, errors.New("invalid page catalog record")
+	}
+	d, err := decodePageRecord(data, kind, 4096)
 	if err != nil {
 		return result, err
 	}
@@ -70,6 +82,14 @@ func (graph *PageGraph) Catalog() (PageCatalog, error) {
 	if err := ValidateIDHighWater(result.NextEdgeID); err != nil {
 		return result, err
 	}
+	constraints, err := graph.graphConstraintsPresent()
+	if err != nil {
+		return result, err
+	}
+	if constraints != (kind == pageCatalogGraphConstraintsRecord) {
+		return result, errors.New("page catalog graph constraint marker mismatch")
+	}
+	result.graphConstraints = constraints
 	return result, nil
 }
 func (graph *PageGraph) PutCatalog(c PageCatalog) error {
@@ -82,7 +102,11 @@ func (graph *PageGraph) PutCatalog(c PageCatalog) error {
 	if err := ValidateIDHighWater(c.NextEdgeID); err != nil {
 		return err
 	}
-	data, err := encodePageRecord(3, func(e *binaryEncoder) {
+	kind := pageCatalogRecord
+	if c.graphConstraints {
+		kind = pageCatalogGraphConstraintsRecord
+	}
+	data, err := encodePageRecord(kind, func(e *binaryEncoder) {
 		e.str(c.DatabaseID)
 		e.u(uint64(c.VectorDimensions))
 		e.u(c.CommitID)
@@ -102,6 +126,22 @@ func (graph *PageGraph) PutCatalog(c PageCatalog) error {
 		return err
 	}
 	return graph.Tx.Put(pageCatalogBucket, []byte("state"), data)
+}
+
+func (graph *PageGraph) graphConstraintsPresent() (bool, error) {
+	digest := sha256.Sum256([]byte(GraphConstraintsFeatureKey))
+	data, err := graph.Tx.Get(pageMetadataBucket, digest[:])
+	if err != nil || data == nil {
+		return false, err
+	}
+	key, value, err := graph.decodeMetadata(digest[:], data)
+	if err != nil {
+		return false, err
+	}
+	if string(key) != GraphConstraintsFeatureKey || !bytes.Equal(value, []byte("1")) {
+		return false, errors.New("invalid graph constraint feature marker")
+	}
+	return true, nil
 }
 func (graph *PageGraph) LoadGraph(ctx context.Context) (*GraphState, PageCatalog, error) {
 	return graph.loadGraph(ctx, nil)

@@ -231,6 +231,9 @@ func importPageFiles(ctx context.Context, checkpoint io.Reader, segments []strin
 	finalGraph, finalCatalog, err := (&PageGraph{Tx: read}).LoadGraph(ctx)
 	var finalSnapshotBytes uint64
 	if err == nil {
+		err = validateRecoveredGraphConstraints(ctx, finalGraph, importer.recovery.withConstraintRecoveryDefaults())
+	}
+	if err == nil {
 		finalSnapshotBytes, err = EstimateSnapshotBytes(finalGraph)
 	}
 	_ = read.Rollback()
@@ -462,7 +465,7 @@ func (p *pageImporter) scanCheckpoint(input io.Reader, limits CheckpointScanLimi
 			if err := p.begin(); err != nil {
 				return err
 			}
-			p.catalog = PageCatalog{DatabaseID: h.DatabaseID, VectorDimensions: h.VectorDimensions, CommitID: h.CommitID, NextNodeID: h.NextNodeID, NextEdgeID: h.NextEdgeID}
+			p.catalog = PageCatalog{DatabaseID: h.DatabaseID, VectorDimensions: h.VectorDimensions, CommitID: h.CommitID, NextNodeID: h.NextNodeID, NextEdgeID: h.NextEdgeID, graphConstraints: h.GraphConstraints}
 			return p.graph.PutCatalog(p.catalog)
 		},
 		Metadata: func(record persistedAppMetadata) error {
@@ -1040,7 +1043,7 @@ func (p *pageImporter) replaySegment(path string, strict bool, budget *migration
 			_ = os.Remove(snapshotFile.Name())
 			continue
 		}
-		decoded, err := decodeBinaryWALPayload(bytes.NewReader(payload), length, maxWALFrameBytes)
+		decoded, err := decodeBinaryWALPayloadForHeader(header, bytes.NewReader(payload), length, maxWALFrameBytes)
 		if err != nil {
 			return err
 		}
@@ -1098,7 +1101,11 @@ func (p *pageImporter) importSnapshotFile(payload *os.File, length uint64, check
 	if _, err := payload.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	header, err := encodeStateHeader(databaseID, commitID, length, checksum)
+	version := uint16(stateVersion)
+	if binary.BigEndian.Uint16(frameHeader[8:10]) == constrainedWALVersion {
+		version = constrainedStateVersion
+	}
+	header, err := encodeStateHeaderVersion(databaseID, commitID, length, checksum, version)
 	if err != nil {
 		return err
 	}
@@ -1414,6 +1421,10 @@ func (p *pageImporter) applyDelta(delta persistedDelta, frameHeader, framePayloa
 		if err := g.CreatePropertyIndex(p.ctx, false, PropertyIndexDefinition{Scope: definition.Scope, Property: definition.Property}); err != nil {
 			return err
 		}
+	}
+	catalog.graphConstraints, err = g.graphConstraintsPresent()
+	if err != nil {
+		return err
 	}
 	catalog.CommitID = delta.CommitID
 	catalog.NextNodeID = delta.NextNodeID

@@ -401,6 +401,8 @@ type vectorRebuildState struct {
 
 type Tx struct {
 	queryBudget            *queryBudget
+	constraintBudget       *queryBudget
+	constraintsChanged     bool
 	db                     *DB
 	readOnly               bool
 	commitID               uint64
@@ -2044,12 +2046,13 @@ func (db *DB) queryContext(ctx context.Context, query string, params map[string]
 		err := db.updateContext(ctx, func(tx *Tx) error {
 			var execErr error
 			result, execErr = plan.execute(tx, params, budget)
+			tx.constraintBudget = budget
 			return execErr
 		})
 		if err != nil {
-			err = &QueryError{Stage: QueryErrorStageExecution, Err: err}
+			return QueryResult{}, &QueryError{Stage: QueryErrorStageExecution, Err: err}
 		}
-		return result, err
+		return result, nil
 	}
 
 	var result QueryResult
@@ -3495,6 +3498,9 @@ func (tx *Tx) commitInternalContext(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+	}
+	if err := tx.validateGraphConstraints(ctx); err != nil {
+		return err
 	}
 	if tx.db.pages != nil {
 		return tx.commitPages(ctx)
