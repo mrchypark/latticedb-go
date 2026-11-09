@@ -50,6 +50,19 @@ func TestPageFTSPostingsUseExactTermBoundariesAndSurviveReopen(t *testing.T) {
 	if len(ids) != 1 || ids[0] != 1 {
 		t.Fatalf("exact go postings=%v", ids)
 	}
+	for _, budget := range []*recordReadTestBudget{
+		{maxWork: 1, maxBytes: 1},
+		{maxWork: 0, maxBytes: 1024},
+	} {
+		ctx := WithPageReadBudget(t.Context(), budget)
+		err := (&PageGraph{Tx: read}).VisitFTSPostings(ctx, "manual-standard", "go", func(PageFTSPosting) error {
+			t.Fatal("posting reached visitor after exhausting its read budget")
+			return nil
+		})
+		if !errors.Is(err, errRecordReadTestBudget) || budget.bytes != 0 {
+			t.Fatalf("posting admission error=%v retained=%d", err, budget.bytes)
+		}
+	}
 	if err := read.Rollback(); err != nil {
 		t.Fatal(err)
 	}

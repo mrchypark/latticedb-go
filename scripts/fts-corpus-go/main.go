@@ -173,6 +173,12 @@ func execute() error {
 	dbPath := flag.String("db", "", "new disk database path")
 	mode := flag.String("mode", "bm25", "frequency, bm25, porter-bm25")
 	repeats := flag.Int("repeats", 3, "measured rounds after one complete warmup")
+	compose := flag.Bool("compose", false, "measure direct FTS plus one-hop graph composition")
+	qrelsPath := flag.String("qrels", "", "SciFact relevance judgments for -compose")
+	edgeType := flag.String("edge-type", "SCIFACT_REF", "composed graph edge type")
+	targetLabel := flag.String("target-label", "SciFactTarget", "composed graph target label")
+	candidateK := flag.Uint("candidate-k", 10, "FTS candidates before composed expansion")
+	resultK := flag.Uint("result-k", 30, "rows after composed expansion")
 	flag.Parse()
 	docs, e := load(*corpusPath)
 	if e != nil {
@@ -182,17 +188,43 @@ func execute() error {
 	if e != nil {
 		return e
 	}
+	if *compose {
+		if *mode != "bm25" {
+			return fmt.Errorf("-compose requires -mode bm25")
+		}
+		maxUint32 := uint(^uint32(0))
+		if *candidateK > maxUint32 || *resultK > maxUint32 {
+			return fmt.Errorf("candidate-k and result-k are too large")
+		}
+		out, e := measureComposition(docs, queries, compositionOptions{
+			QrelsPath:   *qrelsPath,
+			DBPath:      *dbPath,
+			EdgeType:    *edgeType,
+			TargetLabel: *targetLabel,
+			CandidateK:  uint32(*candidateK),
+			ResultK:     uint32(*resultK),
+			Repeats:     *repeats,
+		})
+		if e != nil {
+			return e
+		}
+		return writeJSON(*outPath, out)
+	}
 	out, e := measure(docs, queries, *dbPath, *mode, *repeats)
 	if e != nil {
 		return e
 	}
-	f, e := os.OpenFile(*outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	return writeJSON(*outPath, out)
+}
+
+func writeJSON(path string, value any) error {
+	f, e := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if e != nil {
 		return e
 	}
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
-	if e = enc.Encode(out); e != nil {
+	if e = enc.Encode(value); e != nil {
 		f.Close()
 		return e
 	}
