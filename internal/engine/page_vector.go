@@ -14,13 +14,17 @@ import (
 // pageVectorSearch walks the persisted graph through point reads. Its memory
 // use is bounded by EfSearch and the query budget, independent of index size.
 func pageVectorSearch(ctx context.Context, index store.PageVectorIndex, query []float32, k, ef, m int, budget *directSearchBudget) ([]VectorSearchResult, error) {
-	index.MaxRecordBytes = pageVectorNodeReadBudget(len(query), m)
-	access := newPageVectorAccess(index, budget, false)
-	defer access.close()
 	meta, err := index.Meta()
 	if err != nil {
 		return nil, err
 	}
+	return pageVectorSearchWithMeta(ctx, index, query, k, ef, m, budget, meta)
+}
+
+func pageVectorSearchWithMeta(ctx context.Context, index store.PageVectorIndex, query []float32, k, ef, m int, budget *directSearchBudget, meta store.PageVectorMeta) ([]VectorSearchResult, error) {
+	index.MaxRecordBytes = pageVectorNodeReadBudget(len(query), m)
+	access := newPageVectorAccess(index, budget, false)
+	defer access.close()
 	if !meta.Valid || int(meta.Dimensions) != len(query) || int(meta.M) != m {
 		return nil, fmt.Errorf("page HNSW index configuration is invalid")
 	}
@@ -37,6 +41,7 @@ func pageVectorSearch(ctx context.Context, index store.PageVectorIndex, query []
 		ef = vectorIndexSearchEF
 	}
 	entry := meta.EntryID
+	var err error
 	for level := meta.MaxLevel; level > 0; level-- {
 		entry, err = pageVectorGreedy(ctx, access, query, entry, level, budget)
 		if err != nil {

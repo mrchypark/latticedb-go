@@ -1,0 +1,24 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkGraphTraversalDisk/one_hop-2         	       3	  26667542 ns/op	27578141 B/op	  599917 allocs/op
+BenchmarkGraphTraversalDisk/one_hop-2         	       3	  27460583 ns/op	27578104 B/op	  599917 allocs/op
+BenchmarkGraphTraversalDisk/one_hop-2         	       3	  26242972 ns/op	27578104 B/op	  599917 allocs/op
+BenchmarkGraphTraversalDisk/two_hop-2         	       3	  68795486 ns/op	61559224 B/op	 1389909 allocs/op
+BenchmarkGraphTraversalDisk/two_hop-2         	       3	  74174889 ns/op	61559250 B/op	 1389909 allocs/op
+BenchmarkGraphTraversalDisk/two_hop-2         	       3	  73593055 ns/op	61559213 B/op	 1389909 allocs/op
+BenchmarkGraphTraversalDisk/anchored_one_hop-2         	       3	  24933792 ns/op	24310605 B/op	  580161 allocs/op
+BenchmarkGraphTraversalDisk/anchored_one_hop-2         	       3	  25513569 ns/op	24310509 B/op	  580160 allocs/op
+BenchmarkGraphTraversalDisk/anchored_one_hop-2         	       3	  24521778 ns/op	24310488 B/op	  580160 allocs/op
+BenchmarkGraphTraversalDisk/anchored_two_hop-2         	       3	  98701625 ns/op	58291762 B/op	 1370153 allocs/op
+BenchmarkGraphTraversalDisk/anchored_two_hop-2         	       3	  70592889 ns/op	58291906 B/op	 1370153 allocs/op
+BenchmarkGraphTraversalDisk/anchored_two_hop-2         	       3	 105402014 ns/op	58291906 B/op	 1370153 allocs/op
+BenchmarkGraphTraversalDisk/anchored_one_hop_ordered-2 	       3	   4904736 ns/op	 3850336 B/op	  120218 allocs/op
+BenchmarkGraphTraversalDisk/anchored_one_hop_ordered-2 	       3	   4867514 ns/op	 3850336 B/op	  120218 allocs/op
+BenchmarkGraphTraversalDisk/anchored_one_hop_ordered-2 	       3	   4678250 ns/op	 3850336 B/op	  120218 allocs/op
+BenchmarkGraphTraversalDisk/anchored_two_hop_ordered-2 	       3	   9148944 ns/op	 7695834 B/op	  240335 allocs/op
+BenchmarkGraphTraversalDisk/anchored_two_hop_ordered-2 	       3	   9139320 ns/op	 7695797 B/op	  240335 allocs/op
+BenchmarkGraphTraversalDisk/anchored_two_hop_ordered-2 	       3	   9071180 ns/op	 7695834 B/op	  240335 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go	4.785s

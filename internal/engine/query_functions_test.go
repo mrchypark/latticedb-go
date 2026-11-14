@@ -1,10 +1,13 @@
 package engine
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/latticedb-go/internal/store"
@@ -155,12 +158,14 @@ func callExprCases() []callExprCase {
 		{expr: fnCall("trim", fnLit(int64(1))), wantErr: "trim expects a string, got integer"},
 		{expr: fnCall("trim"), wantErr: "trim expects 1 argument, got 0"},
 
-		// toLower() / toUpper(): ASCII only, like upstream.
-		{expr: fnCall("toLower", fnLit("AbÇ")), want: "abÇ", wantType: reflect.TypeOf("")},
+		// toLower() / toUpper(): simple Unicode case mapping.
+		{expr: fnCall("toLower", fnLit("AbÇ")), want: "abç", wantType: reflect.TypeOf("")},
+		{expr: fnCall("toLower", fnLit("ΣПԱＡ")), want: "σпաａ", wantType: reflect.TypeOf("")},
 		{expr: fnCall("toLower", fnLit(nil))},
 		{expr: fnCall("toLower", fnLit(int64(1))), wantErr: "toLower expects a string, got integer"},
 		{expr: fnCall("toLower"), wantErr: "toLower expects 1 argument, got 0"},
-		{expr: fnCall("toUpper", fnLit("aBç")), want: "ABç", wantType: reflect.TypeOf("")},
+		{expr: fnCall("toUpper", fnLit("aBç")), want: "ABÇ", wantType: reflect.TypeOf("")},
+		{expr: fnCall("toUpper", fnLit("σпаａß")), want: "ΣПАＡß", wantType: reflect.TypeOf("")},
 		{expr: fnCall("toUpper", fnLit(nil))},
 		{expr: fnCall("toUpper", fnLit(true)), wantErr: "toUpper expects a string, got boolean"},
 		{expr: fnCall("toUpper"), wantErr: "toUpper expects 1 argument, got 0"},
@@ -314,5 +319,33 @@ func TestCallExprMissingParameterPropagates(t *testing.T) {
 	_, err := fnCall("size", paramExpr{Name: "p"}).eval(row, map[string]any{}, nil)
 	if err == nil || err.Error() != `missing query parameter "p"` {
 		t.Fatalf("eval() error = %v, want missing parameter error", err)
+	}
+}
+
+func TestUnicodeCaseRespectsBudgetAndCancellation(t *testing.T) {
+	ascii := fnCall("toLower", fnLit(strings.Repeat("A", 1024)))
+	asciiBudget := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 3072})
+	if value, err := ascii.eval(queryRow{}, nil, asciiBudget); err != nil || value != strings.Repeat("a", 1024) {
+		t.Fatalf("ASCII budget: %v", err)
+	}
+	releaseQueryBudget(asciiBudget)
+	expanding := fnCall("toLower", fnLit(strings.Repeat("A", 1022)+"Ⱥ"))
+	expansionBudget := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 3073})
+	if _, err := expanding.eval(queryRow{}, nil, expansionBudget); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("expanded output budget: %v", err)
+	}
+	releaseQueryBudget(expansionBudget)
+	expr := fnCall("toUpper", fnLit(strings.Repeat("ç", 1024)))
+	budget := newQueryBudget(context.Background(), QueryOptions{MaxBytes: 128})
+	if _, err := expr.eval(queryRow{}, nil, budget); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("memory budget: %v", err)
+	}
+	releaseQueryBudget(budget)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	budget = newQueryBudget(ctx, QueryOptions{})
+	defer releaseQueryBudget(budget)
+	if _, err := expr.eval(queryRow{}, nil, budget); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation: %v", err)
 	}
 }
