@@ -5,6 +5,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/mrchypark/latticedb-go/internal/store"
 )
@@ -387,10 +389,10 @@ func (expr callExpr) eval(row queryRow, params map[string]any, budget *queryBudg
 		return trimQueryString(text, budget)
 
 	case "toLower":
-		return expr.evalASCIIString(false, row, params, budget)
+		return expr.evalCaseString(false, row, params, budget)
 
 	case "toUpper":
-		return expr.evalASCIIString(true, row, params, budget)
+		return expr.evalCaseString(true, row, params, budget)
 
 	case "toInteger":
 		args, err := expr.evalArgs(1, 1, row, params, budget)
@@ -583,8 +585,8 @@ func (expr callExpr) listArg(value any) ([]any, bool, error) {
 	return list, true, nil
 }
 
-// evalASCIIString implements toLower/toUpper with byte-wise ASCII folding.
-func (expr callExpr) evalASCIIString(upper bool, row queryRow, params map[string]any, budget *queryBudget) (any, error) {
+// evalCaseString maps Unicode code points without locale-specific expansion.
+func (expr callExpr) evalCaseString(upper bool, row queryRow, params map[string]any, budget *queryBudget) (any, error) {
 	args, err := expr.evalArgs(1, 1, row, params, budget)
 	if err != nil {
 		return nil, err
@@ -596,30 +598,47 @@ func (expr callExpr) evalASCIIString(upper bool, row queryRow, params map[string
 		}
 		return nil, expr.typeError("a string", args[0])
 	}
-	if err := reserveExpression(budget, uint64(len(text))*2); err != nil {
-		return nil, err
+	mapCase := unicode.ToLower
+	if upper {
+		mapCase = unicode.ToUpper
 	}
-	var output strings.Builder
-	output.Grow(len(text))
-	var chunk [queryOrderComparisonChunk]byte
-	for start := 0; start < len(text); start += len(chunk) {
-		end := min(start+len(chunk), len(text))
+	var outputBytes uint64
+	for offset := 0; offset < len(text); {
+		end := min(offset+queryOrderComparisonChunk, len(text))
 		if budget != nil {
-			if err := budget.check(uint64((end-start+63)/64), 0); err != nil {
+			if err := budget.check(uint64((end-offset+63)/64), 0); err != nil {
 				return nil, err
 			}
 		}
-		for i := start; i < end; i++ {
-			char := text[i]
-			switch {
-			case upper && char >= 'a' && char <= 'z':
-				char -= 'a' - 'A'
-			case !upper && char >= 'A' && char <= 'Z':
-				char += 'a' - 'A'
+		for offset < end {
+			char, size := utf8.DecodeRuneInString(text[offset:])
+			if char == utf8.RuneError && size == 1 {
+				return nil, fmt.Errorf("%s expects valid UTF-8", expr.Name)
 			}
-			chunk[i-start] = char
+			outputBytes = saturatingAdd(outputBytes, uint64(utf8.RuneLen(mapCase(char))))
+			offset += size
 		}
-		output.Write(chunk[:end-start])
+	}
+	if outputBytes > uint64(^uint(0)>>1) {
+		return nil, fmt.Errorf("%w: case-mapped string is too large", ErrResourceLimit)
+	}
+	if err := reserveExpression(budget, saturatingMul(outputBytes, 2)); err != nil {
+		return nil, err
+	}
+	var output strings.Builder
+	output.Grow(int(outputBytes))
+	for offset := 0; offset < len(text); {
+		end := min(offset+queryOrderComparisonChunk, len(text))
+		if budget != nil {
+			if err := budget.check(uint64((end-offset+63)/64), 0); err != nil {
+				return nil, err
+			}
+		}
+		for offset < end {
+			char, size := utf8.DecodeRuneInString(text[offset:])
+			output.WriteRune(mapCase(char))
+			offset += size
+		}
 	}
 	return output.String(), nil
 }

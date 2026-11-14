@@ -1,0 +1,8 @@
+nodes=10000 persisted_path=/tmp/latticedb-graph-compare.AMo7g7/graph.ltdb
+verified: 1-hop rows=9999 unique_ids=9999; 2-hop rows=9998 unique_ids=9998
+1-hop repeat=1 elapsed_ns=2049666
+1-hop repeat=2 elapsed_ns=2071416
+1-hop repeat=3 elapsed_ns=2161375
+2-hop repeat=1 elapsed_ns=52276750
+2-hop repeat=2 elapsed_ns=48359458
+2-hop repeat=3 elapsed_ns=48946041

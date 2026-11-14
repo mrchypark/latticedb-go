@@ -246,6 +246,13 @@ func (tx *Tx) ScanBounded(ctx context.Context, bucket string, start, end []byte,
 	if visit == nil {
 		return errors.New("pagestore: nil scan callback")
 	}
+	if tx == nil {
+		return ErrClosed
+	}
+	// A read-only bbolt snapshot cannot invalidate this scan's private cursor.
+	if !tx.writable {
+		return tx.scanReadOnly(ctx, bucket, start, end, maxBytes, visit)
+	}
 	seek, inclusive := start, true
 	for {
 		if err := ctx.Err(); err != nil {
@@ -264,6 +271,63 @@ func (tx *Tx) ScanBounded(ctx context.Context, bucket string, start, end []byte,
 			return fmt.Errorf("pagestore: scan bucket %q: %w", bucket, err)
 		}
 		seek, inclusive = key, false
+	}
+}
+
+func (tx *Tx) scanReadOnly(ctx context.Context, bucket string, start, end []byte, maxBytes uint64, visit func([]byte, []byte) error) error {
+	var cursor *bolt.Cursor
+	var seek []byte
+	reseek := false
+	first := true
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		tx.mu.Lock()
+		if err := tx.check(); err != nil {
+			tx.mu.Unlock()
+			return err
+		}
+		var key, value []byte
+		if first {
+			b := tx.tx.Bucket([]byte(bucket))
+			if b != nil {
+				cursor = b.Cursor()
+				if start == nil {
+					key, value = cursor.First()
+				} else {
+					key, value = cursor.Seek(start)
+				}
+			}
+			first = false
+		} else if cursor != nil {
+			if reseek {
+				key, value = cursor.Seek(seek)
+				if bytes.Equal(key, seek) {
+					key, value = cursor.Next()
+				}
+			} else {
+				key, value = cursor.Next()
+			}
+		}
+		if key == nil || end != nil && bytes.Compare(key, end) >= 0 {
+			tx.mu.Unlock()
+			return nil
+		}
+		if uint64(len(key))+uint64(len(value)) > maxBytes {
+			tx.mu.Unlock()
+			return fmt.Errorf("%w: scan bucket %q record exceeds %d bytes", ErrValueTooLarge, bucket, maxBytes)
+		}
+		key, value = bytes.Clone(key), bytes.Clone(value)
+		original := string(key)
+		tx.mu.Unlock()
+		if err := visit(key, value); err == io.EOF {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("pagestore: scan bucket %q: %w", bucket, err)
+		}
+		reseek = string(key) != original
+		seek = key
 	}
 }
 

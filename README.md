@@ -104,6 +104,7 @@ Important boundaries:
 - Use `DB.ExplainContext` or `Tx.ExplainContext` to inspect a read plan without executing it. See the [EXPLAIN contract](docs/query-explain.md) for supported shapes.
 - Use `Tx.CreateGraphConstraint` to require, type-check, or enforce unique node properties at commit. See the [constraint contract](docs/graph-constraints.md).
 - Use `SearchGraphContext` to project native search scores and expand candidates over one outgoing edge. See the [search composition contract](docs/query-search-composition.md).
+- `toLower` and `toUpper` apply simple Unicode case mappings without locale-specific expansion.
 - No user-defined function calls or `RETURN *`. Numeric arithmetic supports `+`, `-`, `*`, `/`, `%`, `^`, unary signs, and parentheses; invalid numeric operations return an error.
 - `WITH` exports explicit aliases and plain binding names; dropped names cannot be referenced by later parts. A `WITH` must be followed by another query part. See the [grammar contract](docs/engine_conformance.md) for expression and ordering restrictions.
 - Use spaces around binary predicate and assignment operators: `n.age = 1`, not `n.age=1`. Inequality is `<>`, not `!=`.

@@ -1,0 +1,14 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkGraphTraversalDisk/anchored_one_hop-2         	       5	 228265242 ns/op	23030960 B/op	  530173 allocs/op
+BenchmarkGraphTraversalDisk/anchored_two_hop-2         	       5	 243293067 ns/op	55572416 B/op	 1280175 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkGraphTraversalDisk/anchored_one_hop-2         	       5	  43029075 ns/op	23030889 B/op	  530172 allocs/op
+BenchmarkGraphTraversalDisk/anchored_two_hop-2         	       5	 109090025 ns/op	55572505 B/op	 1280175 allocs/op
+PASS

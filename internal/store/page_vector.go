@@ -67,11 +67,18 @@ func (index PageVectorIndex) key(id uint64) []byte {
 }
 
 func (index PageVectorIndex) Meta() (PageVectorMeta, error) {
+	meta, _, err := index.MetaWithPresence()
+	return meta, err
+}
+
+// MetaWithPresence distinguishes a missing metadata record from an empty index.
+func (index PageVectorIndex) MetaWithPresence() (PageVectorMeta, bool, error) {
 	data, err := index.Tx.GetBounded(pageVectorBucket, index.metaKey(), 256)
 	if err != nil || data == nil {
-		return PageVectorMeta{}, err
+		return PageVectorMeta{}, false, err
 	}
-	return decodePageVectorMeta(data)
+	meta, err := decodePageVectorMeta(data)
+	return meta, true, err
 }
 
 func decodePageVectorMeta(data []byte) (PageVectorMeta, error) {

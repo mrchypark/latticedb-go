@@ -80,3 +80,34 @@ func TestPageVectorPutRejectsOversizedDegreeWithoutWriteHook(t *testing.T) {
 		t.Fatal("oversized degree accepted without a write hook")
 	}
 }
+
+func TestPageVectorMetaWithPresence(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "vectors"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	index := PageVectorIndex{Tx: tx, Namespace: "meta"}
+	if _, found, err := index.MetaWithPresence(); err != nil || found {
+		t.Fatalf("missing metadata: found=%v err=%v", found, err)
+	}
+	want := PageVectorMeta{Dimensions: 2, M: 4, Valid: true}
+	if err := index.PutMeta(want); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := index.MetaWithPresence()
+	if err != nil || !found || got != want {
+		t.Fatalf("metadata: got=%+v found=%v err=%v", got, found, err)
+	}
+	if err := tx.Put(pageVectorBucket, index.metaKey(), []byte("corrupt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := index.MetaWithPresence(); err == nil || !found {
+		t.Fatalf("corrupt metadata: found=%v err=%v", found, err)
+	}
+}

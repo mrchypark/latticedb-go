@@ -42,6 +42,7 @@ type querySource struct {
 type querySources struct {
 	records         map[any]*querySource
 	scopes          []*querySourceScope
+	freeScopes      []*querySourceScope
 	roots           map[*querySourceRoot]struct{}
 	addedSinceSweep uint64
 	sweepInterval   uint64
@@ -71,8 +72,16 @@ func (b *queryBudget) sourceScope() *querySourceScope {
 	if b.residentSources {
 		return &residentSourceScope
 	}
-	s := &querySourceScope{budget: b}
-	b.sources().scopes = append(b.source.scopes, s)
+	src := b.sources()
+	var s *querySourceScope
+	if n := len(src.freeScopes); n != 0 {
+		s = src.freeScopes[n-1]
+		src.freeScopes[n-1] = nil
+		src.freeScopes = src.freeScopes[:n-1]
+	} else {
+		s = &querySourceScope{budget: b}
+	}
+	src.scopes = append(src.scopes, s)
 	return s
 }
 func (s *querySourceScope) reset() {
@@ -97,6 +106,13 @@ func (s *querySourceScope) close() {
 	src := s.budget.source
 	src.scopes[len(src.scopes)-1] = nil
 	src.scopes = src.scopes[:len(src.scopes)-1]
+	// Bound scratch retained between nested source reads.
+	if cap(s.records) > 4 {
+		s.records = nil
+	}
+	if len(src.freeScopes) < 8 {
+		src.freeScopes = append(src.freeScopes, s)
+	}
 }
 func (b *queryBudget) ownSource(key any, lease *store.PageReadLease) {
 	if lease == nil {

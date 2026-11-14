@@ -39,7 +39,7 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 			return nil, false, ErrVectorIndexMaintenanceRequired
 		}
 		pageIndex := store.PageVectorIndex{Tx: graph.PageBase.Tx, Namespace: pageVectorNamespaceKey(graph.VectorNamespace)}
-		hasIndex, err := pageIndex.HasMeta()
+		meta, hasIndex, err := pageIndex.MetaWithPresence()
 		if err != nil {
 			return nil, false, err
 		}
@@ -51,11 +51,7 @@ func searchVectorGraph(graph *store.GraphState, vector []float32, opts VectorSea
 			ef = vectorIndexSearchEF
 		}
 		ef = max(ef, int(limit))
-		pageResults, err := pageVectorSearch(budget.ctx, pageIndex, queryVector, int(limit), ef, configuredVectorIndexM(graph), budget)
-		if err != nil {
-			return nil, false, err
-		}
-		meta, err := pageIndex.Meta()
+		pageResults, err := pageVectorSearchWithMeta(budget.ctx, pageIndex, queryVector, int(limit), ef, configuredVectorIndexM(graph), budget, meta)
 		if err != nil {
 			return nil, false, err
 		}

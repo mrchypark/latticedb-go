@@ -3,6 +3,7 @@ package latticedb
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -48,6 +49,9 @@ func BenchmarkVectorSearchDisk128D(b *testing.B) {
 				if err != nil || len(hits) != 10 {
 					b.Fatalf("search: hits=%d err=%v", len(hits), err)
 				}
+				if err := validateDiskVectorHits(hits, uint64(scale.n)); err != nil {
+					b.Fatal(err)
+				}
 				total += times[i]
 			}
 			after, err := db.VectorIndexStats()
@@ -58,7 +62,7 @@ func BenchmarkVectorSearchDisk128D(b *testing.B) {
 				b.Fatal("disk ANN comparison fell back to exact search")
 			}
 			slices.Sort(times)
-			recall := diskVectorRecall(b, db, queries[:10], opts)
+			recall := diskVectorRecall(b, db, queries[:10], opts, uint64(scale.n))
 			b.ReportAllocs()
 			b.ResetTimer()
 			b.ReportMetric(1, "disk-api-contract")
@@ -176,7 +180,35 @@ func diskVectorDB(tb testing.TB, vectors [][]float32) (*DB, time.Duration, time.
 	return db, build, reopen, info.Size()
 }
 
-func diskVectorRecall(tb testing.TB, db *DB, queries [][]float32, opts VectorSearchOptions) float64 {
+func validateDiskVectorHits(hits []VectorSearchResult, maxID uint64) error {
+	for i, hit := range hits {
+		if hit.NodeID == 0 || hit.NodeID > maxID || math.IsNaN(float64(hit.Distance)) || math.IsInf(float64(hit.Distance), 0) {
+			return fmt.Errorf("invalid vector result: %+v", hit)
+		}
+		for _, previous := range hits[:i] {
+			if previous.NodeID == hit.NodeID {
+				return fmt.Errorf("duplicate vector result ID %d", hit.NodeID)
+			}
+		}
+	}
+	return nil
+}
+
+func TestDiskVectorBenchmarkRejectsInvalidHits(t *testing.T) {
+	for _, hits := range [][]VectorSearchResult{
+		{{NodeID: 1}, {NodeID: 1}},
+		{{NodeID: 0}},
+		{{NodeID: 11}},
+		{{NodeID: 1, Distance: float32(math.NaN())}},
+		{{NodeID: 1, Distance: float32(math.Inf(1))}},
+	} {
+		if err := validateDiskVectorHits(hits, 10); err == nil {
+			t.Fatalf("accepted invalid hits: %+v", hits)
+		}
+	}
+}
+
+func diskVectorRecall(tb testing.TB, db *DB, queries [][]float32, opts VectorSearchOptions, maxID uint64) float64 {
 	tb.Helper()
 	hits := 0
 	for _, q := range queries {
@@ -189,6 +221,12 @@ func diskVectorRecall(tb testing.TB, db *DB, queries [][]float32, opts VectorSea
 		exact, err := db.VectorSearch(q, exactOpts)
 		if err != nil || len(exact) != 10 || len(approx) != 10 {
 			tb.Fatalf("recall lengths %d/%d: %v", len(approx), len(exact), err)
+		}
+		if err := validateDiskVectorHits(approx, maxID); err != nil {
+			tb.Fatal(err)
+		}
+		if err := validateDiskVectorHits(exact, maxID); err != nil {
+			tb.Fatal(err)
 		}
 		for _, a := range approx {
 			for _, e := range exact {
@@ -226,7 +264,7 @@ func TestDiskVectorBenchmarkReopensPersistedIndex(t *testing.T) {
 	vectors, queries := benchvector.Generate(32)
 	db, _, _, _ := diskVectorDB(t, vectors)
 	opts := VectorSearchOptions{K: 10, EfSearch: 64}
-	if recall := diskVectorRecall(t, db, queries[:2], opts); recall < .9 {
+	if recall := diskVectorRecall(t, db, queries[:2], opts, uint64(len(vectors))); recall < .9 {
 		t.Fatalf("recall = %g", recall)
 	}
 	stats, err := db.VectorIndexStats()

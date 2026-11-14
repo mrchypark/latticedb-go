@@ -2405,23 +2405,27 @@ func (plan *queryPlan) orderedMatchPatterns(tx *Tx, params map[string]any, budge
 			components = append(components[:j], components[j+1:]...)
 		}
 	}
-	for i := range components {
-		nodeCount, err := tx.graph.NodeCountContext(queryScanContext(budget))
-		if err != nil {
-			return nil, err
-		}
-		edgeCount, err := tx.graph.EdgeCountContext(queryScanContext(budget))
-		if err != nil {
-			return nil, err
-		}
-		components[i].estimate = int(min(saturatingAdd(nodeCount, edgeCount), uint64(^uint(0)>>1)))
-		for _, pattern := range components[i].patterns {
-			estimate, err := plan.patternCardinalityWithBudget(tx, pattern, params, budget)
+	// A single component has no peer to rank. Avoid its unused cardinality
+	// scans, while leaving connected-path planning and its source order intact.
+	if len(components) > 1 {
+		for i := range components {
+			nodeCount, err := tx.graph.NodeCountContext(queryScanContext(budget))
 			if err != nil {
 				return nil, err
 			}
-			if estimate < components[i].estimate {
-				components[i].estimate = estimate
+			edgeCount, err := tx.graph.EdgeCountContext(queryScanContext(budget))
+			if err != nil {
+				return nil, err
+			}
+			components[i].estimate = int(min(saturatingAdd(nodeCount, edgeCount), uint64(^uint(0)>>1)))
+			for _, pattern := range components[i].patterns {
+				estimate, err := plan.patternCardinalityWithBudget(tx, pattern, params, budget)
+				if err != nil {
+					return nil, err
+				}
+				if estimate < components[i].estimate {
+					components[i].estimate = estimate
+				}
 			}
 		}
 	}

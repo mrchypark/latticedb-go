@@ -1,0 +1,7 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/latticedb-go
+cpu: Apple M3
+BenchmarkVectorSearchDisk128D/100K-2         	       1	   4119250 ns/op	         1.000 disk-api-contract	 419856384 file-bytes	    233243 index-build-ms	   4489985 mean-ns	   9775042 p99-ns	       100.0 recall@10	      8592 reopen-ms	 1525448 B/op	   10373 allocs/op
+PASS
+ok  	github.com/mrchypark/latticedb-go	248.773s
