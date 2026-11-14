@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestQuerySourceScopeReuseReleasesOnlyClosedScope(t *testing.T) {
+func TestQuerySourceScopesReleaseOnlyClosedScope(t *testing.T) {
 	db := querySourceFixture(t, 2, 128)
 	defer db.Close()
 	tx, err := db.Begin(true)

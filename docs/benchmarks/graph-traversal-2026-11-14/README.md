@@ -79,6 +79,10 @@ to succeed where it previously failed during redundant scans.
 
 ## Source-scope reuse follow-up
 
+The scope reuse experiment was removed after CI showed a query allocation
+regression. The measurements below describe that discarded candidate, not the
+final implementation.
+
 Source ownership scopes are reused within one query, with at most eight spare
 scopes and at most four retained record slots per spare scope. Closing a scope
 still releases its unescaped leases; live, escaped and pinned sources retain
