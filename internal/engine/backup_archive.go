@@ -34,6 +34,7 @@ type BackupRestoreOptions struct {
 	CommitID                 *uint64
 	Before                   time.Time
 	MaxDatabaseSnapshotBytes uint64
+	MaxRestoreWALBytes       uint64
 }
 
 type BackupMetadata struct {
@@ -1054,6 +1055,10 @@ func (archive *backupArchive) initialize(ctx context.Context, graph *store.Graph
 }
 
 func RestoreBackup(ctx context.Context, directory, destination string, opts BackupRestoreOptions) (BackupMetadata, error) {
+	return restoreBackup(ctx, directory, destination, opts, nil)
+}
+
+func restoreBackup(ctx context.Context, directory, destination string, opts BackupRestoreOptions, beforeConsume func() error) (BackupMetadata, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1082,6 +1087,13 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 	if err != nil {
 		return BackupMetadata{}, err
 	}
+	capturedHead, hasCapturedHead, err := readBackupHeadAnchor(archive)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	if !hasCapturedHead {
+		return BackupMetadata{}, os.ErrNotExist
+	}
 	entries, err := readArchiveEntries(ctx, archive, owner.DatabaseID, false)
 	if err != nil {
 		return BackupMetadata{}, err
@@ -1095,13 +1107,16 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 	if err := validateBackupOrder(entries); err != nil {
 		return BackupMetadata{}, err
 	}
-	if err := verifyBackupHeadAnchor(archive, entries); err != nil {
+	if err := verifyBackupHeadAnchorValue(capturedHead, hasCapturedHead, entries); err != nil {
 		return BackupMetadata{}, err
 	}
 	var selected BackupMetadata
 	var selectedEntry backupEntry
 	for _, entry := range entries {
 		meta := entry.metadata
+		if hasCapturedHead && meta.CommitID > capturedHead.CommitID {
+			continue
+		}
 		if !opts.Before.IsZero() && !entry.gapStart.IsZero() && opts.Before.After(entry.gapStart) && opts.Before.Before(meta.CapturedAt) {
 			return BackupMetadata{}, fmt.Errorf("%w: requested capture time lies in a backup coverage gap", ErrInvalidArgument)
 		}
@@ -1115,12 +1130,55 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 	if selectedEntry.path == "" {
 		return BackupMetadata{}, os.ErrNotExist
 	}
-	archiveState := &backupArchive{directory: archive, entries: entries}
-	base, segments, selectedEntry, err := archiveState.validatedChain(ctx, owner.DatabaseID, selectedEntry)
+	lock, err := acquireFlatDestinationLock(destination)
 	if err != nil {
 		return BackupMetadata{}, err
 	}
-	pageArchive := selectedEntry.hasSourceHistory
+	defer lock.close()
+	if err := checkFlatDestinationAvailable(destination); err != nil {
+		return BackupMetadata{}, err
+	}
+	archiveState := &backupArchive{directory: archive, entries: entries}
+	base, segments, err := archiveState.chainFor(selectedEntry)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	_, pageArchive, err := readSourceHistoryProof(selectedEntry, owner.DatabaseID)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	required := map[string]bool{base.path: true}
+	for _, path := range segments {
+		required[path] = true
+	}
+	chainEntries := make([]backupEntry, 0, len(required))
+	for _, entry := range entries {
+		if required[entry.path] {
+			chainEntries = append(chainEntries, entry)
+		}
+	}
+	stageLimit := maxBytes
+	if pageArchive {
+		stageLimit = opts.MaxDatabaseSnapshotBytes
+	}
+	walLimit := opts.MaxRestoreWALBytes
+	if walLimit == 0 {
+		walLimit = 8 << 30
+	}
+	stagedEntries, stagingDirectory, err := stageRestoreChain(ctx, archive, chainEntries, stageLimit, walLimit, pageArchive)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	defer os.RemoveAll(stagingDirectory)
+	archiveState = &backupArchive{directory: stagingDirectory, entries: stagedEntries}
+	selectedEntry.path = filepath.Join(stagingDirectory, filepath.Base(selectedEntry.path))
+	base, segments, selectedEntry, err = archiveState.validatedChain(ctx, owner.DatabaseID, selectedEntry)
+	if err != nil {
+		return BackupMetadata{}, err
+	}
+	if selectedEntry.hasSourceHistory != pageArchive {
+		return BackupMetadata{}, errors.New("backup archive source history changed during validation")
+	}
 	if pageArchive {
 		if !base.hasSourceHistory {
 			return BackupMetadata{}, errors.New("page backup chain has no base source history proof")
@@ -1131,16 +1189,13 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 	} else if err := validateArchiveFile(ctx, base.path, base.metadata, maxBytes, owner.DatabaseID); err != nil {
 		return BackupMetadata{}, err
 	}
-	lock, err := acquireFlatDestinationLock(destination)
-	if err != nil {
-		return BackupMetadata{}, err
-	}
-	defer lock.close()
-	if err := checkFlatDestinationAvailable(destination); err != nil {
-		return BackupMetadata{}, err
-	}
 	if err := ctx.Err(); err != nil {
 		return BackupMetadata{}, err
+	}
+	if beforeConsume != nil {
+		if err := beforeConsume(); err != nil {
+			return BackupMetadata{}, err
+		}
 	}
 	if pageArchive {
 		var histories [][32]byte
@@ -1157,6 +1212,147 @@ func RestoreBackup(ctx context.Context, directory, destination string, opts Back
 		return BackupMetadata{}, err
 	}
 	return selected, nil
+}
+
+func stageRestoreChain(ctx context.Context, archive string, entries []backupEntry, maxSnapshotBytes, maxWALBytes uint64, pageArchive bool) ([]backupEntry, string, error) {
+	var segmentBytes uint64
+	if maxWALBytes != 0 {
+		for _, entry := range entries {
+			if !entry.segment {
+				continue
+			}
+			size, err := backupRestoreFileSize(entry.path, int64(maxBackupSegmentBytes))
+			if err != nil {
+				return nil, "", err
+			}
+			if size > maxWALBytes-segmentBytes || pageArchive && maxSnapshotBytes != 0 && size > maxSnapshotBytes-segmentBytes {
+				return nil, "", fmt.Errorf("%w: backup restore WAL exceeds input limit", ErrResourceLimit)
+			}
+			segmentBytes += size
+		}
+	}
+	baseBytes := maxSnapshotBytes
+	if pageArchive && maxSnapshotBytes != 0 {
+		baseBytes -= segmentBytes
+	}
+	baseLimit := int64(math.MaxInt64)
+	if maxSnapshotBytes != 0 {
+		baseLimit = int64(baseBytes)
+	}
+	if baseBytes > math.MaxInt64 {
+		baseLimit = math.MaxInt64
+	}
+	if !pageArchive && maxSnapshotBytes != 0 {
+		fileLimit, limitErr := archiveFileSizeLimit(baseBytes)
+		if limitErr != nil {
+			return nil, "", limitErr
+		}
+		baseLimit = fileLimit
+	}
+	stagingDirectory, err := os.MkdirTemp(archive, ".latticedb-restore-*")
+	if err != nil {
+		stagingDirectory, err = os.MkdirTemp("", "latticedb-backup-restore-*")
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.RemoveAll(stagingDirectory)
+		}
+	}()
+
+	staged := make([]backupEntry, 0, len(entries))
+	var copiedSegments uint64
+	for _, entry := range entries {
+		limit := int64(maxBackupSegmentBytes)
+		if !entry.segment {
+			limit = baseLimit
+		} else if maxWALBytes != 0 {
+			limit = int64(min(uint64(maxBackupSegmentBytes), segmentBytes-copiedSegments))
+		}
+		name := filepath.Base(entry.path)
+		target := filepath.Join(stagingDirectory, name)
+		if err := stageRestoreFile(ctx, entry.path, target, limit); err != nil {
+			return nil, "", err
+		}
+		if entry.segment && maxWALBytes != 0 {
+			size, err := backupRestoreFileSize(target, limit)
+			if err != nil {
+				return nil, "", err
+			}
+			copiedSegments += size
+			if copiedSegments > segmentBytes {
+				return nil, "", fmt.Errorf("%w: backup WAL segment changed during staging", ErrResourceLimit)
+			}
+		}
+		proof := sourceHistoryProofPath(filepath.Dir(entry.path), name)
+		stagedProof := sourceHistoryProofPath(stagingDirectory, name)
+		if err := stageRestoreFile(ctx, proof, stagedProof, 4096); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, "", err
+		}
+		entry.path = target
+		staged = append(staged, entry)
+	}
+	cleanup = false
+	return staged, stagingDirectory, nil
+}
+
+func backupRestoreFileSize(path string, limit int64) (uint64, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > limit {
+		return 0, fmt.Errorf("%w: invalid backup restore input", ErrResourceLimit)
+	}
+	return uint64(info.Size()), nil
+}
+
+func stageRestoreFile(ctx context.Context, source, target string, limit int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > limit {
+		return fmt.Errorf("%w: invalid backup restore input", ErrResourceLimit)
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	opened, err := input.Stat()
+	if err != nil {
+		return err
+	}
+	if !opened.Mode().IsRegular() || opened.Size() < 0 || opened.Size() > limit {
+		return fmt.Errorf("%w: invalid backup restore input", ErrResourceLimit)
+	}
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	readLimit := limit
+	if readLimit < math.MaxInt64 {
+		readLimit++
+	}
+	total, copyErr := io.Copy(output, io.LimitReader(&backupContextReader{ctx: ctx, reader: input}, readLimit))
+	if copyErr == nil && total > limit {
+		copyErr = fmt.Errorf("%w: backup restore input exceeds %d bytes", ErrResourceLimit, limit)
+	}
+	if copyErr == nil {
+		copyErr = output.Sync()
+	}
+	closeErr := output.Close()
+	if err := errors.Join(copyErr, closeErr); err != nil {
+		return err
+	}
+	return nil
 }
 
 func checkFlatDestinationAvailable(destination string) error {
@@ -1191,30 +1387,37 @@ func readBackupOwner(directory string) (backupOwner, error) {
 	return owner, nil
 }
 
-func verifyBackupHeadAnchor(directory string, entries []backupEntry) error {
+func readBackupHeadAnchor(directory string) (backupHead, bool, error) {
 	path := filepath.Join(directory, backupHeadFile)
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
+		return backupHead{}, false, nil
+	}
+	if err != nil {
+		return backupHead{}, false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > 64<<10 {
+		return backupHead{}, false, errors.New("invalid backup archive head anchor")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return backupHead{}, false, err
+	}
+	var anchor backupHead
+	if err := json.Unmarshal(data, &anchor); err != nil {
+		return backupHead{}, false, errors.New("invalid backup archive head anchor")
+	}
+	return anchor, true, nil
+}
+
+func verifyBackupHeadAnchorValue(anchor backupHead, found bool, entries []backupEntry) error {
+	if !found {
 		for _, entry := range entries {
 			if entry.segment {
 				return errors.New("backup WAL segments require a head anchor")
 			}
 		}
 		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > 64<<10 {
-		return errors.New("invalid backup archive head anchor")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var anchor backupHead
-	if err := json.Unmarshal(data, &anchor); err != nil {
-		return errors.New("invalid backup archive head anchor")
 	}
 	for _, entry := range entries {
 		if filepath.Base(entry.path) == anchor.Entry && entry.metadata.CommitID == anchor.CommitID && hex.EncodeToString(entry.digest[:]) == anchor.Digest {

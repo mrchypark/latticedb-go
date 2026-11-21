@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -183,6 +185,151 @@ func TestPageBackupPublicConfigForkPreservesExistingArchive(t *testing.T) {
 	destination := filepath.Join(root, "restored")
 	if _, err := RestoreBackup(context.Background(), archivePath, destination, BackupRestoreOptions{}); err != nil {
 		t.Fatalf("rejected configuration fork damaged archived recovery points: %v", err)
+	}
+}
+
+func TestRestoreBackupConsumesValidatedStagedChain(t *testing.T) {
+	fixture := newPageBackupFixture(t)
+	fixture.commitNode(t, 1, 1)
+	read, graph := fixture.readGraph(t)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archive.capturePage(context.Background(), time.Unix(200, 0), graph, 2, 2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := read.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := readArchiveEntries(context.Background(), fixture.archivePath, fixture.databaseID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "restored")
+	hookCalled := false
+	_, err = restoreBackup(context.Background(), fixture.archivePath, destination, BackupRestoreOptions{}, func() error {
+		hookCalled = true
+		for _, entry := range entries {
+			if err := os.WriteFile(entry.path, []byte("replaced after validation"), 0o600); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("restore rejected the validated staged chain: %v", err)
+	}
+	if !hookCalled {
+		t.Fatal("restore did not reach the consumption boundary")
+	}
+	restored, err := Open(destination, OpenOptions{PageStorage: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	var got *Node
+	if err := restored.View(func(tx *Tx) error {
+		var err error
+		got, err = tx.GetNode(1)
+		return err
+	}); err != nil || got == nil {
+		t.Fatalf("restored node=%+v err=%v", got, err)
+	}
+}
+
+func TestRestoreBackupDoesNotSelectBeyondCapturedHead(t *testing.T) {
+	fixture := newPageBackupFixture(t)
+	fixture.commitNode(t, 1, 1)
+	read, graph := fixture.readGraph(t)
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.close()
+	if _, err := archive.capturePage(context.Background(), time.Unix(200, 0), graph, 2, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := read.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	headPath := filepath.Join(fixture.archivePath, backupHeadFile)
+	head, err := os.ReadFile(headPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.commitNode(t, 2, 2)
+	read, graph = fixture.readGraph(t)
+	defer read.Rollback()
+	if _, err := archive.capturePage(context.Background(), time.Unix(201, 0), graph, 3, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(headPath, head, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := RestoreBackup(context.Background(), fixture.archivePath, filepath.Join(t.TempDir(), "restored"), BackupRestoreOptions{})
+	if err != nil || metadata.CommitID != 1 {
+		t.Fatalf("restore = %+v, %v; want commit 1", metadata, err)
+	}
+}
+
+func TestPageRestoreStagingZeroLimitIsUnlimited(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "base")
+	if err := os.WriteFile(source, []byte("checkpoint"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, staging, err := stageRestoreChain(context.Background(), dir, []backupEntry{{path: source}}, 0, 8<<30, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(staging)
+	if data, err := os.ReadFile(filepath.Join(staging, "base")); err != nil || string(data) != "checkpoint" {
+		t.Fatalf("staged data = %q, %v", data, err)
+	}
+}
+
+func TestRestoreStagingWALBudget(t *testing.T) {
+	dir := t.TempDir()
+	base, wal := filepath.Join(dir, "base"), filepath.Join(dir, "wal")
+	if err := os.WriteFile(base, []byte("base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wal, []byte("wal-data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries := []backupEntry{{path: base}, {path: wal, segment: true}}
+	if _, _, err := stageRestoreChain(context.Background(), dir, entries, 0, 7, true); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("WAL budget = %v", err)
+	}
+	_, staging, err := stageRestoreChain(context.Background(), dir, entries, 0, 8, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(staging)
+}
+
+func TestRestoreRequiresPublishedHead(t *testing.T) {
+	fixture := newPageBackupFixture(t)
+	read, graph := fixture.readGraph(t)
+	defer read.Rollback()
+	archive, err := openBackupArchive(context.Background(), fixture.archivePath, fixture.sourcePath, fixture.databaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.close()
+	if _, err := archive.capturePage(context.Background(), time.Unix(200, 0), graph, 1, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(fixture.archivePath, backupHeadFile)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = RestoreBackup(context.Background(), fixture.archivePath, filepath.Join(t.TempDir(), "restore"), BackupRestoreOptions{})
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restore without head = %v", err)
 	}
 }
 
@@ -461,6 +608,15 @@ func TestPageBackupResumesOutboxAndRepairsEntryBeforeHeadCrash(t *testing.T) {
 	limitedDestination := filepath.Join(t.TempDir(), "limited.pages")
 	if _, err := RestoreBackup(ctx, fixture.archivePath, limitedDestination, BackupRestoreOptions{MaxDatabaseSnapshotBytes: 1}); err == nil {
 		t.Fatal("page backup restore ignored the explicit input byte limit")
+	}
+	limitedEntries, err := os.ReadDir(fixture.archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range limitedEntries {
+		if strings.HasPrefix(entry.Name(), ".latticedb-restore-") {
+			t.Fatalf("oversized restore created staging data %q", entry.Name())
+		}
 	}
 	for _, suffix := range []string{".pages", ".pages.layout"} {
 		occupied := filepath.Join(t.TempDir(), "occupied")

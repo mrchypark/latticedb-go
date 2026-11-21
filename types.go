@@ -135,6 +135,8 @@ type BackupRestoreOptions struct {
 	CommitID                 *uint64
 	Before                   time.Time
 	MaxDatabaseSnapshotBytes uint64
+	// MaxRestoreWALBytes bounds staged WAL input; zero defaults to 8 GiB.
+	MaxRestoreWALBytes uint64
 }
 
 // BackupMetadata identifies an immutable archived recovery point.

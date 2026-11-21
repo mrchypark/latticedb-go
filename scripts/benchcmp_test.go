@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -77,6 +78,96 @@ func TestValidateDiskBaselineRequiresAllThreeMetrics(t *testing.T) {
 	}
 	if _, err := parse(strings.NewReader("BenchmarkReadRequests/query-8 1 NaN ns/op 200 B/op 20 allocs/op\n")); err == nil {
 		t.Fatal("invalid disk metric parsed")
+	}
+}
+
+func TestValidateGoResultRequiresDeleteHighDegreeBenchmark(t *testing.T) {
+	benchmarks := result{}
+	for name, units := range requiredGoBenchmarks {
+		metrics := map[string][]float64{}
+		for _, unit := range units {
+			metrics[unit] = []float64{1}
+		}
+		benchmarks[name] = metrics
+	}
+	if err := validateGoResult(benchmarks); err != nil {
+		t.Fatal(err)
+	}
+	delete(benchmarks, "BenchmarkDeleteHighDegreeNode/degree_100000")
+	if err := validateGoResult(benchmarks); err == nil || !strings.Contains(err.Error(), "BenchmarkDeleteHighDegreeNode/degree_100000") {
+		t.Fatalf("missing delete benchmark error = %v", err)
+	}
+}
+
+func TestBenchmarkWorkflowFailsFast(t *testing.T) {
+	workflow, err := os.ReadFile("../.github/workflows/benchmark.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	step := bytes.Index(workflow, []byte("- name: Run benchmarks (maximum scale 100K)"))
+	if step < 0 {
+		t.Fatal("benchmark execution step not found")
+	}
+	rest := workflow[step+1:]
+	if next := bytes.Index(rest, []byte("\n      - name:")); next >= 0 {
+		rest = rest[:next]
+	}
+	if !bytes.Contains(rest, []byte("set -euo pipefail")) {
+		t.Fatal("benchmark workflow must stop after a failed benchmark command")
+	}
+	for _, line := range strings.Split(string(rest), "\n") {
+		if strings.Contains(line, "run_suite \"") && (strings.Contains(line, "||") || strings.Contains(line, "! ")) {
+			t.Fatalf("benchmark suite failure is ignored: %s", line)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	script := "set -euo pipefail\nrun_suite() { (false; printf 'later\\n') | cat >/dev/null; }\nrun_suite\nprintf 'survived\\n'\n"
+	output, err := exec.Command("bash", "-c", script).CombinedOutput()
+	if err == nil || bytes.Contains(output, []byte("survived")) {
+		t.Fatalf("middle pipeline failure did not stop the shell: %q, %v", output, err)
+	}
+}
+
+func TestGoToolchainMeetsSecurityFloor(t *testing.T) {
+	for _, path := range []string{"../go.mod", "../conformance/go/go.mod"} {
+		assertGoVersionFloor(t, path, [3]int{1, 27, 4})
+	}
+}
+
+func assertGoVersionFloor(t *testing.T, path string, floor [3]int) {
+	t.Helper()
+	mod, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version string
+	for _, line := range strings.Split(string(mod), "\n") {
+		if strings.HasPrefix(line, "go ") {
+			version = strings.TrimSpace(strings.TrimPrefix(line, "go "))
+			break
+		}
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 || len(parts) > 3 {
+		t.Fatalf("go.mod version = %q", version)
+	}
+	var numbers [3]int
+	for i, part := range parts {
+		number, parseErr := strconv.Atoi(part)
+		if parseErr != nil {
+			t.Fatalf("%s version = %q", path, version)
+		}
+		numbers[i] = number
+	}
+	for i := range floor {
+		if numbers[i] > floor[i] {
+			break
+		}
+		if numbers[i] < floor[i] {
+			t.Fatalf("%s version %s is below the security floor", path, version)
+		}
 	}
 }
 
@@ -276,7 +367,7 @@ func TestValidateGoResultRequiresBenchmarkSuiteSentinels(t *testing.T) {
 		}
 	}
 
-	benchmarks, err := parse(strings.NewReader("BenchmarkReadRequests/query-8 1 100 ns/op\nBenchmarkCheckpoint-8 1 100 ns/op\nBenchmarkColdOpen-8 1 100 ns/op\nBenchmarkReaderDuringCommit-8 1 100 ns/op\nBenchmarkFTSSearchScaling/records_100000/fuzzy_rare-8 1 100 ns/op\nBenchmarkVectorSearchScaling/records_100000-8 1 100 ns/op\nBenchmarkVectorSearchANNFallback10K-8 1 100 ns/op\nBenchmarkVectorSearchClustered128D/100K-8 1 200 ns/op 300 index-build-ms 99 recall@10\n"))
+	benchmarks, err := parse(strings.NewReader("BenchmarkReadRequests/query-8 1 100 ns/op\nBenchmarkCheckpoint-8 1 100 ns/op\nBenchmarkColdOpen-8 1 100 ns/op\nBenchmarkReaderDuringCommit-8 1 100 ns/op\nBenchmarkFTSSearchScaling/records_100000/fuzzy_rare-8 1 100 ns/op\nBenchmarkVectorSearchScaling/records_100000-8 1 100 ns/op\nBenchmarkVectorSearchANNFallback10K-8 1 100 ns/op\nBenchmarkDeleteHighDegreeNode/degree_100000-8 1 100 ns/op\nBenchmarkVectorSearchClustered128D/100K-8 1 200 ns/op 300 index-build-ms 99 recall@10\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

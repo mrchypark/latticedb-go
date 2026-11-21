@@ -520,18 +520,20 @@ func read(path string) (result, error) {
 	return parse(file)
 }
 
+var requiredGoBenchmarks = map[string][]string{
+	"BenchmarkReadRequests/query":                         {"ns/op"},
+	"BenchmarkCheckpoint":                                 {"ns/op"},
+	"BenchmarkColdOpen":                                   {"ns/op"},
+	"BenchmarkReaderDuringCommit":                         {"ns/op"},
+	"BenchmarkFTSSearchScaling/records_100000/fuzzy_rare": {"ns/op"},
+	"BenchmarkVectorSearchScaling/records_100000":         {"ns/op"},
+	"BenchmarkVectorSearchANNFallback10K":                 {"ns/op"},
+	"BenchmarkDeleteHighDegreeNode/degree_100000":         {"ns/op"},
+	"BenchmarkVectorSearchClustered128D/100K":             {"ns/op", "index-build-ms", "recall@10"},
+}
+
 func validateGoResult(benchmarks result) error {
-	required := map[string][]string{
-		"BenchmarkReadRequests/query":                         {"ns/op"},
-		"BenchmarkCheckpoint":                                 {"ns/op"},
-		"BenchmarkColdOpen":                                   {"ns/op"},
-		"BenchmarkReaderDuringCommit":                         {"ns/op"},
-		"BenchmarkFTSSearchScaling/records_100000/fuzzy_rare": {"ns/op"},
-		"BenchmarkVectorSearchScaling/records_100000":         {"ns/op"},
-		"BenchmarkVectorSearchANNFallback10K":                 {"ns/op"},
-		"BenchmarkVectorSearchClustered128D/100K":             {"ns/op", "index-build-ms", "recall@10"},
-	}
-	for name, units := range required {
+	for name, units := range requiredGoBenchmarks {
 		metrics := benchmarks[name]
 		for _, unit := range units {
 			if _, ok := value(metrics, unit); !ok {

@@ -14,11 +14,21 @@ import (
 // pageVectorSearch walks the persisted graph through point reads. Its memory
 // use is bounded by EfSearch and the query budget, independent of index size.
 func pageVectorSearch(ctx context.Context, index store.PageVectorIndex, query []float32, k, ef, m int, budget *directSearchBudget) ([]VectorSearchResult, error) {
-	meta, err := index.Meta()
+	meta, hasIndex, err := pageVectorMetaWithBudget(index, budget)
 	if err != nil {
 		return nil, err
 	}
+	if !hasIndex {
+		return nil, fmt.Errorf("%w: page HNSW index is missing", ErrVectorIndexMaintenanceRequired)
+	}
 	return pageVectorSearchWithMeta(ctx, index, query, k, ef, m, budget, meta)
+}
+
+func pageVectorMetaWithBudget(index store.PageVectorIndex, budget *directSearchBudget) (store.PageVectorMeta, bool, error) {
+	if budget == nil {
+		return index.MetaWithPresence()
+	}
+	return index.MetaWithPresenceBudget(budget)
 }
 
 func pageVectorSearchWithMeta(ctx context.Context, index store.PageVectorIndex, query []float32, k, ef, m int, budget *directSearchBudget, meta store.PageVectorMeta) ([]VectorSearchResult, error) {
@@ -404,16 +414,12 @@ func pageVectorBuildBudgetForCurrent(ctx context.Context, page *store.PageGraph,
 			}
 		}
 		index := store.PageVectorIndex{Tx: page.Tx, Namespace: target}
-		has, err := index.HasMeta()
+		meta, has, err := pageVectorMetaWithBudget(index, work)
 		if err != nil {
 			return nil, err
 		}
 		if !has {
 			continue
-		}
-		meta, err := index.Meta()
-		if err != nil {
-			return nil, err
 		}
 		bytes := estimateVectorIndexBytesForM(meta.Count, meta.Dimensions, meta.M)
 		if err := budget.chargePersistent(bytes); err != nil {
@@ -677,7 +683,7 @@ func applyPageVectorChanges(ctx context.Context, page *store.PageGraph, before, 
 }
 
 func applyPageVectorChange(ctx context.Context, index *pageVectorAccess, id uint64, vector []float32, present bool, m int, budget *directSearchBudget) error {
-	meta, err := index.Meta()
+	meta, hasMeta, err := pageVectorMetaWithBudget(index.PageVectorIndex, budget)
 	if err != nil {
 		return err
 	}
@@ -692,9 +698,7 @@ func applyPageVectorChange(ctx context.Context, index *pageVectorAccess, id uint
 			index.MaxRecordBytes = limit
 		}
 	}
-	if ok, err := index.HasMeta(); err != nil {
-		return err
-	} else if !ok {
+	if !hasMeta {
 		meta.M, meta.Dimensions, meta.Valid = uint16(m), uint16(len(vector)), true
 		if err := index.PutMeta(meta); err != nil {
 			return err
@@ -736,7 +740,7 @@ func preparePageVectorIndexes(ctx context.Context, page *store.PageGraph, graph 
 	for _, target := range targets {
 		index := store.PageVectorIndex{Tx: page.Tx, Namespace: target.name}
 		index.MaxRecordBytes = pageVectorNodeReadBudget(int(target.dimensions), configuredVectorIndexM(graph))
-		has, err := index.HasMeta()
+		meta, has, err := pageVectorMetaWithBudget(index, budget)
 		if err != nil {
 			return err
 		}
@@ -745,10 +749,6 @@ func preparePageVectorIndexes(ctx context.Context, page *store.PageGraph, graph 
 				return err
 			}
 			continue
-		}
-		meta, err := index.Meta()
-		if err != nil {
-			return err
 		}
 		if !meta.Valid || meta.M != uint16(configuredVectorIndexM(graph)) || meta.Dimensions != target.dimensions {
 			if err := rebuildPageVectorIndexWithBudget(ctx, page, target.name, target.selectVector, target.dimensions, configuredVectorIndexM(graph), buildBudget, budget); err != nil {

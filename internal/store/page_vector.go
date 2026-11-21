@@ -73,7 +73,35 @@ func (index PageVectorIndex) Meta() (PageVectorMeta, error) {
 
 // MetaWithPresence distinguishes a missing metadata record from an empty index.
 func (index PageVectorIndex) MetaWithPresence() (PageVectorMeta, bool, error) {
-	data, err := index.Tx.GetBounded(pageVectorBucket, index.metaKey(), 256)
+	return index.metaWithPresence(nil)
+}
+
+// MetaWithPresenceBudget charges metadata before it is cloned or cached.
+func (index PageVectorIndex) MetaWithPresenceBudget(budget PageReadBudget) (PageVectorMeta, bool, error) {
+	if budget == nil {
+		return index.MetaWithPresence()
+	}
+	return index.metaWithPresence(budget)
+}
+
+func (index PageVectorIndex) metaWithPresence(budget PageReadBudget) (PageVectorMeta, bool, error) {
+	var held uint64
+	var charge func(uint64) error
+	if budget != nil {
+		charge = func(bytes uint64) error {
+			if err := budget.ReservePageRead(0, bytes); err != nil {
+				return err
+			}
+			held = bytes
+			return nil
+		}
+	}
+	data, err := index.Tx.GetBoundedWithCharge(pageVectorBucket, index.metaKey(), 256, charge)
+	defer func() {
+		if held != 0 {
+			budget.ReleasePageRead(held)
+		}
+	}()
 	if err != nil || data == nil {
 		return PageVectorMeta{}, false, err
 	}

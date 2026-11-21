@@ -1014,6 +1014,47 @@ func TestPageVectorLowBudgetErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestPageVectorSearchChargesMetadataToByteBudget(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "page-vector-meta-budget"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	write, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := store.PageVectorIndex{Tx: write, Namespace: "default"}
+	if err := index.PutMeta(store.PageVectorMeta{Dimensions: 2, M: 4, Valid: true}); err != nil {
+		_ = write.Rollback()
+		t.Fatal(err)
+	}
+	if err := write.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	read, err := db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Rollback()
+	budget := &directSearchBudget{ctx: context.Background(), maxWork: 100, maxBytes: 1}
+	index = store.PageVectorIndex{Tx: read, Namespace: "default"}
+	_, err = pageVectorSearch(context.Background(), index, []float32{1, 1}, 1, 8, 4, budget)
+	if !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("metadata budget error = %v, want ErrResourceLimit", err)
+	}
+	if results, err := pageVectorSearch(context.Background(), index, []float32{1, 1}, 1, 8, 4, nil); err != nil || len(results) != 0 {
+		t.Fatalf("nil-budget search = %v, %v", results, err)
+	}
+	graph := store.NewGraphState()
+	graph.PageBase = &store.PageGraph{Tx: read}
+	graph.PageBase.SearchIndexesCurrent = true
+	graph.VectorDimensions = 2
+	if _, _, err := searchVectorGraph(graph, []float32{1, 1}, VectorSearchOptions{K: 1}, budget, false); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("graph metadata budget error = %v, want ErrResourceLimit", err)
+	}
+}
+
 func TestPageVectorCorruptionPropagatesWithoutFallback(t *testing.T) {
 	db, err := pagestore.Open(filepath.Join(t.TempDir(), "page-vector-corruption"), pagestore.Options{})
 	if err != nil {

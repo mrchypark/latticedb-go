@@ -20,6 +20,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - name: Scan reachable vulnerabilities
+        if: runner.os == 'Linux'
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
+          (cd conformance/go && go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...)
       - run: go test ./...
       - name: Test FTS corpus evaluation tools
         run: python scripts/test_fts_corpus.py

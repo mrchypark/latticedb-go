@@ -78,7 +78,9 @@ selected dependency chain and restored commit/history before installing a new
 page database without overwriting an existing database. Missing or corrupt required
 objects are errors, never a reason to silently choose an older commit. These
 checks detect corruption, not an attacker who can rewrite the whole archive.
-Legacy standalone full-checkpoint archives remain readable.
+Restore requires a published archive head; headless standalone checkpoints are
+not accepted. Restore stages up to
+8 GiB of WAL input by default; set `MaxRestoreWALBytes` to permit a longer chain.
 
 `CommitID` selects an exact recorded commit (a pointer permits commit 0); `Before`
 selects a recorded capture at or before that time. The selectors are mutually

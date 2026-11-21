@@ -111,3 +111,38 @@ func TestPageVectorMetaWithPresence(t *testing.T) {
 		t.Fatalf("corrupt metadata: found=%v err=%v", found, err)
 	}
 }
+
+func TestPageVectorMetaWithPresenceChargesReadBudget(t *testing.T) {
+	db, err := pagestore.Open(filepath.Join(t.TempDir(), "vectors"), pagestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	index := PageVectorIndex{Tx: tx, Namespace: "meta-budget"}
+	want := PageVectorMeta{Dimensions: 2, M: 4, Valid: true}
+	if err := index.PutMeta(want); err != nil {
+		t.Fatal(err)
+	}
+
+	rejected := &recordReadTestBudget{maxWork: 1, maxBytes: 1}
+	if _, _, err := index.MetaWithPresenceBudget(rejected); !errors.Is(err, errRecordReadTestBudget) {
+		t.Fatalf("metadata budget error = %v", err)
+	}
+	if rejected.bytes != 0 {
+		t.Fatalf("rejected metadata retained %d bytes", rejected.bytes)
+	}
+
+	admitted := &recordReadTestBudget{maxWork: 1, maxBytes: 256}
+	got, found, err := index.MetaWithPresenceBudget(admitted)
+	if err != nil || !found || got != want {
+		t.Fatalf("metadata: got=%+v found=%v err=%v", got, found, err)
+	}
+	if admitted.peak == 0 || admitted.bytes != 0 {
+		t.Fatalf("metadata budget peak=%d retained=%d", admitted.peak, admitted.bytes)
+	}
+}

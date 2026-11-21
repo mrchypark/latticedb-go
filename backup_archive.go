@@ -10,6 +10,6 @@ import (
 // capture is opt-in through OpenOptions.BackupDirectory; it is full-snapshot
 // PITR, not incremental WAL or delta shipping.
 func RestoreBackup(ctx context.Context, directory, destination string, opts BackupRestoreOptions) (BackupMetadata, error) {
-	metadata, err := engine.RestoreBackup(ctx, directory, destination, engine.BackupRestoreOptions{CommitID: opts.CommitID, Before: opts.Before, MaxDatabaseSnapshotBytes: opts.MaxDatabaseSnapshotBytes})
+	metadata, err := engine.RestoreBackup(ctx, directory, destination, engine.BackupRestoreOptions{CommitID: opts.CommitID, Before: opts.Before, MaxDatabaseSnapshotBytes: opts.MaxDatabaseSnapshotBytes, MaxRestoreWALBytes: opts.MaxRestoreWALBytes})
 	return BackupMetadata{CommitID: metadata.CommitID, CapturedAt: metadata.CapturedAt}, wrapError(err)
 }
